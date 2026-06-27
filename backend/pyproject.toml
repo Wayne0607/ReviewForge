@@ -1,0 +1,43 @@
+[project]
+name = "reviewforge"
+version = "0.1.0"
+description = "AI multi-agent code review system"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "langchain-openai>=0.3",
+    "langchain-core>=0.3",
+    "pydantic>=2.0",
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+    "cryptography>=44.0",  # GitHub webhook signature verification
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+reviewforge = "reviewforge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reviewforge"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -65,12 +65,18 @@ class Planner:
         tasks = []
         for item in data.get("tasks", []):
             reviewer = item.get("reviewer", "")
+            # Normalize: lowercase, replace spaces/hyphens with underscores
+            reviewer = reviewer.lower().replace(" ", "_").replace("-", "_")
             # Map short names to full names
             reviewer_map = {
                 "security": "security_reviewer",
+                "security_reviewer": "security_reviewer",
                 "performance": "performance_reviewer",
+                "performance_reviewer": "performance_reviewer",
                 "style": "style_reviewer",
-                "architecture": "style_reviewer",  # fallback
+                "style_reviewer": "style_reviewer",
+                "architecture": "style_reviewer",
+                "readability": "style_reviewer",
             }
             reviewer = reviewer_map.get(reviewer, reviewer)
 

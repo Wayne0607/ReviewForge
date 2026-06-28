@@ -143,8 +143,8 @@ class Orchestrator:
     def _format_comment(finding: Finding) -> str:
         severity_emoji = {"error": "🔴", "warning": "🟡", "info": "🔵"}.get(finding.severity, "⚪")
         return (
-            f"{severity_emoji} **[{finding.category}]** (confidence: {finding.confidence:.0%})\n\n"
+            f"{severity_emoji} **[{finding.category}]** (置信度: {finding.confidence:.0%})\n\n"
             f"{finding.message}\n\n"
-            f"**Suggestion:** {finding.suggestion}\n\n"
+            f"**建议:** {finding.suggestion}\n\n"
             f"<sub>ReviewForge • {finding.reviewer}</sub>"
         )

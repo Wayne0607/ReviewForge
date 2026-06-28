@@ -16,12 +16,16 @@ PromptSection = Callable[[dict[str, Any]], str | None]
 def _identity(ctx: dict[str, Any]) -> str:
     role = ctx.get("role", "reviewer")
     identities = {
-        "planner": "You are the ReviewForge Planner. You analyze PR diffs and decide which specialized reviewers to dispatch.",
-        "reviewer": f"You are the ReviewForge {ctx.get('reviewer_type', 'code')} reviewer. You examine code changes and report findings.",
-        "verifier": "You are the ReviewForge Verifier. You review candidate findings and decide if they are real issues or false positives.",
-        "commenter": "You are the ReviewForge Commenter. You format confirmed findings into clear, actionable GitHub review comments.",
+        "planner": "你是 ReviewForge 的 Planner。你分析 PR diff，决定派哪些专门的 Reviewer 去审查。",
+        "reviewer": f"你是 ReviewForge 的 {ctx.get('reviewer_type', '代码')}审查员。你检查代码变更并报告发现的问题。",
+        "verifier": "你是 ReviewForge 的 Verifier。你审查候选发现，判断是真实问题还是误报。",
+        "commenter": "你是 ReviewForge 的 Commenter。你将确认的发现格式化为清晰、可操作的 GitHub review 评论。",
     }
     return identities.get(role, identities["reviewer"])
+
+
+def _language(ctx: dict[str, Any]) -> str:
+    return "## 语言要求\n\n所有 message、suggestion、reason 字段必须使用中文。category 和 severity 使用英文。代码标识符、路径、API 名称保留英文。"
 
 
 def _available_tools(ctx: dict[str, Any]) -> str | None:
@@ -54,101 +58,101 @@ def _output_contract(ctx: dict[str, Any]) -> str | None:
 def _planner_mission(ctx: dict[str, Any]) -> str:
     return """## Mission
 
-Analyze the PR diff and decide which reviewers to dispatch.
+分析 PR diff，决定派哪些 Reviewer 去审查。
 
-Rules:
-- Only dispatch reviewers whose expertise is needed for the changed files
-- Security reviewer: if files involve auth, input handling, crypto, network, secrets, SQL
-- Performance reviewer: if files involve loops, data processing, caching, database queries
-- Style reviewer: always dispatch for readability check
-- Each task should list specific files to review
-- Max 4 tasks per round"""
+规则：
+- 只派需要的 Reviewer，不要浪费
+- Security Reviewer：涉及认证、输入处理、加密、网络、密钥、SQL 的文件
+- Performance Reviewer：涉及循环、数据处理、缓存、数据库查询的文件
+- Style Reviewer：始终派发，检查可读性
+- 每个 task 要列出具体文件
+- 每轮最多 4 个 task"""
 
 
 def _reviewer_mission(ctx: dict[str, Any]) -> str:
     reviewer_type = ctx.get("reviewer_type", "general")
     missions = {
-        "security": """## Mission
+        "security": """## 任务
 
-Review code for security vulnerabilities:
-- SQL injection, XSS, CSRF, path traversal
-- Hardcoded secrets, insecure defaults
-- Missing input validation/sanitization
-- Insecure crypto, weak auth patterns
-- Dependency vulnerabilities""",
-        "performance": """## Mission
+审查代码中的安全漏洞：
+- SQL 注入、XSS、CSRF、路径遍历
+- 硬编码密钥、不安全的默认配置
+- 缺少输入验证/清理
+- 不安全的加密、弱认证模式
+- 依赖漏洞""",
+        "performance": """## 任务
 
-Review code for performance issues:
-- O(n²) or worse complexity in hot paths
-- Missing caching opportunities
-- N+1 query patterns
-- Unnecessary memory allocations
-- Blocking I/O in async contexts""",
-        "style": """## Mission
+审查代码中的性能问题：
+- 热路径中的 O(n²) 或更高复杂度
+- 缺少缓存机会
+- N+1 查询模式
+- 不必要的内存分配
+- 在 async 上下文中使用阻塞 I/O""",
+        "style": """## 任务
 
-Review code for readability and maintainability:
-- Unclear naming, magic numbers
-- Missing docstrings on public APIs
-- Overly complex functions (>30 lines)
-- Dead code, unused imports
-- Inconsistent patterns with rest of codebase""",
+审查代码的可读性和可维护性：
+- 命名不清晰、魔法数字
+- 公共 API 缺少文档字符串
+- 过于复杂的函数（>30 行）
+- 死代码、未使用的导入
+- 与代码库其他部分的模式不一致""",
     }
-    return missions.get(reviewer_type, "## Mission\n\nReview the code changes and report findings.")
+    return missions.get(reviewer_type, "## 任务\n\n审查代码变更并报告发现。")
 
 
 def _verifier_mission(ctx: dict[str, Any]) -> str:
-    return """## Mission
+    return """## 任务
 
-For each candidate finding, decide:
-- **confirmed**: the issue is real and actionable
-- **false_positive**: the finding is a mistake, not applicable, or too noisy
+对每个候选发现，判断：
+- **confirmed**：问题是真实且可操作的
+- **false_positive**：发现是错误的、不适用的、或噪音太大
 
-Be strict. Only confirm findings you are confident about.
-If confidence < 0.6, mark as false_positive."""
+严格标准。只确认你有把握的发现。
+如果置信度 < 0.6，标记为 false_positive。"""
 
 
 def _anti_patterns(ctx: dict[str, Any]) -> str:
-    return """## Anti-Patterns (DO NOT DO)
+    return """## 反模式（禁止）
 
-- Do NOT invent findings that aren't grounded in the actual code
-- Do NOT report issues on lines that weren't changed in the PR
-- Do NOT duplicate the same finding across files
-- Do NOT suggest refactors that aren't related to the PR's purpose
-- Do NOT leave placeholder text in suggestions"""
+- 不要编造没有代码依据的发现
+- 不要报告 PR 未改动的行上的问题
+- 不要在不同文件中重复同一个发现
+- 不要建议与 PR 目的无关的重构
+- 不要在建议中留占位符文本"""
 
 
 def _findings_format(ctx: dict[str, Any]) -> str:
-    return """## Findings Format
+    return """## 发现格式
 
-For each finding, provide:
-- `file`: exact file path from the diff
-- `line`: exact line number in the changed file
+每个发现必须包含：
+- `file`: diff 中的精确文件路径
+- `line`: 变更文件中的精确行号
 - `severity`: "info" | "warning" | "error"
-- `category`: short label (e.g., "sql-injection", "n-plus-one", "naming")
-- `message`: what the issue is (1-2 sentences)
-- `suggestion`: how to fix it (concrete code suggestion if possible)
-- `confidence`: 0.0-1.0 (how sure you are this is a real issue)"""
+- `category`: 简短标签（如 "sql-injection", "n-plus-one", "naming"）
+- `message`: 问题是什么（1-2 句话，中文）
+- `suggestion`: 如何修复（具体的代码建议，中文）
+- `confidence`: 0.0-1.0（你对这个发现的把握程度）"""
 
 
 def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     """Build system + user messages for the Planner agent."""
-    sections = [_identity, _planner_mission, _available_tools, _output_contract, _anti_patterns]
+    sections = [_identity, _language, _planner_mission, _available_tools, _output_contract, _anti_patterns]
     system_parts = [s({**ctx, "role": "planner", "agent_name": "planner"}) for s in sections]
     system = "\n\n".join(p for p in system_parts if p)
 
-    user = f"""## PR Context
+    user = f"""## PR 上下文
 
-**Repository**: {ctx.get('repo', 'unknown')}
+**仓库**: {ctx.get('repo', 'unknown')}
 **PR #{ctx.get('pr_number', '?')}**: {ctx.get('pr_title', '')}
-**Files changed**: {', '.join(ctx.get('files_changed', []))}
+**变更文件**: {', '.join(ctx.get('files_changed', []))}
 
-## Diff Summary
+## Diff 摘要
 
-{ctx.get('diff_summary', 'No diff available.')}
+{ctx.get('diff_summary', '无 diff 数据。')}
 
-## Instructions
+## 指示
 
-Analyze the diff and dispatch reviewers. Output JSON."""
+分析 diff 并派发 Reviewer。输出 JSON。"""
 
     return [
         {"role": "system", "content": system},
@@ -159,7 +163,7 @@ Analyze the diff and dispatch reviewers. Output JSON."""
 def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     """Build system + user messages for a Reviewer agent."""
     reviewer_type = ctx.get("reviewer_type", "general")
-    sections = [_identity, _reviewer_mission, _available_tools, _findings_format, _output_contract, _anti_patterns]
+    sections = [_identity, _language, _reviewer_mission, _available_tools, _findings_format, _output_contract, _anti_patterns]
     system_parts = [s({**ctx, "role": "reviewer", "agent_name": f"{reviewer_type}_reviewer"}) for s in sections]
     system = "\n\n".join(p for p in system_parts if p)
 
@@ -168,15 +172,15 @@ def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
 
     diff_text = ""
     for f in files_to_review:
-        diff_text += f"### {f}\n```\n{diffs.get(f, 'No diff available.')}\n```\n\n"
+        diff_text += f"### {f}\n```\n{diffs.get(f, '无 diff 数据。')}\n```\n\n"
 
-    user = f"""## Files to Review
+    user = f"""## 待审查文件
 
 {diff_text}
 
-## Instructions
+## 指示
 
-Review the above changes and report findings as JSON."""
+审查上述变更，以 JSON 格式报告发现。"""
 
     return [
         {"role": "system", "content": system},
@@ -186,7 +190,7 @@ Review the above changes and report findings as JSON."""
 
 def build_verifier_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     """Build system + user messages for the Verifier agent."""
-    sections = [_identity, _verifier_mission, _output_contract, _anti_patterns]
+    sections = [_identity, _language, _verifier_mission, _output_contract, _anti_patterns]
     system_parts = [s({**ctx, "role": "verifier", "agent_name": "verifier"}) for s in sections]
     system = "\n\n".join(p for p in system_parts if p)
 
@@ -196,13 +200,13 @@ def build_verifier_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
         for f in findings
     )
 
-    user = f"""## Candidate Findings
+    user = f"""## 候选发现
 
 {findings_text}
 
-## Instructions
+## 指示
 
-For each finding, determine if it is confirmed or false_positive. Output JSON."""
+对每个发现，判断是 confirmed 还是 false_positive。输出 JSON。"""
 
     return [
         {"role": "system", "content": system},

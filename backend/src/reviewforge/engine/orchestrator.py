@@ -127,7 +127,7 @@ class Orchestrator:
         count = 0
         for finding in findings:
             try:
-                self._gateway.invoke("post_comment", {
+                await self._gateway.invoke("post_comment", {
                     "file_path": finding.file,
                     "line": finding.line,
                     "body": self._format_comment(finding),

@@ -45,7 +45,7 @@ class BaseReviewer:
         files = task.files or state.files_changed
         diffs = {}
         for f in files:
-            diffs[f] = self._gateway.invoke("read_diff", {"file_path": f}, state) or ""
+            diffs[f] = await self._gateway.invoke("read_diff", {"file_path": f}, state) or ""
 
         ctx = {
             "registry": self._registry,

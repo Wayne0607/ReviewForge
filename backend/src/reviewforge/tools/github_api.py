@@ -1,4 +1,4 @@
-"""GitHub API client — wraps the GitHub REST API for ReviewForge."""
+"""GitHub API client — async wrapper around GitHub REST API."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class GitHubClient:
-    """Thin wrapper around GitHub REST API."""
+    """Async GitHub REST API client."""
 
     BASE_URL = "https://api.github.com"
 
@@ -30,26 +30,8 @@ class GitHubClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    def get_file_diff(self, repo: str, pr_number: int, file_path: str) -> str:
-        """Get the diff for a specific file in a PR. (Sync wrapper for tool loop.)"""
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            # We're inside an async context, use a workaround
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(
-                    asyncio.run,
-                    self._get_file_diff_async(repo, pr_number, file_path)
-                )
-                return future.result(timeout=30)
-        return asyncio.run(self._get_file_diff_async(repo, pr_number, file_path))
-
-    async def _get_file_diff_async(self, repo: str, pr_number: int, file_path: str) -> str:
+    async def get_file_diff(self, repo: str, pr_number: int, file_path: str) -> str:
+        """Get the diff for a specific file in a PR."""
         resp = await self._client.get(
             f"/repos/{repo}/pulls/{pr_number}/files",
             params={"per_page": 100},
@@ -60,12 +42,8 @@ class GitHubClient:
                 return f.get("patch", "")
         return f"No diff found for {file_path}"
 
-    def get_file_content(self, repo: str, ref: str, file_path: str) -> str:
+    async def get_file_content(self, repo: str, ref: str, file_path: str) -> str:
         """Get file content at a specific ref."""
-        import asyncio
-        return asyncio.run(self._get_file_content_async(repo, ref, file_path))
-
-    async def _get_file_content_async(self, repo: str, ref: str, file_path: str) -> str:
         resp = await self._client.get(
             f"/repos/{repo}/contents/{file_path}",
             params={"ref": ref},
@@ -74,12 +52,8 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.text
 
-    def search_code(self, repo: str, pattern: str, file_glob: str = "") -> str:
+    async def search_code(self, repo: str, pattern: str, file_glob: str = "") -> str:
         """Search code in a repository."""
-        import asyncio
-        return asyncio.run(self._search_code_async(repo, pattern, file_glob))
-
-    async def _search_code_async(self, repo: str, pattern: str, file_glob: str = "") -> str:
         query = f"{pattern} repo:{repo}"
         if file_glob:
             query += f" path:{file_glob}"
@@ -89,7 +63,7 @@ class GitHubClient:
         items = data.get("items", [])
         return "\n".join(f"- {item['path']}" for item in items) or "No results"
 
-    def post_review_comment(
+    async def post_review_comment(
         self,
         repo: str,
         pr_number: int,
@@ -99,13 +73,6 @@ class GitHubClient:
         body: str,
     ) -> dict[str, Any]:
         """Post a review comment on a specific line."""
-        import asyncio
-        return asyncio.run(self._post_comment_async(repo, pr_number, commit_sha, file_path, line, body))
-
-    async def _post_comment_async(
-        self, repo: str, pr_number: int, commit_sha: str,
-        file_path: str, line: int, body: str,
-    ) -> dict[str, Any]:
         resp = await self._client.post(
             f"/repos/{repo}/pulls/{pr_number}/comments",
             json={

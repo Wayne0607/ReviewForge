@@ -72,6 +72,6 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             import asyncio
             asyncio.create_task(orchestrator.run(state))
 
-            return {"status": "review_triggered", "pr": pr_number}
+            return {"status": "review_triggered", "pr": str(pr_number)}
 
     return {"status": "ignored", "event": event}

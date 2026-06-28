@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,6 +16,7 @@ from fastapi import FastAPI
 from langchain_openai import ChatOpenAI
 
 from reviewforge.api.webhook import router as webhook_router
+from reviewforge.core.config import ReviewForgeConfig
 from reviewforge.core.events import EventBus
 from reviewforge.core.specs import SpecRegistry, build_registry
 from reviewforge.engine.orchestrator import Orchestrator
@@ -24,32 +24,59 @@ from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.github_api import GitHubClient
 
 
-def create_app() -> FastAPI:
+def create_app(config_path: str | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Startup
-        github = GitHubClient(token=os.environ["GITHUB_TOKEN"])
-        registry = build_registry()
+        import os
 
-        # Validate specs
+        # Load config
+        cfg = ReviewForgeConfig.load(config_path)
+        mock_mode = os.environ.get("REVIEWFORGE_MOCK") == "1"
+
+        # GitHub client
+        if mock_mode:
+            from reviewforge.tools.mock_github import MockGitHubClient
+            github = MockGitHubClient()
+            logger.info("Mock mode: using MockGitHubClient")
+        else:
+            github = GitHubClient(token=cfg.github.token)
+
+        # Spec registry
+        registry = build_registry()
         errors = registry.validate()
         if errors:
             raise RuntimeError(f"Spec validation failed: {errors}")
 
-        # Build LLM clients
-        base_url = os.environ.get("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")
-        api_key = os.environ.get("LLM_API_KEY", "")
-        model = os.environ.get("REVIEWFORGE_MODEL", "MiMo")
+        # LLM clients
+        if mock_mode:
+            from reviewforge.engine.mock_llm import MockChatLLM
+            planner_llm = MockChatLLM()
+            reviewer_llm = MockChatLLM()
+            verifier_llm = MockChatLLM()
+            logger.info("Mock mode: using MockChatLLM")
+        else:
+            planner_llm = ChatOpenAI(
+                base_url=cfg.llm.base_url, api_key=cfg.llm.api_key,
+                model=cfg.llm.model, temperature=cfg.llm.temperature_planner,
+            )
+            reviewer_llm = ChatOpenAI(
+                base_url=cfg.llm.base_url, api_key=cfg.llm.api_key,
+                model=cfg.llm.model, temperature=cfg.llm.temperature_reviewer,
+            )
+            verifier_llm = ChatOpenAI(
+                base_url=cfg.llm.base_url, api_key=cfg.llm.api_key,
+                model=cfg.llm.model, temperature=cfg.llm.temperature_verifier,
+            )
 
-        planner_llm = ChatOpenAI(base_url=base_url, api_key=api_key, model=model, temperature=0)
-        reviewer_llm = ChatOpenAI(base_url=base_url, api_key=api_key, model=model, temperature=0.1)
-        verifier_llm = ChatOpenAI(base_url=base_url, api_key=api_key, model=model, temperature=0)
+        # Event bus
+        event_bus = EventBus(log_dir=Path(cfg.events_dir))
 
+        # Tool gateway
         gateway = ToolGateway(registry, github)
-        event_bus = EventBus(log_path=Path(".reviewforge/events.jsonl"))
 
+        # Orchestrator
         orchestrator = Orchestrator(
             registry=registry,
             gateway=gateway,
@@ -62,12 +89,14 @@ def create_app() -> FastAPI:
         # Store on app state
         app.state.orchestrator = orchestrator
         app.state.github_client = github
-        app.state.webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+        app.state.webhook_secret = cfg.github.webhook_secret
         app.state.registry = registry
+        app.state.config = cfg
+
+        logger.info(f"ReviewForge started: model={cfg.llm.model}, reviewers={len(cfg.reviewers)}")
 
         yield
 
-        # Shutdown
         await github.close()
 
     app = FastAPI(
@@ -90,6 +119,15 @@ def create_app() -> FastAPI:
             "agents": {k: {"role": v.role, "description": v.description} for k, v in registry.agents.items()},
             "tools": {k: {"description": v.description} for k, v in registry.tools.items()},
             "skills": list(registry.skills),
+        }
+
+    @app.get("/api/v1/config")
+    async def get_config():
+        cfg: ReviewForgeConfig = app.state.config
+        return {
+            "llm": {"model": cfg.llm.model, "base_url": cfg.llm.base_url},
+            "reviewers": [{"name": r.name, "type": r.type, "enabled": r.enabled} for r in cfg.reviewers],
+            "confidence_threshold": cfg.confidence_threshold,
         }
 
     return app

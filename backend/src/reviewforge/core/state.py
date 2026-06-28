@@ -1,7 +1,8 @@
-"""State Store — Lattice-inspired shared state with deep-copy isolation.
+"""State Store — schema-validated shared state with deep-copy isolation.
 
 All agent-visible state lives here. Agents get deep copies on read,
 so concurrent agents cannot corrupt each other's view.
+Every write is validated against a Pydantic schema.
 """
 
 from __future__ import annotations
@@ -11,79 +12,132 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel, Field
+
+
+class FindingSchema(BaseModel):
+    """Validation schema for findings."""
+
+    id: str = Field(default_factory=lambda: f"finding_{uuid.uuid4().hex[:8]}")
+    file: str = Field(..., min_length=1)
+    line: int = Field(..., ge=0)
+    severity: str = Field(default="info", pattern="^(info|warning|error)$")
+    category: str = Field(default="", max_length=50)
+    message: str = Field(..., min_length=1, max_length=1000)
+    suggestion: str = Field(default="", max_length=2000)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    reviewer: str = Field(default="")
+    status: str = Field(default="candidate", pattern="^(candidate|confirmed|false_positive|reported)$")
+    verified_by: str = Field(default="")
+    verify_reason: str = Field(default="", max_length=500)
+
+
+class TaskSchema(BaseModel):
+    """Validation schema for review tasks."""
+
+    id: str = Field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
+    reviewer: str = Field(..., min_length=1)
+    files: list[str] = Field(default_factory=list)
+    rationale: str = Field(default="", max_length=500)
+    status: str = Field(default="pending", pattern="^(pending|claimed|completed|failed)$")
+    error: str = Field(default="", max_length=500)
+
+
+class NoteSchema(BaseModel):
+    """Validation schema for agent-to-planner notes."""
+
+    id: str = Field(default_factory=lambda: f"note_{uuid.uuid4().hex[:8]}")
+    from_agent: str = Field(..., min_length=1)
+    type: str = Field(..., min_length=1, max_length=50)
+    content: str = Field(..., min_length=1, max_length=2000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
 
 @dataclass
 class Finding:
-    """A single review finding."""
+    """A single review finding (validated on creation)."""
 
     id: str = field(default_factory=lambda: f"finding_{uuid.uuid4().hex[:8]}")
     file: str = ""
     line: int = 0
-    severity: str = "info"  # info / warning / error
+    severity: str = "info"
     category: str = ""
     message: str = ""
     suggestion: str = ""
     confidence: float = 0.0
     reviewer: str = ""
-    status: str = "candidate"  # candidate / confirmed / false_positive
+    status: str = "candidate"
     verified_by: str = ""
     verify_reason: str = ""
 
+    def __post_init__(self) -> None:
+        FindingSchema(
+            id=self.id, file=self.file, line=self.line,
+            severity=self.severity, category=self.category,
+            message=self.message, suggestion=self.suggestion,
+            confidence=self.confidence, reviewer=self.reviewer,
+            status=self.status, verified_by=self.verified_by,
+            verify_reason=self.verify_reason,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
-            "file": self.file,
-            "line": self.line,
-            "severity": self.severity,
-            "category": self.category,
-            "message": self.message,
-            "suggestion": self.suggestion,
-            "confidence": self.confidence,
-            "reviewer": self.reviewer,
-            "status": self.status,
-            "verified_by": self.verified_by,
+            "id": self.id, "file": self.file, "line": self.line,
+            "severity": self.severity, "category": self.category,
+            "message": self.message, "suggestion": self.suggestion,
+            "confidence": self.confidence, "reviewer": self.reviewer,
+            "status": self.status, "verified_by": self.verified_by,
             "verify_reason": self.verify_reason,
         }
 
 
 @dataclass
 class ReviewTask:
-    """A task in the scheduler."""
+    """A task in the scheduler (validated on creation)."""
 
     id: str = field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
     reviewer: str = ""
     files: list[str] = field(default_factory=list)
     rationale: str = ""
-    status: str = "pending"  # pending / claimed / completed / failed
+    status: str = "pending"
     error: str = ""
+
+    def __post_init__(self) -> None:
+        TaskSchema(
+            id=self.id, reviewer=self.reviewer, files=self.files,
+            rationale=self.rationale, status=self.status, error=self.error,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
-            "reviewer": self.reviewer,
-            "files": self.files,
-            "rationale": self.rationale,
-            "status": self.status,
-            "error": self.error,
+            "id": self.id, "reviewer": self.reviewer, "files": self.files,
+            "rationale": self.rationale, "status": self.status, "error": self.error,
         }
 
 
 @dataclass
 class Note:
-    """Agent-to-Planner feedback channel. Consumed then deleted."""
+    """Agent-to-Planner feedback channel (validated on creation)."""
 
     id: str = field(default_factory=lambda: f"note_{uuid.uuid4().hex[:8]}")
     from_agent: str = ""
-    type: str = ""  # needs_more_context / false_positive_suspected / ...
+    type: str = ""
     content: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        NoteSchema(
+            id=self.id, from_agent=self.from_agent,
+            type=self.type, content=self.content, metadata=self.metadata,
+        )
 
 
 @dataclass
 class StateStore:
-    """In-memory state store with deep-copy read isolation.
+    """In-memory state store with deep-copy read isolation and schema validation.
 
     This is the Lattice: single source of truth for all review state.
+    Every write is validated against a Pydantic schema.
     """
 
     # PR context (set once at review start)
@@ -92,7 +146,7 @@ class StateStore:
     head_sha: str = ""
     base_sha: str = ""
     files_changed: list[str] = field(default_factory=list)
-    diff_summary: str = ""  # compact diff for Planner
+    diff_summary: str = ""
 
     # Runtime state
     findings: dict[str, Finding] = field(default_factory=dict)
@@ -112,9 +166,11 @@ class StateStore:
         return copy.deepcopy(list(self.findings.values()))
 
     def update_finding(self, finding_id: str, **kwargs: Any) -> None:
+        f = self.findings[finding_id]
         for k, v in kwargs.items():
-            if hasattr(self.findings[finding_id], k):
-                setattr(self.findings[finding_id], k, v)
+            if hasattr(f, k):
+                setattr(f, k, v)
+        FindingSchema(**f.to_dict())
 
     def add_task(self, task: ReviewTask) -> str:
         self.tasks[task.id] = task
@@ -129,21 +185,21 @@ class StateStore:
         return copy.deepcopy(list(self.tasks.values()))
 
     def update_task(self, task_id: str, **kwargs: Any) -> None:
+        t = self.tasks[task_id]
         for k, v in kwargs.items():
-            if hasattr(self.tasks[task_id], k):
-                setattr(self.tasks[task_id], k, v)
+            if hasattr(t, k):
+                setattr(t, k, v)
+        TaskSchema(**t.to_dict())
 
     def add_note(self, note: Note) -> None:
         self.notes.append(note)
 
     def consume_notes(self) -> list[Note]:
-        """Read and clear all notes (message-queue semantics)."""
         notes = copy.deepcopy(self.notes)
         self.notes.clear()
         return notes
 
     def snapshot(self) -> dict[str, Any]:
-        """Create a serializable snapshot of the full state."""
         return {
             "pr_number": self.pr_number,
             "repo": self.repo,

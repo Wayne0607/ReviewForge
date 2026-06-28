@@ -53,3 +53,4 @@ class user_manager:
             "country": country,
         })
 # trigger
+# retest after async fix

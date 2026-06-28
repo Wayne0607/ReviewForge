@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -79,18 +80,46 @@ class BaseReviewer:
 
         return []
 
-    def _parse_findings(self, content: str) -> list[Finding]:
-        """Parse LLM JSON output into Finding objects."""
+    @staticmethod
+    def _extract_json(content: str) -> dict | None:
+        """Extract JSON from LLM output, handling extra text around it."""
         content = content.strip()
+        # Strip code fences
         if content.startswith("```"):
             content = content.split("\n", 1)[1] if "\n" in content else content[3:]
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
 
+        # Try direct parse
         try:
-            data = json.loads(content)
+            return json.loads(content)
         except json.JSONDecodeError:
+            pass
+
+        # Try to find JSON object in the content
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Try finding { ... } boundaries
+        start = content.find('{')
+        end = content.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(content[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _parse_findings(self, content: str) -> list[Finding]:
+        """Parse LLM JSON output into Finding objects."""
+        data = self._extract_json(content)
+        if data is None:
             logger.warning(f"{self.name}: invalid JSON output")
             return []
 

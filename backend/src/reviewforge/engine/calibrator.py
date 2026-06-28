@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -236,10 +237,8 @@ class DynamicCalibrator:
         self, content: str, findings: list[Finding]
     ) -> list[ChallengeResult]:
         """Parse adversarial verifier output."""
-        content = self._strip_code_fences(content)
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
+        data = self._extract_json(content)
+        if data is None:
             logger.warning("Adversarial verifier returned invalid JSON, keeping original")
             return [
                 ChallengeResult(
@@ -263,10 +262,8 @@ class DynamicCalibrator:
 
     def _parse_judgment(self, content: str, findings: list[Finding]) -> list[Finding]:
         """Parse judge output and update findings."""
-        content = self._strip_code_fences(content)
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
+        data = self._extract_json(content)
+        if data is None:
             logger.warning("Judge returned invalid JSON, keeping findings as-is")
             return findings
 
@@ -329,3 +326,43 @@ class DynamicCalibrator:
         if content.endswith("```"):
             content = content[:-3]
         return content.strip()
+
+    @staticmethod
+    def _extract_json(content: str) -> list | dict | None:
+        """Extract JSON from LLM output, handling extra text around it."""
+        content = DynamicCalibrator._strip_code_fences(content)
+
+        # Try direct parse first
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+
+        # Try to find JSON array in the content
+        # Look for [...] pattern
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Try to find JSON object {...} pattern
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Try removing leading/trailing non-JSON text
+        for start_char, end_char in [('[', ']'), ('{', '}')]:
+            start = content.find(start_char)
+            end = content.rfind(end_char)
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(content[start:end + 1])
+                except json.JSONDecodeError:
+                    continue
+
+        return None

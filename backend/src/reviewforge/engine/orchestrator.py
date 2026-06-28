@@ -196,6 +196,10 @@ class Orchestrator:
         """Post review comments via the tool gateway."""
         count = 0
         for finding in findings:
+            # Validate line number — GitHub rejects line=0 or invalid lines
+            if finding.line <= 0:
+                logger.warning(f"Skipping comment for {finding.id}: invalid line {finding.line}")
+                continue
             try:
                 await self._gateway.invoke("post_comment", {
                     "file_path": finding.file,
@@ -206,7 +210,11 @@ class Orchestrator:
                 state.update_finding(finding.id, status="reported")
                 count += 1
             except Exception as e:
-                logger.error(f"Failed to post comment for {finding.id}: {e}")
+                error_msg = str(e)
+                if "422" in error_msg:
+                    logger.warning(f"Skipping comment for {finding.id}: line {finding.line} not in diff")
+                else:
+                    logger.error(f"Failed to post comment for {finding.id}: {e}")
         return count
 
     @staticmethod

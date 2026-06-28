@@ -196,6 +196,7 @@ class Planner:
                 "testing_reviewer": "testing_reviewer",
                 "test": "testing_reviewer",
                 "documentation": "doc_reviewer",
+                "documentation_reviewer": "doc_reviewer",
                 "doc": "doc_reviewer",
                 "doc_reviewer": "doc_reviewer",
                 "dependency": "dependency_reviewer",

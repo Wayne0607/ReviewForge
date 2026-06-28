@@ -56,13 +56,20 @@ def _output_contract(ctx: dict[str, Any]) -> str | None:
 
 
 def _planner_mission(ctx: dict[str, Any]) -> str:
-    return """## Mission
+    return """## 任务
 
 分析 PR diff，决定派哪些 Reviewer 去审查。
 
 规则：
 - 只派需要的 Reviewer，不要浪费
-- Security Reviewer：涉及认证、输入处理、加密、网络、密钥、SQL 的文件
+- **Security Reviewer（必须派发，如果代码涉及以下任何一项）**：
+  - os.system / subprocess / eval / exec（命令注入）
+  - SQL 查询 / 字符串拼接 SQL（SQL 注入）
+  - pickle.loads / yaml.load（反序列化）
+  - 硬编码密码、密钥、token
+  - open() 用用户输入的路径（路径遍历）
+  - 用户输入未经验证就使用
+  - 网络请求、加密操作
 - Performance Reviewer：涉及循环、数据处理、缓存、数据库查询的文件
 - Style Reviewer：始终派发，检查可读性
 - 每个 task 要列出具体文件

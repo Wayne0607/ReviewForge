@@ -1,0 +1,47 @@
+# ReviewForge 配置文件
+# 环境变量优先级高于此文件
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+
+llm:
+  base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+  model: "mimo-v2.5-pro"
+  temperature_planner: 0.0
+  temperature_reviewer: 0.1
+  temperature_verifier: 0.0
+
+github:
+  # 通过环境变量 GITHUB_TOKEN 和 GITHUB_WEBHOOK_SECRET 设置
+  token: ""
+  webhook_secret: ""
+
+# 审查员配置
+reviewers:
+  - name: security_reviewer
+    type: security
+    enabled: true
+    max_steps: 10
+    confidence_threshold: 0.5
+
+  - name: performance_reviewer
+    type: performance
+    enabled: true
+    max_steps: 8
+    confidence_threshold: 0.5
+
+  - name: style_reviewer
+    type: style
+    enabled: true
+    max_steps: 6
+    confidence_threshold: 0.5
+
+# Skill 规则集目录
+skills_dir: "skills"
+
+# 事件日志目录
+events_dir: ".reviewforge/events"
+
+# 全局置信度阈值（低于此值的发现不发评论）
+confidence_threshold: 0.5

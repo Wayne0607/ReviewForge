@@ -26,9 +26,9 @@ def test_state_deep_copy_isolation():
 
 def test_state_list_by_status():
     state = StateStore()
-    state.add_finding(Finding(file="a.py", status="candidate"))
-    state.add_finding(Finding(file="b.py", status="confirmed"))
-    state.add_finding(Finding(file="c.py", status="candidate"))
+    state.add_finding(Finding(file="a.py", status="candidate", message="finding a"))
+    state.add_finding(Finding(file="b.py", status="confirmed", message="finding b"))
+    state.add_finding(Finding(file="c.py", status="candidate", message="finding c"))
 
     candidates = state.list_findings(status="candidate")
     assert len(candidates) == 2
@@ -54,7 +54,7 @@ def test_state_notes_consumed():
 
 def test_state_snapshot():
     state = StateStore(pr_number=42, repo="owner/repo")
-    state.add_finding(Finding(file="test.py", status="candidate"))
+    state.add_finding(Finding(file="test.py", status="candidate", message="test finding"))
     state.add_task(ReviewTask(reviewer="security_reviewer"))
 
     snap = state.snapshot()

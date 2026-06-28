@@ -53,9 +53,9 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             files_data = await github.get_pr_files(repo, pr_number)
             file_paths = [f["filename"] for f in files_data]
 
-            # Build diff summary for planner
+            # Build diff summary for planner (include actual patches for pattern detection)
             diff_summary = "\n".join(
-                f"--- {f['filename']} (+{f.get('additions', 0)} -{f.get('deletions', 0)})"
+                f"--- {f['filename']} (+{f.get('additions', 0)} -{f.get('deletions', 0)})\n{f.get('patch', '')}"
                 for f in files_data
             )
 

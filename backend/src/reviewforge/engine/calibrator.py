@@ -41,8 +41,16 @@ class DynamicCalibrator:
     2. Adversarial Verifier tries to refute each finding
     3. Judge rules on disputed findings (only if Round 2 disagrees with Round 1)
 
-    Stops early when no disputes remain or max_rounds reached.
+    Security findings skip calibration entirely — they are objective facts
+    and should never be filtered by adversarial verification.
     """
+
+    # Security categories that skip calibration
+    SECURITY_CATEGORIES = {
+        "sql-injection", "xss", "csrf", "command-injection", "path-traversal",
+        "hardcoded-secrets", "insecure-deserialization", "security",
+        "authentication", "authorization", "crypto", "ssrf", "xxe",
+    }
 
     def __init__(
         self,
@@ -57,11 +65,32 @@ class DynamicCalibrator:
         self._consensus_threshold = consensus_threshold
 
     async def calibrate(self, findings: list[Finding], code_diff: str) -> list[Finding]:
-        """Run dynamic calibration loop. Returns calibrated findings."""
+        """Run dynamic calibration loop. Returns calibrated findings.
+
+        Security findings are auto-confirmed and skip calibration.
+        """
         if not findings:
             return []
 
-        current_findings = findings
+        # Split: security findings skip calibration
+        security = []
+        need_calibration = []
+        for f in findings:
+            if f.category.lower().replace(" ", "-") in self.SECURITY_CATEGORIES:
+                f.status = "confirmed"
+                f.verified_by = "security-auto"
+                f.verify_reason = "安全问题直接确认，不经过对抗性校准"
+                security.append(f)
+            else:
+                need_calibration.append(f)
+
+        if security:
+            logger.info(f"Security auto-confirm: {len(security)} findings skip calibration")
+
+        if not need_calibration:
+            return security
+
+        current_findings = need_calibration
         rounds = 1
 
         while rounds < self._max_rounds:
@@ -78,7 +107,7 @@ class DynamicCalibrator:
 
             if not disputed:
                 logger.info(f"Consensus reached after round {rounds}, stopping")
-                return updated
+                return security + updated
 
             # Round 3 (if needed): Judge disputed findings
             if rounds < self._max_rounds:
@@ -92,9 +121,9 @@ class DynamicCalibrator:
                     if f.id in judged_map:
                         updated[i] = judged_map[f.id]
 
-                return updated
+                return security + updated
 
-        return updated
+        return security + updated
 
     async def _adversarial_round(
         self, findings: list[Finding], code_diff: str

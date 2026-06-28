@@ -44,6 +44,26 @@ PERFORMANCE_PATTERNS = [
     (r"sqlite3\.connect\s*\(.*\n.*for\s+", "db-in-loop"),
 ]
 
+# Testing patterns — trigger testing_reviewer
+TESTING_PATTERNS = [
+    (r"def\s+\w+\([^)]*\)\s*->", "has-type-hints"),  # new function with type hints
+    (r"class\s+\w+:", "new-class"),  # new class definition
+]
+
+# Dependency patterns — trigger dependency_reviewer
+DEPENDENCY_PATTERNS = [
+    (r"(?:pip install|add\(|dependencies|pyproject)", "dep-change"),
+    (r"(?:requirements.*\.txt|Pipfile|poetry\.lock|package\.json)", "dep-file-change"),
+]
+
+# Accessibility patterns — trigger accessibility_reviewer
+ACCESSIBILITY_PATTERNS = [
+    (r"(?:<img|<Image|<picture)", "image-element"),
+    (r"(?:<input|<select|<textarea|<button)", "form-element"),
+    (r"(?:onClick|onChange|onSubmit)", "interactive-handler"),
+    (r"(?:aria-|role=)", "aria-usage"),
+]
+
 
 class Planner:
     """Single-shot planner with deterministic pattern detection."""
@@ -79,20 +99,42 @@ class Planner:
         return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed)
 
     def _detect_patterns(self, files: list[str], diff: str) -> set[str]:
-        """Deterministically detect security and performance patterns in diff."""
+        """Deterministically detect patterns and force relevant reviewers."""
         forced = set()
+        file_set = set(files)
+        is_frontend = any(f.endswith((".tsx", ".jsx", ".vue", ".html", ".svelte")) for f in file_set)
 
         for pattern, label in SECURITY_PATTERNS:
             if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                 forced.add("security_reviewer")
                 logger.info(f"Security pattern detected: {label}")
-                break  # One match is enough
+                break
 
         for pattern, label in PERFORMANCE_PATTERNS:
             if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                 forced.add("performance_reviewer")
                 logger.info(f"Performance pattern detected: {label}")
                 break
+
+        for pattern, label in TESTING_PATTERNS:
+            if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                forced.add("testing_reviewer")
+                logger.info(f"Testing pattern detected: {label}")
+                break
+
+        for pattern, label in DEPENDENCY_PATTERNS:
+            if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                forced.add("dependency_reviewer")
+                logger.info(f"Dependency pattern detected: {label}")
+                break
+
+        # Only force accessibility reviewer for frontend files
+        if is_frontend:
+            for pattern, label in ACCESSIBILITY_PATTERNS:
+                if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                    forced.add("accessibility_reviewer")
+                    logger.info(f"Accessibility pattern detected: {label}")
+                    break
 
         return forced
 
@@ -150,6 +192,18 @@ class Planner:
                 "style_reviewer": "style_reviewer",
                 "architecture": "style_reviewer",
                 "readability": "style_reviewer",
+                "testing": "testing_reviewer",
+                "testing_reviewer": "testing_reviewer",
+                "test": "testing_reviewer",
+                "documentation": "doc_reviewer",
+                "doc": "doc_reviewer",
+                "doc_reviewer": "doc_reviewer",
+                "dependency": "dependency_reviewer",
+                "dependency_reviewer": "dependency_reviewer",
+                "deps": "dependency_reviewer",
+                "accessibility": "accessibility_reviewer",
+                "accessibility_reviewer": "accessibility_reviewer",
+                "a11y": "accessibility_reviewer",
             }
             reviewer = reviewer_map.get(reviewer, reviewer)
 

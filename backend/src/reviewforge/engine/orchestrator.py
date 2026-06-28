@@ -1,16 +1,19 @@
 """Orchestrator — the main review loop.
 
 Coordinates Planner → Reviewers → Dynamic Calibration → Commenter.
+Persists all results to the database for dashboard consumption.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
 from langchain_openai import ChatOpenAI
 
+from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
 from reviewforge.core.loop_detector import LoopDetector
 from reviewforge.core.specs import SpecRegistry
@@ -34,6 +37,7 @@ class Orchestrator:
         planner_llm: ChatOpenAI,
         reviewer_llm: ChatOpenAI,
         calibrator_llm: ChatOpenAI,
+        db: Database | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -42,6 +46,13 @@ class Orchestrator:
         self._calibrator = DynamicCalibrator(calibrator_llm, registry)
         self._reviewer_llm = reviewer_llm
         self._loop_detector = LoopDetector()
+        self._db = db
+        # Plugin-loaded reviewers (merged at init time)
+        self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
+
+    def register_plugin_reviewers(self, plugins: dict[str, type[BaseReviewer]]) -> None:
+        """Merge plugin-loaded reviewers into the reviewer map."""
+        self._extra_reviewers.update(plugins)
 
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
@@ -49,93 +60,134 @@ class Orchestrator:
         self._events.set_run_id(run_id)
         self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
 
-        # Phase 1: Plan
-        self._events.emit("planner.started")
-        tasks = await self._planner.plan(state)
-        for task in tasks:
-            state.add_task(task)
-        self._events.emit("planner.completed", {"task_count": len(tasks)})
+        # Persist run start
+        if self._db:
+            await self._db.create_run(
+                run_id=run_id, repo=state.repo,
+                pr_number=state.pr_number,
+                head_sha=state.head_sha, base_sha=state.base_sha,
+            )
 
-        # Phase 2: Execute reviewers
-        for task in state.list_tasks(status="pending"):
-            sig = LoopDetector.make_signature(task.reviewer, task.files)
-            loop_result = self._loop_detector.check(sig)
+        try:
+            # Phase 1: Plan
+            self._events.emit("planner.started")
+            tasks = await self._planner.plan(state)
+            for task in tasks:
+                state.add_task(task)
+            self._events.emit("planner.completed", {"task_count": len(tasks)})
 
-            if loop_result == "stall":
-                state.update_task(task.id, status="failed", error="loop_stalled")
-                self._events.emit("reviewer.stalled", {"task_id": task.id, "signature": sig})
-                continue
-            if loop_result == "rescue":
-                state.update_task(task.id, status="failed", error="rescue_drain")
-                self._events.emit("reviewer.rescued", {"task_id": task.id})
-                continue
+            # Phase 2: Execute reviewers
+            for task in state.list_tasks(status="pending"):
+                sig = LoopDetector.make_signature(task.reviewer, task.files)
+                loop_result = self._loop_detector.check(sig)
 
-            state.update_task(task.id, status="claimed")
-            self._events.emit("reviewer.started", {"reviewer": task.reviewer, "files": task.files})
+                if loop_result == "stall":
+                    state.update_task(task.id, status="failed", error="loop_stalled")
+                    self._events.emit("reviewer.stalled", {"task_id": task.id, "signature": sig})
+                    continue
+                if loop_result == "rescue":
+                    state.update_task(task.id, status="failed", error="rescue_drain")
+                    self._events.emit("reviewer.rescued", {"task_id": task.id})
+                    continue
 
-            try:
-                reviewer = self._create_reviewer(task.reviewer)
-                if reviewer:
-                    findings = await reviewer.execute(task, state)
-                    for f in findings:
-                        state.add_finding(f)
-                    state.update_task(task.id, status="completed")
-                    self._events.emit("reviewer.completed", {
-                        "reviewer": task.reviewer,
-                        "findings_count": len(findings),
-                    })
-                else:
-                    state.update_task(task.id, status="failed", error=f"unknown reviewer: {task.reviewer}")
-            except Exception as e:
-                state.update_task(task.id, status="failed", error=str(e))
-                self._events.emit("reviewer.failed", {"reviewer": task.reviewer, "error": str(e)})
+                state.update_task(task.id, status="claimed")
+                self._events.emit("reviewer.started", {"reviewer": task.reviewer, "files": task.files})
 
-        # Phase 3: Dynamic Calibration (adversarial verify + conditional judge)
-        candidates = state.list_findings(status="candidate")
-        if candidates:
-            self._events.emit("calibration.started", {"candidate_count": len(candidates)})
+                t_start = time.monotonic()
+                try:
+                    reviewer = self._create_reviewer(task.reviewer)
+                    if reviewer:
+                        findings = await reviewer.execute(task, state)
+                        for f in findings:
+                            state.add_finding(f)
+                        state.update_task(task.id, status="completed")
+                        self._events.emit("reviewer.completed", {
+                            "reviewer": task.reviewer,
+                            "findings_count": len(findings),
+                        })
+                        # Persist metric
+                        if self._db:
+                            duration_ms = int((time.monotonic() - t_start) * 1000)
+                            await self._db.insert_metric(
+                                run_id, task.reviewer,
+                                findings_count=len(findings),
+                                duration_ms=duration_ms,
+                            )
+                    else:
+                        state.update_task(task.id, status="failed", error=f"unknown reviewer: {task.reviewer}")
+                        if self._db:
+                            await self._db.insert_metric(
+                                run_id, task.reviewer,
+                                status="failed", error=f"unknown reviewer: {task.reviewer}",
+                            )
+                except Exception as e:
+                    state.update_task(task.id, status="failed", error=str(e))
+                    self._events.emit("reviewer.failed", {"reviewer": task.reviewer, "error": str(e)})
+                    if self._db:
+                        duration_ms = int((time.monotonic() - t_start) * 1000)
+                        await self._db.insert_metric(
+                            run_id, task.reviewer,
+                            duration_ms=duration_ms, status="failed", error=str(e),
+                        )
 
-            # Build diff context for calibrator
-            diff_context = state.diff_summary
+            # Phase 3: Dynamic Calibration (adversarial verify + conditional judge)
+            candidates = state.list_findings(status="candidate")
+            if candidates:
+                self._events.emit("calibration.started", {"candidate_count": len(candidates)})
 
-            # Run dynamic calibration
-            calibrated = await self._calibrator.calibrate(candidates, diff_context)
+                diff_context = state.diff_summary
+                calibrated = await self._calibrator.calibrate(candidates, diff_context)
 
-            # Update state with calibrated findings
-            for f in calibrated:
-                if f.status == "confirmed":
-                    state.update_finding(f.id, status="confirmed", verified_by=f.verified_by,
-                                         verify_reason=f.verify_reason)
-                elif f.status == "false_positive":
-                    state.update_finding(f.id, status="false_positive", verified_by=f.verified_by,
-                                         verify_reason=f.verify_reason)
+                for f in calibrated:
+                    if f.status == "confirmed":
+                        state.update_finding(f.id, status="confirmed", verified_by=f.verified_by,
+                                             verify_reason=f.verify_reason)
+                    elif f.status == "false_positive":
+                        state.update_finding(f.id, status="false_positive", verified_by=f.verified_by,
+                                             verify_reason=f.verify_reason)
 
-            confirmed_count = len([f for f in calibrated if f.status == "confirmed"])
-            filtered_count = len([f for f in calibrated if f.status == "false_positive"])
-            self._events.emit("calibration.completed", {
-                "confirmed": confirmed_count,
-                "filtered": filtered_count,
-            })
+                confirmed_count = len([f for f in calibrated if f.status == "confirmed"])
+                filtered_count = len([f for f in calibrated if f.status == "false_positive"])
+                self._events.emit("calibration.completed", {
+                    "confirmed": confirmed_count,
+                    "filtered": filtered_count,
+                })
 
-        # Phase 4: Comment
-        confirmed = state.list_findings(status="confirmed")
-        if confirmed:
-            self._events.emit("commenter.started", {"finding_count": len(confirmed)})
-            comment_count = await self._post_comments(confirmed, state)
-            self._events.emit("commenter.completed", {"comments_posted": comment_count})
+            # Persist all findings to DB
+            if self._db:
+                for f in state.findings.values():
+                    await self._db.insert_finding(run_id, f.to_dict())
 
-        summary = {
-            "total_findings": len(state.findings),
-            "confirmed": len(state.list_findings(status="confirmed")),
-            "false_positives": len(state.list_findings(status="false_positive")),
-            "tasks_completed": len(state.list_tasks(status="completed")),
-            "tasks_failed": len(state.list_tasks(status="failed")),
-        }
-        self._events.emit("review.completed", summary)
-        return summary
+            # Phase 4: Comment
+            confirmed = state.list_findings(status="confirmed")
+            if confirmed:
+                self._events.emit("commenter.started", {"finding_count": len(confirmed)})
+                comment_count = await self._post_comments(confirmed, state)
+                self._events.emit("commenter.completed", {"comments_posted": comment_count})
+
+            summary = {
+                "total_findings": len(state.findings),
+                "confirmed": len(state.list_findings(status="confirmed")),
+                "false_positives": len(state.list_findings(status="false_positive")),
+                "tasks_completed": len(state.list_tasks(status="completed")),
+                "tasks_failed": len(state.list_tasks(status="failed")),
+            }
+            self._events.emit("review.completed", summary)
+
+            # Persist run completion
+            if self._db:
+                await self._db.complete_run(run_id, summary)
+
+            return summary
+
+        except Exception as e:
+            if self._db:
+                await self._db.fail_run(run_id, str(e))
+            raise
 
     def _create_reviewer(self, name: str) -> BaseReviewer | None:
-        cls = REVIEWER_MAP.get(name)
+        # Check built-in reviewers first, then plugins
+        cls = REVIEWER_MAP.get(name) or self._extra_reviewers.get(name)
         if cls:
             return cls(self._reviewer_llm, self._registry, self._gateway)
         return None

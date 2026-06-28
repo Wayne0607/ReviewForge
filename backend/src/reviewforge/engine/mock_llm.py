@@ -44,6 +44,8 @@ class MockChatLLM(BaseChatModel):
             "tasks": [
                 {"reviewer": "security_reviewer", "files": ["test.py"], "rationale": "涉及安全相关代码"},
                 {"reviewer": "style_reviewer", "files": ["test.py"], "rationale": "检查代码风格"},
+                {"reviewer": "testing_reviewer", "files": ["test.py"], "rationale": "检查测试覆盖"},
+                {"reviewer": "doc_reviewer", "files": ["test.py"], "rationale": "检查文档完整性"},
             ]
         })
 

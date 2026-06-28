@@ -14,6 +14,16 @@ import yaml
 
 
 @dataclass
+class ModelProfile:
+    """A named model configuration for multi-model routing."""
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    temperature: float = 0.1
+    max_tokens: int = 4096
+
+
+@dataclass
 class LLMConfig:
     base_url: str = "https://token-plan-cn.xiaomimimo.com/v1"
     api_key: str = ""
@@ -21,6 +31,7 @@ class LLMConfig:
     temperature_planner: float = 0.0
     temperature_reviewer: float = 0.1
     temperature_verifier: float = 0.0
+    profiles: dict[str, ModelProfile] = field(default_factory=dict)
 
 
 @dataclass
@@ -82,6 +93,10 @@ class ReviewForgeConfig:
                 ReviewerConfig(name="security_reviewer", type="security", max_steps=10),
                 ReviewerConfig(name="performance_reviewer", type="performance", max_steps=8),
                 ReviewerConfig(name="style_reviewer", type="style", max_steps=6),
+                ReviewerConfig(name="testing_reviewer", type="testing", max_steps=6),
+                ReviewerConfig(name="doc_reviewer", type="documentation", max_steps=5),
+                ReviewerConfig(name="dependency_reviewer", type="dependency", max_steps=6),
+                ReviewerConfig(name="accessibility_reviewer", type="accessibility", max_steps=6),
             ]
 
         return cfg
@@ -90,7 +105,12 @@ class ReviewForgeConfig:
         """Apply values from a dict."""
         if "llm" in data:
             for k, v in data["llm"].items():
-                if hasattr(self.llm, k):
+                if k == "profiles" and isinstance(v, dict):
+                    self.llm.profiles = {
+                        name: ModelProfile(**p) if isinstance(p, dict) else p
+                        for name, p in v.items()
+                    }
+                elif hasattr(self.llm, k):
                     setattr(self.llm, k, v)
         if "server" in data:
             for k, v in data["server"].items():

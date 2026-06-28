@@ -12,6 +12,18 @@ llm:
   temperature_reviewer: 0.1
   temperature_verifier: 0.0
 
+  # 多模型路由 profiles
+  # 不同 agent 可以使用不同的模型配置
+  profiles:
+    fast:
+      model: "mimo-v2.5-pro"
+      temperature: 0.1
+      max_tokens: 4096
+    accurate:
+      model: "mimo-v2.5-pro"
+      temperature: 0.0
+      max_tokens: 8192
+
 github:
   # 通过环境变量 GITHUB_TOKEN 和 GITHUB_WEBHOOK_SECRET 设置
   token: ""
@@ -33,6 +45,30 @@ reviewers:
 
   - name: style_reviewer
     type: style
+    enabled: true
+    max_steps: 6
+    confidence_threshold: 0.5
+
+  - name: testing_reviewer
+    type: testing
+    enabled: true
+    max_steps: 6
+    confidence_threshold: 0.5
+
+  - name: doc_reviewer
+    type: documentation
+    enabled: true
+    max_steps: 5
+    confidence_threshold: 0.5
+
+  - name: dependency_reviewer
+    type: dependency
+    enabled: true
+    max_steps: 6
+    confidence_threshold: 0.5
+
+  - name: accessibility_reviewer
+    type: accessibility
     enabled: true
     max_steps: 6
     confidence_threshold: 0.5

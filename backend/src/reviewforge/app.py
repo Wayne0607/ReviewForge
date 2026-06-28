@@ -13,10 +13,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
 
 from reviewforge.api.webhook import router as webhook_router
 from reviewforge.core.config import ReviewForgeConfig
+from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
 from reviewforge.core.specs import SpecRegistry, build_registry
 from reviewforge.engine.orchestrator import Orchestrator
@@ -49,7 +52,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         if errors:
             raise RuntimeError(f"Spec validation failed: {errors}")
 
-        # LLM clients
+        # LLM clients — multi-model routing
         if mock_mode:
             from reviewforge.engine.mock_llm import MockChatLLM
             planner_llm = MockChatLLM()
@@ -57,18 +60,16 @@ def create_app(config_path: str | None = None) -> FastAPI:
             verifier_llm = MockChatLLM()
             logger.info("Mock mode: using MockChatLLM")
         else:
-            planner_llm = ChatOpenAI(
-                base_url=cfg.llm.base_url, api_key=cfg.llm.api_key,
-                model=cfg.llm.model, temperature=cfg.llm.temperature_planner,
-            )
-            reviewer_llm = ChatOpenAI(
-                base_url=cfg.llm.base_url, api_key=cfg.llm.api_key,
-                model=cfg.llm.model, temperature=cfg.llm.temperature_reviewer,
-            )
-            verifier_llm = ChatOpenAI(
-                base_url=cfg.llm.base_url, api_key=cfg.llm.api_key,
-                model=cfg.llm.model, temperature=cfg.llm.temperature_verifier,
-            )
+            from reviewforge.engine.model_router import ModelRouter
+            router = ModelRouter(cfg.llm)
+            planner_llm = router.get_llm("planner")
+            reviewer_llm = router.get_llm("reviewer")
+            verifier_llm = router.get_llm("verifier")
+
+        # Database
+        db = Database(Path(cfg.events_dir).parent / "reviewforge.db")
+        await db.connect()
+        logger.info("Database initialized")
 
         # Event bus
         event_bus = EventBus(log_dir=Path(cfg.events_dir))
@@ -83,8 +84,18 @@ def create_app(config_path: str | None = None) -> FastAPI:
             event_bus=event_bus,
             planner_llm=planner_llm,
             reviewer_llm=reviewer_llm,
-            calibrator_llm=verifier_llm,  # calibrator uses the same LLM as verifier
+            calibrator_llm=verifier_llm,
+            db=db,
         )
+
+        # Load plugins
+        from reviewforge.engine.plugin_loader import PluginLoader
+        plugin_loader = PluginLoader()
+        plugins_dir = Path(__file__).parent / "plugins"
+        plugins = plugin_loader.discover(plugins_dir)
+        if plugins:
+            orchestrator.register_plugin_reviewers(plugins)
+            logger.info(f"Loaded {len(plugins)} plugin(s): {list(plugins.keys())}")
 
         # Store on app state
         app.state.orchestrator = orchestrator
@@ -92,21 +103,37 @@ def create_app(config_path: str | None = None) -> FastAPI:
         app.state.webhook_secret = cfg.github.webhook_secret
         app.state.registry = registry
         app.state.config = cfg
+        app.state.db = db
 
         logger.info(f"ReviewForge started: model={cfg.llm.model}, reviewers={len(cfg.reviewers)}")
 
         yield
 
+        await db.close()
         await github.close()
 
     app = FastAPI(
         title="ReviewForge",
         description="AI multi-agent code review system",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
+    # CORS (for frontend dev server)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Routers
     app.include_router(webhook_router)
+
+    # Dashboard API
+    from reviewforge.api.dashboard import router as dashboard_router
+    app.include_router(dashboard_router)
 
     @app.get("/health")
     async def health():
@@ -129,5 +156,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
             "reviewers": [{"name": r.name, "type": r.type, "enabled": r.enabled} for r in cfg.reviewers],
             "confidence_threshold": cfg.confidence_threshold,
         }
+
+    # Serve frontend static files (if built)
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.exists():
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
     return app

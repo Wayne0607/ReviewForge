@@ -149,3 +149,67 @@ REVIEWER_MAP: dict[str, type[BaseReviewer]] = {
     "performance_reviewer": PerformanceReviewer,
     "style_reviewer": StyleReviewer,
 }
+
+
+class TestingReviewer(BaseReviewer):
+    """Reviews code for testing issues — missing tests, poor coverage, edge cases."""
+
+    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway) -> None:
+        super().__init__(
+            name="testing_reviewer",
+            reviewer_type="testing",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
+            max_steps=registry.get_agent("testing_reviewer").max_steps,
+        )
+
+
+class DocumentationReviewer(BaseReviewer):
+    """Reviews code for documentation gaps — missing docstrings, comments, types."""
+
+    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway) -> None:
+        super().__init__(
+            name="doc_reviewer",
+            reviewer_type="documentation",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
+            max_steps=registry.get_agent("doc_reviewer").max_steps,
+        )
+
+
+class DependencyReviewer(BaseReviewer):
+    """Reviews code for dependency risks — new deps, version locks, vulnerabilities."""
+
+    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway) -> None:
+        super().__init__(
+            name="dependency_reviewer",
+            reviewer_type="dependency",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
+            max_steps=registry.get_agent("dependency_reviewer").max_steps,
+        )
+
+
+class AccessibilityReviewer(BaseReviewer):
+    """Reviews code for accessibility issues — missing alt, aria, keyboard nav."""
+
+    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway) -> None:
+        super().__init__(
+            name="accessibility_reviewer",
+            reviewer_type="accessibility",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
+            max_steps=registry.get_agent("accessibility_reviewer").max_steps,
+        )
+
+
+REVIEWER_MAP.update({
+    "testing_reviewer": TestingReviewer,
+    "doc_reviewer": DocumentationReviewer,
+    "dependency_reviewer": DependencyReviewer,
+    "accessibility_reviewer": AccessibilityReviewer,
+})

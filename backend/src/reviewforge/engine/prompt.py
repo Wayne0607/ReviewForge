@@ -72,8 +72,12 @@ def _planner_mission(ctx: dict[str, Any]) -> str:
   - 网络请求、加密操作
 - Performance Reviewer：涉及循环、数据处理、缓存、数据库查询的文件
 - Style Reviewer：始终派发，检查可读性
+- Testing Reviewer：新增了公共函数/类、修改了业务逻辑
+- Documentation Reviewer：新增了公共 API、修改了配置项
+- Dependency Reviewer：修改了依赖文件（requirements.txt, pyproject.toml 等）
+- Accessibility Reviewer：涉及前端 UI 组件（图片、表单、交互元素）
 - 每个 task 要列出具体文件
-- 每轮最多 4 个 task"""
+- 每轮最多 6 个 task"""
 
 
 def _reviewer_mission(ctx: dict[str, Any]) -> str:
@@ -103,6 +107,47 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - 过于复杂的函数（>30 行）
 - 死代码、未使用的导入
 - 与代码库其他部分的模式不一致""",
+        "testing": """## 任务
+
+审查代码变更的测试质量：
+- 新增的公共函数/类缺少对应测试
+- 测试用例未覆盖边界条件（空值、极端值、异常路径）
+- 测试中过度使用 mock，未测试真实行为
+- 测试命名不清晰，无法看出测试意图
+- 缺少集成测试（只测了单元，没测交互）
+- 测试断言过于宽松（assertTrue(True)）
+- 修改了逻辑但未更新对应测试""",
+        "documentation": """## 任务
+
+审查代码的文档完整性：
+- 公共函数/类缺少 docstring
+- 复杂算法/业务逻辑缺少注释说明
+- 类型注解缺失（参数和返回值）
+- README 未同步更新（新增功能/配置项）
+- API 接口缺少使用示例
+- 配置项缺少说明注释
+- 错误码/枚举值缺少含义说明""",
+        "dependency": """## 任务
+
+审查代码的依赖风险：
+- 引入了新的第三方依赖（检查必要性和信誉）
+- 依赖版本未锁定（>=, ^, ~等范围约束）
+- 已知存在安全漏洞的依赖
+- 引入了不必要的重型依赖（可用标准库替代）
+- 依赖许可证不兼容（GPL vs MIT）
+- 依赖已停止维护（>2年无更新）
+- 重复功能的依赖（已有类似库）""",
+        "accessibility": """## 任务
+
+审查代码的可访问性（a11y）问题：
+- 图片缺少 alt 属性
+- 交互元素缺少 aria 标签
+- 表单控件缺少 label 关联
+- 颜色对比度不足（文本/背景）
+- 缺少键盘导航支持（tabindex, focus 管理）
+- 动画缺少 prefers-reduced-motion 适配
+- 语义化 HTML 使用不当（用 div 代替 button）
+- 屏幕阅读器无法理解的动态内容更新""",
     }
     return missions.get(reviewer_type, "## 任务\n\n审查代码变更并报告发现。")
 

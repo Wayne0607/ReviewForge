@@ -1,6 +1,6 @@
 [project]
 name = "reviewforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI multi-agent code review system"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.28",
     "pyyaml>=6.0",
     "cryptography>=44.0",  # GitHub webhook signature verification
+    "aiosqlite>=0.20",     # async SQLite for review history
 ]
 
 [project.optional-dependencies]

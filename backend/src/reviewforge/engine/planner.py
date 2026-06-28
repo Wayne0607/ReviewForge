@@ -1,13 +1,14 @@
-"""Planner Agent — single-shot LLM decision maker.
+"""Planner Agent — single-shot LLM decision maker with deterministic security detection.
 
 Reads PR diff summary, outputs task proposals for reviewers.
-This is the Conductor: one LLM call per round, not an agentic loop.
+Security patterns are detected deterministically before LLM call.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -19,9 +20,33 @@ from reviewforge.engine.prompt import build_planner_prompt
 
 logger = logging.getLogger(__name__)
 
+# Deterministic security patterns — if any match, security_reviewer is forced
+SECURITY_PATTERNS = [
+    (r"os\.system\s*\(", "command-injection"),
+    (r"subprocess\.\w+\(.*shell\s*=\s*True", "command-injection"),
+    (r"os\.popen\s*\(", "command-injection"),
+    (r"eval\s*\(", "code-injection"),
+    (r"exec\s*\(", "code-injection"),
+    (r"pickle\.loads?\s*\(", "insecure-deserialization"),
+    (r"yaml\.load\s*\([^)]*\)", "insecure-deserialization"),  # missing Loader=SafeLoader
+    (r"(?:SELECT|INSERT|UPDATE|DELETE).*\+\s*(?:str\(|f['\"])", "sql-injection"),
+    (r"f['\"].*(?:SELECT|INSERT|UPDATE|DELETE).*\{", "sql-injection"),
+    (r"(?:API_KEY|SECRET_KEY|PASSWORD|TOKEN)\s*=\s*['\"][^'\"]{8,}['\"]", "hardcoded-secrets"),
+    (r"open\s*\([^)]*\+.*['\"]r['\"]", "path-traversal"),
+    (r"(?:innerHTML|dangerouslySetInnerHTML|v-html)", "xss"),
+    (r"subprocess\.(?:call|run|Popen)\s*\(", "command-injection"),
+]
+
+# Performance patterns
+PERFORMANCE_PATTERNS = [
+    (r"for\s+\w+\s+in\s+range.*\n.*for\s+\w+\s+in\s+range", "nested-loop"),
+    (r"(?:urllib\.request\.urlopen|requests\.get)\s*\(.*\n.*for\s+", "blocking-io-in-loop"),
+    (r"sqlite3\.connect\s*\(.*\n.*for\s+", "db-in-loop"),
+]
+
 
 class Planner:
-    """Single-shot planner that decides which reviewers to dispatch."""
+    """Single-shot planner with deterministic pattern detection."""
 
     def __init__(self, llm: ChatOpenAI, registry: SpecRegistry) -> None:
         self._llm = llm
@@ -29,11 +54,15 @@ class Planner:
 
     async def plan(self, state: StateStore) -> list[ReviewTask]:
         """Analyze the PR and return task proposals."""
+        # Step 1: Deterministic pattern detection
+        forced_reviewers = self._detect_patterns(state.files_changed, state.diff_summary)
+
+        # Step 2: LLM decision for additional reviewers
         ctx = {
             "registry": self._registry,
             "repo": state.repo,
             "pr_number": state.pr_number,
-            "pr_title": "",  # could be enriched
+            "pr_title": "",
             "files_changed": state.files_changed,
             "diff_summary": state.diff_summary,
         }
@@ -44,11 +73,57 @@ class Planner:
              HumanMessage(content=messages[1]["content"])]
         )
 
-        return self._parse_response(response.content)
+        llm_tasks = self._parse_response(response.content)
+
+        # Step 3: Merge — ensure forced reviewers are always included
+        return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed)
+
+    def _detect_patterns(self, files: list[str], diff: str) -> set[str]:
+        """Deterministically detect security and performance patterns in diff."""
+        forced = set()
+
+        for pattern, label in SECURITY_PATTERNS:
+            if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                forced.add("security_reviewer")
+                logger.info(f"Security pattern detected: {label}")
+                break  # One match is enough
+
+        for pattern, label in PERFORMANCE_PATTERNS:
+            if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                forced.add("performance_reviewer")
+                logger.info(f"Performance pattern detected: {label}")
+                break
+
+        return forced
+
+    def _merge_tasks(
+        self, forced: set[str], llm_tasks: list[ReviewTask], files: list[str]
+    ) -> list[ReviewTask]:
+        """Merge forced reviewers with LLM decisions."""
+        llm_reviewers = {t.reviewer for t in llm_tasks}
+        merged = list(llm_tasks)
+
+        for reviewer in forced:
+            if reviewer not in llm_reviewers:
+                merged.append(ReviewTask(
+                    reviewer=reviewer,
+                    files=files,
+                    rationale="自动检测到安全/性能模式",
+                ))
+                logger.info(f"Forced reviewer added: {reviewer}")
+
+        # Always include style_reviewer
+        if "style_reviewer" not in {t.reviewer for t in merged}:
+            merged.append(ReviewTask(
+                reviewer="style_reviewer",
+                files=files,
+                rationale="默认风格审查",
+            ))
+
+        return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
 
     def _parse_response(self, content: str) -> list[ReviewTask]:
         """Parse LLM JSON output into ReviewTask objects."""
-        # Strip markdown code fences if present
         content = content.strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1] if "\n" in content else content[3:]
@@ -60,14 +135,12 @@ class Planner:
             data = json.loads(content)
         except json.JSONDecodeError:
             logger.warning("Planner returned invalid JSON, falling back to style-only review")
-            return [ReviewTask(reviewer="style_reviewer", files=[], rationale="fallback")]
+            return []
 
         tasks = []
         for item in data.get("tasks", []):
             reviewer = item.get("reviewer", "")
-            # Normalize: lowercase, replace spaces/hyphens with underscores
             reviewer = reviewer.lower().replace(" ", "_").replace("-", "_")
-            # Map short names to full names
             reviewer_map = {
                 "security": "security_reviewer",
                 "security_reviewer": "security_reviewer",
@@ -90,4 +163,4 @@ class Planner:
                 rationale=item.get("rationale", ""),
             ))
 
-        return tasks or [ReviewTask(reviewer="style_reviewer", files=[], rationale="fallback")]
+        return tasks

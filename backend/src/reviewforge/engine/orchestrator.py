@@ -1,6 +1,6 @@
 """Orchestrator — the main review loop.
 
-Coordinates Planner → Scheduler → Reviewers → Verifier → Commenter.
+Coordinates Planner → Reviewers → Dynamic Calibration → Commenter.
 """
 
 from __future__ import annotations
@@ -15,16 +15,16 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.loop_detector import LoopDetector
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
+from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
-from reviewforge.engine.verifier import Verifier
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Main review loop: Planner → Reviewers → Verifier → Commenter."""
+    """Main review loop: Planner → Reviewers → Dynamic Calibration → Commenter."""
 
     def __init__(
         self,
@@ -33,13 +33,13 @@ class Orchestrator:
         event_bus: EventBus,
         planner_llm: ChatOpenAI,
         reviewer_llm: ChatOpenAI,
-        verifier_llm: ChatOpenAI,
+        calibrator_llm: ChatOpenAI,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._events = event_bus
         self._planner = Planner(planner_llm, registry)
-        self._verifier = Verifier(verifier_llm, registry)
+        self._calibrator = DynamicCalibrator(calibrator_llm, registry)
         self._reviewer_llm = reviewer_llm
         self._loop_detector = LoopDetector()
 
@@ -90,16 +90,31 @@ class Orchestrator:
                 state.update_task(task.id, status="failed", error=str(e))
                 self._events.emit("reviewer.failed", {"reviewer": task.reviewer, "error": str(e)})
 
-        # Phase 3: Verify
+        # Phase 3: Dynamic Calibration (adversarial verify + conditional judge)
         candidates = state.list_findings(status="candidate")
         if candidates:
-            self._events.emit("verifier.started", {"candidate_count": len(candidates)})
-            confirmed = await self._verifier.verify(state)
-            for f in confirmed:
-                state.update_finding(f.id, status="confirmed", verified_by="verifier")
-            self._events.emit("verifier.completed", {
-                "confirmed": len(confirmed),
-                "filtered": len(candidates) - len(confirmed),
+            self._events.emit("calibration.started", {"candidate_count": len(candidates)})
+
+            # Build diff context for calibrator
+            diff_context = state.diff_summary
+
+            # Run dynamic calibration
+            calibrated = await self._calibrator.calibrate(candidates, diff_context)
+
+            # Update state with calibrated findings
+            for f in calibrated:
+                if f.status == "confirmed":
+                    state.update_finding(f.id, status="confirmed", verified_by=f.verified_by,
+                                         verify_reason=f.verify_reason)
+                elif f.status == "false_positive":
+                    state.update_finding(f.id, status="false_positive", verified_by=f.verified_by,
+                                         verify_reason=f.verify_reason)
+
+            confirmed_count = len([f for f in calibrated if f.status == "confirmed"])
+            filtered_count = len([f for f in calibrated if f.status == "false_positive"])
+            self._events.emit("calibration.completed", {
+                "confirmed": confirmed_count,
+                "filtered": filtered_count,
             })
 
         # Phase 4: Comment

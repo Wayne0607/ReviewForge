@@ -83,7 +83,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             event_bus=event_bus,
             planner_llm=planner_llm,
             reviewer_llm=reviewer_llm,
-            verifier_llm=verifier_llm,
+            calibrator_llm=verifier_llm,  # calibrator uses the same LLM as verifier
         )
 
         # Store on app state

@@ -283,3 +283,4 @@ def _internal_helper():
 # Module-level code that runs on import
 print("User module loaded")
 time.sleep(0.1)  # Blocking sleep on import
+# Round 2 test

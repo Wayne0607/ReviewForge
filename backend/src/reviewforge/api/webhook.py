@@ -70,7 +70,16 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             )
 
             import asyncio
-            asyncio.create_task(orchestrator.run(state))
+
+            async def _run_review():
+                try:
+                    logger.info(f"Starting review for PR #{pr_number} on {repo}")
+                    summary = await orchestrator.run(state)
+                    logger.info(f"Review completed for PR #{pr_number}: {summary}")
+                except Exception as e:
+                    logger.error(f"Review failed for PR #{pr_number}: {e}", exc_info=True)
+
+            asyncio.create_task(_run_review())
 
             return {"status": "review_triggered", "pr": str(pr_number)}
 

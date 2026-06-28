@@ -52,3 +52,4 @@ class user_manager:
             "zip_code": zip_code,
             "country": country,
         })
+# trigger

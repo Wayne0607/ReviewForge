@@ -6,6 +6,7 @@ Coordinates Planner → Scheduler → Reviewers → Verifier → Commenter.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -44,7 +45,9 @@ class Orchestrator:
 
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
-        self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number})
+        run_id = uuid.uuid4().hex[:12]
+        self._events.set_run_id(run_id)
+        self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
 
         # Phase 1: Plan
         self._events.emit("planner.started")

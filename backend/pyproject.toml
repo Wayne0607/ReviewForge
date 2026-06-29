@@ -31,6 +31,13 @@ reviewforge = "reviewforge.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Aliyun PyPI mirror — the production server (Aliyun, China) cannot reliably reach
+# files.pythonhosted.org. Pinning this registry in the lockfile makes `uv sync --frozen`
+# resolve wheels from the mirror so deploys work from the China server.
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/reviewforge"]
 

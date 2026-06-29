@@ -100,24 +100,42 @@ class Orchestrator:
 
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
-        run_id = uuid.uuid4().hex[:12]
         loop_detector = LoopDetector()  # B4: per-run instance
-        self._events.set_run_id(run_id)
-        self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+
+        # Resume (可恢复): if a prior run for this exact (repo, pr, head_sha) didn't
+        # complete, reuse its run_id and rehydrate findings + completed reviewers from
+        # the DB so already-done work is skipped instead of redone.
+        resumed = await self._db.get_resumable_run(state.repo, state.pr_number, state.head_sha) if self._db else None
+        if resumed:
+            run_id = resumed["run_id"]
+            await self._rehydrate(state, run_id)
+            self._events.set_run_id(run_id)
+            self._events.emit(
+                "review.resumed",
+                {
+                    "repo": state.repo,
+                    "pr": state.pr_number,
+                    "run_id": run_id,
+                    "prior_findings": len(state.findings),
+                    "done_reviewers": len(state.list_tasks()),
+                },
+            )
+        else:
+            run_id = uuid.uuid4().hex[:12]
+            self._events.set_run_id(run_id)
+            self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+            if self._db:
+                await self._db.create_run(
+                    run_id=run_id,
+                    repo=state.repo,
+                    pr_number=state.pr_number,
+                    head_sha=state.head_sha,
+                    base_sha=state.base_sha,
+                )
 
         # Set token tracking context for this run
         if self._db:
             self._token_ctx.set(run_id, self._db)
-
-        # Persist run start
-        if self._db:
-            await self._db.create_run(
-                run_id=run_id,
-                repo=state.repo,
-                pr_number=state.pr_number,
-                head_sha=state.head_sha,
-                base_sha=state.base_sha,
-            )
 
         try:
             # Phase 1+2: iterative plan → schedule → execute (re-planning loop).
@@ -318,7 +336,11 @@ class Orchestrator:
                 llm = self._reviewer_llm
             # W2/#1: 有显式 allowlist 时按成员判定，否则用默认（默认全部 reviewer 走工具循环）
             agentic = name in self._agentic_reviewers if self._agentic_reviewers else self._agentic_default
-            reviewer = cls(llm, self._registry, self._gateway, agentic=agentic, event_bus=self._events)
+            # Construct with the base (llm, registry, gateway) signature so custom plugins
+            # (which only accept those three) work too; set per-run flags as attributes.
+            reviewer = cls(llm, self._registry, self._gateway)
+            reviewer._agentic = agentic
+            reviewer._events = self._events
             self._attach_skill(reviewer)
             return reviewer
         return None
@@ -336,6 +358,37 @@ class Orchestrator:
             reviewer._skill_loader = self._skill_loader
         except Exception as e:
             logger.warning(f"Skill load failed for {meta.name}: {e}")
+
+    async def _rehydrate(self, state: StateStore, run_id: str) -> None:
+        """Resume: load a prior run's persisted findings + completed reviewers into state,
+        so the re-planning loop skips finished reviewers and keeps their findings."""
+        for fd in await self._db.get_findings(run_id=run_id, limit=10000):
+            try:
+                state.add_finding(
+                    Finding(
+                        id=fd["id"],
+                        file=fd["file"],
+                        line=fd["line"],
+                        severity=fd["severity"],
+                        category=fd["category"],
+                        message=fd["message"],
+                        suggestion=fd.get("suggestion", ""),
+                        confidence=fd["confidence"],
+                        reviewer=fd.get("reviewer", ""),
+                        status=fd.get("status", "candidate"),
+                        verified_by=fd.get("verified_by", ""),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"resume: skip finding {fd.get('id')}: {e}")
+        for m in await self._db.get_metrics(run_id=run_id):
+            if m.get("status") == "completed":
+                try:
+                    state.add_task(
+                        ReviewTask(reviewer=m["reviewer_name"], files=state.files_changed, status="completed")
+                    )
+                except Exception:
+                    pass
 
     async def _post_comments(self, findings: list[Finding], state: StateStore) -> int:
         """Post review comments via the tool gateway."""

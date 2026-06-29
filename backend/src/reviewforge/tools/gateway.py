@@ -15,6 +15,16 @@ from reviewforge.tools.github_api import GitHubClient
 
 logger = logging.getLogger(__name__)
 
+# JSON Schema type → Python type(s), for lightweight param validation (no jsonschema dep).
+_JSON_PY_TYPES: dict[str, Any] = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "object": dict,
+    "array": list,
+}
+
 
 class ToolGateway:
     """Executes tools with permission and schema checks."""
@@ -51,12 +61,32 @@ class ToolGateway:
         if tool_name == "post_comment" and agent_name not in ("commenter", "orchestrator", ""):
             raise PermissionError(f"{agent_name} 不允许直接发评论")
 
+        # 四层门控第 2 层：Schema 校验 — 必填参数齐全且类型匹配 ToolSpec.input_schema
+        self._validate_params(tool_name, params)
+
         handler = self._handlers.get(tool_name)
         if not handler:
             raise NotImplementedError(f"Tool '{tool_name}' has no handler")
 
         logger.debug(f"Executing tool: {tool_name} (agent={agent_name})")
         return await handler(params, state)
+
+    def _validate_params(self, tool_name: str, params: dict[str, Any]) -> None:
+        """Schema 校验（四层门控第 2 层）：必填键齐全 + 基础类型匹配 ToolSpec.input_schema。"""
+        schema = self._registry.tools[tool_name].input_schema or {}
+        for key in schema.get("required", []):
+            if key not in params:
+                raise ValueError(f"Tool '{tool_name}' missing required param: {key}")
+        props = schema.get("properties", {})
+        for key, value in params.items():
+            expected = props.get(key, {}).get("type")
+            if not expected:
+                continue
+            if expected in ("integer", "number") and isinstance(value, bool):
+                raise ValueError(f"Tool '{tool_name}' param '{key}' must be {expected}, not bool")
+            py = _JSON_PY_TYPES.get(expected)
+            if py and not isinstance(value, py):
+                raise ValueError(f"Tool '{tool_name}' param '{key}' must be {expected}")
 
     async def _read_diff(self, params: dict[str, Any], state: StateStore) -> str:
         return await self._github.get_file_diff(state.repo, state.pr_number, params["file_path"])

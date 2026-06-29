@@ -85,9 +85,11 @@ class TrackedChatLLM(BaseChatModel):
         total_tokens = token_usage.get("total_tokens", prompt_tokens + completion_tokens)
         model = usage.get("model_name", "")
 
-        # Also check usage_metadata (newer LangChain versions)
+        # Also check usage_metadata (newer LangChain versions). _agenerate returns a
+        # ChatResult whose .generations is a flat list[ChatGeneration], not nested —
+        # so index once. (Indexing twice crashed on any provider that omits token_usage.)
         if total_tokens == 0 and result.generations:
-            msg = result.generations[0][0].message if result.generations[0] else None
+            msg = getattr(result.generations[0], "message", None)
             if msg and hasattr(msg, "usage_metadata") and msg.usage_metadata:
                 um = msg.usage_metadata
                 prompt_tokens = um.get("input_tokens", prompt_tokens)

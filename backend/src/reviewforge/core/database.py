@@ -209,6 +209,16 @@ class Database:
         row = await cursor.fetchone()
         return self._row_to_dict(row) if row else None
 
+    async def get_resumable_run(self, repo: str, pr_number: int, head_sha: str) -> dict[str, Any] | None:
+        """Most recent NON-completed run for this exact PR head — used to resume."""
+        cursor = await self._db.execute(
+            "SELECT * FROM review_runs WHERE repo=? AND pr_number=? AND head_sha=? "
+            "AND status != 'completed' ORDER BY started_at DESC LIMIT 1",
+            (repo, pr_number, head_sha),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_dict(row) if row else None
+
     # ── Findings ─────────────────────────────────────────────────
 
     async def insert_finding(self, run_id: str, finding: dict[str, Any]) -> None:

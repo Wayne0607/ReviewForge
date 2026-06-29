@@ -1,6 +1,8 @@
 # Stage 1: Build frontend
 FROM node:20-slim AS frontend-build
-WORKDIR /app
+# WORKDIR is /app/frontend so Vite's outDir '../backend/src/reviewforge/static'
+# resolves to /app/backend/src/reviewforge/static (matched by the stage-2 COPY).
+WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm ci
 COPY frontend/ .

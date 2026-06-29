@@ -1,7 +1,8 @@
 """Dashboard API — endpoints for the frontend dashboard.
 
 Provides review history, metrics, trends, and system info
-for the React dashboard to consume.
+for the React dashboard to consume. All counts are computed
+from actual findings in the database, not from summary_json.
 """
 
 from __future__ import annotations
@@ -12,6 +13,26 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 
 router = APIRouter(prefix="/api/v1/dashboard")
+
+
+async def _enrich_run(db, run: dict) -> dict:
+    """Add accurate counts from actual findings instead of summary_json."""
+    run_id = run["run_id"]
+    findings = await db.get_findings(run_id=run_id)
+
+    total = len(findings)
+    confirmed = len([f for f in findings if f.get("status") == "confirmed"])
+    false_pos = len([f for f in findings if f.get("status") == "false_positive"])
+
+    # Override summary with actual DB counts
+    run["summary"] = {
+        "total_findings": total,
+        "confirmed": confirmed,
+        "false_positives": false_pos,
+        "tasks_completed": 0,  # Not tracked in findings table
+        "tasks_failed": 0,
+    }
+    return run
 
 
 # ── Reviews ──────────────────────────────────────────────────
@@ -26,10 +47,13 @@ async def list_reviews(
     """List review runs with pagination."""
     db = request.app.state.db
     runs = await db.get_runs(repo=repo, limit=limit, offset=offset)
+
+    # Enrich each run with accurate counts
+    enriched = []
     for r in runs:
-        sj = r.get("summary_json", "{}")
-        r["summary"] = json.loads(sj) if isinstance(sj, str) else sj
-    return {"runs": runs, "limit": limit, "offset": offset}
+        enriched.append(await _enrich_run(db, r))
+
+    return {"runs": enriched, "limit": limit, "offset": offset}
 
 
 @router.get("/reviews/{run_id}")
@@ -40,9 +64,7 @@ async def get_review_detail(request: Request, run_id: str):
     if not run:
         raise HTTPException(404, "Review run not found")
 
-    sj = run.get("summary_json", "{}")
-    run["summary"] = json.loads(sj) if isinstance(sj, str) else sj
-
+    run = await _enrich_run(db, run)
     findings = await db.get_findings(run_id=run_id)
     metrics = await db.get_metrics(run_id=run_id)
 
@@ -53,9 +75,27 @@ async def get_review_detail(request: Request, run_id: str):
 
 @router.get("/metrics/summary")
 async def metrics_summary(request: Request, repo: str | None = None):
-    """Global summary statistics."""
+    """Global summary statistics computed from actual findings."""
     db = request.app.state.db
-    return await db.get_summary_stats(repo=repo)
+
+    # Get all runs
+    runs = await db.get_runs(repo=repo, limit=1000)
+    total_runs = len(runs)
+
+    # Get all findings
+    findings = await db.get_findings(limit=10000)
+    total = len(findings)
+    confirmed = len([f for f in findings if f.get("status") == "confirmed"])
+    false_pos = len([f for f in findings if f.get("status") == "false_positive"])
+    avg_conf = sum(f.get("confidence", 0) for f in findings) / total if total else 0
+
+    return {
+        "total_runs": total_runs,
+        "total_findings": total,
+        "confirmed": confirmed,
+        "false_positives": false_pos,
+        "avg_confidence": avg_conf,
+    }
 
 
 @router.get("/metrics/categories")

@@ -7,9 +7,6 @@ from actual findings in the database, not from summary_json.
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from fastapi import APIRouter, HTTPException, Query, Request
 
 router = APIRouter(prefix="/api/v1/dashboard")
@@ -36,6 +33,7 @@ async def _enrich_run(db, run: dict) -> dict:
 
 
 # ── Reviews ──────────────────────────────────────────────────
+
 
 @router.get("/reviews")
 async def list_reviews(
@@ -72,6 +70,7 @@ async def get_review_detail(request: Request, run_id: str):
 
 
 # ── Metrics ──────────────────────────────────────────────────
+
 
 @router.get("/metrics/summary")
 async def metrics_summary(request: Request, repo: str | None = None):
@@ -123,6 +122,7 @@ async def metrics_recurring(request: Request, repo: str | None = None, limit: in
 
 
 # ── Token Usage ──────────────────────────────────────────────
+
 
 @router.get("/tokens/summary")
 async def token_summary(request: Request, repo: str | None = None):

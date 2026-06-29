@@ -25,7 +25,7 @@ class MockChatLLM(BaseChatModel):
     model_name: str = "mock"
     _bound_tools: list = []
 
-    def bind_tools(self, tools: list, **kwargs: Any) -> "MockChatLLM":
+    def bind_tools(self, tools: list, **kwargs: Any) -> MockChatLLM:
         """W3: Store tools for agentic loop simulation."""
         # Return a copy with tools bound
         clone = MockChatLLM()
@@ -75,7 +75,8 @@ class MockChatLLM(BaseChatModel):
                 if hasattr(m, "content") and "--- " in str(m.content):
                     # Try to extract filename from diff header
                     import re
-                    match = re.search(r'--- (\S+)', str(m.content))
+
+                    match = re.search(r"--- (\S+)", str(m.content))
                     if match:
                         file_path = match.group(1)
                         break
@@ -95,41 +96,47 @@ class MockChatLLM(BaseChatModel):
             return ChatResult(generations=[ChatGeneration(message=msg)])
 
     def _mock_planner(self, content: str) -> str:
-        return json.dumps({
-            "tasks": [
-                {"reviewer": "security_reviewer", "files": ["test.py"], "rationale": "涉及安全相关代码"},
-                {"reviewer": "style_reviewer", "files": ["test.py"], "rationale": "检查代码风格"},
-                {"reviewer": "testing_reviewer", "files": ["test.py"], "rationale": "检查测试覆盖"},
-                {"reviewer": "doc_reviewer", "files": ["test.py"], "rationale": "检查文档完整性"},
-            ]
-        })
+        return json.dumps(
+            {
+                "tasks": [
+                    {"reviewer": "security_reviewer", "files": ["test.py"], "rationale": "涉及安全相关代码"},
+                    {"reviewer": "style_reviewer", "files": ["test.py"], "rationale": "检查代码风格"},
+                    {"reviewer": "testing_reviewer", "files": ["test.py"], "rationale": "检查测试覆盖"},
+                    {"reviewer": "doc_reviewer", "files": ["test.py"], "rationale": "检查文档完整性"},
+                ]
+            }
+        )
 
     def _mock_reviewer(self, content: str) -> str:
-        return json.dumps({
-            "findings": [
-                {
-                    "file": "test.py",
-                    "line": 1,
-                    "severity": "warning",
-                    "category": "security",
-                    "message": "发现硬编码的 import pickle，存在反序列化安全风险",
-                    "suggestion": "避免使用 pickle.loads 处理不可信数据，考虑使用 json 替代",
-                    "confidence": 0.85,
-                }
-            ]
-        })
+        return json.dumps(
+            {
+                "findings": [
+                    {
+                        "file": "test.py",
+                        "line": 1,
+                        "severity": "warning",
+                        "category": "security",
+                        "message": "发现硬编码的 import pickle，存在反序列化安全风险",
+                        "suggestion": "避免使用 pickle.loads 处理不可信数据，考虑使用 json 替代",
+                        "confidence": 0.85,
+                    }
+                ]
+            }
+        )
 
     def _mock_verifier(self, content: str) -> str:
-        return json.dumps({
-            "verified": [
-                {
-                    "file": "test.py",
-                    "line": 1,
-                    "verdict": "confirmed",
-                    "reason": "pickle 反序列化确实是安全风险",
-                }
-            ]
-        })
+        return json.dumps(
+            {
+                "verified": [
+                    {
+                        "file": "test.py",
+                        "line": 1,
+                        "verdict": "confirmed",
+                        "reason": "pickle 反序列化确实是安全风险",
+                    }
+                ]
+            }
+        )
 
     @property
     def _llm_type(self) -> str:

@@ -8,7 +8,6 @@ profile override is specified.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from langchain_openai import ChatOpenAI
 

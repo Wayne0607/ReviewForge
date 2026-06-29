@@ -72,21 +72,33 @@ class Finding:
 
     def __post_init__(self) -> None:
         FindingSchema(
-            id=self.id, file=self.file, line=self.line,
-            severity=self.severity, category=self.category,
-            message=self.message, suggestion=self.suggestion,
-            confidence=self.confidence, reviewer=self.reviewer,
-            status=self.status, verified_by=self.verified_by,
+            id=self.id,
+            file=self.file,
+            line=self.line,
+            severity=self.severity,
+            category=self.category,
+            message=self.message,
+            suggestion=self.suggestion,
+            confidence=self.confidence,
+            reviewer=self.reviewer,
+            status=self.status,
+            verified_by=self.verified_by,
             verify_reason=self.verify_reason,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id, "file": self.file, "line": self.line,
-            "severity": self.severity, "category": self.category,
-            "message": self.message, "suggestion": self.suggestion,
-            "confidence": self.confidence, "reviewer": self.reviewer,
-            "status": self.status, "verified_by": self.verified_by,
+            "id": self.id,
+            "file": self.file,
+            "line": self.line,
+            "severity": self.severity,
+            "category": self.category,
+            "message": self.message,
+            "suggestion": self.suggestion,
+            "confidence": self.confidence,
+            "reviewer": self.reviewer,
+            "status": self.status,
+            "verified_by": self.verified_by,
             "verify_reason": self.verify_reason,
         }
 
@@ -104,14 +116,22 @@ class ReviewTask:
 
     def __post_init__(self) -> None:
         TaskSchema(
-            id=self.id, reviewer=self.reviewer, files=self.files,
-            rationale=self.rationale, status=self.status, error=self.error,
+            id=self.id,
+            reviewer=self.reviewer,
+            files=self.files,
+            rationale=self.rationale,
+            status=self.status,
+            error=self.error,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id, "reviewer": self.reviewer, "files": self.files,
-            "rationale": self.rationale, "status": self.status, "error": self.error,
+            "id": self.id,
+            "reviewer": self.reviewer,
+            "files": self.files,
+            "rationale": self.rationale,
+            "status": self.status,
+            "error": self.error,
         }
 
 
@@ -127,8 +147,11 @@ class Note:
 
     def __post_init__(self) -> None:
         NoteSchema(
-            id=self.id, from_agent=self.from_agent,
-            type=self.type, content=self.content, metadata=self.metadata,
+            id=self.id,
+            from_agent=self.from_agent,
+            type=self.type,
+            content=self.content,
+            metadata=self.metadata,
         )
 
 

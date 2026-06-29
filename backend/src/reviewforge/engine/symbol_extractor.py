@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +17,11 @@ logger = logging.getLogger(__name__)
 
 LANG_MAP = {
     ".py": "python",
-    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
-    ".ts": "typescript", ".tsx": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
     ".go": "go",
     ".java": "java",
     ".rs": "rust",
@@ -123,6 +125,7 @@ CALL_PATTERNS["typescript"] = CALL_PATTERNS["javascript"]
 
 # ── Data classes ─────────────────────────────────────────────
 
+
 @dataclass
 class SymbolInfo:
     name: str
@@ -134,7 +137,7 @@ class SymbolInfo:
 @dataclass
 class ImportInfo:
     source: str  # module path
-    name: str    # specific symbol imported
+    name: str  # specific symbol imported
     file_path: str
     import_type: str = "named"  # named / wildcard / module / destructured
 
@@ -148,6 +151,7 @@ class CallInfo:
 
 
 # ── Extraction functions ────────────────────────────────────
+
 
 def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
     """Extract import statements from file content."""
@@ -172,11 +176,20 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
                     name = name.split(" as ")[0].strip() if " as " in name else name
                     imports.append(ImportInfo(source=source, name=name, file_path=file_path, import_type="named"))
             elif imp_type in ("named", "wildcard"):
-                imports.append(ImportInfo(source=match.group(1), name=match.group(2) if imp_type == "named" else "*", file_path=file_path, import_type=imp_type))
+                imports.append(
+                    ImportInfo(
+                        source=match.group(1),
+                        name=match.group(2) if imp_type == "named" else "*",
+                        file_path=file_path,
+                        import_type=imp_type,
+                    )
+                )
             elif imp_type in ("module", "single"):
                 imports.append(ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type))
             elif imp_type == "default":
-                imports.append(ImportInfo(source=match.group(2), name=match.group(1), file_path=file_path, import_type=imp_type))
+                imports.append(
+                    ImportInfo(source=match.group(2), name=match.group(1), file_path=file_path, import_type=imp_type)
+                )
             elif imp_type == "require":
                 imports.append(ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type))
             elif imp_type == "side_effect":
@@ -196,12 +209,14 @@ def extract_definitions(content: str, file_path: str) -> list[SymbolInfo]:
         for pattern, sym_type in patterns:
             match = re.search(pattern, line)
             if match:
-                symbols.append(SymbolInfo(
-                    name=match.group(1),
-                    symbol_type=sym_type,
-                    file_path=file_path,
-                    line=i + 1,
-                ))
+                symbols.append(
+                    SymbolInfo(
+                        name=match.group(1),
+                        symbol_type=sym_type,
+                        file_path=file_path,
+                        line=i + 1,
+                    )
+                )
                 break  # One match per line
 
     return symbols
@@ -229,11 +244,40 @@ def extract_calls(content: str, file_path: str) -> list[CallInfo]:
             for match in re.finditer(pattern, line):
                 callee = match.group(1)
                 # Skip common keywords/builtins
-                if callee in ("if", "for", "while", "return", "print", "len", "range",
-                              "int", "str", "float", "list", "dict", "set", "tuple",
-                              "True", "False", "None", "self", "cls", "super",
-                              "import", "from", "class", "def", "async", "await",
-                              "try", "except", "finally", "with", "as", "yield"):
+                if callee in (
+                    "if",
+                    "for",
+                    "while",
+                    "return",
+                    "print",
+                    "len",
+                    "range",
+                    "int",
+                    "str",
+                    "float",
+                    "list",
+                    "dict",
+                    "set",
+                    "tuple",
+                    "True",
+                    "False",
+                    "None",
+                    "self",
+                    "cls",
+                    "super",
+                    "import",
+                    "from",
+                    "class",
+                    "def",
+                    "async",
+                    "await",
+                    "try",
+                    "except",
+                    "finally",
+                    "with",
+                    "as",
+                    "yield",
+                ):
                     continue
                 caller = current_func.get(i, "<module>")
                 calls.append(CallInfo(caller=caller, callee=callee, file_path=file_path, line=i + 1))

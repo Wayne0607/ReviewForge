@@ -42,12 +42,10 @@ def load_labels() -> dict[str, list[str]]:
     return json.loads(labels_path.read_text(encoding="utf-8"))
 
 
-async def run_reviewer(
-    llm, gateway, state, mode: str, fixture_name: str, fixture_content: str
-) -> dict:
+async def run_reviewer(llm, gateway, state, mode: str, fixture_name: str, fixture_content: str) -> dict:
     """Run a single review and collect metrics."""
     from reviewforge.core.specs import build_registry
-    from reviewforge.core.state import Finding, ReviewTask
+    from reviewforge.core.state import ReviewTask
     from reviewforge.engine.reviewers import SecurityReviewer
 
     registry = build_registry()
@@ -114,23 +112,27 @@ def compute_metrics(results: list[dict], labels: dict[str, list[str]]) -> dict:
         fp += len(extra)
         fn += len(missed)
 
-        details.append({
-            "fixture": r["fixture"],
-            "mode": r["mode"],
-            "expected": sorted(expected),
-            "actual": sorted(actual),
-            "matched": sorted(matched),
-            "extra": sorted(extra),
-            "missed": sorted(missed),
-            "latency_s": r["latency_s"],
-        })
+        details.append(
+            {
+                "fixture": r["fixture"],
+                "mode": r["mode"],
+                "expected": sorted(expected),
+                "actual": sorted(actual),
+                "matched": sorted(matched),
+                "extra": sorted(extra),
+                "missed": sorted(missed),
+                "latency_s": r["latency_s"],
+            }
+        )
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
     return {
-        "tp": tp, "fp": fp, "fn": fn,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
         "precision": round(precision, 3),
         "recall": round(recall, 3),
         "f1": round(f1, 3),
@@ -154,19 +156,22 @@ async def main() -> None:
     # Setup LLM
     if use_mock:
         from reviewforge.engine.mock_llm import MockChatLLM
+
         llm = MockChatLLM()
     else:
         from reviewforge.core.config import ReviewForgeConfig
         from reviewforge.engine.model_router import ModelRouter
+
         cfg = ReviewForgeConfig.load()
         router = ModelRouter(cfg.llm)
         llm = router.get_llm("security_reviewer")
         print(f"Model: {cfg.llm.model}")
 
     # Setup mock gateway
-    from reviewforge.tools.mock_github import MockGitHubClient
-    from reviewforge.tools.gateway import ToolGateway
     from reviewforge.core.specs import build_registry
+    from reviewforge.tools.gateway import ToolGateway
+    from reviewforge.tools.mock_github import MockGitHubClient
+
     registry = build_registry()
     gateway = ToolGateway(registry, MockGitHubClient())
 
@@ -175,8 +180,10 @@ async def main() -> None:
 
     for name, content in fixtures.items():
         from reviewforge.core.state import StateStore
+
         state = StateStore(
-            pr_number=0, repo="eval/eval",
+            pr_number=0,
+            repo="eval/eval",
             files_changed=[name],
             diff_summary=f"--- {name}\n+{content.replace(chr(10), chr(10) + '+')}",
         )

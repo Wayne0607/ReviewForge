@@ -16,6 +16,7 @@ import yaml
 @dataclass
 class ModelProfile:
     """A named model configuration for multi-model routing."""
+
     model: str = ""
     base_url: str = ""
     api_key: str = ""
@@ -81,7 +82,7 @@ class ReviewForgeConfig:
             path = Path("reviewforge.yaml")
 
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             cfg._apply_dict(data)
 
@@ -107,10 +108,7 @@ class ReviewForgeConfig:
         if "llm" in data:
             for k, v in data["llm"].items():
                 if k == "profiles" and isinstance(v, dict):
-                    self.llm.profiles = {
-                        name: ModelProfile(**p) if isinstance(p, dict) else p
-                        for name, p in v.items()
-                    }
+                    self.llm.profiles = {name: ModelProfile(**p) if isinstance(p, dict) else p for name, p in v.items()}
                 elif hasattr(self.llm, k):
                     setattr(self.llm, k, v)
         if "server" in data:

@@ -29,9 +29,7 @@ class ToolGateway:
             "post_comment": self._post_comment,
         }
 
-    async def invoke(
-        self, tool_name: str, params: dict[str, Any], state: StateStore, agent_name: str = ""
-    ) -> Any:
+    async def invoke(self, tool_name: str, params: dict[str, Any], state: StateStore, agent_name: str = "") -> Any:
         """Execute a tool with full gating.
 
         Args:

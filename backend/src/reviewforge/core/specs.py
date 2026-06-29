@@ -76,342 +76,370 @@ def build_registry() -> SpecRegistry:
     registry = SpecRegistry()
 
     # --- Tools ---
-    registry.register_tool(ToolSpec(
-        name="read_diff",
-        description="Read the diff of a specific file in the PR",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "File path in the PR"},
+    registry.register_tool(
+        ToolSpec(
+            name="read_diff",
+            description="Read the diff of a specific file in the PR",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "File path in the PR"},
+                },
+                "required": ["file_path"],
             },
-            "required": ["file_path"],
-        },
-        risk_level="low",
-    ))
+            risk_level="low",
+        )
+    )
 
-    registry.register_tool(ToolSpec(
-        name="read_file",
-        description="Read the full content of a file at the PR head commit",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
+    registry.register_tool(
+        ToolSpec(
+            name="read_file",
+            description="Read the full content of a file at the PR head commit",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                },
+                "required": ["file_path"],
             },
-            "required": ["file_path"],
-        },
-        risk_level="low",
-    ))
+            risk_level="low",
+        )
+    )
 
-    registry.register_tool(ToolSpec(
-        name="search_code",
-        description="Search for a pattern in the repository",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "Search pattern (regex)"},
-                "file_glob": {"type": "string", "description": "File glob filter"},
+    registry.register_tool(
+        ToolSpec(
+            name="search_code",
+            description="Search for a pattern in the repository",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Search pattern (regex)"},
+                    "file_glob": {"type": "string", "description": "File glob filter"},
+                },
+                "required": ["pattern"],
             },
-            "required": ["pattern"],
-        },
-        risk_level="low",
-    ))
+            risk_level="low",
+        )
+    )
 
-    registry.register_tool(ToolSpec(
-        name="post_comment",
-        description="Post a review comment on a specific line of the PR",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "line": {"type": "integer"},
-                "body": {"type": "string"},
-                "severity": {"type": "string", "enum": ["info", "warning", "error"]},
+    registry.register_tool(
+        ToolSpec(
+            name="post_comment",
+            description="Post a review comment on a specific line of the PR",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "body": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["info", "warning", "error"]},
+                },
+                "required": ["file_path", "line", "body", "severity"],
             },
-            "required": ["file_path", "line", "body", "severity"],
-        },
-        risk_level="medium",
-    ))
+            risk_level="medium",
+        )
+    )
 
     # --- Agents ---
-    registry.register_agent(AgentSpec(
-        name="planner",
-        role="planner",
-        description="Reads PR diff, decides which reviewers to dispatch",
-        model_profile="planner",
-        max_steps=1,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "reviewer": {"type": "string"},
-                            "files": {"type": "array", "items": {"type": "string"}},
-                            "rationale": {"type": "string"},
+    registry.register_agent(
+        AgentSpec(
+            name="planner",
+            role="planner",
+            description="Reads PR diff, decides which reviewers to dispatch",
+            model_profile="planner",
+            max_steps=1,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reviewer": {"type": "string"},
+                                "files": {"type": "array", "items": {"type": "string"}},
+                                "rationale": {"type": "string"},
+                            },
+                            "required": ["reviewer", "files"],
                         },
-                        "required": ["reviewer", "files"],
-                    },
-                }
+                    }
+                },
+                "required": ["tasks"],
             },
-            "required": ["tasks"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="security_reviewer",
-        role="executor",
-        description="Reviews code for security vulnerabilities",
-        allowed_tools=["read_diff", "read_file", "search_code"],
-        model_profile="reviewer",
-        max_steps=10,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="security_reviewer",
+            role="executor",
+            description="Reviews code for security vulnerabilities",
+            allowed_tools=["read_diff", "read_file", "search_code"],
+            model_profile="reviewer",
+            max_steps=10,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="performance_reviewer",
-        role="executor",
-        description="Reviews code for performance issues",
-        allowed_tools=["read_diff", "read_file", "search_code"],
-        model_profile="reviewer",
-        max_steps=8,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="performance_reviewer",
+            role="executor",
+            description="Reviews code for performance issues",
+            allowed_tools=["read_diff", "read_file", "search_code"],
+            model_profile="reviewer",
+            max_steps=8,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="style_reviewer",
-        role="executor",
-        description="Reviews code for readability and style issues",
-        allowed_tools=["read_diff", "read_file"],
-        model_profile="reviewer",
-        max_steps=6,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="style_reviewer",
+            role="executor",
+            description="Reviews code for readability and style issues",
+            allowed_tools=["read_diff", "read_file"],
+            model_profile="reviewer",
+            max_steps=6,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="verifier",
-        role="validator",
-        description="Reviews candidate findings, removes false positives",
-        allowed_tools=[],
-        model_profile="verifier",
-        max_steps=1,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "verified": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "verdict": {"type": "string", "enum": ["confirmed", "false_positive"]},
-                            "reason": {"type": "string"},
+    registry.register_agent(
+        AgentSpec(
+            name="verifier",
+            role="validator",
+            description="Reviews candidate findings, removes false positives",
+            allowed_tools=[],
+            model_profile="verifier",
+            max_steps=1,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "verified": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "verdict": {"type": "string", "enum": ["confirmed", "false_positive"]},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["file", "line", "verdict"],
                         },
-                        "required": ["file", "line", "verdict"],
-                    },
-                }
+                    }
+                },
+                "required": ["verified"],
             },
-            "required": ["verified"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="commenter",
-        role="synthesizer",
-        description="Formats confirmed findings into GitHub review comments",
-        allowed_tools=["post_comment"],
-        model_profile="commenter",
-        max_steps=1,
-    ))
+    registry.register_agent(
+        AgentSpec(
+            name="commenter",
+            role="synthesizer",
+            description="Formats confirmed findings into GitHub review comments",
+            allowed_tools=["post_comment"],
+            model_profile="commenter",
+            max_steps=1,
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="testing_reviewer",
-        role="executor",
-        description="Reviews code for testing issues — missing tests, poor coverage, edge cases",
-        allowed_tools=["read_diff", "read_file", "search_code"],
-        model_profile="reviewer",
-        max_steps=6,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="testing_reviewer",
+            role="executor",
+            description="Reviews code for testing issues — missing tests, poor coverage, edge cases",
+            allowed_tools=["read_diff", "read_file", "search_code"],
+            model_profile="reviewer",
+            max_steps=6,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="doc_reviewer",
-        role="executor",
-        description="Reviews code for documentation gaps — missing docstrings, type hints, comments",
-        allowed_tools=["read_diff", "read_file"],
-        model_profile="reviewer",
-        max_steps=5,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="doc_reviewer",
+            role="executor",
+            description="Reviews code for documentation gaps — missing docstrings, type hints, comments",
+            allowed_tools=["read_diff", "read_file"],
+            model_profile="reviewer",
+            max_steps=5,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="dependency_reviewer",
-        role="executor",
-        description="Reviews code for dependency risks — new deps, version locks, vulnerabilities",
-        allowed_tools=["read_diff", "read_file", "search_code"],
-        model_profile="reviewer",
-        max_steps=6,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="dependency_reviewer",
+            role="executor",
+            description="Reviews code for dependency risks — new deps, version locks, vulnerabilities",
+            allowed_tools=["read_diff", "read_file", "search_code"],
+            model_profile="reviewer",
+            max_steps=6,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
-    registry.register_agent(AgentSpec(
-        name="accessibility_reviewer",
-        role="executor",
-        description="Reviews code for accessibility issues — missing alt, aria labels, keyboard nav",
-        allowed_tools=["read_diff", "read_file"],
-        model_profile="reviewer",
-        max_steps=6,
-        output_contract={
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "severity": {"type": "string"},
-                            "category": {"type": "string"},
-                            "message": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "confidence": {"type": "number"},
+    registry.register_agent(
+        AgentSpec(
+            name="accessibility_reviewer",
+            role="executor",
+            description="Reviews code for accessibility issues — missing alt, aria labels, keyboard nav",
+            allowed_tools=["read_diff", "read_file"],
+            model_profile="reviewer",
+            max_steps=6,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
                         },
-                        "required": ["file", "line", "severity", "message", "confidence"],
-                    },
-                }
+                    }
+                },
+                "required": ["findings"],
             },
-            "required": ["findings"],
-        },
-    ))
+        )
+    )
 
     # --- Skills ---
     for skill_name in ["python_best_practices", "react_patterns", "security_rules"]:

@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -152,10 +151,14 @@ class Database:
     # ── Review Runs ──────────────────────────────────────────────
 
     async def create_run(
-        self, run_id: str, repo: str, pr_number: int,
-        head_sha: str = "", base_sha: str = "",
+        self,
+        run_id: str,
+        repo: str,
+        pr_number: int,
+        head_sha: str = "",
+        base_sha: str = "",
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._db.execute(
             "INSERT INTO review_runs (run_id, repo, pr_number, head_sha, base_sha, status, started_at) "
             "VALUES (?, ?, ?, ?, ?, 'running', ?)",
@@ -164,7 +167,7 @@ class Database:
         await self._db.commit()
 
     async def complete_run(self, run_id: str, summary: dict[str, Any]) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._db.execute(
             "UPDATE review_runs SET status='completed', completed_at=?, summary_json=? WHERE run_id=?",
             (now, json.dumps(summary, ensure_ascii=False), run_id),
@@ -172,7 +175,7 @@ class Database:
         await self._db.commit()
 
     async def fail_run(self, run_id: str, error: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._db.execute(
             "UPDATE review_runs SET status='failed', completed_at=?, summary_json=? WHERE run_id=?",
             (now, json.dumps({"error": error}), run_id),
@@ -180,7 +183,10 @@ class Database:
         await self._db.commit()
 
     async def get_runs(
-        self, repo: str | None = None, limit: int = 50, offset: int = 0,
+        self,
+        repo: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         if repo:
             cursor = await self._db.execute(
@@ -197,7 +203,8 @@ class Database:
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         cursor = await self._db.execute(
-            "SELECT * FROM review_runs WHERE run_id=?", (run_id,),
+            "SELECT * FROM review_runs WHERE run_id=?",
+            (run_id,),
         )
         row = await cursor.fetchone()
         return self._row_to_dict(row) if row else None
@@ -207,20 +214,30 @@ class Database:
     async def insert_finding(self, run_id: str, finding: dict[str, Any]) -> None:
         await self._db.execute(
             "INSERT OR REPLACE INTO review_findings "
-            "(id, run_id, file, line, severity, category, message, suggestion, confidence, reviewer, status, verified_by) "
+            "(id, run_id, file, line, severity, category, message, suggestion, confidence, reviewer, status, verified_by) "  # noqa: E501
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                finding["id"], run_id, finding["file"], finding["line"],
-                finding["severity"], finding["category"], finding["message"],
-                finding.get("suggestion", ""), finding["confidence"],
-                finding.get("reviewer", ""), finding.get("status", "candidate"),
+                finding["id"],
+                run_id,
+                finding["file"],
+                finding["line"],
+                finding["severity"],
+                finding["category"],
+                finding["message"],
+                finding.get("suggestion", ""),
+                finding["confidence"],
+                finding.get("reviewer", ""),
+                finding.get("status", "candidate"),
                 finding.get("verified_by", ""),
             ),
         )
         await self._db.commit()
 
     async def update_finding_status(
-        self, finding_id: str, status: str, verified_by: str = "",
+        self,
+        finding_id: str,
+        status: str,
+        verified_by: str = "",
     ) -> None:
         await self._db.execute(
             "UPDATE review_findings SET status=?, verified_by=? WHERE id=?",
@@ -229,7 +246,9 @@ class Database:
         await self._db.commit()
 
     async def get_findings(
-        self, run_id: str | None = None, status: str | None = None,
+        self,
+        run_id: str | None = None,
+        status: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         conditions, params = [], []
@@ -250,9 +269,13 @@ class Database:
     # ── Reviewer Metrics ─────────────────────────────────────────
 
     async def insert_metric(
-        self, run_id: str, reviewer_name: str,
-        findings_count: int = 0, duration_ms: int = 0,
-        status: str = "completed", error: str = "",
+        self,
+        run_id: str,
+        reviewer_name: str,
+        findings_count: int = 0,
+        duration_ms: int = 0,
+        status: str = "completed",
+        error: str = "",
     ) -> None:
         await self._db.execute(
             "INSERT INTO reviewer_metrics (run_id, reviewer_name, findings_count, duration_ms, status, error) "
@@ -264,7 +287,8 @@ class Database:
     async def get_metrics(self, run_id: str | None = None) -> list[dict[str, Any]]:
         if run_id:
             cursor = await self._db.execute(
-                "SELECT * FROM reviewer_metrics WHERE run_id=?", (run_id,),
+                "SELECT * FROM reviewer_metrics WHERE run_id=?",
+                (run_id,),
             )
         else:
             cursor = await self._db.execute("SELECT * FROM reviewer_metrics ORDER BY id DESC LIMIT 500")
@@ -278,7 +302,8 @@ class Database:
         repo_filter = "WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
 
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT
                 COUNT(DISTINCT r.run_id) as total_runs,
                 COUNT(f.id) as total_findings,
@@ -288,7 +313,9 @@ class Database:
             FROM review_runs r
             LEFT JOIN review_findings f ON f.run_id = r.run_id
             {repo_filter}
-        """, params)
+        """,
+            params,
+        )
         row = await cursor.fetchone()
         return self._row_to_dict(row) if row else {}
 
@@ -296,12 +323,15 @@ class Database:
         """Finding count by category."""
         repo_join = "JOIN review_runs r ON f.run_id=r.run_id WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT category, COUNT(*) as count
             FROM review_findings f
             {repo_join}
             GROUP BY category ORDER BY count DESC
-        """, params)
+        """,
+            params,
+        )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def get_weekly_trends(self, repo: str | None = None, weeks: int = 12) -> list[dict[str, Any]]:
@@ -309,7 +339,8 @@ class Database:
         repo_filter = "AND r.repo=?" if repo else ""
         interval = f"-{int(weeks) * 7} days"
         params = (interval, repo) if repo else (interval,)
-        async with self._db.execute(f"""
+        async with self._db.execute(
+            f"""
             SELECT
                 strftime('%Y-W%W', r.started_at) as week,
                 COUNT(f.id) as total,
@@ -319,27 +350,33 @@ class Database:
             WHERE r.started_at > datetime('now', ?)
             {repo_filter}
             GROUP BY week ORDER BY week
-        """, params) as cursor:
+        """,
+            params,
+        ) as cursor:
             return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def get_hotspot_files(self, repo: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         """Files with most findings."""
         repo_join = "JOIN review_runs r ON f.run_id=r.run_id WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT file, COUNT(*) as count,
                    SUM(CASE WHEN f.status='confirmed' THEN 1 ELSE 0 END) as confirmed
             FROM review_findings f
             {repo_join}
             GROUP BY file ORDER BY count DESC LIMIT ?
-        """, (*params, limit))
+        """,
+            (*params, limit),
+        )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def get_reviewer_stats(self, repo: str | None = None) -> list[dict[str, Any]]:
         """Per-reviewer statistics."""
         repo_join = "JOIN review_runs r ON m.run_id=r.run_id WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT
                 m.reviewer_name,
                 COUNT(*) as total_runs,
@@ -349,14 +386,17 @@ class Database:
             FROM reviewer_metrics m
             {repo_join}
             GROUP BY m.reviewer_name ORDER BY total_findings DESC
-        """, params)
+        """,
+            params,
+        )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def get_recurring_issues(self, repo: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Same file + same category appearing in multiple runs."""
         repo_join = "JOIN review_runs r ON f.run_id=r.run_id WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT file, category, COUNT(DISTINCT run_id) as run_count, COUNT(*) as total_count
             FROM review_findings f
             {repo_join}
@@ -364,7 +404,9 @@ class Database:
             HAVING run_count > 1
             ORDER BY run_count DESC, total_count DESC
             LIMIT ?
-        """, (*params, limit))
+        """,
+            (*params, limit),
+        )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     # ── Helpers ──────────────────────────────────────────────────
@@ -378,13 +420,17 @@ class Database:
     # ── Token Usage ──────────────────────────────────────────────
 
     async def record_token_usage(
-        self, run_id: str, agent_name: str,
-        prompt_tokens: int = 0, completion_tokens: int = 0,
-        total_tokens: int = 0, model: str = "",
+        self,
+        run_id: str,
+        agent_name: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        model: str = "",
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._db.execute(
-            "INSERT INTO token_usage (run_id, agent_name, prompt_tokens, completion_tokens, total_tokens, model, created_at) "
+            "INSERT INTO token_usage (run_id, agent_name, prompt_tokens, completion_tokens, total_tokens, model, created_at) "  # noqa: E501
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (run_id, agent_name, prompt_tokens, completion_tokens, total_tokens, model, now),
         )
@@ -393,7 +439,8 @@ class Database:
     async def get_token_usage(self, run_id: str | None = None) -> list[dict[str, Any]]:
         if run_id:
             cursor = await self._db.execute(
-                "SELECT * FROM token_usage WHERE run_id=? ORDER BY id", (run_id,),
+                "SELECT * FROM token_usage WHERE run_id=? ORDER BY id",
+                (run_id,),
             )
         else:
             cursor = await self._db.execute(
@@ -404,7 +451,8 @@ class Database:
     async def get_token_summary(self, repo: str | None = None) -> dict[str, Any]:
         repo_join = "JOIN review_runs r ON t.run_id=r.run_id WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT
                 SUM(t.prompt_tokens) as total_prompt,
                 SUM(t.completion_tokens) as total_completion,
@@ -412,14 +460,17 @@ class Database:
                 COUNT(DISTINCT t.run_id) as run_count
             FROM token_usage t
             {repo_join}
-        """, params)
+        """,
+            params,
+        )
         row = await cursor.fetchone()
         return self._row_to_dict(row) if row else {}
 
     async def get_token_by_agent(self, repo: str | None = None) -> list[dict[str, Any]]:
         repo_join = "JOIN review_runs r ON t.run_id=r.run_id WHERE r.repo=?" if repo else ""
         params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        cursor = await self._db.execute(
+            f"""
             SELECT
                 t.agent_name,
                 SUM(t.total_tokens) as total_tokens,
@@ -428,19 +479,27 @@ class Database:
             FROM token_usage t
             {repo_join}
             GROUP BY t.agent_name ORDER BY total_tokens DESC
-        """, params)
+        """,
+            params,
+        )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     # ── Code Graph (Symbols & Relations) ─────────────────────────
 
     async def upsert_symbol(
-        self, file_path: str, symbol_name: str, symbol_type: str,
-        run_id: str, pr_number: int = 0, language: str = "",
-        risk_level: str = "safe", risk_categories: list[str] | None = None,
+        self,
+        file_path: str,
+        symbol_name: str,
+        symbol_type: str,
+        run_id: str,
+        pr_number: int = 0,
+        language: str = "",
+        risk_level: str = "safe",
+        risk_categories: list[str] | None = None,
     ) -> None:
         cats = json.dumps(risk_categories or [], ensure_ascii=False)
         await self._db.execute(
-            "INSERT INTO code_symbols (file_path, symbol_name, symbol_type, risk_level, risk_categories, defined_in_run, pr_number, language) "
+            "INSERT INTO code_symbols (file_path, symbol_name, symbol_type, risk_level, risk_categories, defined_in_run, pr_number, language) "  # noqa: E501
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(file_path, symbol_name) DO UPDATE SET "
             "risk_level=excluded.risk_level, risk_categories=excluded.risk_categories, "
@@ -470,49 +529,59 @@ class Database:
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def upsert_relation(
-        self, run_id: str, source_file: str,
-        target_file: str, target_symbol: str, relation_type: str,
+        self,
+        run_id: str,
+        source_file: str,
+        target_file: str,
+        target_symbol: str,
+        relation_type: str,
     ) -> None:
         await self._db.execute(
             "INSERT INTO code_relations (run_id, source_file, target_file, target_symbol, relation_type) "
             "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(run_id, source_file, target_file, target_symbol) DO UPDATE SET relation_type=excluded.relation_type",
+            "ON CONFLICT(run_id, source_file, target_file, target_symbol) DO UPDATE SET relation_type=excluded.relation_type",  # noqa: E501
             (run_id, source_file, target_file, target_symbol, relation_type),
         )
         await self._db.commit()
 
     async def get_relations_from(self, source_file: str) -> list[dict[str, Any]]:
         cursor = await self._db.execute(
-            "SELECT * FROM code_relations WHERE source_file=?", (source_file,),
+            "SELECT * FROM code_relations WHERE source_file=?",
+            (source_file,),
         )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def get_relations_to(self, target_file: str) -> list[dict[str, Any]]:
         cursor = await self._db.execute(
-            "SELECT * FROM code_relations WHERE target_file=?", (target_file,),
+            "SELECT * FROM code_relations WHERE target_file=?",
+            (target_file,),
         )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def upsert_file_risk(
-        self, file_path: str, max_risk: str,
+        self,
+        file_path: str,
+        max_risk: str,
         risk_categories: list[str] | None = None,
-        findings_count: int = 0, run_id: str = "",
+        findings_count: int = 0,
+        run_id: str = "",
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         cats = json.dumps(risk_categories or [], ensure_ascii=False)
         await self._db.execute(
-            "INSERT INTO file_risk_summary (file_path, max_risk, risk_categories, findings_count, last_run_id, last_updated) "
+            "INSERT INTO file_risk_summary (file_path, max_risk, risk_categories, findings_count, last_run_id, last_updated) "  # noqa: E501
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(file_path) DO UPDATE SET "
             "max_risk=excluded.max_risk, risk_categories=excluded.risk_categories, "
-            "findings_count=excluded.findings_count, last_run_id=excluded.last_run_id, last_updated=excluded.last_updated",
+            "findings_count=excluded.findings_count, last_run_id=excluded.last_run_id, last_updated=excluded.last_updated",  # noqa: E501
             (file_path, max_risk, cats, findings_count, run_id, now),
         )
         await self._db.commit()
 
     async def get_file_risk(self, file_path: str) -> dict[str, Any] | None:
         cursor = await self._db.execute(
-            "SELECT * FROM file_risk_summary WHERE file_path=?", (file_path,),
+            "SELECT * FROM file_risk_summary WHERE file_path=?",
+            (file_path,),
         )
         row = await cursor.fetchone()
         return self._row_to_dict(row) if row else None

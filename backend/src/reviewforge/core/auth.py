@@ -1,4 +1,5 @@
 """极简 API Token 鉴权依赖。"""
+
 from __future__ import annotations
 
 import os

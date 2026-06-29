@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -89,8 +88,7 @@ class Planner:
         messages = build_planner_prompt(ctx)
 
         response = await self._llm.ainvoke(
-            [SystemMessage(content=messages[0]["content"]),
-             HumanMessage(content=messages[1]["content"])]
+            [SystemMessage(content=messages[0]["content"]), HumanMessage(content=messages[1]["content"])]
         )
 
         llm_tasks = self._parse_response(response.content)
@@ -138,29 +136,31 @@ class Planner:
 
         return forced
 
-    def _merge_tasks(
-        self, forced: set[str], llm_tasks: list[ReviewTask], files: list[str]
-    ) -> list[ReviewTask]:
+    def _merge_tasks(self, forced: set[str], llm_tasks: list[ReviewTask], files: list[str]) -> list[ReviewTask]:
         """Merge forced reviewers with LLM decisions."""
         llm_reviewers = {t.reviewer for t in llm_tasks}
         merged = list(llm_tasks)
 
         for reviewer in forced:
             if reviewer not in llm_reviewers:
-                merged.append(ReviewTask(
-                    reviewer=reviewer,
-                    files=files,
-                    rationale="自动检测到安全/性能模式",
-                ))
+                merged.append(
+                    ReviewTask(
+                        reviewer=reviewer,
+                        files=files,
+                        rationale="自动检测到安全/性能模式",
+                    )
+                )
                 logger.info(f"Forced reviewer added: {reviewer}")
 
         # Always include style_reviewer
         if "style_reviewer" not in {t.reviewer for t in merged}:
-            merged.append(ReviewTask(
-                reviewer="style_reviewer",
-                files=files,
-                rationale="默认风格审查",
-            ))
+            merged.append(
+                ReviewTask(
+                    reviewer="style_reviewer",
+                    files=files,
+                    rationale="默认风格审查",
+                )
+            )
 
         return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
 
@@ -212,10 +212,12 @@ class Planner:
                 logger.warning(f"Planner proposed unknown reviewer '{reviewer}', skipping")
                 continue
 
-            tasks.append(ReviewTask(
-                reviewer=reviewer,
-                files=item.get("files", []),
-                rationale=item.get("rationale", ""),
-            ))
+            tasks.append(
+                ReviewTask(
+                    reviewer=reviewer,
+                    files=item.get("files", []),
+                    rationale=item.get("rationale", ""),
+                )
+            )
 
         return tasks

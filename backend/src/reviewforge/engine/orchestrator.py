@@ -6,7 +6,6 @@ Persists all results to the database for dashboard consumption.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 import uuid
@@ -94,9 +93,11 @@ class Orchestrator:
         # Persist run start
         if self._db:
             await self._db.create_run(
-                run_id=run_id, repo=state.repo,
+                run_id=run_id,
+                repo=state.repo,
                 pr_number=state.pr_number,
-                head_sha=state.head_sha, base_sha=state.base_sha,
+                head_sha=state.head_sha,
+                base_sha=state.base_sha,
             )
 
         try:
@@ -109,6 +110,7 @@ class Orchestrator:
 
             # D1: Phase 2 — 串行筛 loop + 并行执行 reviewer
             import asyncio as _aio
+
             pending = state.list_tasks(status="pending")
 
             # 先串行做 loop 检查，过滤掉 stall/rescue
@@ -134,27 +136,39 @@ class Orchestrator:
                     if not reviewer:
                         state.update_task(task.id, status="failed", error=f"unknown reviewer: {task.reviewer}")
                         if self._db:
-                            await self._db.insert_metric(run_id, task.reviewer,
-                                                         status="failed", error=f"unknown reviewer: {task.reviewer}")
+                            await self._db.insert_metric(
+                                run_id, task.reviewer, status="failed", error=f"unknown reviewer: {task.reviewer}"
+                            )
                         return
                     findings = await reviewer.execute(task, state)
                     for f in findings:
                         state.add_finding(f)
                     state.update_task(task.id, status="completed")
-                    self._events.emit("reviewer.completed", {
-                        "reviewer": task.reviewer, "findings_count": len(findings),
-                    })
+                    self._events.emit(
+                        "reviewer.completed",
+                        {
+                            "reviewer": task.reviewer,
+                            "findings_count": len(findings),
+                        },
+                    )
                     if self._db:
-                        await self._db.insert_metric(run_id, task.reviewer,
-                                                     findings_count=len(findings),
-                                                     duration_ms=int((time.monotonic() - t_start) * 1000))
+                        await self._db.insert_metric(
+                            run_id,
+                            task.reviewer,
+                            findings_count=len(findings),
+                            duration_ms=int((time.monotonic() - t_start) * 1000),
+                        )
                 except Exception as e:
                     state.update_task(task.id, status="failed", error=str(e))
                     self._events.emit("reviewer.failed", {"reviewer": task.reviewer, "error": str(e)})
                     if self._db:
-                        await self._db.insert_metric(run_id, task.reviewer,
-                                                     duration_ms=int((time.monotonic() - t_start) * 1000),
-                                                     status="failed", error=str(e))
+                        await self._db.insert_metric(
+                            run_id,
+                            task.reviewer,
+                            duration_ms=int((time.monotonic() - t_start) * 1000),
+                            status="failed",
+                            error=str(e),
+                        )
 
             await _aio.gather(*(_run_one(t) for t in runnable))
 
@@ -183,18 +197,23 @@ class Orchestrator:
 
                 for f in calibrated:
                     if f.status == "confirmed":
-                        state.update_finding(f.id, status="confirmed", verified_by=f.verified_by,
-                                             verify_reason=f.verify_reason)
+                        state.update_finding(
+                            f.id, status="confirmed", verified_by=f.verified_by, verify_reason=f.verify_reason
+                        )
                     elif f.status == "false_positive":
-                        state.update_finding(f.id, status="false_positive", verified_by=f.verified_by,
-                                             verify_reason=f.verify_reason)
+                        state.update_finding(
+                            f.id, status="false_positive", verified_by=f.verified_by, verify_reason=f.verify_reason
+                        )
 
                 confirmed_count = len([f for f in calibrated if f.status == "confirmed"])
                 filtered_count = len([f for f in calibrated if f.status == "false_positive"])
-                self._events.emit("calibration.completed", {
-                    "confirmed": confirmed_count,
-                    "filtered": filtered_count,
-                })
+                self._events.emit(
+                    "calibration.completed",
+                    {
+                        "confirmed": confirmed_count,
+                        "filtered": filtered_count,
+                    },
+                )
 
             # Phase 3.5: Cross-PR Analysis
             if self._cross_pr:
@@ -209,9 +228,12 @@ class Orchestrator:
                     for f in cross_findings:
                         state.add_finding(f)
                     if cross_findings:
-                        self._events.emit("cross_pr.completed", {
-                            "cross_pr_findings": len(cross_findings),
-                        })
+                        self._events.emit(
+                            "cross_pr.completed",
+                            {
+                                "cross_pr_findings": len(cross_findings),
+                            },
+                        )
                         logger.info(f"Cross-PR: found {len(cross_findings)} cross-PR issues")
                     else:
                         self._events.emit("cross_pr.completed", {"cross_pr_findings": 0})
@@ -264,8 +286,7 @@ class Orchestrator:
                 llm = self._reviewer_llm
             # W2: agentic 标志
             agentic = name in self._agentic_reviewers
-            return cls(llm, self._registry, self._gateway,
-                       agentic=agentic, event_bus=self._events)
+            return cls(llm, self._registry, self._gateway, agentic=agentic, event_bus=self._events)
         return None
 
     async def _post_comments(self, findings: list[Finding], state: StateStore) -> int:
@@ -277,12 +298,17 @@ class Orchestrator:
                 logger.warning(f"Skipping comment for {finding.id}: invalid line {finding.line}")
                 continue
             try:
-                await self._gateway.invoke("post_comment", {
-                    "file_path": finding.file,
-                    "line": finding.line,
-                    "body": self._format_comment(finding),
-                    "severity": finding.severity,
-                }, state, agent_name="orchestrator")
+                await self._gateway.invoke(
+                    "post_comment",
+                    {
+                        "file_path": finding.file,
+                        "line": finding.line,
+                        "body": self._format_comment(finding),
+                        "severity": finding.severity,
+                    },
+                    state,
+                    agent_name="orchestrator",
+                )
                 state.update_finding(finding.id, status="reported")
                 count += 1
             except Exception as e:

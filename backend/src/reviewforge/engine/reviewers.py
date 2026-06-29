@@ -13,7 +13,7 @@ import logging
 import re
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
@@ -145,9 +145,15 @@ class BaseReviewer:
 
                 # Emit tool event
                 if self._events:
-                    self._events.emit("tool.invoked", {
-                        "reviewer": self.name, "tool": name, "args": args, "step": step,
-                    })
+                    self._events.emit(
+                        "tool.invoked",
+                        {
+                            "reviewer": self.name,
+                            "tool": name,
+                            "args": args,
+                            "step": step,
+                        },
+                    )
 
                 # Repeat-call guard
                 key = f"{name}:{sorted(args.items()) if isinstance(args, dict) else args}"
@@ -189,19 +195,29 @@ class BaseReviewer:
 
         async def search_code(pattern: str, file_glob: str = "") -> str:
             """Search code in repo by pattern."""
-            return await gw.invoke("search_code", {"pattern": pattern, "file_glob": file_glob}, state, agent_name=name) or ""
+            return (
+                await gw.invoke("search_code", {"pattern": pattern, "file_glob": file_glob}, state, agent_name=name)
+                or ""
+            )
 
         async def read_diff(file_path: str) -> str:
             """Read diff for a specific file in this PR."""
             return await gw.invoke("read_diff", {"file_path": file_path}, state, agent_name=name) or ""
 
         return [
-            StructuredTool.from_function(coroutine=read_file, name="read_file",
-                description="读取文件在 PR head 版本的完整内容；当 diff 上下文不足以判断时使用"),
-            StructuredTool.from_function(coroutine=search_code, name="search_code",
-                description="在仓库搜索代码，定位调用方/定义，判断输入是否在别处已被校验"),
-            StructuredTool.from_function(coroutine=read_diff, name="read_diff",
-                description="读取某文件在本 PR 的 diff"),
+            StructuredTool.from_function(
+                coroutine=read_file,
+                name="read_file",
+                description="读取文件在 PR head 版本的完整内容；当 diff 上下文不足以判断时使用",
+            ),
+            StructuredTool.from_function(
+                coroutine=search_code,
+                name="search_code",
+                description="在仓库搜索代码，定位调用方/定义，判断输入是否在别处已被校验",
+            ),
+            StructuredTool.from_function(
+                coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"
+            ),
         ]
 
     def _emit_step_event(self, state: StateStore, step: int, resp: Any) -> None:
@@ -214,9 +230,14 @@ class BaseReviewer:
             # Fallback: estimate from content length
             content = getattr(resp, "content", "")
             tokens = len(str(content)) // 4
-        self._events.emit("reviewer.step", {
-            "reviewer": self.name, "step": step, "tokens": tokens,
-        })
+        self._events.emit(
+            "reviewer.step",
+            {
+                "reviewer": self.name,
+                "step": step,
+                "tokens": tokens,
+            },
+        )
 
     @staticmethod
     def _extract_json(content: str) -> dict | None:
@@ -233,18 +254,18 @@ class BaseReviewer:
         except json.JSONDecodeError:
             pass
 
-        match = re.search(r'\{.*\}', content, re.DOTALL)
+        match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
 
-        start = content.find('{')
-        end = content.rfind('}')
+        start = content.find("{")
+        end = content.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                return json.loads(content[start:end + 1])
+                return json.loads(content[start : end + 1])
             except json.JSONDecodeError:
                 pass
 
@@ -260,94 +281,180 @@ class BaseReviewer:
         findings = []
         for item in data.get("findings", []):
             try:
-                findings.append(Finding(
-                    file=item.get("file", ""),
-                    line=item.get("line", 0),
-                    severity=item.get("severity", "info"),
-                    category=item.get("category", ""),
-                    message=item.get("message", ""),
-                    suggestion=item.get("suggestion", ""),
-                    confidence=item.get("confidence", 0.5),
-                ))
+                findings.append(
+                    Finding(
+                        file=item.get("file", ""),
+                        line=item.get("line", 0),
+                        severity=item.get("severity", "info"),
+                        category=item.get("category", ""),
+                        message=item.get("message", ""),
+                        suggestion=item.get("suggestion", ""),
+                        confidence=item.get("confidence", 0.5),
+                    )
+                )
             except Exception as e:
                 logger.warning(f"{self.name}: skipped invalid finding {item!r}: {e}")
         return findings
 
 
 class SecurityReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="security_reviewer", reviewer_type="security", llm=llm,
-            registry=registry, gateway=gateway,
+            name="security_reviewer",
+            reviewer_type="security",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("security_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 
 class PerformanceReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="performance_reviewer", reviewer_type="performance", llm=llm,
-            registry=registry, gateway=gateway,
+            name="performance_reviewer",
+            reviewer_type="performance",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("performance_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 
 class StyleReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="style_reviewer", reviewer_type="style", llm=llm,
-            registry=registry, gateway=gateway,
+            name="style_reviewer",
+            reviewer_type="style",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("style_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 
 class TestingReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="testing_reviewer", reviewer_type="testing", llm=llm,
-            registry=registry, gateway=gateway,
+            name="testing_reviewer",
+            reviewer_type="testing",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("testing_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 
 class DocumentationReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="doc_reviewer", reviewer_type="documentation", llm=llm,
-            registry=registry, gateway=gateway,
+            name="doc_reviewer",
+            reviewer_type="documentation",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("doc_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 
 class DependencyReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="dependency_reviewer", reviewer_type="dependency", llm=llm,
-            registry=registry, gateway=gateway,
+            name="dependency_reviewer",
+            reviewer_type="dependency",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("dependency_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 
 class AccessibilityReviewer(BaseReviewer):
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, gateway: ToolGateway,
-                 agentic: bool = False, max_tokens: int = 20000, event_bus: Any = None) -> None:
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
         super().__init__(
-            name="accessibility_reviewer", reviewer_type="accessibility", llm=llm,
-            registry=registry, gateway=gateway,
+            name="accessibility_reviewer",
+            reviewer_type="accessibility",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
             max_steps=registry.get_agent("accessibility_reviewer").max_steps,
-            agentic=agentic, max_tokens=max_tokens, event_bus=event_bus,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
         )
 
 

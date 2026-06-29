@@ -8,7 +8,6 @@ import hmac
 import json
 import logging
 import re
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -74,7 +73,7 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                         file_paths = [f["filename"] for f in files_data]
 
                         diff_summary = "\n".join(
-                            f"--- {f['filename']} (+{f.get('additions', 0)} -{f.get('deletions', 0)})\n{f.get('patch', '')}"
+                            f"--- {f['filename']} (+{f.get('additions', 0)} -{f.get('deletions', 0)})\n{f.get('patch', '')}"  # noqa: E501
                             for f in files_data
                         )
 

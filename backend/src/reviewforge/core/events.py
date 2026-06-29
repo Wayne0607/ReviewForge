@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import contextvars
 import json
-import time
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +64,11 @@ class EventBus:
 
     def subscribe_type(self, event_type: str, callback: Callable[[ReviewEvent], None]) -> None:
         """Subscribe to events of a specific type."""
+
         def _filter(event: ReviewEvent) -> None:
             if event.event_type == event_type:
                 callback(event)
+
         self._subscribers.append(_filter)
 
     def emit(self, event_type: str, data: dict[str, Any] | None = None) -> ReviewEvent:
@@ -110,19 +113,21 @@ class EventBus:
             return []
 
         events = []
-        with open(log_path, "r", encoding="utf-8") as f:
+        with open(log_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
-                    events.append(ReviewEvent(
-                        event_type=data.pop("_event", "unknown"),
-                        timestamp=data.pop("_ts", 0),
-                        run_id=data.pop("_run_id", ""),
-                        data=data,
-                    ))
+                    events.append(
+                        ReviewEvent(
+                            event_type=data.pop("_event", "unknown"),
+                            timestamp=data.pop("_ts", 0),
+                            run_id=data.pop("_run_id", ""),
+                            data=data,
+                        )
+                    )
                 except json.JSONDecodeError:
                     continue
         return events

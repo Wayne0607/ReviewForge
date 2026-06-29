@@ -27,7 +27,6 @@ import importlib
 import inspect
 import logging
 from pathlib import Path
-from typing import Any
 
 from reviewforge.engine.reviewers import BaseReviewer
 
@@ -92,6 +91,6 @@ class PluginLoader:
     @staticmethod
     def validate(cls: type[BaseReviewer]) -> bool:
         """校验插件类是否具备必需属性。返回 True 表示通过。"""
-        return bool(getattr(cls, "plugin_name", "")) \
-            and bool(getattr(cls, "plugin_type", "")) \
-            and hasattr(cls, "execute")
+        return (
+            bool(getattr(cls, "plugin_name", "")) and bool(getattr(cls, "plugin_type", "")) and hasattr(cls, "execute")
+        )

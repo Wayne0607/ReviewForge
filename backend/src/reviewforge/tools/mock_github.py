@@ -15,7 +15,7 @@ class MockGitHubClient:
         pass
 
     async def get_file_diff(self, repo: str, pr_number: int, file_path: str) -> str:
-        return f"@@ -1,3 +1,5 @@\n+import os\n+import pickle\n def test():\n     pass"
+        return "@@ -1,3 +1,5 @@\n+import os\n+import pickle\n def test():\n     pass"
 
     async def get_file_content(self, repo: str, ref: str, file_path: str) -> str:
         return "# test file\nprint('hello')\n"
@@ -24,8 +24,13 @@ class MockGitHubClient:
         return f"- {file_glob or 'src/'}:match.py"
 
     async def post_review_comment(
-        self, repo: str, pr_number: int, commit_sha: str,
-        file_path: str, line: int, body: str,
+        self,
+        repo: str,
+        pr_number: int,
+        commit_sha: str,
+        file_path: str,
+        line: int,
+        body: str,
     ) -> dict[str, Any]:
         comment = {"file": file_path, "line": line, "body": body}
         self.posted_comments.append(comment)

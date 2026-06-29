@@ -27,6 +27,7 @@ async def main() -> None:
 
     if use_mock:
         from reviewforge.engine.mock_llm import MockChatLLM
+
         llm = MockChatLLM()
         print("[mock] MockChatLLM (needs bind_tools support)")
     else:
@@ -53,9 +54,7 @@ async def main() -> None:
 
     try:
         bound_llm = llm.bind_tools([tool])
-        resp = await bound_llm.ainvoke(
-            [HumanMessage(content="Beijing weather? Use get_weather tool.")]
-        )
+        resp = await bound_llm.ainvoke([HumanMessage(content="Beijing weather? Use get_weather tool.")])
         calls = getattr(resp, "tool_calls", None)
         print(f"tool_calls: {calls}")
         if calls:

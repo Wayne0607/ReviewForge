@@ -10,8 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -23,20 +22,30 @@ from reviewforge.engine.symbol_extractor import (
     ImportInfo,
     SymbolInfo,
     detect_language,
-    extract_calls,
-    extract_definitions,
     extract_diff_symbols,
-    extract_imports,
 )
 
 logger = logging.getLogger(__name__)
 
 # Security categories that propagate across PRs
 SECURITY_CATEGORIES = {
-    "sql-injection", "xss", "csrf", "command-injection", "path-traversal",
-    "hardcoded-secrets", "insecure-deserialization", "unsafe-deserialization",
-    "security", "authentication", "authorization", "crypto", "ssrf", "xxe",
-    "rce", "config-injection", "code-injection",
+    "sql-injection",
+    "xss",
+    "csrf",
+    "command-injection",
+    "path-traversal",
+    "hardcoded-secrets",
+    "insecure-deserialization",
+    "unsafe-deserialization",
+    "security",
+    "authentication",
+    "authorization",
+    "crypto",
+    "ssrf",
+    "xxe",
+    "rce",
+    "config-injection",
+    "code-injection",
 }
 
 # Max propagation depth by risk level
@@ -51,6 +60,7 @@ MAX_DEPTH = {
 @dataclass
 class CrossPRChain:
     """A cross-PR call chain."""
+
     source_file: str
     source_symbol: str
     target_file: str
@@ -84,7 +94,6 @@ class CrossPRAnalyzer:
 
         Returns a list of cross-PR findings.
         """
-        repo = state.repo
         pr_number = state.pr_number
         diff_summary = state.diff_summary
 
@@ -93,7 +102,6 @@ class CrossPRAnalyzer:
         all_imports: list[ImportInfo] = []
 
         for file_path in state.files_changed:
-            lang = detect_language(file_path)
             # Extract from the diff portion
             file_diff = self._extract_file_diff(diff_summary, file_path)
             if file_diff:
@@ -139,7 +147,9 @@ class CrossPRAnalyzer:
         # Step 5: LLM confirmation for suspicious chains
         if self._llm:
             cross_findings = await self._llm_confirm_chains(
-                suspicious_chains, diff_summary, state,
+                suspicious_chains,
+                diff_summary,
+                state,
             )
         else:
             # No LLM available — generate findings directly from structural analysis
@@ -185,7 +195,10 @@ class CrossPRAnalyzer:
         return None
 
     async def _mark_symbol_risks(
-        self, findings: list[Finding], run_id: str, pr_number: int,
+        self,
+        findings: list[Finding],
+        run_id: str,
+        pr_number: int,
     ) -> None:
         """Link current findings to their corresponding symbols."""
         for finding in findings:
@@ -193,7 +206,6 @@ class CrossPRAnalyzer:
                 continue
 
             # Find symbols in the same file
-            lang = detect_language(finding.file)
             # We need the full file content to extract definitions,
             # but we can infer from the finding's context
             risk_level = self._category_to_risk(finding.category)
@@ -206,16 +218,25 @@ class CrossPRAnalyzer:
                     cats.append(finding.category)
                 max_risk = self._higher_risk(existing.get("max_risk", "safe"), risk_level)
                 await self._db.upsert_file_risk(
-                    finding.file, max_risk, cats,
-                    existing.get("findings_count", 0) + 1, run_id,
+                    finding.file,
+                    max_risk,
+                    cats,
+                    existing.get("findings_count", 0) + 1,
+                    run_id,
                 )
             else:
                 await self._db.upsert_file_risk(
-                    finding.file, risk_level, [finding.category], 1, run_id,
+                    finding.file,
+                    risk_level,
+                    [finding.category],
+                    1,
+                    run_id,
                 )
 
     async def _find_suspicious_chains(
-        self, imports: list[ImportInfo], known_files: list[str],
+        self,
+        imports: list[ImportInfo],
+        known_files: list[str],
     ) -> list[CrossPRChain]:
         """Find import chains that connect to historically risky code."""
         chains = []
@@ -327,21 +348,23 @@ class CrossPRAnalyzer:
         findings = []
         for chain in chains[:10]:  # Max 10 findings
             chain_path = " → ".join(f"{p['file']}:{p['symbol']}" for p in chain.path)
-            findings.append(Finding(
-                file=chain.source_file,
-                line=0,
-                severity="error",
-                category=f"cross-pr-{chain.risk_category}",
-                message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"
-                        f"存在 {chain.risk_category} 风险。"
-                        f"调用链: {chain_path}",
-                suggestion=f"检查 {chain.target_symbol}() 的安全性，确保输入经过验证。",
-                confidence=0.85,
-                reviewer="cross_pr_analyzer",
-                status="confirmed",
-                verified_by="structural-analysis",
-                verify_reason="基于代码结构分析，未经过 LLM 语义确认",
-            ))
+            findings.append(
+                Finding(
+                    file=chain.source_file,
+                    line=0,
+                    severity="error",
+                    category=f"cross-pr-{chain.risk_category}",
+                    message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"
+                    f"存在 {chain.risk_category} 风险。"
+                    f"调用链: {chain_path}",
+                    suggestion=f"检查 {chain.target_symbol}() 的安全性，确保输入经过验证。",
+                    confidence=0.85,
+                    reviewer="cross_pr_analyzer",
+                    status="confirmed",
+                    verified_by="structural-analysis",
+                    verify_reason="基于代码结构分析，未经过 LLM 语义确认",
+                )
+            )
         return findings
 
     async def _llm_confirm_chains(
@@ -355,10 +378,9 @@ class CrossPRAnalyzer:
         chain_descriptions = []
         for i, chain in enumerate(chains[:5]):  # Max 5 chains per analysis
             path_str = " → ".join(
-                f"{p['file']}:{p['symbol']}" + (f" [{p.get('risk', '')}]" if p.get('risk') else "")
-                for p in chain.path
+                f"{p['file']}:{p['symbol']}" + (f" [{p.get('risk', '')}]" if p.get("risk") else "") for p in chain.path
             )
-            chain_descriptions.append(f"Chain {i+1}: {path_str}")
+            chain_descriptions.append(f"Chain {i + 1}: {path_str}")
 
         chains_text = "\n".join(chain_descriptions)
 
@@ -369,7 +391,9 @@ class CrossPRAnalyzer:
                 if self._github and state.repo:
                     try:
                         content = await self._github.get_file_content(
-                            state.repo, state.head_sha, step["file"],
+                            state.repo,
+                            state.head_sha,
+                            step["file"],
                         )
                         # Extract just the relevant function
                         relevant = self._extract_function(content, step["symbol"])
@@ -421,10 +445,12 @@ class CrossPRAnalyzer:
 ]
 ```"""
 
-        response = await self._llm.ainvoke([
-            SystemMessage(content=system),
-            HumanMessage(content=user),
-        ])
+        response = await self._llm.ainvoke(
+            [
+                SystemMessage(content=system),
+                HumanMessage(content=user),
+            ]
+        )
 
         return self._parse_confirmation(response.content, chains)
 
@@ -443,7 +469,8 @@ class CrossPRAnalyzer:
         except json.JSONDecodeError:
             # Try to find JSON array
             import re
-            match = re.search(r'\[.*\]', content, re.DOTALL)
+
+            match = re.search(r"\[.*\]", content, re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group())
@@ -467,21 +494,23 @@ class CrossPRAnalyzer:
             chain = chains[chain_id]
             chain_path = " → ".join(f"{p['file']}:{p['symbol']}" for p in chain.path)
 
-            findings.append(Finding(
-                file=chain.source_file,
-                line=0,
-                severity="error",
-                category=f"cross-pr-{chain.risk_category}",
-                message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"
-                        f"存在 {chain.risk_category} 风险。\n"
-                        f"调用链: {chain_path}",
-                suggestion=f"检查 {chain.target_symbol}() 的安全性，确保输入经过验证。",
-                confidence=confidence,
-                reviewer="cross_pr_analyzer",
-                status="confirmed",
-                verified_by="cross-pr-analysis",
-                verify_reason=reason,
-            ))
+            findings.append(
+                Finding(
+                    file=chain.source_file,
+                    line=0,
+                    severity="error",
+                    category=f"cross-pr-{chain.risk_category}",
+                    message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"
+                    f"存在 {chain.risk_category} 风险。\n"
+                    f"调用链: {chain_path}",
+                    suggestion=f"检查 {chain.target_symbol}() 的安全性，确保输入经过验证。",
+                    confidence=confidence,
+                    reviewer="cross_pr_analyzer",
+                    status="confirmed",
+                    verified_by="cross-pr-analysis",
+                    verify_reason=reason,
+                )
+            )
 
         return findings
 

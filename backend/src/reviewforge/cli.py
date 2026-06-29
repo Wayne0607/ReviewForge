@@ -25,10 +25,12 @@ def main() -> None:
 
     if args.command == "serve":
         import uvicorn
+
         from reviewforge.app import create_app
 
         if args.mock:
             import os
+
             os.environ["REVIEWFORGE_MOCK"] = "1"
 
         app = create_app(config_path=args.config)
@@ -39,7 +41,10 @@ def main() -> None:
         if args.dev:
             uvicorn.run(
                 "reviewforge.app:create_app",
-                host=host, port=port, reload=True, factory=True,
+                host=host,
+                port=port,
+                reload=True,
+                factory=True,
             )
         else:
             uvicorn.run(app, host=host, port=port)
@@ -61,6 +66,7 @@ def main() -> None:
 
         # Check skills dir
         from pathlib import Path
+
         skills_path = Path(cfg.skills_dir)
         if skills_path.exists():
             skill_count = len(list(skills_path.glob("*/SKILL.md")))
@@ -74,7 +80,9 @@ def main() -> None:
                 print(f"  - {e}")
             sys.exit(1)
         else:
-            print(f"Spec validation OK: {len(registry.agents)} agents, {len(registry.tools)} tools, {len(registry.skills)} skills")
+            print(
+                f"Spec validation OK: {len(registry.agents)} agents, {len(registry.tools)} tools, {len(registry.skills)} skills"  # noqa: E501
+            )
             print(f"Config: model={cfg.llm.model}, reviewers={len(cfg.reviewers)}")
 
     else:

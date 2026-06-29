@@ -55,7 +55,58 @@ CREATE TABLE IF NOT EXISTS reviewer_metrics (
     duration_ms   INTEGER NOT NULL DEFAULT 0,
     status        TEXT NOT NULL DEFAULT 'completed',
     error         TEXT NOT NULL DEFAULT '',
+    prompt_tokens     INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens      INTEGER DEFAULT 0,
     FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+-- Token usage tracking per agent per run
+CREATE TABLE IF NOT EXISTS token_usage (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT NOT NULL,
+    agent_name       TEXT NOT NULL,
+    prompt_tokens    INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens     INTEGER DEFAULT 0,
+    model            TEXT DEFAULT '',
+    created_at       TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+-- Code symbols: functions/classes defined in reviewed code
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path       TEXT NOT NULL,
+    symbol_name     TEXT NOT NULL,
+    symbol_type     TEXT NOT NULL,
+    risk_level      TEXT DEFAULT 'safe',
+    risk_categories TEXT DEFAULT '[]',
+    defined_in_run  TEXT NOT NULL,
+    pr_number       INTEGER DEFAULT 0,
+    language        TEXT DEFAULT '',
+    UNIQUE(file_path, symbol_name)
+);
+
+-- Code relations: import and call relationships
+CREATE TABLE IF NOT EXISTS code_relations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL,
+    source_file   TEXT NOT NULL,
+    target_file   TEXT NOT NULL DEFAULT '',
+    target_symbol TEXT NOT NULL DEFAULT '',
+    relation_type TEXT NOT NULL,
+    UNIQUE(run_id, source_file, target_file, target_symbol)
+);
+
+-- File risk summary cache
+CREATE TABLE IF NOT EXISTS file_risk_summary (
+    file_path       TEXT PRIMARY KEY,
+    max_risk        TEXT NOT NULL DEFAULT 'safe',
+    risk_categories TEXT DEFAULT '[]',
+    findings_count  INTEGER DEFAULT 0,
+    last_run_id     TEXT,
+    last_updated    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_run ON review_findings(run_id);
@@ -63,6 +114,13 @@ CREATE INDEX IF NOT EXISTS idx_findings_file ON review_findings(file);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON review_findings(category);
 CREATE INDEX IF NOT EXISTS idx_metrics_run ON reviewer_metrics(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_repo ON review_runs(repo);
+CREATE INDEX IF NOT EXISTS idx_symbols_file ON code_symbols(file_path);
+CREATE INDEX IF NOT EXISTS idx_symbols_risk ON code_symbols(risk_level);
+CREATE INDEX IF NOT EXISTS idx_symbols_name ON code_symbols(symbol_name);
+CREATE INDEX IF NOT EXISTS idx_relations_source ON code_relations(source_file);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON code_relations(target_file, target_symbol);
+CREATE INDEX IF NOT EXISTS idx_risk_max ON file_risk_summary(max_risk);
+CREATE INDEX IF NOT EXISTS idx_token_run ON token_usage(run_id);
 """
 
 
@@ -311,3 +369,155 @@ class Database:
         if hasattr(row, "keys"):
             return {k: row[k] for k in row.keys()}
         return dict(row) if row else {}
+
+    # ── Token Usage ──────────────────────────────────────────────
+
+    async def record_token_usage(
+        self, run_id: str, agent_name: str,
+        prompt_tokens: int = 0, completion_tokens: int = 0,
+        total_tokens: int = 0, model: str = "",
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        await self._db.execute(
+            "INSERT INTO token_usage (run_id, agent_name, prompt_tokens, completion_tokens, total_tokens, model, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, agent_name, prompt_tokens, completion_tokens, total_tokens, model, now),
+        )
+        await self._db.commit()
+
+    async def get_token_usage(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        if run_id:
+            cursor = await self._db.execute(
+                "SELECT * FROM token_usage WHERE run_id=? ORDER BY id", (run_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM token_usage ORDER BY created_at DESC LIMIT 500",
+            )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def get_token_summary(self, repo: str | None = None) -> dict[str, Any]:
+        repo_join = "JOIN review_runs r ON t.run_id=r.run_id WHERE r.repo=?" if repo else ""
+        params = (repo,) if repo else ()
+        cursor = await self._db.execute(f"""
+            SELECT
+                SUM(t.prompt_tokens) as total_prompt,
+                SUM(t.completion_tokens) as total_completion,
+                SUM(t.total_tokens) as total_tokens,
+                COUNT(DISTINCT t.run_id) as run_count
+            FROM token_usage t
+            {repo_join}
+        """, params)
+        row = await cursor.fetchone()
+        return self._row_to_dict(row) if row else {}
+
+    async def get_token_by_agent(self, repo: str | None = None) -> list[dict[str, Any]]:
+        repo_join = "JOIN review_runs r ON t.run_id=r.run_id WHERE r.repo=?" if repo else ""
+        params = (repo,) if repo else ()
+        cursor = await self._db.execute(f"""
+            SELECT
+                t.agent_name,
+                SUM(t.total_tokens) as total_tokens,
+                COUNT(*) as call_count,
+                AVG(t.total_tokens) as avg_tokens
+            FROM token_usage t
+            {repo_join}
+            GROUP BY t.agent_name ORDER BY total_tokens DESC
+        """, params)
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    # ── Code Graph (Symbols & Relations) ─────────────────────────
+
+    async def upsert_symbol(
+        self, file_path: str, symbol_name: str, symbol_type: str,
+        run_id: str, pr_number: int = 0, language: str = "",
+        risk_level: str = "safe", risk_categories: list[str] | None = None,
+    ) -> None:
+        cats = json.dumps(risk_categories or [], ensure_ascii=False)
+        await self._db.execute(
+            "INSERT INTO code_symbols (file_path, symbol_name, symbol_type, risk_level, risk_categories, defined_in_run, pr_number, language) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(file_path, symbol_name) DO UPDATE SET "
+            "risk_level=excluded.risk_level, risk_categories=excluded.risk_categories, "
+            "defined_in_run=excluded.defined_in_run, pr_number=excluded.pr_number",
+            (file_path, symbol_name, symbol_type, risk_level, cats, run_id, pr_number, language),
+        )
+        await self._db.commit()
+
+    async def get_symbol(self, file_path: str, symbol_name: str) -> dict[str, Any] | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM code_symbols WHERE file_path=? AND symbol_name=?",
+            (file_path, symbol_name),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_dict(row) if row else None
+
+    async def get_risky_symbols(self, file_path: str | None = None) -> list[dict[str, Any]]:
+        if file_path:
+            cursor = await self._db.execute(
+                "SELECT * FROM code_symbols WHERE file_path=? AND risk_level != 'safe'",
+                (file_path,),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM code_symbols WHERE risk_level != 'safe' ORDER BY pr_number DESC LIMIT 500",
+            )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def upsert_relation(
+        self, run_id: str, source_file: str,
+        target_file: str, target_symbol: str, relation_type: str,
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO code_relations (run_id, source_file, target_file, target_symbol, relation_type) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, source_file, target_file, target_symbol) DO UPDATE SET relation_type=excluded.relation_type",
+            (run_id, source_file, target_file, target_symbol, relation_type),
+        )
+        await self._db.commit()
+
+    async def get_relations_from(self, source_file: str) -> list[dict[str, Any]]:
+        cursor = await self._db.execute(
+            "SELECT * FROM code_relations WHERE source_file=?", (source_file,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def get_relations_to(self, target_file: str) -> list[dict[str, Any]]:
+        cursor = await self._db.execute(
+            "SELECT * FROM code_relations WHERE target_file=?", (target_file,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def upsert_file_risk(
+        self, file_path: str, max_risk: str,
+        risk_categories: list[str] | None = None,
+        findings_count: int = 0, run_id: str = "",
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        cats = json.dumps(risk_categories or [], ensure_ascii=False)
+        await self._db.execute(
+            "INSERT INTO file_risk_summary (file_path, max_risk, risk_categories, findings_count, last_run_id, last_updated) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(file_path) DO UPDATE SET "
+            "max_risk=excluded.max_risk, risk_categories=excluded.risk_categories, "
+            "findings_count=excluded.findings_count, last_run_id=excluded.last_run_id, last_updated=excluded.last_updated",
+            (file_path, max_risk, cats, findings_count, run_id, now),
+        )
+        await self._db.commit()
+
+    async def get_file_risk(self, file_path: str) -> dict[str, Any] | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM file_risk_summary WHERE file_path=?", (file_path,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_dict(row) if row else None
+
+    async def find_risky_files_for_import(self, import_source: str) -> list[dict[str, Any]]:
+        """Find files matching an import path that have known risks."""
+        # Match by suffix: import 'utils/data' should match 'backend/src/utils/data.py'
+        pattern = f"%{import_source.replace('.', '/')}%"
+        cursor = await self._db.execute(
+            "SELECT * FROM file_risk_summary WHERE file_path LIKE ? AND max_risk != 'safe'",
+            (pattern,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]

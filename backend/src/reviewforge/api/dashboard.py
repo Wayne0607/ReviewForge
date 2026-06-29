@@ -131,3 +131,28 @@ async def metrics_recurring(request: Request, repo: str | None = None, limit: in
     """Recurring issues across PRs."""
     db = request.app.state.db
     return await db.get_recurring_issues(repo=repo, limit=limit)
+
+
+# ── Token Usage ──────────────────────────────────────────────
+
+@router.get("/tokens/summary")
+async def token_summary(request: Request, repo: str | None = None):
+    """Global token usage summary."""
+    db = request.app.state.db
+    return await db.get_token_summary(repo=repo)
+
+
+@router.get("/tokens/by-agent")
+async def token_by_agent(request: Request, repo: str | None = None):
+    """Token usage breakdown by agent."""
+    db = request.app.state.db
+    return await db.get_token_by_agent(repo=repo)
+
+
+@router.get("/tokens/{run_id}")
+async def token_by_run(request: Request, run_id: str):
+    """Token usage for a specific review run."""
+    db = request.app.state.db
+    usage = await db.get_token_usage(run_id=run_id)
+    total = sum(u.get("total_tokens", 0) for u in usage)
+    return {"run_id": run_id, "agents": usage, "total_tokens": total}

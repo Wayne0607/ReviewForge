@@ -77,6 +77,9 @@ def create_app(config_path: str | None = None) -> FastAPI:
         # Tool gateway
         gateway = ToolGateway(registry, github)
 
+        # Cross-PR analyzer LLM (reuses verifier model)
+        cross_pr_llm = verifier_llm if not mock_mode else None
+
         # Orchestrator
         orchestrator = Orchestrator(
             registry=registry,
@@ -86,6 +89,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
             reviewer_llm=reviewer_llm,
             calibrator_llm=verifier_llm,
             db=db,
+            cross_pr_llm=cross_pr_llm,
+            github_client=github,
         )
 
         # Load plugins

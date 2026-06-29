@@ -19,6 +19,7 @@ from reviewforge.core.loop_detector import LoopDetector
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator
+from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.tools.gateway import ToolGateway
@@ -38,6 +39,8 @@ class Orchestrator:
         reviewer_llm: ChatOpenAI,
         calibrator_llm: ChatOpenAI,
         db: Database | None = None,
+        cross_pr_llm: ChatOpenAI | None = None,
+        github_client: Any = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -47,6 +50,7 @@ class Orchestrator:
         self._reviewer_llm = reviewer_llm
         self._loop_detector = LoopDetector()
         self._db = db
+        self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
 
@@ -152,6 +156,29 @@ class Orchestrator:
                     "confirmed": confirmed_count,
                     "filtered": filtered_count,
                 })
+
+            # Phase 3.5: Cross-PR Analysis
+            if self._cross_pr:
+                confirmed_findings = state.list_findings(status="confirmed")
+                self._events.emit("cross_pr.started")
+                try:
+                    cross_findings = await self._cross_pr.analyze(
+                        run_id=run_id,
+                        state=state,
+                        existing_findings=confirmed_findings,
+                    )
+                    for f in cross_findings:
+                        state.add_finding(f)
+                    if cross_findings:
+                        self._events.emit("cross_pr.completed", {
+                            "cross_pr_findings": len(cross_findings),
+                        })
+                        logger.info(f"Cross-PR: found {len(cross_findings)} cross-PR issues")
+                    else:
+                        self._events.emit("cross_pr.completed", {"cross_pr_findings": 0})
+                except Exception as e:
+                    logger.error(f"Cross-PR analysis failed: {e}")
+                    self._events.emit("cross_pr.failed", {"error": str(e)})
 
             # Persist all findings to DB
             if self._db:

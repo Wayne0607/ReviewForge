@@ -1,7 +1,7 @@
 #!/bin/bash
 # ReviewForge Deploy Script
 # Run on the server after git pull
-set -e
+set -euo pipefail
 
 APP_DIR="/opt/reviewforge"
 BACKEND_DIR="$APP_DIR/backend"
@@ -14,7 +14,7 @@ echo "Commit: $(git rev-parse --short HEAD)"
 if command -v node &> /dev/null && [ -d "$FRONTEND_DIR" ]; then
     echo "--- Building frontend ---"
     cd "$FRONTEND_DIR"
-    npm ci --ignore-scripts 2>/dev/null || npm install
+    npm ci --ignore-scripts
     npm run build
     echo "Frontend built to backend/src/reviewforge/static/"
 else

@@ -27,11 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: cd backend && uv sync && uv run ruff check . && uv run ruff format --check .
+      - run: cd backend && uv sync --frozen && uv run ruff check . && uv run ruff format --check .
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: cd backend && uv sync && uv run pytest -q
+      - run: cd backend && uv sync --frozen && uv run pytest -q

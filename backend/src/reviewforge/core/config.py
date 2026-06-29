@@ -69,6 +69,7 @@ class ReviewForgeConfig:
     events_dir: str = ".reviewforge/events"
     confidence_threshold: float = 0.5
     agentic_reviewers: list[str] = field(default_factory=list)
+    agentic_default: bool = True  # reviewers run the agentic tool loop by default
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> ReviewForgeConfig:
@@ -139,7 +140,11 @@ class ReviewForgeConfig:
         port = os.environ.get("REVIEWFORGE_PORT")
         if port:
             self.server.port = int(port)
-        # W1: agentic reviewers (comma-separated)
+        # W1: agentic reviewers (comma-separated allowlist)
         agentic = os.environ.get("REVIEWFORGE_AGENTIC_REVIEWERS", "")
         if agentic:
             self.agentic_reviewers = [r.strip() for r in agentic.split(",") if r.strip()]
+        # #1: agentic tool loop is the default for all reviewers (when no explicit allowlist)
+        default_flag = os.environ.get("REVIEWFORGE_AGENTIC_DEFAULT")
+        if default_flag is not None:
+            self.agentic_default = default_flag.strip().lower() not in ("0", "false", "no", "")

@@ -45,13 +45,15 @@ class Orchestrator:
         github_client: Any = None,
         model_router: ModelRouter | None = None,
         agentic_reviewers: list[str] | None = None,
+        agentic_default: bool = True,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._events = event_bus
         self._db = db
         self._model_router = model_router  # D6: 多模型路由
-        self._agentic_reviewers = set(agentic_reviewers or [])  # W1: agentic 开关
+        self._agentic_reviewers = set(agentic_reviewers or [])  # W1: agentic 显式 allowlist
+        self._agentic_default = agentic_default  # #1: 无 allowlist 时所有 reviewer 默认走工具循环
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
@@ -298,8 +300,8 @@ class Orchestrator:
                     llm = TrackedChatLLM(inner=llm, ctx=self._token_ctx, agent_name=name)
             else:
                 llm = self._reviewer_llm
-            # W2: agentic 标志
-            agentic = name in self._agentic_reviewers
+            # W2/#1: 有显式 allowlist 时按成员判定，否则用默认（默认全部 reviewer 走工具循环）
+            agentic = name in self._agentic_reviewers if self._agentic_reviewers else self._agentic_default
             reviewer = cls(llm, self._registry, self._gateway, agentic=agentic, event_bus=self._events)
             self._attach_skill(reviewer)
             return reviewer

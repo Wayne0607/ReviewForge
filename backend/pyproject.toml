@@ -15,7 +15,9 @@ dependencies = [
     "aiosqlite>=0.20",     # async SQLite for review history
 ]
 
-[project.optional-dependencies]
+# PEP 735 dependency group — installed by `uv sync` by default (unlike
+# optional-dependencies extras, which CI's `uv sync` would skip → pytest/ruff missing).
+[dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

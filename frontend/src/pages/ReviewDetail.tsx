@@ -5,29 +5,38 @@ import {
   GitPullRequest,
   CheckCircle2,
   XCircle,
-  Clock,
-  FileCode,
+  Zap,
 } from 'lucide-react'
-import { reviews } from '../api/client'
+import { reviews, tokens } from '../api/client'
 import FindingBadge from '../components/FindingBadge'
+import TokenUsageCard from '../components/TokenUsageCard'
 import type { ReviewRun, Finding, ReviewerMetric } from '../types'
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
 
 export default function ReviewDetail() {
   const { runId } = useParams<{ runId: string }>()
   const [run, setRun] = useState<ReviewRun | null>(null)
   const [findings, setFindings] = useState<Finding[]>([])
   const [metrics, setMetrics] = useState<ReviewerMetric[]>([])
+  const [tokenData, setTokenData] = useState<{ agents: { agent_name: string; total_tokens: number }[]; total_tokens: number } | null>(null)
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState<string>('all')
 
   useEffect(() => {
     if (!runId) return
-    reviews
-      .detail(runId)
-      .then((r) => {
-        setRun(r.run)
-        setFindings(r.findings)
-        setMetrics(r.metrics)
+    Promise.all([
+      reviews.detail(runId),
+      tokens.byRun(runId).catch(() => null),
+    ]).then(([r, t]) => {
+      setRun(r.run)
+      setFindings(r.findings)
+      setMetrics(r.metrics)
+      setTokenData(t)
       })
       .catch(console.error)
       .finally(() => setLoading(false))
@@ -113,6 +122,14 @@ export default function ReviewDetail() {
           <div className="text-sm text-gray-500">Reviewer 完成</div>
         </div>
       </div>
+
+      {/* Token usage */}
+      {tokenData && tokenData.total_tokens > 0 && (
+        <TokenUsageCard
+          totalTokens={tokenData.total_tokens}
+          agents={tokenData.agents}
+        />
+      )}
 
       {/* Reviewer metrics */}
       {metrics.length > 0 && (

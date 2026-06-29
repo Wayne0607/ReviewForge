@@ -22,6 +22,7 @@ from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
+from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
@@ -45,12 +46,27 @@ class Orchestrator:
         self._registry = registry
         self._gateway = gateway
         self._events = event_bus
-        self._planner = Planner(planner_llm, registry)
-        self._calibrator = DynamicCalibrator(calibrator_llm, registry)
-        self._reviewer_llm = reviewer_llm
-        self._loop_detector = LoopDetector()
         self._db = db
+
+        # Token tracking context — updated per-run
+        self._token_ctx = RunContext()
+
+        # Wrap LLMs with token tracking if DB available
+        if db:
+            tracked_planner = TrackedChatLLM(inner=planner_llm, ctx=self._token_ctx, agent_name="planner")
+            tracked_calibrator = TrackedChatLLM(inner=calibrator_llm, ctx=self._token_ctx, agent_name="calibrator")
+            self._planner = Planner(tracked_planner, registry)
+            self._calibrator = DynamicCalibrator(tracked_calibrator, registry)
+            self._reviewer_llm = TrackedChatLLM(inner=reviewer_llm, ctx=self._token_ctx, agent_name="reviewer")
+            if cross_pr_llm:
+                cross_pr_llm = TrackedChatLLM(inner=cross_pr_llm, ctx=self._token_ctx, agent_name="cross_pr_analyzer")
+        else:
+            self._planner = Planner(planner_llm, registry)
+            self._calibrator = DynamicCalibrator(calibrator_llm, registry)
+            self._reviewer_llm = reviewer_llm
+
         self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
+        self._loop_detector = LoopDetector()
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
 
@@ -63,6 +79,10 @@ class Orchestrator:
         run_id = uuid.uuid4().hex[:12]
         self._events.set_run_id(run_id)
         self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+
+        # Set token tracking context for this run
+        if self._db:
+            self._token_ctx.set(run_id, self._db)
 
         # Persist run start
         if self._db:

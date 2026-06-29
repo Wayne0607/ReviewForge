@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   BarChart3,
   TrendingUp,
+  Zap,
 } from 'lucide-react'
 import {
   PieChart,
@@ -14,19 +15,27 @@ import {
   Tooltip,
   Legend,
 } from 'recharts'
-import { metrics, reviews } from '../api/client'
+import { metrics, reviews, tokens } from '../api/client'
 import StatsCard from '../components/StatsCard'
 import ReviewTimeline from '../components/ReviewTimeline'
 import TrendChart from '../components/TrendChart'
+import TokenUsageCard from '../components/TokenUsageCard'
 import type { SummaryStats, CategoryCount, WeeklyTrend, ReviewRun } from '../types'
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4']
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
 
 export default function Dashboard() {
   const [stats, setStats] = useState<SummaryStats | null>(null)
   const [categories, setCategories] = useState<CategoryCount[]>([])
   const [trends, setTrends] = useState<WeeklyTrend[]>([])
   const [recentRuns, setRecentRuns] = useState<ReviewRun[]>([])
+  const [tokenSummary, setTokenSummary] = useState<{ total_tokens: number } | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -35,11 +44,13 @@ export default function Dashboard() {
       metrics.categories(),
       metrics.trends(),
       reviews.list({ limit: 5 }),
-    ]).then(([s, c, t, r]) => {
+      tokens.summary().catch(() => ({ total_tokens: 0 })),
+    ]).then(([s, c, t, r, ts]) => {
       setStats(s)
       setCategories(c)
       setTrends(t)
       setRecentRuns(r.runs)
+      setTokenSummary(ts)
     }).catch(console.error).finally(() => setLoading(false))
   }, [])
 
@@ -83,9 +94,9 @@ export default function Dashboard() {
           trend={confirmRate > 70 ? 'up' : 'down'}
         />
         <StatsCard
-          title="平均置信度"
-          value={`${Math.round((stats?.avg_confidence ?? 0) * 100)}%`}
-          icon={<TrendingUp className="w-6 h-6" />}
+          title="Token 消耗"
+          value={formatTokens(tokenSummary?.total_tokens ?? 0)}
+          icon={<Zap className="w-6 h-6" />}
         />
       </div>
 

@@ -62,6 +62,21 @@ export const metrics = {
   },
 }
 
+// ── Token Usage ──────────────────────────────────────────────
+
+export const tokens = {
+  summary: (repo?: string) => {
+    const q = repo ? `?repo=${encodeURIComponent(repo)}` : ''
+    return get<{ total_prompt: number; total_completion: number; total_tokens: number; run_count: number }>(`/dashboard/tokens/summary${q}`)
+  },
+  byAgent: (repo?: string) => {
+    const q = repo ? `?repo=${encodeURIComponent(repo)}` : ''
+    return get<{ agent_name: string; total_tokens: number; call_count: number; avg_tokens: number }[]>(`/dashboard/tokens/by-agent${q}`)
+  },
+  byRun: (runId: string) =>
+    get<{ run_id: string; agents: { agent_name: string; total_tokens: number; prompt_tokens: number; completion_tokens: number }[]; total_tokens: number }>(`/dashboard/tokens/${runId}`),
+}
+
 // ── System ───────────────────────────────────────────────────
 
 export const system = {

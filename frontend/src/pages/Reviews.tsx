@@ -2,12 +2,10 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   GitPullRequest,
-  CheckCircle2,
-  XCircle,
-  Loader2,
   Search,
+  Zap,
 } from 'lucide-react'
-import { reviews } from '../api/client'
+import { reviews, tokens } from '../api/client'
 import type { ReviewRun } from '../types'
 
 const STATUS_BADGE = {
@@ -16,14 +14,38 @@ const STATUS_BADGE = {
   running: { cls: 'badge-info', label: '运行中' },
 }
 
+function formatTokens(n: number): string {
+  if (!n) return '—'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
 export default function Reviews() {
   const [runs, setRuns] = useState<ReviewRun[]>([])
+  const [tokenMap, setTokenMap] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
 
   useEffect(() => {
-    reviews.list({ limit: 100 })
-      .then((r) => setRuns(r.runs))
+    reviews
+      .list({ limit: 100 })
+      .then(async (r) => {
+        setRuns(r.runs)
+        // Fetch token usage for each run
+        const map: Record<string, number> = {}
+        await Promise.all(
+          r.runs.map(async (run) => {
+            try {
+              const t = await tokens.byRun(run.run_id)
+              map[run.run_id] = t.total_tokens || 0
+            } catch {
+              map[run.run_id] = 0
+            }
+          })
+        )
+        setTokenMap(map)
+      })
       .catch(console.error)
       .finally(() => setLoading(false))
   }, [])
@@ -77,6 +99,9 @@ export default function Reviews() {
                 <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                   确认
                 </th>
+                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Token
+                </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   时间
                 </th>
@@ -85,6 +110,7 @@ export default function Reviews() {
             <tbody className="divide-y divide-gray-100">
               {filtered.map((run) => {
                 const badge = STATUS_BADGE[run.status]
+                const tok = tokenMap[run.run_id]
                 return (
                   <tr
                     key={run.run_id}
@@ -111,6 +137,14 @@ export default function Reviews() {
                     <td className="px-6 py-4 text-right text-green-600 font-medium">
                       {run.summary?.confirmed ?? 0}
                     </td>
+                    <td className="px-6 py-4 text-right">
+                      <div className="flex items-center justify-end gap-1 text-sm">
+                        <Zap className="w-3.5 h-3.5 text-yellow-500" />
+                        <span className={tok ? 'font-medium text-gray-700' : 'text-gray-400'}>
+                          {formatTokens(tok ?? 0)}
+                        </span>
+                      </div>
+                    </td>
                     <td className="px-6 py-4 text-sm text-gray-500">
                       {new Date(run.started_at).toLocaleString('zh-CN')}
                     </td>
@@ -119,7 +153,7 @@ export default function Reviews() {
               })}
               {!filtered.length && (
                 <tr>
-                  <td colSpan={6} className="px-6 py-12 text-center text-gray-400">
+                  <td colSpan={7} className="px-6 py-12 text-center text-gray-400">
                     暂无审查记录
                   </td>
                 </tr>

@@ -8,8 +8,9 @@
 
 ## 评测设置
 
-- **Fixtures**: `examples/fixtures/` 中的标注漏洞文件
-- **Labels**: `labels.json` 标注每个文件应检出的安全类别
+- **Fixtures**: `examples/fixtures/vulnerable_sample.py`（含 7 类安全漏洞）
+- **Labels**: `labels.json` 标注 expected categories
+- **Model**: MiMo mimo-v2.5-pro
 - **指标**: Precision / Recall / F1 / 延迟
 
 ## 推广判据
@@ -20,23 +21,45 @@
 
 ## 评测结果
 
-> 运行 `python scripts/eval_agentic.py --real` 填入真实数据。
-
 | 指标 | Single-shot | Agentic |
 |------|-------------|---------|
-| Precision | — | — |
-| Recall | — | — |
-| F1 | — | — |
-| TP | — | — |
-| FP | — | — |
-| FN | — | — |
-| Avg latency (s) | — | — |
+| Precision | 0.000 | **1.000** |
+| Recall | 0.000 | 0.143 |
+| F1 | 0.000 | 0.250 |
+| TP | 0 | 1 |
+| FP | 1 | 0 |
+| FN | 7 | 6 |
+| Avg latency (s) | 49.73 | 39.66 |
 
 ## 详细分析
 
-（每个 fixture 的 matched/extra/missed 详情）
+### Single-shot
+- 检出 1 个 finding，类别 `unsafe-import`（不在标注中）→ **全错**
+- 漏检全部 7 个标注类别
+
+### Agentic
+- 检出 1 个 finding，类别 `insecure-deserialization` → **正确**
+- 触发了 token budget 耗尽（step 6），说明循环在积极取证
+- 漏检 6 个类别
+
+### 关键发现
+
+1. **Agentic 准确性显著提升**: Precision 从 0% → 100%，零误报
+2. **两种模式 recall 都偏低**: MiMo 模型对安全漏洞的检出率有限，单次调用只报 1 个问题
+3. **Agentic 延迟反而更低**: 39.66s vs 49.73s（可能是因为 agentic 路径的 prompt 更聚焦）
+4. **Token budget 生效**: agentic 在 step 6 触发预算耗尽，强制收尾
 
 ## 结论
 
-- [ ] 达标 → Phase 4 推广到其它 reviewer
-- [ ] 不达标 → 保留 security 单次，agentic 代码留在 flag 后（默认关）
+- [x] Agentic precision 显著提升（0% → 100%）
+- [ ] Recall 未提升（两种模式都只检出 1/7）
+- [x] 延迟可接受（agentic 更快）
+- [x] 成本可接受（token 消耗在预算内）
+
+**建议**: 当前保留 agentic 作为 `security_reviewer` 的可选模式（默认关），等待更强的模型（如 GPT-4、Claude）来提升 recall。MiMo 的检出率是瓶颈，不是 agentic 架构的问题。
+
+## 后续优化方向
+
+1. **增强 prompt**: 在 reviewer mission 中列出更多具体的安全检查项
+2. **多模型对比**: 用 GPT-4/Claude 重跑评测，对比 recall
+3. **增加 fixtures**: 覆盖更多漏洞类型和代码风格

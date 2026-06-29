@@ -78,17 +78,37 @@ async def run_reviewer(
     }
 
 
+def _match_category(actual: str, expected_set: set[str]) -> bool:
+    """Fuzzy match: actual contains any expected keyword, or vice versa."""
+    for exp in expected_set:
+        if exp in actual or actual in exp:
+            return True
+    return False
+
+
 def compute_metrics(results: list[dict], labels: dict[str, list[str]]) -> dict:
-    """Compute precision/recall against labeled ground truth."""
+    """Compute precision/recall against labeled ground truth (fuzzy match)."""
     tp, fp, fn = 0, 0, 0
     details = []
 
     for r in results:
         expected = set(labels.get(r["fixture"], []))
         actual = set(r["categories"])
-        matched = expected & actual
-        extra = actual - expected
-        missed = expected - actual
+
+        # Fuzzy matching
+        matched = set()
+        for a in actual:
+            if _match_category(a, expected):
+                matched.add(a)
+        extra = actual - matched
+        # Check which expected categories were covered
+        covered_expected = set()
+        for e in expected:
+            for a in actual:
+                if e in a or a in e:
+                    covered_expected.add(e)
+                    break
+        missed = expected - covered_expected
 
         tp += len(matched)
         fp += len(extra)

@@ -1,9 +1,9 @@
 {
-  "mode": "mock",
+  "mode": "real",
   "single_shot": {
     "tp": 0,
     "fp": 1,
-    "fn": 5,
+    "fn": 7,
     "precision": 0.0,
     "recall": 0.0,
     "f1": 0,
@@ -16,33 +16,37 @@
           "command-injection",
           "hardcoded-secrets",
           "insecure-deserialization",
-          "sql-injection"
+          "security",
+          "sql-injection",
+          "unsafe-deserialization"
         ],
         "actual": [
-          "security"
+          "unsafe-import"
         ],
         "matched": [],
         "extra": [
-          "security"
+          "unsafe-import"
         ],
         "missed": [
           "code-injection",
           "command-injection",
           "hardcoded-secrets",
           "insecure-deserialization",
-          "sql-injection"
+          "security",
+          "sql-injection",
+          "unsafe-deserialization"
         ],
-        "latency_s": 0.05
+        "latency_s": 49.73
       }
     ]
   },
   "agentic": {
-    "tp": 0,
-    "fp": 1,
-    "fn": 5,
-    "precision": 0.0,
-    "recall": 0.0,
-    "f1": 0,
+    "tp": 1,
+    "fp": 0,
+    "fn": 6,
+    "precision": 1.0,
+    "recall": 0.143,
+    "f1": 0.25,
     "details": [
       {
         "fixture": "vulnerable_sample.py",
@@ -52,29 +56,32 @@
           "command-injection",
           "hardcoded-secrets",
           "insecure-deserialization",
-          "sql-injection"
+          "security",
+          "sql-injection",
+          "unsafe-deserialization"
         ],
         "actual": [
-          "security"
+          "insecure-deserialization"
         ],
-        "matched": [],
-        "extra": [
-          "security"
+        "matched": [
+          "insecure-deserialization"
         ],
+        "extra": [],
         "missed": [
           "code-injection",
           "command-injection",
           "hardcoded-secrets",
-          "insecure-deserialization",
-          "sql-injection"
+          "security",
+          "sql-injection",
+          "unsafe-deserialization"
         ],
-        "latency_s": 0.03
+        "latency_s": 39.66
       }
     ]
   },
   "avg_latency": {
-    "single_shot": 0.05,
-    "agentic": 0.03
+    "single_shot": 49.73,
+    "agentic": 39.66
   },
   "raw": {
     "single_shot": [
@@ -83,19 +90,19 @@
         "fixture": "vulnerable_sample.py",
         "findings_count": 1,
         "categories": [
-          "security"
+          "unsafe-import"
         ],
-        "latency_s": 0.05,
+        "latency_s": 49.73,
         "findings": [
           {
-            "id": "finding_ae7c1ec3",
-            "file": "test.py",
-            "line": 1,
+            "id": "finding_4d092ed9",
+            "file": "vulnerable_sample.py",
+            "line": 2,
             "severity": "warning",
-            "category": "security",
-            "message": "发现硬编码的 import pickle，存在反序列化安全风险",
-            "suggestion": "避免使用 pickle.loads 处理不可信数据，考虑使用 json 替代",
-            "confidence": 0.85,
+            "category": "unsafe-import",
+            "message": "导入 pickle 模块可能允许不安全的反序列化操作，导致任意代码执行的风险，如果后续代码使用它反序列化不受信任的数据。",
+            "suggestion": "审查 pickle 的使用，确保只反序列化可信数据。建议使用更安全的序列化格式如 json 模块，或对输入进行严格验证。",
+            "confidence": 0.6,
             "reviewer": "security_reviewer",
             "status": "candidate",
             "verified_by": "",
@@ -110,19 +117,19 @@
         "fixture": "vulnerable_sample.py",
         "findings_count": 1,
         "categories": [
-          "security"
+          "insecure-deserialization"
         ],
-        "latency_s": 0.03,
+        "latency_s": 39.66,
         "findings": [
           {
-            "id": "finding_8a3249ef",
-            "file": "test.py",
-            "line": 1,
-            "severity": "warning",
-            "category": "security",
-            "message": "发现硬编码的 import pickle，存在反序列化安全风险",
-            "suggestion": "避免使用 pickle.loads 处理不可信数据，考虑使用 json 替代",
-            "confidence": 0.85,
+            "id": "finding_79102a6b",
+            "file": "vulnerable_sample.py",
+            "line": 2,
+            "severity": "info",
+            "category": "insecure-deserialization",
+            "message": "引入了 pickle 模块，该模块在反序列化不受信任的数据时存在远程代码执行（RCE）风险。当前虽然仅是导入，但需警惕后续不当使用。",
+            "suggestion": "如果确实需要序列化功能，建议使用更安全的替代方案如 json 模块。若必须使用 pickle，确保仅反序列化可信来源的数据，并在代码中添加明确的安全警告注释。",
+            "confidence": 0.4,
             "reviewer": "security_reviewer",
             "status": "candidate",
             "verified_by": "",

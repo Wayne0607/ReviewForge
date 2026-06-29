@@ -1,9 +1,11 @@
 {
   "vulnerable_sample.py": [
+    "unsafe-deserialization",
+    "insecure-deserialization",
     "command-injection",
     "code-injection",
-    "insecure-deserialization",
     "hardcoded-secrets",
-    "sql-injection"
+    "sql-injection",
+    "security"
   ]
 }

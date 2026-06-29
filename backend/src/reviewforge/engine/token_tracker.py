@@ -6,6 +6,7 @@ to the database after each call.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from typing import Any
 
@@ -18,17 +19,27 @@ from reviewforge.core.database import Database
 
 logger = logging.getLogger(__name__)
 
+# Per-run token-tracking state, isolated across concurrent reviews via contextvars.
+# Orchestrator.run() calls RunContext.set() inside its own asyncio task; the gathered
+# reviewer child-tasks inherit that context, while a second concurrent run() gets its own.
+_run_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("token_run_id", default="")
+_db_var: contextvars.ContextVar[Database | None] = contextvars.ContextVar("token_db", default=None)
+
 
 class RunContext:
-    """Mutable context shared across all tracked LLMs for a single run."""
-
-    def __init__(self) -> None:
-        self.run_id: str = ""
-        self.db: Database | None = None
+    """Per-run token-tracking context backed by contextvars (concurrency-safe)."""
 
     def set(self, run_id: str, db: Database) -> None:
-        self.run_id = run_id
-        self.db = db
+        _run_id_var.set(run_id)
+        _db_var.set(db)
+
+    @property
+    def run_id(self) -> str:
+        return _run_id_var.get()
+
+    @property
+    def db(self) -> Database | None:
+        return _db_var.get()
 
 
 class TrackedChatLLM(BaseChatModel):
@@ -121,7 +132,12 @@ class TrackedChatLLM(BaseChatModel):
         return self._inner._identifying_params
 
     def bind_tools(self, tools, **kwargs):
-        return self._inner.bind_tools(tools, **kwargs)
+        # Bind tools onto THIS wrapper (not the raw inner) so tool-calling invocations
+        # still route through _agenerate and get their token usage recorded.
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        formatted = [convert_to_openai_tool(t) for t in tools]
+        return self.bind(tools=formatted, **kwargs)
 
     def with_structured_output(self, schema, **kwargs):
         return self._inner.with_structured_output(schema, **kwargs)

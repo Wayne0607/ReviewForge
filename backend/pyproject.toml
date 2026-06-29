@@ -35,11 +35,15 @@ build-backend = "hatchling.build"
 packages = ["src/reviewforge"]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# app.py 在导入前调用 logging.basicConfig（让被导入库的 logger 继承配置），属有意为之。
+"src/reviewforge/app.py" = ["E402"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

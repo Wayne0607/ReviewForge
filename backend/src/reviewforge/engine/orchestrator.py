@@ -45,12 +45,14 @@ class Orchestrator:
         cross_pr_llm: ChatOpenAI | None = None,
         github_client: Any = None,
         model_router: ModelRouter | None = None,
+        agentic_reviewers: list[str] | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._events = event_bus
         self._db = db
         self._model_router = model_router  # D6: 多模型路由
+        self._agentic_reviewers = set(agentic_reviewers or [])  # W1: agentic 开关
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
@@ -250,18 +252,20 @@ class Orchestrator:
             raise
 
     def _create_reviewer(self, name: str) -> BaseReviewer | None:
-        """D6: 按 reviewer 名字解析 LLM（支持多模型路由）。"""
+        """D6+W2: 按 reviewer 名字解析 LLM + agentic 标志。"""
         cls = REVIEWER_MAP.get(name) or self._extra_reviewers.get(name)
         if cls:
             # D6: 如果有 ModelRouter，按 agent 名字取对应 LLM
             if self._model_router:
                 llm = self._model_router.get_llm(name)
-                # 包装 token tracking
                 if self._db:
                     llm = TrackedChatLLM(inner=llm, ctx=self._token_ctx, agent_name=name)
             else:
                 llm = self._reviewer_llm
-            return cls(llm, self._registry, self._gateway)
+            # W2: agentic 标志
+            agentic = name in self._agentic_reviewers
+            return cls(llm, self._registry, self._gateway,
+                       agentic=agentic, event_bus=self._events)
         return None
 
     async def _post_comments(self, findings: list[Finding], state: StateStore) -> int:

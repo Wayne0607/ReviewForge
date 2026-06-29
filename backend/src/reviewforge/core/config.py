@@ -67,6 +67,7 @@ class ReviewForgeConfig:
     skills_dir: str = "skills"
     events_dir: str = ".reviewforge/events"
     confidence_threshold: float = 0.5
+    agentic_reviewers: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> ReviewForgeConfig:
@@ -140,3 +141,7 @@ class ReviewForgeConfig:
         port = os.environ.get("REVIEWFORGE_PORT")
         if port:
             self.server.port = int(port)
+        # W1: agentic reviewers (comma-separated)
+        agentic = os.environ.get("REVIEWFORGE_AGENTIC_REVIEWERS", "")
+        if agentic:
+            self.agentic_reviewers = [r.strip() for r in agentic.split(",") if r.strip()]

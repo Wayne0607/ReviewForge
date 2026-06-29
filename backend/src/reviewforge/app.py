@@ -106,6 +106,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             cross_pr_llm=cross_pr_llm,
             github_client=github,
             model_router=model_router,
+            agentic_reviewers=cfg.agentic_reviewers,
         )
 
         # S4: 插件默认关闭，靠显式 env 开启

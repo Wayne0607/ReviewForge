@@ -160,6 +160,22 @@ def create_app(config_path: str | None = None) -> FastAPI:
     # Serve frontend static files (if built)
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+        from fastapi.responses import FileResponse
+
+        # Mount static assets (JS, CSS, etc.)
+        app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="static-assets")
+
+        # SPA catch-all: return index.html for all non-API routes
+        @app.exception_handler(404)
+        async def spa_fallback(request, exc):
+            path = request.url.path
+            # Don't intercept API or webhook routes
+            if path.startswith("/api/") or path.startswith("/webhook") or path.startswith("/health"):
+                return exc
+            # Serve index.html for all other routes (SPA routing)
+            index_path = static_dir / "index.html"
+            if index_path.exists():
+                return FileResponse(str(index_path))
+            return exc
 
     return app

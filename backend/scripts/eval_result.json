@@ -1,0 +1,135 @@
+{
+  "mode": "mock",
+  "single_shot": {
+    "tp": 0,
+    "fp": 1,
+    "fn": 5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0,
+    "details": [
+      {
+        "fixture": "vulnerable_sample.py",
+        "mode": "single_shot",
+        "expected": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection"
+        ],
+        "actual": [
+          "security"
+        ],
+        "matched": [],
+        "extra": [
+          "security"
+        ],
+        "missed": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection"
+        ],
+        "latency_s": 0.05
+      }
+    ]
+  },
+  "agentic": {
+    "tp": 0,
+    "fp": 1,
+    "fn": 5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0,
+    "details": [
+      {
+        "fixture": "vulnerable_sample.py",
+        "mode": "agentic",
+        "expected": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection"
+        ],
+        "actual": [
+          "security"
+        ],
+        "matched": [],
+        "extra": [
+          "security"
+        ],
+        "missed": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection"
+        ],
+        "latency_s": 0.03
+      }
+    ]
+  },
+  "avg_latency": {
+    "single_shot": 0.05,
+    "agentic": 0.03
+  },
+  "raw": {
+    "single_shot": [
+      {
+        "mode": "single_shot",
+        "fixture": "vulnerable_sample.py",
+        "findings_count": 1,
+        "categories": [
+          "security"
+        ],
+        "latency_s": 0.05,
+        "findings": [
+          {
+            "id": "finding_ae7c1ec3",
+            "file": "test.py",
+            "line": 1,
+            "severity": "warning",
+            "category": "security",
+            "message": "发现硬编码的 import pickle，存在反序列化安全风险",
+            "suggestion": "避免使用 pickle.loads 处理不可信数据，考虑使用 json 替代",
+            "confidence": 0.85,
+            "reviewer": "security_reviewer",
+            "status": "candidate",
+            "verified_by": "",
+            "verify_reason": ""
+          }
+        ]
+      }
+    ],
+    "agentic": [
+      {
+        "mode": "agentic",
+        "fixture": "vulnerable_sample.py",
+        "findings_count": 1,
+        "categories": [
+          "security"
+        ],
+        "latency_s": 0.03,
+        "findings": [
+          {
+            "id": "finding_8a3249ef",
+            "file": "test.py",
+            "line": 1,
+            "severity": "warning",
+            "category": "security",
+            "message": "发现硬编码的 import pickle，存在反序列化安全风险",
+            "suggestion": "避免使用 pickle.loads 处理不可信数据，考虑使用 json 替代",
+            "confidence": 0.85,
+            "reviewer": "security_reviewer",
+            "status": "candidate",
+            "verified_by": "",
+            "verify_reason": ""
+          }
+        ]
+      }
+    ]
+  }
+}

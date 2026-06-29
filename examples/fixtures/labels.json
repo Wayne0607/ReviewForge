@@ -1,0 +1,9 @@
+{
+  "vulnerable_sample.py": [
+    "command-injection",
+    "code-injection",
+    "insecure-deserialization",
+    "hardcoded-secrets",
+    "sql-injection"
+  ]
+}

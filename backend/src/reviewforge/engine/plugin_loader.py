@@ -90,13 +90,8 @@ class PluginLoader:
         return results
 
     @staticmethod
-    def validate(cls: type[BaseReviewer]) -> list[str]:
-        """Validate a plugin class has required attributes."""
-        errors = []
-        if not hasattr(cls, "plugin_name") or not cls.plugin_name:
-            errors.append("Missing plugin_name class attribute")
-        if not hasattr(cls, "plugin_type") or not cls.plugin_type:
-            errors.append("Missing plugin_type class attribute")
-        if not hasattr(cls, "execute"):
-            errors.append("Missing execute() method")
-        return not errors or errors  # Returns True if valid, list if errors
+    def validate(cls: type[BaseReviewer]) -> bool:
+        """校验插件类是否具备必需属性。返回 True 表示通过。"""
+        return bool(getattr(cls, "plugin_name", "")) \
+            and bool(getattr(cls, "plugin_type", "")) \
+            and hasattr(cls, "execute")

@@ -75,26 +75,15 @@ async def get_review_detail(request: Request, run_id: str):
 
 @router.get("/metrics/summary")
 async def metrics_summary(request: Request, repo: str | None = None):
-    """Global summary statistics computed from actual findings."""
+    """B10: 用 SQL 聚合计算全局统计。"""
     db = request.app.state.db
-
-    # Get all runs
-    runs = await db.get_runs(repo=repo, limit=1000)
-    total_runs = len(runs)
-
-    # Get all findings
-    findings = await db.get_findings(limit=10000)
-    total = len(findings)
-    confirmed = len([f for f in findings if f.get("status") == "confirmed"])
-    false_pos = len([f for f in findings if f.get("status") == "false_positive"])
-    avg_conf = sum(f.get("confidence", 0) for f in findings) / total if total else 0
-
+    stats = await db.get_summary_stats(repo=repo)
     return {
-        "total_runs": total_runs,
-        "total_findings": total,
-        "confirmed": confirmed,
-        "false_positives": false_pos,
-        "avg_confidence": avg_conf,
+        "total_runs": stats.get("total_runs") or 0,
+        "total_findings": stats.get("total_findings") or 0,
+        "confirmed": stats.get("confirmed") or 0,
+        "false_positives": stats.get("false_positives") or 0,
+        "avg_confidence": stats.get("avg_confidence") or 0,
     }
 
 
@@ -106,14 +95,14 @@ async def metrics_categories(request: Request, repo: str | None = None):
 
 
 @router.get("/metrics/trends")
-async def metrics_trends(request: Request, repo: str | None = None, weeks: int = 12):
+async def metrics_trends(request: Request, repo: str | None = None, weeks: int = Query(default=12, ge=1, le=52)):
     """Weekly finding trends."""
     db = request.app.state.db
     return await db.get_weekly_trends(repo=repo, weeks=weeks)
 
 
 @router.get("/metrics/hotspots")
-async def metrics_hotspots(request: Request, repo: str | None = None, limit: int = 10):
+async def metrics_hotspots(request: Request, repo: str | None = None, limit: int = Query(default=10, ge=1, le=100)):
     """Files with the most findings."""
     db = request.app.state.db
     return await db.get_hotspot_files(repo=repo, limit=limit)
@@ -127,7 +116,7 @@ async def metrics_reviewers(request: Request, repo: str | None = None):
 
 
 @router.get("/metrics/recurring")
-async def metrics_recurring(request: Request, repo: str | None = None, limit: int = 20):
+async def metrics_recurring(request: Request, repo: str | None = None, limit: int = Query(default=20, ge=1, le=100)):
     """Recurring issues across PRs."""
     db = request.app.state.db
     return await db.get_recurring_issues(repo=repo, limit=limit)

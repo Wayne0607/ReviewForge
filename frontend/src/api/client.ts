@@ -2,8 +2,17 @@
 
 const BASE = '/api/v1'
 
+function getHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {}
+  const token = import.meta.env.VITE_API_TOKEN
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  return headers
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`)
+  const res = await fetch(`${BASE}${path}`, { headers: getHeaders() })
   if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`)
   return res.json()
 }

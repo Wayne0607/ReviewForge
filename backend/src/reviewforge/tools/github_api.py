@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_path(file_path: str) -> str:
+    """URL-encode each segment of a file path."""
+    return "/".join(quote(seg, safe="") for seg in file_path.split("/"))
 
 
 class GitHubClient:
@@ -30,22 +36,35 @@ class GitHubClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _list_pr_files(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """B9: Paginated PR file listing."""
+        files, page = [], 1
+        while True:
+            resp = await self._client.get(
+                f"/repos/{repo}/pulls/{int(pr_number)}/files",
+                params={"per_page": 100, "page": page},
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            files.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return files
+
     async def get_file_diff(self, repo: str, pr_number: int, file_path: str) -> str:
         """Get the diff for a specific file in a PR."""
-        resp = await self._client.get(
-            f"/repos/{repo}/pulls/{pr_number}/files",
-            params={"per_page": 100},
-        )
-        resp.raise_for_status()
-        for f in resp.json():
-            if f.get("filename") == file_path or f.get("filename", "").endswith(file_path):
+        files = await self._list_pr_files(repo, pr_number)
+        for f in files:
+            # B9: 精确匹配，不用 endswith
+            if f.get("filename") == file_path:
                 return f.get("patch", "")
         return f"No diff found for {file_path}"
 
     async def get_file_content(self, repo: str, ref: str, file_path: str) -> str:
         """Get file content at a specific ref."""
         resp = await self._client.get(
-            f"/repos/{repo}/contents/{file_path}",
+            f"/repos/{repo}/contents/{_encode_path(file_path)}",
             params={"ref": ref},
             headers={"Accept": "application/vnd.github.v3.raw"},
         )
@@ -74,12 +93,12 @@ class GitHubClient:
     ) -> dict[str, Any]:
         """Post a review comment on a specific line."""
         resp = await self._client.post(
-            f"/repos/{repo}/pulls/{pr_number}/comments",
+            f"/repos/{repo}/pulls/{int(pr_number)}/comments",
             json={
                 "body": body,
                 "commit_id": commit_sha,
                 "path": file_path,
-                "line": line,
+                "line": int(line),
                 "side": "RIGHT",
             },
         )
@@ -87,16 +106,11 @@ class GitHubClient:
         return resp.json()
 
     async def get_pr_files(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
-        """Get list of files changed in a PR."""
-        resp = await self._client.get(
-            f"/repos/{repo}/pulls/{pr_number}/files",
-            params={"per_page": 100},
-        )
-        resp.raise_for_status()
-        return resp.json()
+        """Get list of files changed in a PR (paginated)."""
+        return await self._list_pr_files(repo, pr_number)
 
     async def get_pr_info(self, repo: str, pr_number: int) -> dict[str, Any]:
         """Get PR metadata."""
-        resp = await self._client.get(f"/repos/{repo}/pulls/{pr_number}")
+        resp = await self._client.get(f"/repos/{repo}/pulls/{int(pr_number)}")
         resp.raise_for_status()
         return resp.json()

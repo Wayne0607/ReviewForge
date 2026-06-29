@@ -64,7 +64,7 @@ class Finding:
     category: str = ""
     message: str = ""
     suggestion: str = ""
-    confidence: float = 0.0
+    confidence: float = 0.5
     reviewer: str = ""
     status: str = "candidate"
     verified_by: str = ""
@@ -167,10 +167,15 @@ class StateStore:
 
     def update_finding(self, finding_id: str, **kwargs: Any) -> None:
         f = self.findings[finding_id]
+        if "id" in kwargs and kwargs["id"] != f.id:
+            raise ValueError("不允许修改 finding.id")
+        unknown = [k for k in kwargs if not hasattr(f, k)]
+        if unknown:
+            raise ValueError(f"未知 finding 字段: {unknown}")
+        candidate = {**f.to_dict(), **kwargs}
+        FindingSchema(**candidate)
         for k, v in kwargs.items():
-            if hasattr(f, k):
-                setattr(f, k, v)
-        FindingSchema(**f.to_dict())
+            setattr(f, k, v)
 
     def add_task(self, task: ReviewTask) -> str:
         self.tasks[task.id] = task
@@ -186,10 +191,15 @@ class StateStore:
 
     def update_task(self, task_id: str, **kwargs: Any) -> None:
         t = self.tasks[task_id]
+        if "id" in kwargs and kwargs["id"] != t.id:
+            raise ValueError("不允许修改 task.id")
+        unknown = [k for k in kwargs if not hasattr(t, k)]
+        if unknown:
+            raise ValueError(f"未知 task 字段: {unknown}")
+        candidate = {**t.to_dict(), **kwargs}
+        TaskSchema(**candidate)
         for k, v in kwargs.items():
-            if hasattr(t, k):
-                setattr(t, k, v)
-        TaskSchema(**t.to_dict())
+            setattr(t, k, v)
 
     def add_note(self, note: Note) -> None:
         self.notes.append(note)

@@ -125,15 +125,18 @@ class BaseReviewer:
 
         findings = []
         for item in data.get("findings", []):
-            findings.append(Finding(
-                file=item.get("file", ""),
-                line=item.get("line", 0),
-                severity=item.get("severity", "info"),
-                category=item.get("category", ""),
-                message=item.get("message", ""),
-                suggestion=item.get("suggestion", ""),
-                confidence=item.get("confidence", 0.5),
-            ))
+            try:
+                findings.append(Finding(
+                    file=item.get("file", ""),
+                    line=item.get("line", 0),
+                    severity=item.get("severity", "info"),
+                    category=item.get("category", ""),
+                    message=item.get("message", ""),
+                    suggestion=item.get("suggestion", ""),
+                    confidence=item.get("confidence", 0.5),
+                ))
+            except Exception as e:
+                logger.warning(f"{self.name}: 跳过非法 finding {item!r}: {e}")
         return findings
 
 

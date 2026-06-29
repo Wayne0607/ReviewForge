@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,12 +14,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
 
 from reviewforge.api.webhook import router as webhook_router
+from reviewforge.core.auth import require_token
 from reviewforge.core.config import ReviewForgeConfig
 from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
@@ -32,11 +35,21 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        import os
-
         # Load config
         cfg = ReviewForgeConfig.load(config_path)
         mock_mode = os.environ.get("REVIEWFORGE_MOCK") == "1"
+
+        # S1: 非 mock 模式下 webhook_secret 必填
+        if not mock_mode and not cfg.github.webhook_secret:
+            raise RuntimeError(
+                "GITHUB_WEBHOOK_SECRET 必填（本地测试请用 REVIEWFORGE_MOCK=1）"
+            )
+
+        # S2: 非 mock 模式下 API token 必填
+        if not mock_mode and not os.environ.get("REVIEWFORGE_API_TOKEN"):
+            raise RuntimeError(
+                "REVIEWFORGE_API_TOKEN 必填（本地测试请用 REVIEWFORGE_MOCK=1）"
+            )
 
         # GitHub client
         if mock_mode:
@@ -93,14 +106,25 @@ def create_app(config_path: str | None = None) -> FastAPI:
             github_client=github,
         )
 
-        # Load plugins
-        from reviewforge.engine.plugin_loader import PluginLoader
-        plugin_loader = PluginLoader()
-        plugins_dir = Path(__file__).parent / "plugins"
-        plugins = plugin_loader.discover(plugins_dir)
-        if plugins:
-            orchestrator.register_plugin_reviewers(plugins)
-            logger.info(f"Loaded {len(plugins)} plugin(s): {list(plugins.keys())}")
+        # S4: 插件默认关闭，靠显式 env 开启
+        if os.environ.get("REVIEWFORGE_ENABLE_PLUGINS") == "1":
+            from reviewforge.engine.plugin_loader import PluginLoader
+            plugin_loader = PluginLoader()
+            plugins_dir = Path(__file__).parent / "plugins"
+            plugins = plugin_loader.discover(plugins_dir)
+            if plugins:
+                orchestrator.register_plugin_reviewers(plugins)
+                logger.warning(
+                    f"⚠️ 已加载 {len(plugins)} 个插件（执行任意代码）: {list(plugins.keys())}"
+                )
+        else:
+            logger.info("插件加载已禁用（设 REVIEWFORGE_ENABLE_PLUGINS=1 开启）")
+
+        # S7: 并发控制
+        app.state.review_tasks = set()
+        app.state.review_semaphore = asyncio.Semaphore(
+            int(os.environ.get("REVIEWFORGE_MAX_CONCURRENT_REVIEWS", "3"))
+        )
 
         # Store on app state
         app.state.orchestrator = orchestrator
@@ -124,27 +148,30 @@ def create_app(config_path: str | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS (for frontend dev server)
+    # S3: 收紧 CORS
+    cors_origins = os.environ.get(
+        "REVIEWFORGE_CORS_ORIGINS", "http://localhost:5173"
+    ).split(",")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=[o.strip() for o in cors_origins if o.strip()],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
     )
 
     # Routers
     app.include_router(webhook_router)
 
-    # Dashboard API
+    # Dashboard API (S2: 需要 token)
     from reviewforge.api.dashboard import router as dashboard_router
-    app.include_router(dashboard_router)
+    app.include_router(dashboard_router, dependencies=[Depends(require_token)])
 
     @app.get("/health")
     async def health():
         return {"status": "ok"}
 
-    @app.get("/api/v1/specs")
+    @app.get("/api/v1/specs", dependencies=[Depends(require_token)])
     async def get_specs():
         registry: SpecRegistry = app.state.registry
         return {
@@ -153,7 +180,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             "skills": list(registry.skills),
         }
 
-    @app.get("/api/v1/config")
+    @app.get("/api/v1/config", dependencies=[Depends(require_token)])
     async def get_config():
         cfg: ReviewForgeConfig = app.state.config
         return {
@@ -167,17 +194,13 @@ def create_app(config_path: str | None = None) -> FastAPI:
     if static_dir.exists():
         from fastapi.responses import FileResponse
 
-        # Mount static assets (JS, CSS, etc.)
         app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="static-assets")
 
-        # SPA catch-all: return index.html for all non-API routes
         @app.exception_handler(404)
         async def spa_fallback(request, exc):
             path = request.url.path
-            # Don't intercept API or webhook routes
             if path.startswith("/api/") or path.startswith("/webhook") or path.startswith("/health"):
                 return exc
-            # Serve index.html for all other routes (SPA routing)
             index_path = static_dir / "index.html"
             if index_path.exists():
                 return FileResponse(str(index_path))

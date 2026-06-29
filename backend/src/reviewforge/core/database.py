@@ -136,6 +136,10 @@ class Database:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
+        # B11: 启用外键、WAL 模式、busy_timeout
+        await self._db.execute("PRAGMA foreign_keys=ON")
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
         logger.info(f"Database connected: {self._db_path}")
@@ -303,19 +307,20 @@ class Database:
     async def get_weekly_trends(self, repo: str | None = None, weeks: int = 12) -> list[dict[str, Any]]:
         """Finding count by week."""
         repo_filter = "AND r.repo=?" if repo else ""
-        params = (repo,) if repo else ()
-        cursor = await self._db.execute(f"""
+        interval = f"-{int(weeks) * 7} days"
+        params = (interval, repo) if repo else (interval,)
+        async with self._db.execute(f"""
             SELECT
                 strftime('%Y-W%W', r.started_at) as week,
                 COUNT(f.id) as total,
                 SUM(CASE WHEN f.status='confirmed' THEN 1 ELSE 0 END) as confirmed
             FROM review_runs r
             LEFT JOIN review_findings f ON f.run_id = r.run_id
-            WHERE r.started_at > datetime('now', '-{weeks * 7} days')
+            WHERE r.started_at > datetime('now', ?)
             {repo_filter}
             GROUP BY week ORDER BY week
-        """, params)
-        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+        """, params) as cursor:
+            return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
     async def get_hotspot_files(self, repo: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         """Files with most findings."""

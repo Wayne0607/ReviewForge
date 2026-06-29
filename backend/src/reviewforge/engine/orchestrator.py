@@ -66,7 +66,7 @@ class Orchestrator:
             self._reviewer_llm = reviewer_llm
 
         self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
-        self._loop_detector = LoopDetector()
+        # B4: LoopDetector 每 run 新建，避免跨 run 状态污染
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
 
@@ -77,6 +77,7 @@ class Orchestrator:
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
         run_id = uuid.uuid4().hex[:12]
+        loop_detector = LoopDetector()  # B4: per-run instance
         self._events.set_run_id(run_id)
         self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
 
@@ -103,7 +104,7 @@ class Orchestrator:
             # Phase 2: Execute reviewers
             for task in state.list_tasks(status="pending"):
                 sig = LoopDetector.make_signature(task.reviewer, task.files)
-                loop_result = self._loop_detector.check(sig)
+                loop_result = loop_detector.check(sig)
 
                 if loop_result == "stall":
                     state.update_task(task.id, status="failed", error="loop_stalled")

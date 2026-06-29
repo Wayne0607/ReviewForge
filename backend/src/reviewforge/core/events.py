@@ -5,10 +5,12 @@ Supports:
 - Subscriber callbacks (used by orchestrator, webhook, etc.)
 - Event filtering by type
 - Review traceability (every state change is an event)
+- B4: contextvar-based run_id for concurrent task isolation
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import time
 import logging
@@ -17,6 +19,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+# B4: 每个 asyncio task 独立的 run_id
+_run_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("run_id", default="")
 
 
 @dataclass
@@ -47,11 +52,10 @@ class EventBus:
     def __init__(self, log_dir: Path | None = None) -> None:
         self._subscribers: list[Callable[[ReviewEvent], None]] = []
         self._log_dir = log_dir
-        self._current_run_id: str = ""
 
     def set_run_id(self, run_id: str) -> None:
-        """Set the current run ID for all subsequent events."""
-        self._current_run_id = run_id
+        """Set the current run ID for this asyncio context."""
+        _run_id_var.set(run_id)
 
     def subscribe(self, callback: Callable[[ReviewEvent], None]) -> None:
         """Subscribe to all events."""
@@ -66,16 +70,17 @@ class EventBus:
 
     def emit(self, event_type: str, data: dict[str, Any] | None = None) -> ReviewEvent:
         """Emit an event. Logs to JSONL and notifies subscribers."""
+        current_run_id = _run_id_var.get("")
         event = ReviewEvent(
             event_type=event_type,
             data=data or {},
-            run_id=self._current_run_id,
+            run_id=current_run_id,
         )
 
         # Log to JSONL
         if self._log_dir:
             self._log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = self._log_dir / f"{self._current_run_id or 'default'}.jsonl"
+            log_path = self._log_dir / f"{current_run_id or 'default'}.jsonl"
             try:
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
@@ -99,7 +104,7 @@ class EventBus:
         if not self._log_dir:
             return []
 
-        rid = run_id or self._current_run_id or "default"
+        rid = run_id or _run_id_var.get("") or "default"
         log_path = self._log_dir / f"{rid}.jsonl"
         if not log_path.exists():
             return []

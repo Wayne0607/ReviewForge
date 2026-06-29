@@ -75,6 +75,20 @@ class Orchestrator:
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
 
+        # 渐进式 Skill 加载（Level 1）：发现 skills，建立 reviewer_type -> SkillMeta 映射
+        from pathlib import Path
+
+        from reviewforge.skills.loader import SkillLoader
+
+        self._skill_loader = SkillLoader(Path(__file__).resolve().parent.parent / "skills")
+        self._skills_by_type: dict[str, Any] = {}
+        try:
+            for meta in self._skill_loader.discover():
+                if meta.reviewer_type and meta.reviewer_type not in self._skills_by_type:
+                    self._skills_by_type[meta.reviewer_type] = meta
+        except Exception as e:
+            logger.warning(f"Skill discovery failed: {e}")
+
     def register_plugin_reviewers(self, plugins: dict[str, type[BaseReviewer]]) -> None:
         """Merge plugin-loaded reviewers into the reviewer map."""
         self._extra_reviewers.update(plugins)
@@ -286,8 +300,24 @@ class Orchestrator:
                 llm = self._reviewer_llm
             # W2: agentic 标志
             agentic = name in self._agentic_reviewers
-            return cls(llm, self._registry, self._gateway, agentic=agentic, event_bus=self._events)
+            reviewer = cls(llm, self._registry, self._gateway, agentic=agentic, event_bus=self._events)
+            self._attach_skill(reviewer)
+            return reviewer
         return None
+
+    def _attach_skill(self, reviewer: BaseReviewer) -> None:
+        """渐进式 Skill 加载（Level 2）：把匹配 reviewer_type 的 SKILL.md 注入该 reviewer。"""
+        meta = self._skills_by_type.get(reviewer.reviewer_type)
+        if not meta:
+            return
+        try:
+            content = self._skill_loader.load(meta.name)
+            reviewer._skill_body = content.body
+            reviewer._skill_name = meta.name
+            reviewer._skill_refs = list(meta.references or [])
+            reviewer._skill_loader = self._skill_loader
+        except Exception as e:
+            logger.warning(f"Skill load failed for {meta.name}: {e}")
 
     async def _post_comments(self, findings: list[Finding], state: StateStore) -> int:
         """Post review comments via the tool gateway."""

@@ -256,6 +256,16 @@ def _tool_usage_guidance(ctx: dict[str, Any]) -> str | None:
 **终止契约**：取证完毕后，最后一条消息只输出 findings JSON（无问题则空数组），不要再夹带工具调用。"""  # noqa: E501
 
 
+def _skill_rules(ctx: dict[str, Any]) -> str | None:
+    """渐进式知识加载 Level 2：把选中的 SKILL.md 完整内容注入 prompt。"""
+    body = ctx.get("skill_body")
+    if not body:
+        return None
+    refs = ctx.get("skill_refs") or []
+    ref_hint = f"\n\n（更深入的规则可用 read_reference 工具按需读取：{', '.join(refs)}）" if refs else ""
+    return f"## 审查规则集 (Skill)\n\n以下是本维度的专家审查规则，请严格据此判断：\n\n{body}{ref_hint}"
+
+
 def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     """Build system + user messages for a Reviewer agent."""
     reviewer_type = ctx.get("reviewer_type", "general")
@@ -263,6 +273,7 @@ def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
         _identity,
         _language,
         _reviewer_mission,
+        _skill_rules,
         _available_tools,
         _tool_usage_guidance,
         _findings_format,

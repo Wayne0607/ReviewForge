@@ -53,6 +53,11 @@ class BaseReviewer:
         self._agentic = agentic
         self._max_tokens = max_tokens
         self._events = event_bus
+        # Progressive skill loading — set post-construction by the orchestrator
+        self._skill_body: str = ""
+        self._skill_name: str = ""
+        self._skill_refs: list[str] = []
+        self._skill_loader: Any = None
 
     async def execute(self, task: ReviewTask, state: StateStore) -> list[Finding]:
         """Dispatch to single-shot or agentic execution."""
@@ -73,6 +78,8 @@ class BaseReviewer:
             "agent_name": self.name,
             "files_to_review": files,
             "diffs": diffs,
+            "skill_body": self._skill_body,
+            "skill_refs": self._skill_refs,
         }
         messages = build_reviewer_prompt(ctx)
 
@@ -101,6 +108,8 @@ class BaseReviewer:
             "files_to_review": files,
             "diffs": diffs,
             "tools_enabled": True,
+            "skill_body": self._skill_body,
+            "skill_refs": self._skill_refs,
         }
         messages = build_reviewer_prompt(ctx)
         chat = [
@@ -204,7 +213,7 @@ class BaseReviewer:
             """Read diff for a specific file in this PR."""
             return await gw.invoke("read_diff", {"file_path": file_path}, state, agent_name=name) or ""
 
-        return [
+        tools = [
             StructuredTool.from_function(
                 coroutine=read_file,
                 name="read_file",
@@ -219,6 +228,28 @@ class BaseReviewer:
                 coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"
             ),
         ]
+
+        # Level-3 progressive disclosure: pull deeper Skill reference files on demand.
+        if self._skill_loader and self._skill_name and self._skill_refs:
+            loader = self._skill_loader
+            skill_name = self._skill_name
+
+            async def read_reference(ref_path: str) -> str:
+                """读取本审查维度 Skill 的深层参考文件（references/ 下）。"""
+                try:
+                    return loader.read_ref(skill_name, ref_path)
+                except Exception as e:
+                    return f"reference read failed: {e}"
+
+            tools.append(
+                StructuredTool.from_function(
+                    coroutine=read_reference,
+                    name="read_reference",
+                    description="读取本维度 Skill 的深层规则参考文件（Level 3，按需）",
+                )
+            )
+
+        return tools
 
     def _emit_step_event(self, state: StateStore, step: int, resp: Any) -> None:
         """Emit per-step token usage event."""

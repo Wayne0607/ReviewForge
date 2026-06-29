@@ -215,6 +215,21 @@ def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
 
     diff_content = wrap_untrusted(ctx.get("diff_summary", "无 diff 数据。"))
 
+    done = ctx.get("done_reviewers") or []
+    notes = ctx.get("notes") or []
+    if done or notes:
+        note_lines = "\n".join(f"- [{n.get('type', '')}] {n.get('content', '')}" for n in notes) or "（无）"
+        replan_block = (
+            "\n## 重新规划上下文\n\n"
+            f"已派发并处理过的 Reviewer：{', '.join(done) or '（无）'}\n"
+            f"反馈 Notes：\n{note_lines}\n\n"
+            "**只补充尚未派发、确有必要的 Reviewer**；若无需更多审查，输出空的 tasks 数组。\n"
+        )
+        instruction = "根据上面的反馈与已完成情况补充派发 Reviewer（无需更多则输出空 tasks 数组）。输出 JSON。"
+    else:
+        replan_block = ""
+        instruction = "分析 diff 并派发 Reviewer。输出 JSON。"
+
     user = f"""## PR 上下文
 
 **仓库**: {ctx.get("repo", "unknown")}
@@ -224,10 +239,10 @@ def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
 ## Diff 摘要
 
 {diff_content}
-
+{replan_block}
 ## 指示
 
-分析 diff 并派发 Reviewer。输出 JSON。"""
+{instruction}"""
 
     return [
         {"role": "system", "content": system},

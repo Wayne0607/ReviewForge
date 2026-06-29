@@ -71,10 +71,18 @@ class Planner:
         self._llm = llm
         self._registry = registry
 
-    async def plan(self, state: StateStore) -> list[ReviewTask]:
-        """Analyze the PR and return task proposals."""
-        # Step 1: Deterministic pattern detection
-        forced_reviewers = self._detect_patterns(state.files_changed, state.diff_summary)
+    async def plan(self, state: StateStore, notes: list | None = None) -> list[ReviewTask]:
+        """Analyze the PR and return task proposals (re-planning aware).
+
+        Reviewers already dispatched this run are excluded, so repeat rounds
+        converge to empty (and the loop detector catches genuine repeats). Notes
+        from prior rounds (e.g. loop-detector rescue hints) are fed to the LLM.
+        """
+        done_reviewers = {t.reviewer for t in state.list_tasks() if t.status in ("completed", "claimed", "failed")}
+        first_round = not done_reviewers
+
+        # Step 1: Deterministic pattern detection (skip already-dispatched reviewers)
+        forced_reviewers = self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers
 
         # Step 2: LLM decision for additional reviewers
         ctx = {
@@ -84,6 +92,8 @@ class Planner:
             "pr_title": "",
             "files_changed": state.files_changed,
             "diff_summary": state.diff_summary,
+            "done_reviewers": sorted(done_reviewers),
+            "notes": [{"from": n.from_agent, "type": n.type, "content": n.content} for n in (notes or [])],
         }
         messages = build_planner_prompt(ctx)
 
@@ -91,10 +101,10 @@ class Planner:
             [SystemMessage(content=messages[0]["content"]), HumanMessage(content=messages[1]["content"])]
         )
 
-        llm_tasks = self._parse_response(response.content)
+        llm_tasks = [t for t in self._parse_response(response.content) if t.reviewer not in done_reviewers]
 
-        # Step 3: Merge — ensure forced reviewers are always included
-        return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed)
+        # Step 3: Merge — include forced reviewers; default style only on the first round
+        return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed, first_round)
 
     def _detect_patterns(self, files: list[str], diff: str) -> set[str]:
         """Deterministically detect patterns and force relevant reviewers."""
@@ -136,8 +146,15 @@ class Planner:
 
         return forced
 
-    def _merge_tasks(self, forced: set[str], llm_tasks: list[ReviewTask], files: list[str]) -> list[ReviewTask]:
-        """Merge forced reviewers with LLM decisions."""
+    def _merge_tasks(
+        self, forced: set[str], llm_tasks: list[ReviewTask], files: list[str], first_round: bool = True
+    ) -> list[ReviewTask]:
+        """Merge forced reviewers with LLM decisions.
+
+        On the first round, style_reviewer is always added as a default and a
+        fallback guarantees at least one task. On re-planning rounds an empty
+        result is valid (it signals convergence — nothing more to dispatch).
+        """
         llm_reviewers = {t.reviewer for t in llm_tasks}
         merged = list(llm_tasks)
 
@@ -152,8 +169,7 @@ class Planner:
                 )
                 logger.info(f"Forced reviewer added: {reviewer}")
 
-        # Always include style_reviewer
-        if "style_reviewer" not in {t.reviewer for t in merged}:
+        if first_round and "style_reviewer" not in {t.reviewer for t in merged}:
             merged.append(
                 ReviewTask(
                     reviewer="style_reviewer",
@@ -162,7 +178,9 @@ class Planner:
                 )
             )
 
-        return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
+        if first_round:
+            return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
+        return merged
 
     def _parse_response(self, content: str) -> list[ReviewTask]:
         """Parse LLM JSON output into ReviewTask objects."""

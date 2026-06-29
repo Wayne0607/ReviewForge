@@ -16,14 +16,16 @@ from langchain_openai import ChatOpenAI
 from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
 from reviewforge.core.loop_detector import LoopDetector
+from reviewforge.core.scheduler import Scheduler
 from reviewforge.core.specs import SpecRegistry
-from reviewforge.core.state import Finding, ReviewTask, StateStore
+from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
+from reviewforge.engine.verifier import Verifier
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,7 @@ class Orchestrator:
             self._reviewer_llm = reviewer_llm
 
         self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
+        self._verifier = Verifier()  # #5: 纯逻辑去重/合并阶段（在 LLM 校准之前）
         # B4: LoopDetector 每 run 新建，避免跨 run 状态污染
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
@@ -117,32 +120,12 @@ class Orchestrator:
             )
 
         try:
-            # Phase 1: Plan
-            self._events.emit("planner.started")
-            tasks = await self._planner.plan(state)
-            for task in tasks:
-                state.add_task(task)
-            self._events.emit("planner.completed", {"task_count": len(tasks)})
-
-            # D1: Phase 2 — 串行筛 loop + 并行执行 reviewer
-            import asyncio as _aio
-
-            pending = state.list_tasks(status="pending")
-
-            # 先串行做 loop 检查，过滤掉 stall/rescue
-            runnable = []
-            for task in pending:
-                sig = LoopDetector.make_signature(task.reviewer, task.files)
-                loop_result = loop_detector.check(sig)
-                if loop_result == "stall":
-                    state.update_task(task.id, status="failed", error="loop_stalled")
-                    self._events.emit("reviewer.stalled", {"task_id": task.id, "signature": sig})
-                elif loop_result == "rescue":
-                    state.update_task(task.id, status="failed", error="rescue_drain")
-                    self._events.emit("reviewer.rescued", {"task_id": task.id})
-                else:
-                    state.update_task(task.id, status="claimed")
-                    runnable.append(task)
+            # Phase 1+2: iterative plan → schedule → execute (re-planning loop).
+            # #4 Scheduler dispatches reviewers by priority with bounded concurrency.
+            # #2/#3 bounded rounds; loop-detector rescue→stall guards repeats and writes
+            # a Note that the Planner consumes when re-planning the next round.
+            scheduler = Scheduler(concurrency=4)
+            max_rounds = 3
 
             async def _run_one(task: ReviewTask) -> None:
                 self._events.emit("reviewer.started", {"reviewer": task.reviewer, "files": task.files})
@@ -162,10 +145,7 @@ class Orchestrator:
                     state.update_task(task.id, status="completed")
                     self._events.emit(
                         "reviewer.completed",
-                        {
-                            "reviewer": task.reviewer,
-                            "findings_count": len(findings),
-                        },
+                        {"reviewer": task.reviewer, "findings_count": len(findings)},
                     )
                     if self._db:
                         await self._db.insert_metric(
@@ -186,24 +166,60 @@ class Orchestrator:
                             error=str(e),
                         )
 
-            await _aio.gather(*(_run_one(t) for t in runnable))
+            for round_no in range(max_rounds):
+                self._events.emit("planner.started", {"round": round_no})
+                notes = state.consume_notes()  # #3: feed prior-round hints to the planner
+                proposed = await self._planner.plan(state, notes=notes)
+                for task in proposed:
+                    state.add_task(task)
+                self._events.emit("planner.completed", {"round": round_no, "task_count": len(proposed)})
 
-            # Phase 3: Dynamic Calibration (adversarial verify + conditional judge)
-            # D4: 去重 — 按 file+line+category 归并，保留 confidence 最高的
+                pending = state.list_tasks(status="pending")
+                if not pending:
+                    break  # planner proposed nothing new → converged
+
+                # Loop detection (rescue → stall) before dispatch
+                runnable = []
+                for task in pending:
+                    sig = LoopDetector.make_signature(task.reviewer, task.files)
+                    loop_result = loop_detector.check(sig)
+                    if loop_result == "stall":
+                        state.update_task(task.id, status="failed", error="loop_stalled")
+                        self._events.emit("reviewer.stalled", {"task_id": task.id, "signature": sig})
+                    elif loop_result == "rescue":
+                        state.update_task(task.id, status="failed", error="rescue_drain")
+                        self._events.emit("reviewer.rescued", {"task_id": task.id})
+                        # #3: hint the Planner that this reviewer/file combo is looping
+                        state.add_note(
+                            Note(
+                                from_agent="loop_detector",
+                                type="rescue_hint",
+                                content=f"Reviewer {task.reviewer} 在相同文件上重复，已排空；请改派其他维度或停止。",
+                            )
+                        )
+                    else:
+                        state.update_task(task.id, status="claimed")
+                        runnable.append(task)
+
+                if runnable:
+                    await scheduler.dispatch(runnable, _run_one)  # #4: priority + concurrency
+
+                if loop_detector.is_stalled:
+                    self._events.emit("planner.stalled", {"round": round_no})
+                    break
+                # Re-plan only when fresh hints (notes) exist; otherwise converged.
+                if not state.notes:
+                    break
+
+            # Phase 3: Verifier (#5, pure-logic de-dupe/merge) → Dynamic Calibration.
             raw_candidates = state.list_findings(status="candidate")
-            if raw_candidates:
-                seen: dict[tuple, Finding] = {}
-                for f in raw_candidates:
-                    key = (f.file, f.line, f.category)
-                    if key not in seen or f.confidence > seen[key].confidence:
-                        seen[key] = f
-                candidates = list(seen.values())
-                dedup_count = len(raw_candidates) - len(candidates)
-                if dedup_count > 0:
-                    logger.info(f"Dedup: {dedup_count} duplicate findings removed")
-                    self._events.emit("dedup.completed", {"removed": dedup_count})
-            else:
-                candidates = []
+            candidates, dropped_ids = self._verifier.verify(raw_candidates)
+            for fid in dropped_ids:
+                state.update_finding(
+                    fid, status="false_positive", verified_by="verifier", verify_reason="重复/低置信，已合并"
+                )
+            if dropped_ids:
+                self._events.emit("verifier.completed", {"kept": len(candidates), "merged": len(dropped_ids)})
 
             if candidates:
                 self._events.emit("calibration.started", {"candidate_count": len(candidates)})

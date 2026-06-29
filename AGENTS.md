@@ -11,13 +11,15 @@
 ### Reviewer (Operative)
 - 角色：执行者，无状态单任务
 - 每个 Reviewer 专注一个维度（security/performance/style/architecture）
-- 通过 `_run_tool_loop` 运行，可调用 tools
+- 通过 `BaseReviewer.execute_agentic` 的工具循环运行（默认开启，`REVIEWFORGE_AGENTIC_DEFAULT`），
+  可调用 `read_file`/`search_code`/`read_diff`/`read_reference`；亦可降级为 `execute_singleshot`
+- 由 `core/scheduler.py` 的 Scheduler 按优先级 + 并发上限调度
 - 输出写回 State Store
 
 ### Verifier (Auditor)
-- 角色：验证者，无工具纯推理
+- 角色：验证者，纯逻辑（无 LLM）
 - 输入：Reviewer 输出的 candidate findings
-- 输出：confirmed / false_positive
+- 输出：去重/合并重复（`engine/verifier.py`），再交给 Dynamic Calibrator 做对抗式确认
 
 ### Commenter (Analyst)
 - 角色：综合者

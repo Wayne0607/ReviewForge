@@ -50,7 +50,7 @@ User=reviewforge
 Group=reviewforge
 WorkingDirectory=/opt/reviewforge/backend
 EnvironmentFile=/opt/reviewforge/.env
-ExecStart=/home/reviewforge/.local/bin/uv run reviewforge serve --host 127.0.0.1 --port 8000
+ExecStart=/opt/reviewforge/backend/.venv/bin/uvicorn reviewforge.app:create_app --host 127.0.0.1 --port 8000 --factory
 Restart=always
 RestartSec=5
 

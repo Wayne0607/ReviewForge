@@ -4,7 +4,7 @@ import { GitPullRequest, CheckCircle2, XCircle, Loader2, Zap } from 'lucide-reac
 import { tokens } from '../api/client'
 import type { ReviewRun } from '../types'
 
-const STATUS_ICON = {
+const STATUS_ICON: Record<string, React.ReactNode> = {
   completed: <CheckCircle2 className="w-4 h-4 text-green-500" />,
   failed: <XCircle className="w-4 h-4 text-red-500" />,
   running: <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />,
@@ -64,7 +64,7 @@ export default function ReviewTimeline({ runs }: { runs: ReviewRun[] }) {
             className="flex items-center gap-4 p-4 rounded-lg border border-gray-200 hover:border-brand-300 hover:shadow-sm transition-all group"
           >
             <div className="shrink-0">
-              {STATUS_ICON[run.status]}
+              {STATUS_ICON[run.status] ?? <div className="w-4 h-4 rounded-full bg-gray-300" />}
             </div>
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">

@@ -25,27 +25,46 @@ export default function ReviewDetail() {
   const [metrics, setMetrics] = useState<ReviewerMetric[]>([])
   const [tokenData, setTokenData] = useState<{ agents: { agent_name: string; total_tokens: number }[]; total_tokens: number } | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<string>('all')
 
   useEffect(() => {
     if (!runId) return
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+
     Promise.all([
       reviews.detail(runId),
       tokens.byRun(runId).catch(() => null),
     ]).then(([r, t]) => {
+      if (cancelled) return
       setRun(r.run)
       setFindings(r.findings)
       setMetrics(r.metrics)
       setTokenData(t)
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false))
+    }).catch((e) => {
+      if (!cancelled) setError(e.message)
+    }).finally(() => {
+      if (!cancelled) setLoading(false)
+    })
+
+    return () => { cancelled = true }
   }, [runId])
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64 text-gray-400">
+      <div className="flex items-center justify-center h-64 text-gray-400" role="status" aria-live="polite">
         加载中...
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-4">
+        <div className="text-red-500">⚠️ {error}</div>
+        <Link to="/reviews" className="btn btn-primary">返回列表</Link>
       </div>
     )
   }
@@ -117,7 +136,7 @@ export default function ReviewDetail() {
         </div>
         <div className="card card-body text-center">
           <div className="text-2xl font-bold text-gray-700">
-            {run.summary?.tasks_completed ?? 0} / {(run.summary?.tasks_completed ?? 0) + (run.summary?.tasks_failed ?? 0)}
+            {metrics.filter(m => m.status === 'completed').length} / {metrics.length}
           </div>
           <div className="text-sm text-gray-500">Reviewer 完成</div>
         </div>

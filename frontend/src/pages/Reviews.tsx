@@ -8,7 +8,7 @@ import {
 import { reviews, tokens } from '../api/client'
 import type { ReviewRun } from '../types'
 
-const STATUS_BADGE = {
+const STATUS_BADGE: Record<string, { cls: string; label: string }> = {
   completed: { cls: 'badge-success', label: '完成' },
   failed: { cls: 'badge-error', label: '失败' },
   running: { cls: 'badge-info', label: '运行中' },
@@ -109,7 +109,7 @@ export default function Reviews() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {filtered.map((run) => {
-                const badge = STATUS_BADGE[run.status]
+                const badge = STATUS_BADGE[run.status] ?? { cls: 'badge-gray', label: run.status }
                 const tok = tokenMap[run.run_id]
                 return (
                   <tr

@@ -37,27 +37,39 @@ export default function Dashboard() {
   const [recentRuns, setRecentRuns] = useState<ReviewRun[]>([])
   const [tokenSummary, setTokenSummary] = useState<{ total_tokens: number } | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    Promise.all([
+    Promise.allSettled([
       metrics.summary(),
       metrics.categories(),
       metrics.trends(),
       reviews.list({ limit: 5 }),
-      tokens.summary().catch(() => ({ total_tokens: 0 })),
-    ]).then(([s, c, t, r, ts]) => {
-      setStats(s)
-      setCategories(c)
-      setTrends(t)
-      setRecentRuns(r.runs)
-      setTokenSummary(ts)
-    }).catch(console.error).finally(() => setLoading(false))
+      tokens.summary(),
+    ]).then((results) => {
+      const [s, c, t, r, ts] = results
+      if (s.status === 'fulfilled') setStats(s.value)
+      else setError(s.reason?.message || '加载统计数据失败')
+      if (c.status === 'fulfilled') setCategories(c.value)
+      if (t.status === 'fulfilled') setTrends(t.value)
+      if (r.status === 'fulfilled') setRecentRuns(r.value.runs)
+      if (ts.status === 'fulfilled') setTokenSummary(ts.value)
+    }).finally(() => setLoading(false))
   }, [])
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
+      <div className="flex items-center justify-center h-64" role="status" aria-live="polite">
         <div className="text-gray-400">加载中...</div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-4">
+        <div className="text-red-500">⚠️ {error}</div>
+        <button onClick={() => window.location.reload()} className="btn btn-primary">重试</button>
       </div>
     )
   }

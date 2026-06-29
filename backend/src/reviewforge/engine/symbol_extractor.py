@@ -40,6 +40,8 @@ IMPORT_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"from\s+([\w.]+)\s+import\s+(\w+)", "named"),
         # from x.y import *  (treat as module import)
         (r"from\s+([\w.]+)\s+import\s+\*", "wildcard"),
+        # from x.y.z import (a, b, c) — multi-line joined
+        (r"from\s+([\w.]+)\s+import\s+\(([^)]+)\)", "multi"),
         # import x.y.z (only at line start, not after 'from')
         (r"^import\s+([\w.]+)", "module"),
     ],
@@ -160,9 +162,15 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
                 names = [n.strip() for n in match.group(1).split(",")]
                 source = match.group(2)
                 for name in names:
-                    # Handle 'as' aliases: import { orig as alias }
                     actual = name.split(" as ")[0].strip() if " as " in name else name
                     imports.append(ImportInfo(source=source, name=actual, file_path=file_path, import_type=imp_type))
+            elif imp_type == "multi":
+                # from x.y import (a, b, c)
+                source = match.group(1)
+                names = [n.strip() for n in match.group(2).split(",") if n.strip()]
+                for name in names:
+                    name = name.split(" as ")[0].strip() if " as " in name else name
+                    imports.append(ImportInfo(source=source, name=name, file_path=file_path, import_type="named"))
             elif imp_type in ("named", "wildcard"):
                 imports.append(ImportInfo(source=match.group(1), name=match.group(2) if imp_type == "named" else "*", file_path=file_path, import_type=imp_type))
             elif imp_type in ("module", "single"):
@@ -275,6 +283,37 @@ def extract_diff_symbols(diff_content: str, file_path: str) -> tuple[list[Symbol
             added_lines.append(line[1:])
 
     added_content = "\n".join(added_lines)
+
+    # Join multi-line imports (Python: from x import (\n  a,\n  b,\n))
+    added_content = _join_multiline_imports(added_content)
+
     symbols = extract_definitions(added_content, file_path)
     imports = extract_imports(added_content, file_path)
     return symbols, imports
+
+
+def _join_multiline_imports(content: str) -> str:
+    """Join multi-line import statements into single lines."""
+    lines = content.split("\n")
+    result = []
+    buffer = ""
+    paren_depth = 0
+
+    for line in lines:
+        if buffer:
+            buffer += " " + line.strip()
+            paren_depth += line.count("(") - line.count(")")
+            if paren_depth <= 0:
+                result.append(buffer)
+                buffer = ""
+                paren_depth = 0
+        elif re.match(r"(?:from|import)\s+", line.strip()) and "(" in line and ")" not in line:
+            buffer = line.strip()
+            paren_depth = line.count("(") - line.count(")")
+        else:
+            result.append(line)
+
+    if buffer:
+        result.append(buffer)
+
+    return "\n".join(result)

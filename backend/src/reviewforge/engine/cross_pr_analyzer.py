@@ -136,11 +136,13 @@ class CrossPRAnalyzer:
         logger.info(f"Cross-PR: found {len(suspicious_chains)} suspicious chains")
 
         # Step 5: LLM confirmation for suspicious chains
-        cross_findings = []
-        if self._llm and suspicious_chains:
+        if self._llm:
             cross_findings = await self._llm_confirm_chains(
                 suspicious_chains, diff_summary, state,
             )
+        else:
+            # No LLM available — generate findings directly from structural analysis
+            cross_findings = self._chains_to_findings(suspicious_chains)
 
         return cross_findings
 
@@ -238,9 +240,31 @@ class CrossPRAnalyzer:
             # Get risky symbols in the target file
             risky_symbols = await self._db.get_risky_symbols(target_file)
 
-            for sym in risky_symbols:
-                sym_categories = json.loads(sym.get("risk_categories", "[]"))
-                for cat in sym_categories:
+            if risky_symbols:
+                # Use symbol-level detail
+                for sym in risky_symbols:
+                    sym_categories = json.loads(sym.get("risk_categories", "[]"))
+                    for cat in sym_categories:
+                        if cat not in SECURITY_CATEGORIES:
+                            continue
+
+                        chain = CrossPRChain(
+                            source_file=imp.file_path,
+                            source_symbol=imp.name or "<import>",
+                            target_file=target_file,
+                            target_symbol=sym["symbol_name"],
+                            risk_category=cat,
+                            risk_level=sym.get("risk_level", risk_level),
+                            depth=1,
+                            path=[
+                                {"file": imp.file_path, "symbol": imp.name or "<import>"},
+                                {"file": target_file, "symbol": sym["symbol_name"], "risk": cat},
+                            ],
+                        )
+                        chains.append(chain)
+            else:
+                # No symbol-level data — use file-level risk
+                for cat in risk_categories:
                     if cat not in SECURITY_CATEGORIES:
                         continue
 
@@ -248,13 +272,13 @@ class CrossPRAnalyzer:
                         source_file=imp.file_path,
                         source_symbol=imp.name or "<import>",
                         target_file=target_file,
-                        target_symbol=sym["symbol_name"],
+                        target_symbol=imp.name or "<module>",
                         risk_category=cat,
-                        risk_level=sym.get("risk_level", risk_level),
+                        risk_level=risk_level,
                         depth=1,
                         path=[
                             {"file": imp.file_path, "symbol": imp.name or "<import>"},
-                            {"file": target_file, "symbol": sym["symbol_name"], "risk": cat},
+                            {"file": target_file, "symbol": f"<{cat}>", "risk": cat},
                         ],
                     )
                     chains.append(chain)
@@ -296,6 +320,28 @@ class CrossPRAnalyzer:
                 unique.append(c)
 
         return unique
+
+    def _chains_to_findings(self, chains: list[CrossPRChain]) -> list[Finding]:
+        """Convert suspicious chains directly to findings without LLM confirmation."""
+        findings = []
+        for chain in chains[:10]:  # Max 10 findings
+            chain_path = " → ".join(f"{p['file']}:{p['symbol']}" for p in chain.path)
+            findings.append(Finding(
+                file=chain.source_file,
+                line=0,
+                severity="error",
+                category=f"cross-pr-{chain.risk_category}",
+                message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"
+                        f"存在 {chain.risk_category} 风险。"
+                        f"调用链: {chain_path}",
+                suggestion=f"检查 {chain.target_symbol}() 的安全性，确保输入经过验证。",
+                confidence=0.85,
+                reviewer="cross_pr_analyzer",
+                status="confirmed",
+                verified_by="structural-analysis",
+                verify_reason="基于代码结构分析，未经过 LLM 语义确认",
+            ))
+        return findings
 
     async def _llm_confirm_chains(
         self,

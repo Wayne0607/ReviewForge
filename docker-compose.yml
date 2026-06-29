@@ -2,12 +2,12 @@ services:
   reviewforge:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     volumes:
       - ./skills:/app/skills
-      - .reviewforge:/app/.reviewforge
+      - ./.reviewforge:/app/.reviewforge
       - ./reviewforge.yaml:/app/reviewforge.yaml
     restart: unless-stopped
 
@@ -15,12 +15,13 @@ services:
   reviewforge-mock:
     build: .
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       - REVIEWFORGE_MOCK=1
       - GITHUB_TOKEN=mock
       - GITHUB_WEBHOOK_SECRET=mock
       - LLM_API_KEY=mock
+      - REVIEWFORGE_API_TOKEN=mock
     volumes:
       - ./skills:/app/skills
     profiles:

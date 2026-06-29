@@ -2,7 +2,7 @@
 FROM node:20-slim AS frontend-build
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --ignore-scripts 2>/dev/null || npm install
+RUN npm ci
 COPY frontend/ .
 RUN npm run build
 
@@ -13,13 +13,13 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY backend/pyproject.toml backend/
-RUN pip install --no-cache-dir -e backend/ 2>/dev/null || \
-    pip install --no-cache-dir fastapi uvicorn langchain-openai langchain-core pydantic httpx pyyaml cryptography aiosqlite
+RUN pip install --no-cache-dir -e backend/
 
 # Copy source
 COPY backend/src/ backend/src/
 COPY skills/ skills/
 COPY reviewforge.yaml .
+COPY .env.example .
 
 # Copy frontend build output
 COPY --from=frontend-build /app/backend/src/reviewforge/static/ backend/src/reviewforge/static/
@@ -29,6 +29,10 @@ RUN pip install --no-cache-dir -e backend/
 
 # Create data directory
 RUN mkdir -p .reviewforge/events
+
+# E3: 非 root 用户
+RUN useradd -m app && chown -R app:app /app
+USER app
 
 EXPOSE 8000
 

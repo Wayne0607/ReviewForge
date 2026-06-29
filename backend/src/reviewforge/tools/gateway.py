@@ -1,4 +1,8 @@
-"""Tool Gateway — async single entry point for all tool execution."""
+"""Tool Gateway — async single entry point for all tool execution.
+
+D3: 真正做权限门控 — 按 agent 的 allowed_tools 校验，
+写工具 post_comment 仅限 commenter/orchestrator 身份。
+"""
 
 from __future__ import annotations
 
@@ -25,16 +29,35 @@ class ToolGateway:
             "post_comment": self._post_comment,
         }
 
-    async def invoke(self, tool_name: str, params: dict[str, Any], state: StateStore) -> Any:
-        """Execute a tool with full gating."""
+    async def invoke(
+        self, tool_name: str, params: dict[str, Any], state: StateStore, agent_name: str = ""
+    ) -> Any:
+        """Execute a tool with full gating.
+
+        Args:
+            tool_name: 工具名
+            params: 工具参数
+            state: 共享状态
+            agent_name: 调用方身份（用于权限校验）
+        """
         if tool_name not in self._registry.tools:
             raise KeyError(f"Unknown tool: {tool_name}")
+
+        # D3: 权限校验 — agent 的 allowed_tools 是否包含该工具
+        if agent_name:
+            spec = self._registry.agents.get(agent_name)
+            if spec is not None and tool_name not in spec.allowed_tools:
+                raise PermissionError(f"{agent_name} 无权调用 {tool_name}")
+
+        # D3: 策略 — 写工具仅限特定身份
+        if tool_name == "post_comment" and agent_name not in ("commenter", "orchestrator", ""):
+            raise PermissionError(f"{agent_name} 不允许直接发评论")
 
         handler = self._handlers.get(tool_name)
         if not handler:
             raise NotImplementedError(f"Tool '{tool_name}' has no handler")
 
-        logger.debug(f"Executing tool: {tool_name} with params: {params}")
+        logger.debug(f"Executing tool: {tool_name} (agent={agent_name})")
         return await handler(params, state)
 
     async def _read_diff(self, params: dict[str, Any], state: StateStore) -> str:

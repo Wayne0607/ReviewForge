@@ -46,7 +46,7 @@ class BaseReviewer:
         files = task.files or state.files_changed
         diffs = {}
         for f in files:
-            diffs[f] = await self._gateway.invoke("read_diff", {"file_path": f}, state) or ""
+            diffs[f] = await self._gateway.invoke("read_diff", {"file_path": f}, state, agent_name=self.name) or ""
 
         ctx = {
             "registry": self._registry,
@@ -57,28 +57,17 @@ class BaseReviewer:
         }
         messages = build_reviewer_prompt(ctx)
 
-        # Tool loop: LLM calls tools, we execute them
+        # D2: 单次 prompt → 解析（非 tool loop，未来可扩展 bind_tools）
         chat_messages = [
             SystemMessage(content=messages[0]["content"]),
             HumanMessage(content=messages[1]["content"]),
         ]
 
-        for step in range(self._max_steps):
-            response = await self._llm.ainvoke(chat_messages)
-            content = response.content
-
-            # Try to parse as findings output
-            findings = self._parse_findings(content)
-            if findings:
-                for f in findings:
-                    f.reviewer = self.name
-                return findings
-
-            # If LLM wants to use a tool (future: bind_tools)
-            chat_messages.append(response)
-            break  # For now, single-shot
-
-        return []
+        response = await self._llm.ainvoke(chat_messages)
+        findings = self._parse_findings(response.content)
+        for f in findings:
+            f.reviewer = self.name
+        return findings
 
     @staticmethod
     def _extract_json(content: str) -> dict | None:

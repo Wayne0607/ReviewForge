@@ -6,6 +6,7 @@ Persists all results to the database for dashboard consumption.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -20,6 +21,7 @@ from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
+from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
@@ -42,11 +44,13 @@ class Orchestrator:
         db: Database | None = None,
         cross_pr_llm: ChatOpenAI | None = None,
         github_client: Any = None,
+        model_router: ModelRouter | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._events = event_bus
         self._db = db
+        self._model_router = model_router  # D6: 多模型路由
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
@@ -101,62 +105,74 @@ class Orchestrator:
                 state.add_task(task)
             self._events.emit("planner.completed", {"task_count": len(tasks)})
 
-            # Phase 2: Execute reviewers
-            for task in state.list_tasks(status="pending"):
+            # D1: Phase 2 — 串行筛 loop + 并行执行 reviewer
+            import asyncio as _aio
+            pending = state.list_tasks(status="pending")
+
+            # 先串行做 loop 检查，过滤掉 stall/rescue
+            runnable = []
+            for task in pending:
                 sig = LoopDetector.make_signature(task.reviewer, task.files)
                 loop_result = loop_detector.check(sig)
-
                 if loop_result == "stall":
                     state.update_task(task.id, status="failed", error="loop_stalled")
                     self._events.emit("reviewer.stalled", {"task_id": task.id, "signature": sig})
-                    continue
-                if loop_result == "rescue":
+                elif loop_result == "rescue":
                     state.update_task(task.id, status="failed", error="rescue_drain")
                     self._events.emit("reviewer.rescued", {"task_id": task.id})
-                    continue
+                else:
+                    state.update_task(task.id, status="claimed")
+                    runnable.append(task)
 
-                state.update_task(task.id, status="claimed")
+            async def _run_one(task: ReviewTask) -> None:
                 self._events.emit("reviewer.started", {"reviewer": task.reviewer, "files": task.files})
-
                 t_start = time.monotonic()
                 try:
                     reviewer = self._create_reviewer(task.reviewer)
-                    if reviewer:
-                        findings = await reviewer.execute(task, state)
-                        for f in findings:
-                            state.add_finding(f)
-                        state.update_task(task.id, status="completed")
-                        self._events.emit("reviewer.completed", {
-                            "reviewer": task.reviewer,
-                            "findings_count": len(findings),
-                        })
-                        # Persist metric
-                        if self._db:
-                            duration_ms = int((time.monotonic() - t_start) * 1000)
-                            await self._db.insert_metric(
-                                run_id, task.reviewer,
-                                findings_count=len(findings),
-                                duration_ms=duration_ms,
-                            )
-                    else:
+                    if not reviewer:
                         state.update_task(task.id, status="failed", error=f"unknown reviewer: {task.reviewer}")
                         if self._db:
-                            await self._db.insert_metric(
-                                run_id, task.reviewer,
-                                status="failed", error=f"unknown reviewer: {task.reviewer}",
-                            )
+                            await self._db.insert_metric(run_id, task.reviewer,
+                                                         status="failed", error=f"unknown reviewer: {task.reviewer}")
+                        return
+                    findings = await reviewer.execute(task, state)
+                    for f in findings:
+                        state.add_finding(f)
+                    state.update_task(task.id, status="completed")
+                    self._events.emit("reviewer.completed", {
+                        "reviewer": task.reviewer, "findings_count": len(findings),
+                    })
+                    if self._db:
+                        await self._db.insert_metric(run_id, task.reviewer,
+                                                     findings_count=len(findings),
+                                                     duration_ms=int((time.monotonic() - t_start) * 1000))
                 except Exception as e:
                     state.update_task(task.id, status="failed", error=str(e))
                     self._events.emit("reviewer.failed", {"reviewer": task.reviewer, "error": str(e)})
                     if self._db:
-                        duration_ms = int((time.monotonic() - t_start) * 1000)
-                        await self._db.insert_metric(
-                            run_id, task.reviewer,
-                            duration_ms=duration_ms, status="failed", error=str(e),
-                        )
+                        await self._db.insert_metric(run_id, task.reviewer,
+                                                     duration_ms=int((time.monotonic() - t_start) * 1000),
+                                                     status="failed", error=str(e))
+
+            await _aio.gather(*(_run_one(t) for t in runnable))
 
             # Phase 3: Dynamic Calibration (adversarial verify + conditional judge)
-            candidates = state.list_findings(status="candidate")
+            # D4: 去重 — 按 file+line+category 归并，保留 confidence 最高的
+            raw_candidates = state.list_findings(status="candidate")
+            if raw_candidates:
+                seen: dict[tuple, Finding] = {}
+                for f in raw_candidates:
+                    key = (f.file, f.line, f.category)
+                    if key not in seen or f.confidence > seen[key].confidence:
+                        seen[key] = f
+                candidates = list(seen.values())
+                dedup_count = len(raw_candidates) - len(candidates)
+                if dedup_count > 0:
+                    logger.info(f"Dedup: {dedup_count} duplicate findings removed")
+                    self._events.emit("dedup.completed", {"removed": dedup_count})
+            else:
+                candidates = []
+
             if candidates:
                 self._events.emit("calibration.started", {"candidate_count": len(candidates)})
 
@@ -234,10 +250,18 @@ class Orchestrator:
             raise
 
     def _create_reviewer(self, name: str) -> BaseReviewer | None:
-        # Check built-in reviewers first, then plugins
+        """D6: 按 reviewer 名字解析 LLM（支持多模型路由）。"""
         cls = REVIEWER_MAP.get(name) or self._extra_reviewers.get(name)
         if cls:
-            return cls(self._reviewer_llm, self._registry, self._gateway)
+            # D6: 如果有 ModelRouter，按 agent 名字取对应 LLM
+            if self._model_router:
+                llm = self._model_router.get_llm(name)
+                # 包装 token tracking
+                if self._db:
+                    llm = TrackedChatLLM(inner=llm, ctx=self._token_ctx, agent_name=name)
+            else:
+                llm = self._reviewer_llm
+            return cls(llm, self._registry, self._gateway)
         return None
 
     async def _post_comments(self, findings: list[Finding], state: StateStore) -> int:
@@ -254,7 +278,7 @@ class Orchestrator:
                     "line": finding.line,
                     "body": self._format_comment(finding),
                     "severity": finding.severity,
-                }, state)
+                }, state, agent_name="orchestrator")
                 state.update_finding(finding.id, status="reported")
                 count += 1
             except Exception as e:

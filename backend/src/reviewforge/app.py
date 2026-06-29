@@ -65,7 +65,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
         if errors:
             raise RuntimeError(f"Spec validation failed: {errors}")
 
-        # LLM clients — multi-model routing
+        # LLM clients — D6: multi-model routing
+        model_router = None
         if mock_mode:
             from reviewforge.engine.mock_llm import MockChatLLM
             planner_llm = MockChatLLM()
@@ -74,10 +75,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
             logger.info("Mock mode: using MockChatLLM")
         else:
             from reviewforge.engine.model_router import ModelRouter
-            router = ModelRouter(cfg.llm)
-            planner_llm = router.get_llm("planner")
-            reviewer_llm = router.get_llm("reviewer")
-            verifier_llm = router.get_llm("verifier")
+            model_router = ModelRouter(cfg.llm)
+            planner_llm = model_router.get_llm("planner")
+            reviewer_llm = model_router.get_llm("reviewer")
+            verifier_llm = model_router.get_llm("verifier")
 
         # Database
         db = Database(Path(cfg.events_dir).parent / "reviewforge.db")
@@ -104,6 +105,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             db=db,
             cross_pr_llm=cross_pr_llm,
             github_client=github,
+            model_router=model_router,
         )
 
         # S4: 插件默认关闭，靠显式 env 开启

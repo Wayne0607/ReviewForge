@@ -1,0 +1,15 @@
+.git
+**/node_modules
+.venv
+.env*
+.reviewforge
+**/__pycache__
+*.egg-info
+dist
+build
+frontend/dist
+*.pyc
+.DS_Store
+Thumbs.db
+.vscode
+.idea

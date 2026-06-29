@@ -145,17 +145,27 @@ class CrossPRAnalyzer:
         return cross_findings
 
     def _extract_file_diff(self, diff_summary: str, file_path: str) -> str:
-        """Extract the diff portion for a specific file."""
+        """Extract the diff portion for a specific file.
+
+        The diff_summary format from the webhook is:
+            --- filename.py (+10 -5)
+            <patch content>
+        """
         lines = diff_summary.split("\n")
         result = []
         in_target = False
 
         for line in lines:
-            if line.startswith("diff --git"):
-                in_target = file_path in line
+            if line.startswith("--- "):
+                # Check if this is the target file
+                header_file = line.split(" ")[1] if len(line.split(" ")) > 1 else ""
+                in_target = file_path.endswith(header_file) or header_file.endswith(file_path)
                 if in_target:
                     result.append(line)
             elif in_target:
+                # Stop at next file header
+                if line.startswith("--- ") and not in_target:
+                    break
                 result.append(line)
 
         return "\n".join(result)

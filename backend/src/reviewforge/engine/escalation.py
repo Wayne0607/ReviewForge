@@ -183,7 +183,7 @@ class EscalationReviewer:
                     {
                         "finding_id": finding_id,
                         "step": step,
-                        "tokens": getattr(resp, "usage_metadata", {}).get("total_tokens", 0),
+                        "tokens": (getattr(resp, "usage_metadata", None) or {}).get("total_tokens", 0),
                     },
                 )
 

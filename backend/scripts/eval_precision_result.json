@@ -1,0 +1,271 @@
+{
+  "mode": "mock",
+  "single_shot": {
+    "tp": 0,
+    "fp": 0,
+    "fn": 11,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tokens": 0,
+    "latency_s": 0.0,
+    "detail": [
+      {
+        "fixture": "clean_parameterized.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [],
+        "matched": [],
+        "missed": [],
+        "extra": []
+      },
+      {
+        "fixture": "clean_validated.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [],
+        "matched": [],
+        "missed": [],
+        "extra": []
+      },
+      {
+        "fixture": "vulnerable_sample.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection",
+          "weak-crypto"
+        ],
+        "matched": [],
+        "missed": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection",
+          "weak-crypto"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_cmd.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "command-injection"
+        ],
+        "matched": [],
+        "missed": [
+          "command-injection"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_deser.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "insecure-deserialization"
+        ],
+        "matched": [],
+        "missed": [
+          "insecure-deserialization"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_eval.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "code-injection"
+        ],
+        "matched": [],
+        "missed": [
+          "code-injection"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_secrets.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "hardcoded-secrets"
+        ],
+        "matched": [],
+        "missed": [
+          "hardcoded-secrets"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_sql.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "sql-injection"
+        ],
+        "matched": [],
+        "missed": [
+          "sql-injection"
+        ],
+        "extra": []
+      }
+    ]
+  },
+  "agentic": {
+    "tp": 0,
+    "fp": 0,
+    "fn": 11,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tokens": 0,
+    "latency_s": 0.0,
+    "detail": [
+      {
+        "fixture": "clean_parameterized.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [],
+        "matched": [],
+        "missed": [],
+        "extra": []
+      },
+      {
+        "fixture": "clean_validated.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [],
+        "matched": [],
+        "missed": [],
+        "extra": []
+      },
+      {
+        "fixture": "vulnerable_sample.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection",
+          "weak-crypto"
+        ],
+        "matched": [],
+        "missed": [
+          "code-injection",
+          "command-injection",
+          "hardcoded-secrets",
+          "insecure-deserialization",
+          "sql-injection",
+          "weak-crypto"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_cmd.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "command-injection"
+        ],
+        "matched": [],
+        "missed": [
+          "command-injection"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_deser.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "insecure-deserialization"
+        ],
+        "matched": [],
+        "missed": [
+          "insecure-deserialization"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_eval.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "code-injection"
+        ],
+        "matched": [],
+        "missed": [
+          "code-injection"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_secrets.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "hardcoded-secrets"
+        ],
+        "matched": [],
+        "missed": [
+          "hardcoded-secrets"
+        ],
+        "extra": []
+      },
+      {
+        "fixture": "vuln_sql.py",
+        "categories": [],
+        "tokens": 0,
+        "calls": 1,
+        "latency_s": 0.0,
+        "expected": [
+          "sql-injection"
+        ],
+        "matched": [],
+        "missed": [
+          "sql-injection"
+        ],
+        "extra": []
+      }
+    ]
+  }
+}

@@ -254,10 +254,13 @@ class Orchestrator:
             if dropped_ids:
                 self._events.emit("verifier.completed", {"kept": len(candidates), "merged": len(dropped_ids)})
 
-            # Phase 3.5: Escalation — agentic verification of uncertain findings.
-            # Only runs when escalation is enabled and there are candidates.
+            # Phase 3.5/4: split candidates — trace/uncertain findings → Escalation
+            # (agentic verify, verdict is FINAL); the rest → Dynamic Calibration. Mutually
+            # exclusive, so a finding is judged once and escalation verdicts are never
+            # overwritten by the calibrator's security auto-confirm.
+            esc_set: list[Finding] = []
+            calib_set: list[Finding] = []
             if candidates and self._escalation_enabled:
-                # Lazy-init escalation reviewer
                 if self._escalation_reviewer is None:
                     esc_llm = self._escalation_llm_raw
                     if self._db:
@@ -271,15 +274,37 @@ class Orchestrator:
                         confidence_max=self._escalation_confidence_max,
                         event_bus=self._events,
                     )
-                self._events.emit("escalation.started", {"candidate_count": len(candidates)})
-                candidates = await self._escalation_reviewer.escalate_batch(candidates, state)
+                for f in candidates:
+                    bucket = (
+                        esc_set
+                        if EscalationReviewer.should_escalate(
+                            f, self._escalation_confidence_min, self._escalation_confidence_max
+                        )
+                        else calib_set
+                    )
+                    bucket.append(f)
+            else:
+                calib_set = list(candidates)
 
-            if candidates:
-                self._events.emit("calibration.started", {"candidate_count": len(candidates)})
+            if esc_set:
+                self._events.emit("escalation.started", {"candidate_count": len(esc_set)})
+                escalated = await self._escalation_reviewer.escalate_batch(esc_set, state)
+                for f in escalated:
+                    if f.status in ("confirmed", "false_positive"):
+                        state.update_finding(
+                            f.id, status=f.status, verified_by=f.verified_by, verify_reason=f.verify_reason
+                        )
+                self._events.emit(
+                    "escalation.completed",
+                    {
+                        "confirmed": len([f for f in escalated if f.status == "confirmed"]),
+                        "filtered": len([f for f in escalated if f.status == "false_positive"]),
+                    },
+                )
 
-                diff_context = state.diff_summary
-                calibrated = await self._calibrator.calibrate(candidates, diff_context)
-
+            if calib_set:
+                self._events.emit("calibration.started", {"candidate_count": len(calib_set)})
+                calibrated = await self._calibrator.calibrate(calib_set, state.diff_summary)
                 for f in calibrated:
                     if f.status == "confirmed":
                         state.update_finding(
@@ -289,15 +314,11 @@ class Orchestrator:
                         state.update_finding(
                             f.id, status="false_positive", verified_by=f.verified_by, verify_reason=f.verify_reason
                         )
-
                 confirmed_count = len([f for f in calibrated if f.status == "confirmed"])
                 filtered_count = len([f for f in calibrated if f.status == "false_positive"])
                 self._events.emit(
                     "calibration.completed",
-                    {
-                        "confirmed": confirmed_count,
-                        "filtered": filtered_count,
-                    },
+                    {"confirmed": confirmed_count, "filtered": filtered_count},
                 )
 
             # Phase 3.5: Cross-PR Analysis

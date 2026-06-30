@@ -10,6 +10,9 @@ Escalation criteria (deterministic, zero LLM cost):
 
 This replaces the old "agentic default on for all reviewers" with a targeted
 approach: same accuracy, ~1/3 token cost on clean/obvious code.
+
+Architecture:
+    Planner → Reviewers(single-shot) → Verifier(dedup) → Escalation → Calibrator → Commenter
 """
 
 from __future__ import annotations

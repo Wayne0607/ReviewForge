@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Main review loop: Planner → Reviewers → Dynamic Calibration → Commenter."""
+    """Main review loop: Planner → Reviewers → Verifier → Escalation → Calibrator → Commenter."""
 
     def __init__(
         self,

@@ -178,10 +178,14 @@ class EscalationReviewer:
             budget.add(resp)
 
             if self._events:
-                self._events.emit("escalation.step", {
-                    "finding_id": finding_id, "step": step,
-                    "tokens": getattr(resp, "usage_metadata", {}).get("total_tokens", 0),
-                })
+                self._events.emit(
+                    "escalation.step",
+                    {
+                        "finding_id": finding_id,
+                        "step": step,
+                        "tokens": getattr(resp, "usage_metadata", {}).get("total_tokens", 0),
+                    },
+                )
 
             tool_calls = getattr(resp, "tool_calls", None) or []
             if not tool_calls:
@@ -292,11 +296,14 @@ class EscalationReviewer:
             await asyncio.gather(*tasks)
 
         if self._events:
-            self._events.emit("escalation.completed", {
-                "total": len(findings),
-                "escalated": len(tasks),
-                "skipped": skipped,
-            })
+            self._events.emit(
+                "escalation.completed",
+                {
+                    "total": len(findings),
+                    "escalated": len(tasks),
+                    "skipped": skipped,
+                },
+            )
             logger.info(f"Escalation: {len(tasks)} escalated, {skipped} skipped")
 
         return [r for r in results if r is not None]

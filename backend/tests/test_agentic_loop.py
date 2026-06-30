@@ -154,8 +154,11 @@ async def test_singleshot_parse_invalid_json(registry, gateway, state, task):
     from reviewforge.engine.reviewers import BaseReviewer
 
     reviewer = BaseReviewer(
-        name="test", reviewer_type="test",
-        llm=MockChatLLM(), registry=registry, gateway=gateway,
+        name="test",
+        reviewer_type="test",
+        llm=MockChatLLM(),
+        registry=registry,
+        gateway=gateway,
     )
     # _parse_findings with garbage input
     findings = reviewer._parse_findings("this is not json")
@@ -166,26 +169,32 @@ async def test_singleshot_parse_invalid_json(registry, gateway, state, task):
 async def test_singleshot_parse_valid_findings(registry, gateway):
     """_parse_findings should correctly parse JSON findings."""
     import json
+
     from reviewforge.engine.reviewers import BaseReviewer
 
     reviewer = BaseReviewer(
-        name="test", reviewer_type="test",
-        llm=MockChatLLM(), registry=registry, gateway=gateway,
+        name="test",
+        reviewer_type="test",
+        llm=MockChatLLM(),
+        registry=registry,
+        gateway=gateway,
     )
 
-    content = json.dumps({
-        "findings": [
-            {
-                "file": "test.py",
-                "line": 5,
-                "severity": "error",
-                "category": "sql-injection",
-                "message": "SQL injection risk",
-                "suggestion": "Use parameterized queries",
-                "confidence": 0.95,
-            }
-        ]
-    })
+    content = json.dumps(
+        {
+            "findings": [
+                {
+                    "file": "test.py",
+                    "line": 5,
+                    "severity": "error",
+                    "category": "sql-injection",
+                    "message": "SQL injection risk",
+                    "suggestion": "Use parameterized queries",
+                    "confidence": 0.95,
+                }
+            ]
+        }
+    )
 
     findings = reviewer._parse_findings(content)
     assert len(findings) == 1

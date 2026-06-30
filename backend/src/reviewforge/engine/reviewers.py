@@ -66,9 +66,7 @@ def build_reviewer_tools(
             name="search_code",
             description="在仓库搜索代码，定位调用方/定义，判断输入是否在别处已被校验",
         ),
-        StructuredTool.from_function(
-            coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"
-        ),
+        StructuredTool.from_function(coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"),
     ]
 
     # Level-3 progressive disclosure: pull deeper Skill reference files on demand.
@@ -264,8 +262,12 @@ class BaseReviewer:
     def _build_tools(self, state: StateStore) -> list[StructuredTool]:
         """Wrap gateway read-only tools as LangChain tools (no post_comment)."""
         return build_reviewer_tools(
-            self._gateway, state, self.name,
-            self._skill_loader, self._skill_name, self._skill_refs,
+            self._gateway,
+            state,
+            self.name,
+            self._skill_loader,
+            self._skill_name,
+            self._skill_refs,
         )
 
     def _emit_step_event(self, state: StateStore, step: int, resp: Any) -> None:

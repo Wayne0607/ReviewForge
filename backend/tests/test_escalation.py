@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from reviewforge.core.specs import build_registry
@@ -22,7 +20,9 @@ def gateway():
 @pytest.fixture
 def state():
     s = StateStore(
-        pr_number=1, repo="test/repo", head_sha="abc123",
+        pr_number=1,
+        repo="test/repo",
+        head_sha="abc123",
         files_changed=["app.py"],
         diff_summary="--- app.py\n+import os\n+os.system(cmd)",
     )
@@ -31,15 +31,20 @@ def state():
 
 def _make_finding(**overrides) -> Finding:
     defaults = {
-        "file": "app.py", "line": 5, "severity": "warning",
-        "category": "sql-injection", "message": "SQL injection risk",
-        "suggestion": "Use parameterized queries", "confidence": 0.6,
+        "file": "app.py",
+        "line": 5,
+        "severity": "warning",
+        "category": "sql-injection",
+        "message": "SQL injection risk",
+        "suggestion": "Use parameterized queries",
+        "confidence": 0.6,
     }
     defaults.update(overrides)
     return Finding(**defaults)
 
 
 # ── should_escalate ──────────────────────────────────────────────
+
 
 class TestShouldEscalate:
     def test_fuzzy_confidence_triggers(self):
@@ -94,6 +99,7 @@ class TestShouldEscalate:
 
 # ── escalate (mock LLM) ──────────────────────────────────────────
 
+
 class TestEscalate:
     @pytest.mark.asyncio
     async def test_escalate_high_confidence_skips(self):
@@ -114,7 +120,9 @@ class TestEscalate:
         gw = ToolGateway(build_registry(), MockGitHubClient())
         esc = EscalationReviewer(llm, gw)
         state = StateStore(
-            pr_number=1, repo="t/t", head_sha="x",
+            pr_number=1,
+            repo="t/t",
+            head_sha="x",
             files_changed=["app.py"],
             diff_summary="--- app.py\n+os.system(cmd)",
         )
@@ -150,7 +158,9 @@ class TestEscalate:
         gw = ToolGateway(build_registry(), MockGitHubClient())
         esc = EscalationReviewer(llm, gw)
         state = StateStore(
-            pr_number=1, repo="t/t", head_sha="x",
+            pr_number=1,
+            repo="t/t",
+            head_sha="x",
             files_changed=["app.py"],
             diff_summary="--- app.py\n+import os",
         )
@@ -169,6 +179,7 @@ class TestEscalate:
 
 
 # ── _parse_verdict ───────────────────────────────────────────────
+
 
 class TestParseVerdict:
     def test_parse_clean_json(self):
@@ -196,6 +207,7 @@ class TestParseVerdict:
 
 
 # ── _apply_verdict ───────────────────────────────────────────────
+
 
 class TestApplyVerdict:
     def test_apply_confirmed(self):

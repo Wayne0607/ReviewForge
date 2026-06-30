@@ -26,6 +26,74 @@ from reviewforge.tools.gateway import ToolGateway
 logger = logging.getLogger(__name__)
 
 
+def build_reviewer_tools(
+    gateway: ToolGateway,
+    state: StateStore,
+    agent_name: str,
+    skill_loader: Any = None,
+    skill_name: str = "",
+    skill_refs: list[str] | None = None,
+) -> list[StructuredTool]:
+    """Build read-only LangChain tools for agentic reviewers.
+
+    Extracted from BaseReviewer so EscalationReviewer can reuse the same tool set.
+    """
+    gw = gateway
+
+    async def read_file(file_path: str) -> str:
+        """Read full file content at PR head commit."""
+        return await gw.invoke("read_file", {"file_path": file_path}, state, agent_name=agent_name) or ""
+
+    async def search_code(pattern: str, file_glob: str = "") -> str:
+        """Search code in repo by pattern."""
+        return (
+            await gw.invoke("search_code", {"pattern": pattern, "file_glob": file_glob}, state, agent_name=agent_name)
+            or ""
+        )
+
+    async def read_diff(file_path: str) -> str:
+        """Read diff for a specific file in this PR."""
+        return await gw.invoke("read_diff", {"file_path": file_path}, state, agent_name=agent_name) or ""
+
+    tools = [
+        StructuredTool.from_function(
+            coroutine=read_file,
+            name="read_file",
+            description="读取文件在 PR head 版本的完整内容；当 diff 上下文不足以判断时使用",
+        ),
+        StructuredTool.from_function(
+            coroutine=search_code,
+            name="search_code",
+            description="在仓库搜索代码，定位调用方/定义，判断输入是否在别处已被校验",
+        ),
+        StructuredTool.from_function(
+            coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"
+        ),
+    ]
+
+    # Level-3 progressive disclosure: pull deeper Skill reference files on demand.
+    if skill_loader and skill_name and (skill_refs or []):
+        loader = skill_loader
+        sname = skill_name
+
+        async def read_reference(ref_path: str) -> str:
+            """读取本审查维度 Skill 的深层参考文件（references/ 下）。"""
+            try:
+                return loader.read_ref(sname, ref_path)
+            except Exception as e:
+                return f"reference read failed: {e}"
+
+        tools.append(
+            StructuredTool.from_function(
+                coroutine=read_reference,
+                name="read_reference",
+                description="读取本维度 Skill 的深层规则参考文件（Level 3，按需）",
+            )
+        )
+
+    return tools
+
+
 class BaseReviewer:
     """Base class for all reviewers.
 
@@ -195,61 +263,10 @@ class BaseReviewer:
 
     def _build_tools(self, state: StateStore) -> list[StructuredTool]:
         """Wrap gateway read-only tools as LangChain tools (no post_comment)."""
-        gw = self._gateway
-        name = self.name
-
-        async def read_file(file_path: str) -> str:
-            """Read full file content at PR head commit."""
-            return await gw.invoke("read_file", {"file_path": file_path}, state, agent_name=name) or ""
-
-        async def search_code(pattern: str, file_glob: str = "") -> str:
-            """Search code in repo by pattern."""
-            return (
-                await gw.invoke("search_code", {"pattern": pattern, "file_glob": file_glob}, state, agent_name=name)
-                or ""
-            )
-
-        async def read_diff(file_path: str) -> str:
-            """Read diff for a specific file in this PR."""
-            return await gw.invoke("read_diff", {"file_path": file_path}, state, agent_name=name) or ""
-
-        tools = [
-            StructuredTool.from_function(
-                coroutine=read_file,
-                name="read_file",
-                description="读取文件在 PR head 版本的完整内容；当 diff 上下文不足以判断时使用",
-            ),
-            StructuredTool.from_function(
-                coroutine=search_code,
-                name="search_code",
-                description="在仓库搜索代码，定位调用方/定义，判断输入是否在别处已被校验",
-            ),
-            StructuredTool.from_function(
-                coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"
-            ),
-        ]
-
-        # Level-3 progressive disclosure: pull deeper Skill reference files on demand.
-        if self._skill_loader and self._skill_name and self._skill_refs:
-            loader = self._skill_loader
-            skill_name = self._skill_name
-
-            async def read_reference(ref_path: str) -> str:
-                """读取本审查维度 Skill 的深层参考文件（references/ 下）。"""
-                try:
-                    return loader.read_ref(skill_name, ref_path)
-                except Exception as e:
-                    return f"reference read failed: {e}"
-
-            tools.append(
-                StructuredTool.from_function(
-                    coroutine=read_reference,
-                    name="read_reference",
-                    description="读取本维度 Skill 的深层规则参考文件（Level 3，按需）",
-                )
-            )
-
-        return tools
+        return build_reviewer_tools(
+            self._gateway, state, self.name,
+            self._skill_loader, self._skill_name, self._skill_refs,
+        )
 
     def _emit_step_event(self, state: StateStore, step: int, resp: Any) -> None:
         """Emit per-step token usage event."""

@@ -81,3 +81,11 @@ events_dir: ".reviewforge/events"
 
 # 全局置信度阈值（低于此值的发现不发评论）
 confidence_threshold: 0.5
+
+# Escalation：对不确定的 finding 自动用工具核实
+escalation:
+  enabled: true
+  confidence_min: 0.4
+  confidence_max: 0.7
+  max_steps: 3
+  max_tokens: 5000

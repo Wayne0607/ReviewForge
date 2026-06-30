@@ -69,7 +69,14 @@ class ReviewForgeConfig:
     events_dir: str = ".reviewforge/events"
     confidence_threshold: float = 0.5
     agentic_reviewers: list[str] = field(default_factory=list)
-    agentic_default: bool = True  # reviewers run the agentic tool loop by default
+    agentic_default: bool = False  # default OFF — escalate-on-uncertainty replaces full agentic
+
+    # Escalation: auto-verify uncertain findings with agentic tools
+    escalation_enabled: bool = True
+    escalation_confidence_min: float = 0.4
+    escalation_confidence_max: float = 0.7
+    escalation_max_steps: int = 3
+    escalation_max_tokens: int = 5000
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> ReviewForgeConfig:
@@ -128,6 +135,12 @@ class ReviewForgeConfig:
             self.events_dir = data["events_dir"]
         if "confidence_threshold" in data:
             self.confidence_threshold = data["confidence_threshold"]
+        if "escalation" in data:
+            esc = data["escalation"]
+            for k, v in esc.items():
+                attr = f"escalation_{k}"
+                if hasattr(self, attr):
+                    setattr(self, attr, v)
 
     def _apply_env(self) -> None:
         """Environment variables override config file."""
@@ -148,3 +161,7 @@ class ReviewForgeConfig:
         default_flag = os.environ.get("REVIEWFORGE_AGENTIC_DEFAULT")
         if default_flag is not None:
             self.agentic_default = default_flag.strip().lower() not in ("0", "false", "no", "")
+        # Escalation env overrides
+        esc_flag = os.environ.get("REVIEWFORGE_ESCALATION_ENABLED")
+        if esc_flag is not None:
+            self.escalation_enabled = esc_flag.strip().lower() not in ("0", "false", "no", "")

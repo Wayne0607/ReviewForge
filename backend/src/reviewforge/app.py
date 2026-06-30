@@ -106,6 +106,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
             model_router=model_router,
             agentic_reviewers=cfg.agentic_reviewers,
             agentic_default=cfg.agentic_default,
+            escalation_enabled=cfg.escalation_enabled,
+            escalation_confidence_min=cfg.escalation_confidence_min,
+            escalation_confidence_max=cfg.escalation_confidence_max,
+            escalation_max_steps=cfg.escalation_max_steps,
+            escalation_max_tokens=cfg.escalation_max_tokens,
         )
 
         # S4: 插件默认关闭，靠显式 env 开启

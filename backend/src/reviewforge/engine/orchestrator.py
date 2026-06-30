@@ -21,6 +21,7 @@ from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
+from reviewforge.engine.escalation import EscalationReviewer
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
@@ -47,7 +48,12 @@ class Orchestrator:
         github_client: Any = None,
         model_router: ModelRouter | None = None,
         agentic_reviewers: list[str] | None = None,
-        agentic_default: bool = True,
+        agentic_default: bool = False,
+        escalation_enabled: bool = True,
+        escalation_confidence_min: float = 0.4,
+        escalation_confidence_max: float = 0.7,
+        escalation_max_steps: int = 3,
+        escalation_max_tokens: int = 5000,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -57,8 +63,16 @@ class Orchestrator:
         self._agentic_reviewers = set(agentic_reviewers or [])  # W1: agentic 显式 allowlist
         self._agentic_default = agentic_default  # #1: 无 allowlist 时所有 reviewer 默认走工具循环
 
+        # Escalation config
+        self._escalation_enabled = escalation_enabled
+        self._escalation_confidence_min = escalation_confidence_min
+        self._escalation_confidence_max = escalation_confidence_max
+        self._escalation_max_steps = escalation_max_steps
+        self._escalation_max_tokens = escalation_max_tokens
+
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
+        self._escalation_llm_raw = reviewer_llm  # store for lazy init
 
         # Wrap LLMs with token tracking if DB available
         if db:
@@ -76,6 +90,10 @@ class Orchestrator:
 
         self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
         self._verifier = Verifier()  # #5: 纯逻辑去重/合并阶段（在 LLM 校准之前）
+
+        # Escalation reviewer (initialized lazily — needs LLM which might be tracked)
+        self._escalation_llm = None  # set below
+        self._escalation_reviewer: EscalationReviewer | None = None
         # B4: LoopDetector 每 run 新建，避免跨 run 状态污染
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
@@ -238,6 +256,24 @@ class Orchestrator:
                 )
             if dropped_ids:
                 self._events.emit("verifier.completed", {"kept": len(candidates), "merged": len(dropped_ids)})
+
+            # Phase 3.5: Escalation — agentic verification of uncertain findings.
+            # Only runs when escalation is enabled and there are candidates.
+            if candidates and self._escalation_enabled:
+                # Lazy-init escalation reviewer
+                if self._escalation_reviewer is None:
+                    esc_llm = self._escalation_llm_raw
+                    if self._db:
+                        esc_llm = TrackedChatLLM(inner=esc_llm, ctx=self._token_ctx, agent_name="escalation")
+                    self._escalation_reviewer = EscalationReviewer(
+                        llm=esc_llm,
+                        gateway=self._gateway,
+                        max_steps=self._escalation_max_steps if hasattr(self, '_escalation_max_steps') else 3,
+                        max_tokens=self._escalation_max_tokens if hasattr(self, '_escalation_max_tokens') else 5000,
+                        event_bus=self._events,
+                    )
+                self._events.emit("escalation.started", {"candidate_count": len(candidates)})
+                candidates = await self._escalation_reviewer.escalate_batch(candidates, state)
 
             if candidates:
                 self._events.emit("calibration.started", {"candidate_count": len(candidates)})

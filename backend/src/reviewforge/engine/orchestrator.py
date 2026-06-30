@@ -113,6 +113,64 @@ class Orchestrator:
         """Merge plugin-loaded reviewers into the reviewer map."""
         self._extra_reviewers.update(plugins)
 
+    @property
+    def skills_dir(self):
+        """Directory the SkillLoader scans (for console-driven skill CRUD)."""
+        return self._skill_loader._skills_dir
+
+    def reload_skills(self) -> int:
+        """Re-scan the skills directory and rebuild the reviewer_type → SkillMeta map.
+
+        Skill *bodies* are already read fresh per run; this picks up new skills and
+        changed frontmatter (the type mapping) without a restart. Returns skill count.
+        """
+        self._skills_by_type = {}
+        metas = self._skill_loader.discover()
+        for meta in metas:
+            if meta.reviewer_type and meta.reviewer_type not in self._skills_by_type:
+                self._skills_by_type[meta.reviewer_type] = meta
+        return len(metas)
+
+    def register_config_agent(
+        self,
+        *,
+        reviewer_type: str,
+        description: str,
+        allowed_tools: list[str],
+        model_profile: str = "default",
+        max_steps: int = 6,
+        instructions: str = "",
+    ) -> str:
+        """Register a config-type reviewer into the live registry + reviewer map (no restart).
+
+        Returns the reviewer name (``<reviewer_type>_reviewer``).
+        """
+        from reviewforge.core.specs import AgentSpec
+        from reviewforge.engine.generic_reviewer import make_config_reviewer
+
+        name = f"{reviewer_type}_reviewer"
+        self._registry.register_agent(
+            AgentSpec(
+                name=name,
+                role="executor",
+                description=description,
+                allowed_tools=list(allowed_tools),
+                model_profile=model_profile,
+                max_steps=max_steps,
+            )
+        )
+        self._extra_reviewers[name] = make_config_reviewer(
+            name=name, reviewer_type=reviewer_type, instructions=instructions, max_steps=max_steps
+        )
+        return name
+
+    def unregister_config_agent(self, reviewer_type: str) -> bool:
+        """Remove a config-type reviewer from the live registry + reviewer map."""
+        name = f"{reviewer_type}_reviewer"
+        removed = self._extra_reviewers.pop(name, None) is not None
+        self._registry.unregister_agent(name)
+        return removed
+
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
         loop_detector = LoopDetector()  # B4: per-run instance
@@ -403,6 +461,9 @@ class Orchestrator:
 
     def _attach_skill(self, reviewer: BaseReviewer) -> None:
         """渐进式 Skill 加载（Level 2）：把匹配 reviewer_type 的 SKILL.md 注入该 reviewer。"""
+        # Config-type agents carry inline instructions as their skill body — don't clobber.
+        if getattr(reviewer, "_skill_body", ""):
+            return
         meta = self._skills_by_type.get(reviewer.reviewer_type)
         if not meta:
             return

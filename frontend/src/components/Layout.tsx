@@ -6,12 +6,16 @@ import {
   BarChart3,
   Server,
   Shield,
+  BookOpen,
+  Bot,
 } from 'lucide-react'
 
 const NAV_ITEMS = [
   { to: '/', label: '总览', icon: LayoutDashboard },
   { to: '/reviews', label: '审查记录', icon: GitPullRequest },
   { to: '/analytics', label: '趋势分析', icon: BarChart3 },
+  { to: '/skills', label: 'Skills', icon: BookOpen },
+  { to: '/agents', label: 'Agents', icon: Bot },
   { to: '/system', label: '系统信息', icon: Server },
 ]
 

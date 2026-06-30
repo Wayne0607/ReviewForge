@@ -126,6 +126,31 @@ def create_app(config_path: str | None = None) -> FastAPI:
         else:
             logger.info("插件加载已禁用（设 REVIEWFORGE_ENABLE_PLUGINS=1 开启）")
 
+        # Console-driven Skills + config-type Agents (CRUD via /api/v1/admin, hot-reloaded)
+        from reviewforge.core.custom_store import CustomAgentStore, SkillStore
+
+        app.state.skill_store = SkillStore(orchestrator.skills_dir)
+        custom_agent_store = CustomAgentStore(Path(cfg.events_dir).parent / "custom_agents.json")
+        loaded_agents = 0
+        for spec in custom_agent_store.list():
+            if not spec.get("enabled", True):
+                continue
+            try:
+                orchestrator.register_config_agent(
+                    reviewer_type=spec["reviewer_type"],
+                    description=spec.get("description", ""),
+                    allowed_tools=spec.get("allowed_tools", []),
+                    model_profile=spec.get("model_profile", "default"),
+                    max_steps=spec.get("max_steps", 6),
+                    instructions=spec.get("instructions", ""),
+                )
+                loaded_agents += 1
+            except Exception as e:
+                logger.warning(f"Failed to register custom agent {spec.get('reviewer_type')}: {e}")
+        app.state.custom_agent_store = custom_agent_store
+        if loaded_agents:
+            logger.info(f"Loaded {loaded_agents} custom config-type agent(s)")
+
         # S7: 并发控制
         app.state.review_tasks = set()
         app.state.review_semaphore = asyncio.Semaphore(int(os.environ.get("REVIEWFORGE_MAX_CONCURRENT_REVIEWS", "3")))
@@ -169,6 +194,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
     from reviewforge.api.dashboard import router as dashboard_router
 
     app.include_router(dashboard_router, dependencies=[Depends(require_token)])
+
+    # Admin API (console-driven Skill/Agent CRUD; S2: 需要 token)
+    from reviewforge.api.admin import router as admin_router
+
+    app.include_router(admin_router, dependencies=[Depends(require_token)])
 
     @app.get("/health")
     async def health():

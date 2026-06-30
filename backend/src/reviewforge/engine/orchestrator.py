@@ -90,9 +90,6 @@ class Orchestrator:
 
         self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
         self._verifier = Verifier()  # #5: 纯逻辑去重/合并阶段（在 LLM 校准之前）
-
-        # Escalation reviewer (initialized lazily — needs LLM which might be tracked)
-        self._escalation_llm = None  # set below
         self._escalation_reviewer: EscalationReviewer | None = None
         # B4: LoopDetector 每 run 新建，避免跨 run 状态污染
         # Plugin-loaded reviewers (merged at init time)
@@ -268,8 +265,8 @@ class Orchestrator:
                     self._escalation_reviewer = EscalationReviewer(
                         llm=esc_llm,
                         gateway=self._gateway,
-                        max_steps=self._escalation_max_steps if hasattr(self, '_escalation_max_steps') else 3,
-                        max_tokens=self._escalation_max_tokens if hasattr(self, '_escalation_max_tokens') else 5000,
+                        max_steps=self._escalation_max_steps,
+                        max_tokens=self._escalation_max_tokens,
                         event_bus=self._events,
                     )
                 self._events.emit("escalation.started", {"candidate_count": len(candidates)})

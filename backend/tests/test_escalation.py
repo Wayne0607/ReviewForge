@@ -57,11 +57,17 @@ class TestShouldEscalate:
         f = _make_finding(confidence=0.2, category="naming")
         assert EscalationReviewer.should_escalate(f) is False
 
-    def test_trace_category_always_escalates(self):
-        """Trace-type categories escalate regardless of confidence."""
+    def test_trace_category_escalates_when_uncertain(self):
+        """Trace-type categories escalate when confidence < 0.85."""
+        for cat in TRACE_CATEGORIES:
+            f = _make_finding(confidence=0.7, category=cat)
+            assert EscalationReviewer.should_escalate(f) is True, f"{cat} should escalate at conf=0.7"
+
+    def test_trace_category_skips_when_high_confidence(self):
+        """Trace-type categories skip when confidence >= 0.85."""
         for cat in TRACE_CATEGORIES:
             f = _make_finding(confidence=0.95, category=cat)
-            assert EscalationReviewer.should_escalate(f) is True, f"{cat} should escalate"
+            assert EscalationReviewer.should_escalate(f) is False, f"{cat} should not escalate at conf=0.95"
 
     def test_style_category_only_on_fuzzy(self):
         """Non-trace categories only escalate when confidence is fuzzy."""
@@ -150,7 +156,7 @@ class TestEscalate:
         )
 
         findings = [
-            _make_finding(confidence=0.9, category="command-injection"),  # trace → escalate
+            _make_finding(confidence=0.6, category="command-injection"),  # trace + fuzzy → escalate
             _make_finding(confidence=0.9, category="naming"),  # high conf, non-trace → skip
         ]
 

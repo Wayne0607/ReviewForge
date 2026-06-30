@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import { ReactNode, useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard,
@@ -8,7 +8,9 @@ import {
   Shield,
   BookOpen,
   Bot,
+  KeyRound,
 } from 'lucide-react'
+import { TOKEN_KEY } from '../api/client'
 
 const NAV_ITEMS = [
   { to: '/', label: '总览', icon: LayoutDashboard },
@@ -20,6 +22,14 @@ const NAV_ITEMS = [
 ]
 
 export default function Layout({ children }: { children: ReactNode }) {
+  const [token, setToken] = useState(() =>
+    typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) ?? '' : ''
+  )
+  const saveToken = () => {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+    window.location.reload() // refetch everything with the new header
+  }
   return (
     <div className="flex h-screen overflow-hidden">
       {/* Sidebar */}
@@ -53,6 +63,27 @@ export default function Layout({ children }: { children: ReactNode }) {
             </NavLink>
           ))}
         </nav>
+
+        {/* API token (stored in this browser only; not baked into the build) */}
+        <div className="px-4 py-3 border-t border-gray-700">
+          <label htmlFor="rf-token" className="flex items-center gap-1.5 text-xs text-gray-400 mb-1">
+            <KeyRound className="w-3.5 h-3.5" /> API Token
+          </label>
+          <div className="flex gap-1">
+            <input
+              id="rf-token"
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && saveToken()}
+              placeholder="粘贴 REVIEWFORGE_API_TOKEN"
+              className="flex-1 min-w-0 bg-gray-800 text-gray-100 text-xs rounded px-2 py-1 border border-gray-700 focus:border-brand-500 outline-none"
+            />
+            <button onClick={saveToken} className="text-xs px-2.5 py-1 bg-brand-600 hover:bg-brand-700 rounded text-white shrink-0">
+              保存
+            </button>
+          </div>
+        </div>
 
         {/* Footer */}
         <div className="px-6 py-4 border-t border-gray-700 text-xs text-gray-500">

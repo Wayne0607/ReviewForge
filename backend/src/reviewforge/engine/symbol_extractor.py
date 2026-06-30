@@ -38,10 +38,10 @@ def detect_language(file_path: str) -> str:
 
 IMPORT_PATTERNS: dict[str, list[tuple[str, str]]] = {
     "python": [
-        # from x.y.z import func_name
-        (r"from\s+([\w.]+)\s+import\s+(\w+)", "named"),
-        # from x.y import *  (treat as module import)
+        # from x.y import *  (treat as module import) — checked before the named list
         (r"from\s+([\w.]+)\s+import\s+\*", "wildcard"),
+        # from x.y.z import a, b as c, d  (comma list, optionally with trailing comment)
+        (r"from\s+([\w.]+)\s+import\s+(\w[\w ,]*?)\s*(?:#.*)?$", "named"),
         # from x.y.z import (a, b, c) — multi-line joined
         (r"from\s+([\w.]+)\s+import\s+\(([^)]+)\)", "multi"),
         # import x.y.z (only at line start, not after 'from')
@@ -175,15 +175,19 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
                 for name in names:
                     name = name.split(" as ")[0].strip() if " as " in name else name
                     imports.append(ImportInfo(source=source, name=name, file_path=file_path, import_type="named"))
-            elif imp_type in ("named", "wildcard"):
+            elif imp_type == "wildcard":
                 imports.append(
-                    ImportInfo(
-                        source=match.group(1),
-                        name=match.group(2) if imp_type == "named" else "*",
-                        file_path=file_path,
-                        import_type=imp_type,
-                    )
+                    ImportInfo(source=match.group(1), name="*", file_path=file_path, import_type="wildcard")
                 )
+            elif imp_type == "named":
+                # group(2) may be a comma-separated list: "a, b as c, d"
+                source = match.group(1)
+                for piece in match.group(2).split(","):
+                    piece = piece.strip()
+                    if not piece:
+                        continue
+                    actual = piece.split(" as ")[0].strip() if " as " in piece else piece
+                    imports.append(ImportInfo(source=source, name=actual, file_path=file_path, import_type="named"))
             elif imp_type in ("module", "single"):
                 imports.append(ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type))
             elif imp_type == "default":

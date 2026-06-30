@@ -133,7 +133,7 @@ class CrossPRAnalyzer:
             )
 
         # Step 3: Mark symbols with risk from current findings
-        await self._mark_symbol_risks(existing_findings, run_id, pr_number)
+        await self._mark_symbol_risks(existing_findings, all_symbols, run_id, pr_number)
 
         # Step 4: Find suspicious cross-PR connections (zero tokens)
         suspicious_chains = await self._find_suspicious_chains(all_imports, state.files_changed)
@@ -197,20 +197,44 @@ class CrossPRAnalyzer:
     async def _mark_symbol_risks(
         self,
         findings: list[Finding],
+        symbols: list[SymbolInfo],
         run_id: str,
         pr_number: int,
     ) -> None:
-        """Link current findings to their corresponding symbols."""
+        """Link current findings to (a) their enclosing symbol and (b) the file risk summary.
+
+        Per-symbol attribution lets cross-PR analysis stay precise: importing a
+        deserialization-risky symbol must not inherit a SQL-injection risk that lives
+        in a *different* symbol of the same file.
+        """
+        # Definition lines per file, ascending — used to find each finding's enclosing symbol.
+        defs_by_file: dict[str, list[SymbolInfo]] = {}
+        for s in symbols:
+            defs_by_file.setdefault(s.file_path, []).append(s)
+        for lst in defs_by_file.values():
+            lst.sort(key=lambda s: s.line)
+
+        # Accumulate categories per symbol before writing (one upsert per symbol).
+        symbol_cats: dict[tuple[str, str], tuple[SymbolInfo, set[str]]] = {}
+
         for finding in findings:
             if finding.category not in SECURITY_CATEGORIES:
                 continue
 
-            # Find symbols in the same file
-            # We need the full file content to extract definitions,
-            # but we can infer from the finding's context
             risk_level = self._category_to_risk(finding.category)
 
-            # Update file risk summary
+            # (a) Attribute to the enclosing symbol = last definition at/above the finding line.
+            enclosing: SymbolInfo | None = None
+            for s in defs_by_file.get(finding.file, []):
+                if s.line <= (finding.line or 0):
+                    enclosing = s
+                else:
+                    break
+            if enclosing is not None:
+                key = (enclosing.file_path, enclosing.name)
+                symbol_cats.setdefault(key, (enclosing, set()))[1].add(finding.category)
+
+            # (b) File risk summary (coarse fallback for fuzzy import matching + depth-2).
             existing = await self._db.get_file_risk(finding.file)
             if existing:
                 cats = json.loads(existing.get("risk_categories", "[]"))
@@ -232,6 +256,22 @@ class CrossPRAnalyzer:
                     1,
                     run_id,
                 )
+
+        # Write accumulated per-symbol risk.
+        for (file_path, name), (sym, cats) in symbol_cats.items():
+            level = "safe"
+            for c in cats:
+                level = self._higher_risk(level, self._category_to_risk(c))
+            await self._db.upsert_symbol(
+                file_path=file_path,
+                symbol_name=name,
+                symbol_type=sym.symbol_type,
+                run_id=run_id,
+                pr_number=pr_number,
+                language=detect_language(file_path),
+                risk_level=level,
+                risk_categories=sorted(cats),
+            )
 
     async def _find_suspicious_chains(
         self,
@@ -263,8 +303,19 @@ class CrossPRAnalyzer:
             risky_symbols = await self._db.get_risky_symbols(target_file)
 
             if risky_symbols:
+                # A specific named import (e.g. `from db import cache_load`) only carries the
+                # risk of *that* symbol; a module/wildcard import carries the whole file's risk.
+                imported = (imp.name or "").strip()
+                if imported and imported != "*":
+                    matched = [s for s in risky_symbols if s["symbol_name"] == imported]
+                    if not matched:
+                        # Imported a non-risky symbol from a risky file → no cross-PR risk here.
+                        continue
+                else:
+                    matched = risky_symbols
+
                 # Use symbol-level detail
-                for sym in risky_symbols:
+                for sym in matched:
                     sym_categories = json.loads(sym.get("risk_categories", "[]"))
                     for cat in sym_categories:
                         if cat not in SECURITY_CATEGORIES:

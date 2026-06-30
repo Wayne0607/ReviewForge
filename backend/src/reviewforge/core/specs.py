@@ -51,6 +51,15 @@ class SpecRegistry:
     def register_skill(self, name: str) -> None:
         self.skills.add(name)
 
+    def unregister_agent(self, name: str) -> bool:
+        return self.agents.pop(name, None) is not None
+
+    def unregister_skill(self, name: str) -> bool:
+        if name in self.skills:
+            self.skills.discard(name)
+            return True
+        return False
+
     def validate(self) -> list[str]:
         """Validate cross-references. Returns list of errors (empty = OK)."""
         errors: list[str] = []

@@ -17,6 +17,16 @@ async function get<T>(path: string): Promise<T> {
   return res.json()
 }
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { ...getHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`)
+  return res.json()
+}
+
 // ── Reviews ──────────────────────────────────────────────────
 
 export const reviews = {
@@ -91,4 +101,54 @@ export const tokens = {
 export const system = {
   specs: () => get<import('../types').SystemSpecs>('/specs'),
   config: () => get<Record<string, unknown>>('/config'),
+}
+
+// ── Admin (console-driven Skill / config-type Agent CRUD) ────
+
+export interface SkillMeta {
+  name: string
+  description: string
+  category: string
+  reviewer_type: string
+  references: string[]
+  is_builtin: boolean
+}
+
+export interface CustomAgent {
+  reviewer_type: string
+  name: string
+  description: string
+  allowed_tools: string[]
+  model_profile: string
+  max_steps: number
+  instructions: string
+  enabled: boolean
+}
+
+export interface BuiltinAgent {
+  name: string
+  role: string
+  description: string
+}
+
+export const admin = {
+  listSkills: () => get<{ skills: SkillMeta[] }>('/admin/skills'),
+  getSkill: (name: string) =>
+    get<{ name: string; raw: string; body: string; meta: { description: string; reviewer_type: string; category: string }; is_builtin: boolean }>(
+      `/admin/skills/${name}`
+    ),
+  saveSkill: (s: { name: string; description: string; reviewer_type?: string; category?: string; body: string }) =>
+    post<{ ok: boolean; skills_loaded: number }>('/admin/skills', s),
+  deleteSkill: (name: string) => post<{ ok: boolean }>(`/admin/skills/${name}/delete`, {}),
+  listAgents: () => get<{ custom: CustomAgent[]; builtin: BuiltinAgent[]; available_tools: string[] }>('/admin/agents'),
+  saveAgent: (a: {
+    reviewer_type: string
+    description: string
+    allowed_tools?: string[]
+    model_profile?: string
+    max_steps?: number
+    instructions?: string
+    enabled?: boolean
+  }) => post<{ ok: boolean }>('/admin/agents', a),
+  deleteAgent: (reviewerType: string) => post<{ ok: boolean }>(`/admin/agents/${reviewerType}/delete`, {}),
 }

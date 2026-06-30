@@ -92,6 +92,20 @@ def build_reviewer_tools(
     return tools
 
 
+# Per-reviewer-type cap on findings, to cut low-value nitpick noise. Keep the top-N
+# by severity then confidence. Security/perf are allowed more; doc/style capped low.
+_MAX_FINDINGS_BY_TYPE = {
+    "security": 15,
+    "performance": 10,
+    "dependency": 10,
+    "accessibility": 6,
+    "testing": 6,
+    "documentation": 4,
+    "style": 5,
+}
+_SEVERITY_RANK = {"error": 3, "warning": 2, "info": 1}
+
+
 class BaseReviewer:
     """Base class for all reviewers.
 
@@ -344,6 +358,12 @@ class BaseReviewer:
                 )
             except Exception as e:
                 logger.warning(f"{self.name}: skipped invalid finding {item!r}: {e}")
+        # Cut nitpick noise: keep only the top-N findings per reviewer (by severity then
+        # confidence), so doc/style don't flood with per-line comments.
+        cap = _MAX_FINDINGS_BY_TYPE.get(self.reviewer_type, 8)
+        if len(findings) > cap:
+            findings.sort(key=lambda f: (_SEVERITY_RANK.get(f.severity, 0), f.confidence), reverse=True)
+            findings = findings[:cap]
         return findings
 
 

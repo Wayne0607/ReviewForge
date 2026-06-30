@@ -64,7 +64,7 @@ export default function Skills() {
     }
   }
 
-  if (loading) return <div className="flex items-center justify-center h-64 text-gray-400">加载中...</div>
+  if (loading) return <div role="status" className="flex items-center justify-center h-64 text-gray-400">加载中...</div>
 
   return (
     <div className="space-y-6">
@@ -78,7 +78,7 @@ export default function Skills() {
         </button>
       </div>
 
-      {error && <div className="bg-red-50 text-red-700 text-sm rounded-lg p-3">{error}</div>}
+      {error && <div role="alert" className="bg-red-50 text-red-700 text-sm rounded-lg p-3">{error}</div>}
 
       {editing && (
         <div className="card">

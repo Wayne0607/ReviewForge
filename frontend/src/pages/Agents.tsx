@@ -68,7 +68,7 @@ export default function Agents() {
     }
   }
 
-  if (loading) return <div className="flex items-center justify-center h-64 text-gray-400">加载中...</div>
+  if (loading) return <div role="status" className="flex items-center justify-center h-64 text-gray-400">加载中...</div>
 
   return (
     <div className="space-y-6">
@@ -82,7 +82,7 @@ export default function Agents() {
         </button>
       </div>
 
-      {error && <div className="bg-red-50 text-red-700 text-sm rounded-lg p-3">{error}</div>}
+      {error && <div role="alert" className="bg-red-50 text-red-700 text-sm rounded-lg p-3">{error}</div>}
 
       {editing && (
         <div className="card">
@@ -111,7 +111,7 @@ export default function Agents() {
               <span className="text-gray-600">可用工具</span>
               <div className="flex flex-wrap gap-2 mt-1">
                 {tools.map((t) => (
-                  <button key={t} type="button" onClick={() => toggleTool(t)} className={`px-3 py-1.5 rounded-lg text-xs border ${form.allowed_tools.includes(t) ? 'bg-brand-50 border-brand-300 text-brand-700' : 'border-gray-200 text-gray-500'}`}>
+                  <button key={t} type="button" aria-pressed={form.allowed_tools.includes(t)} onClick={() => toggleTool(t)} className={`px-3 py-1.5 rounded-lg text-xs border ${form.allowed_tools.includes(t) ? 'bg-brand-50 border-brand-300 text-brand-700' : 'border-gray-200 text-gray-500'}`}>
                     {t}
                   </button>
                 ))}

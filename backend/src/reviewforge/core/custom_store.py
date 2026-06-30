@@ -11,11 +11,14 @@ No arbitrary code is ever stored or executed.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # Slug: lowercase, starts with a letter, 2-40 chars of [a-z0-9_].
 _SLUG = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
@@ -56,8 +59,9 @@ class SkillStore:
 
     def _skill_dir(self, name: str) -> Path:
         name = _require_slug(name, "skill name")
+        base = self._dir.resolve()
         d = (self._dir / name).resolve()
-        if not str(d).startswith(str(self._dir.resolve())):
+        if not d.is_relative_to(base):  # robust against sibling-prefix / symlink tricks
             raise ValidationError("非法路径（path traversal）")
         return d
 
@@ -162,8 +166,8 @@ class CustomAgentStore:
             for a in data:
                 if isinstance(a, dict) and a.get("reviewer_type"):
                     self._agents[a["reviewer_type"]] = a
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"custom_agents.json unreadable, ignoring ({e}); existing agents kept")
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

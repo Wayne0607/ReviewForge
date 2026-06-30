@@ -267,6 +267,8 @@ class Orchestrator:
                         gateway=self._gateway,
                         max_steps=self._escalation_max_steps,
                         max_tokens=self._escalation_max_tokens,
+                        confidence_min=self._escalation_confidence_min,
+                        confidence_max=self._escalation_confidence_max,
                         event_bus=self._events,
                     )
                 self._events.emit("escalation.started", {"candidate_count": len(candidates)})

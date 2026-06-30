@@ -86,24 +86,31 @@ class EscalationReviewer:
         gateway: ToolGateway,
         max_steps: int = 3,
         max_tokens: int = 5000,
+        confidence_min: float = 0.4,
+        confidence_max: float = 0.7,
         event_bus: EventBus | None = None,
     ) -> None:
         self._llm = llm
         self._gateway = gateway
         self._max_steps = max_steps
         self._max_tokens = max_tokens
+        self._confidence_min = confidence_min
+        self._confidence_max = confidence_max
         self._events = event_bus
-        # Cached tools — rebuilt per state, not per finding.
+        # Cached tools — keyed by (repo, pr_number) to invalidate on state change.
+        self._cache_key: tuple[str, int] | None = None
         self._cached_tools: list | None = None
         self._cached_tool_map: dict | None = None
         self._cached_bound_llm: Any = None
 
     def _ensure_tools(self, state: StateStore) -> tuple[list, dict, Any]:
-        """Build and cache tools + bound LLM for the current state."""
-        if self._cached_tools is None:
+        """Build and cache tools + bound LLM. Invalidates when state changes."""
+        key = (state.repo, state.pr_number)
+        if self._cache_key != key:
             self._cached_tools = build_reviewer_tools(self._gateway, state, "escalation_reviewer")
             self._cached_tool_map = {t.name: t for t in self._cached_tools}
             self._cached_bound_llm = self._llm.bind_tools(self._cached_tools)
+            self._cache_key = key
         return self._cached_tools, self._cached_tool_map, self._cached_bound_llm
 
     @staticmethod
@@ -152,9 +159,9 @@ class EscalationReviewer:
 
     async def _run_tool_loop(
         self,
-        chat: list,
+        chat: list[Any],
         llm: Any,
-        tool_map: dict,
+        tool_map: dict[str, Any],
         budget: TokenBudget,
         finding_id: str,
     ) -> dict | None:
@@ -205,7 +212,7 @@ class EscalationReviewer:
 
         return None
 
-    async def _force_final_verdict(self, chat: list, llm: Any, budget: TokenBudget) -> dict | None:
+    async def _force_final_verdict(self, chat: list[Any], llm: Any, budget: TokenBudget) -> dict | None:
         """Budget/steps exhausted — force one final LLM call for verdict."""
         chat.append(HumanMessage(content="已达上限。请立刻只输出 verdict JSON。"))
         try:
@@ -223,7 +230,12 @@ class EscalationReviewer:
         escalation_categories: set[str] | None = None,
     ) -> Finding:
         """Agentic verification of a single finding. Returns updated finding."""
-        if not self.should_escalate(finding, escalation_categories=escalation_categories):
+        if not self.should_escalate(
+            finding,
+            confidence_min=self._confidence_min,
+            confidence_max=self._confidence_max,
+            escalation_categories=escalation_categories,
+        ):
             return finding
 
         logger.info(f"Escalating finding {finding.id} ({finding.category}, conf={finding.confidence:.2f})")
@@ -265,7 +277,12 @@ class EscalationReviewer:
         tasks = []
         skipped = 0
         for i, f in enumerate(findings):
-            if self.should_escalate(f, escalation_categories=escalation_categories):
+            if self.should_escalate(
+                f,
+                confidence_min=self._confidence_min,
+                confidence_max=self._confidence_max,
+                escalation_categories=escalation_categories,
+            ):
                 tasks.append(_escalate_one(i, f))
             else:
                 results[i] = f

@@ -137,9 +137,22 @@ class ReviewForgeConfig:
             self.confidence_threshold = data["confidence_threshold"]
         if "escalation" in data:
             esc = data["escalation"]
+            _esc_types = {
+                "enabled": bool,
+                "confidence_min": float,
+                "confidence_max": float,
+                "max_steps": int,
+                "max_tokens": int,
+            }
             for k, v in esc.items():
                 attr = f"escalation_{k}"
                 if hasattr(self, attr):
+                    expected = _esc_types.get(k)
+                    if expected:
+                        try:
+                            v = expected(v)
+                        except (ValueError, TypeError):
+                            pass
                     setattr(self, attr, v)
 
     def _apply_env(self) -> None:

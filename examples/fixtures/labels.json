@@ -1,11 +1,10 @@
 {
-  "vulnerable_sample.py": [
-    "unsafe-deserialization",
-    "insecure-deserialization",
-    "command-injection",
-    "code-injection",
-    "hardcoded-secrets",
-    "sql-injection",
-    "security"
-  ]
+  "vuln_sql.py": ["sql-injection"],
+  "vuln_cmd.py": ["command-injection"],
+  "vuln_deser.py": ["insecure-deserialization"],
+  "vuln_eval.py": ["code-injection"],
+  "vuln_secrets.py": ["hardcoded-secrets"],
+  "vulnerable_sample.py": ["sql-injection", "command-injection", "code-injection", "insecure-deserialization", "hardcoded-secrets", "weak-crypto"],
+  "clean_parameterized.py": [],
+  "clean_validated.py": []
 }

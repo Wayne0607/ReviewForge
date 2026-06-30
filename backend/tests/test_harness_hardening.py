@@ -75,7 +75,7 @@ def test_gateway_rejects_missing_and_mistyped_params():
 async def test_resume_skips_completed_reviewers_and_keeps_findings(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.connect()
-    # A prior run that never completed (status stays 'running'): one reviewer done + one finding.
+    # A prior run that crashed (status 'failed'): one reviewer done + one finding.
     await db.create_run(run_id="r1", repo="o/r", pr_number=5, head_sha="HEAD", base_sha="B")
     await db.insert_finding(
         "r1",
@@ -92,6 +92,7 @@ async def test_resume_skips_completed_reviewers_and_keeps_findings(tmp_path):
         },
     )
     await db.insert_metric("r1", "security_reviewer", findings_count=1, status="completed")
+    await db.fail_run("r1", "simulated crash")  # mark failed → resumable (not an active run)
 
     assert (await db.get_resumable_run("o/r", 5, "HEAD"))["run_id"] == "r1"
 

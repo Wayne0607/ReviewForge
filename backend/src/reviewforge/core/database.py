@@ -210,10 +210,16 @@ class Database:
         return self._row_to_dict(row) if row else None
 
     async def get_resumable_run(self, repo: str, pr_number: int, head_sha: str) -> dict[str, Any] | None:
-        """Most recent NON-completed run for this exact PR head — used to resume."""
+        """Most recent crashed/stale run for this exact PR head — used to resume.
+
+        Only resumes a 'failed' run, or a 'running' run older than 15 minutes (i.e.
+        crashed/orphaned). A run that is still actively running (e.g. a concurrent
+        webhook for the same head) is NOT resumed, to avoid two runs colliding on one id.
+        """
         cursor = await self._db.execute(
             "SELECT * FROM review_runs WHERE repo=? AND pr_number=? AND head_sha=? "
-            "AND status != 'completed' ORDER BY started_at DESC LIMIT 1",
+            "AND (status = 'failed' OR (status = 'running' AND started_at <= datetime('now', '-15 minutes'))) "
+            "ORDER BY started_at DESC LIMIT 1",
             (repo, pr_number, head_sha),
         )
         row = await cursor.fetchone()

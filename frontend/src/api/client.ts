@@ -2,9 +2,22 @@
 
 const BASE = '/api/v1'
 
+// Token resolution order: a token saved in the browser (Settings field in the sidebar)
+// wins, so we never have to bake the secret into the public JS bundle; the build-time
+// VITE_API_TOKEN is a fallback for local dev.
+export const TOKEN_KEY = 'rf_api_token'
+
+function getToken(): string {
+  if (typeof localStorage !== 'undefined') {
+    const t = localStorage.getItem(TOKEN_KEY)
+    if (t) return t
+  }
+  return import.meta.env.VITE_API_TOKEN ?? ''
+}
+
 function getHeaders(): Record<string, string> {
   const headers: Record<string, string> = {}
-  const token = import.meta.env.VITE_API_TOKEN
+  const token = getToken()
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   }

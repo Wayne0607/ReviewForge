@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   GitPullRequest,
   Bug,
@@ -13,7 +13,6 @@ import {
   Cell,
   ResponsiveContainer,
   Tooltip,
-  Legend,
 } from 'recharts'
 import { metrics, reviews, tokens } from '../api/client'
 import StatsCard from '../components/StatsCard'
@@ -22,7 +21,17 @@ import TrendChart from '../components/TrendChart'
 import TokenUsageCard from '../components/TokenUsageCard'
 import type { SummaryStats, CategoryCount, WeeklyTrend, ReviewRun } from '../types'
 
-const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4']
+const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#14b8a6']
+
+/** Group small categories into "其他" to prevent label overlap. */
+function groupCategories(data: CategoryCount[], topN = 6): CategoryCount[] {
+  if (data.length <= topN) return data
+  const sorted = [...data].sort((a, b) => b.count - a.count)
+  const top = sorted.slice(0, topN)
+  const rest = sorted.slice(topN)
+  const otherCount = rest.reduce((sum, c) => sum + c.count, 0)
+  return [...top, { category: '其他', count: otherCount }]
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -78,6 +87,8 @@ export default function Dashboard() {
     ? Math.round(((stats.confirmed || 0) / stats.total_findings) * 100)
     : 0
 
+  const grouped = useMemo(() => groupCategories(categories), [categories])
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -119,28 +130,42 @@ export default function Dashboard() {
           <div className="card-header">问题分类分布</div>
           <div className="card-body">
             {categories.length > 0 ? (
-              <ResponsiveContainer width="100%" height={250}>
-                <PieChart>
-                  <Pie
-                    data={categories}
-                    dataKey="count"
-                    nameKey="category"
-                    cx="50%"
-                    cy="50%"
-                    outerRadius={80}
-                    label={({ category, percent }) =>
-                      `${category} ${(percent * 100).toFixed(0)}%`
-                    }
-                    labelLine={false}
-                    fontSize={11}
-                  >
-                    {categories.map((_, i) => (
-                      <Cell key={i} fill={COLORS[i % COLORS.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
+              <div className="flex flex-col items-center">
+                <ResponsiveContainer width="100%" height={220}>
+                  <PieChart>
+                    <Pie
+                      data={grouped}
+                      dataKey="count"
+                      nameKey="category"
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={50}
+                      outerRadius={80}
+                      paddingAngle={2}
+                    >
+                      {grouped.map((_, i) => (
+                        <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      formatter={(value: number, name: string) => [`${value} 个`, name]}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                {/* Custom legend */}
+                <div className="flex flex-wrap justify-center gap-x-4 gap-y-1 mt-2">
+                  {grouped.map((item, i) => (
+                    <div key={item.category} className="flex items-center gap-1.5 text-xs">
+                      <span
+                        className="w-2.5 h-2.5 rounded-full inline-block"
+                        style={{ backgroundColor: COLORS[i % COLORS.length] }}
+                      />
+                      <span className="text-gray-600">{item.category}</span>
+                      <span className="text-gray-400">({item.count})</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             ) : (
               <div className="flex items-center justify-center h-64 text-gray-400">
                 暂无分类数据

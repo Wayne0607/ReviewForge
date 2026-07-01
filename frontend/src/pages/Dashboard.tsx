@@ -66,6 +66,12 @@ export default function Dashboard() {
     }).finally(() => setLoading(false))
   }, [])
 
+  const confirmRate = stats?.total_findings
+    ? Math.round(((stats.confirmed || 0) / stats.total_findings) * 100)
+    : 0
+
+  const grouped = useMemo(() => groupCategories(categories), [categories])
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64" role="status" aria-live="polite">
@@ -82,12 +88,6 @@ export default function Dashboard() {
       </div>
     )
   }
-
-  const confirmRate = stats?.total_findings
-    ? Math.round(((stats.confirmed || 0) / stats.total_findings) * 100)
-    : 0
-
-  const grouped = useMemo(() => groupCategories(categories), [categories])
 
   return (
     <div className="space-y-6">

@@ -1,0 +1,278 @@
+[
+  {
+    "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503801416",
+    "pull_request_review_id": 4606447622,
+    "id": 3503801416,
+    "node_id": "PRRC_kwDOTG6tAM7Q18RI",
+    "diff_hunk": "@@ -78,6 +87,8 @@ export default function Dashboard() {\n     ? Math.round(((stats.confirmed || 0) / stats.total_findings) * 100)\n     : 0\n \n+  const grouped = useMemo(() => groupCategories(categories), [categories])",
+    "path": "frontend/src/pages/Dashboard.tsx",
+    "commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "original_commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "`useMemo` is being called after the `loading`/`error` early returns. That violates the Rules of Hooks because the first render returns before calling `useMemo`, and later renders call an extra hook, which can throw \"Rendered more hooks than during the previous render\". Move the derived `confirmRate`/`grouped` calculations (including `useMemo`) above any conditional returns so hooks are called unconditionally.",
+    "created_at": "2026-07-01T06:44:46Z",
+    "updated_at": "2026-07-01T06:44:46Z",
+    "html_url": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503801416",
+    "pull_request_url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503801416"
+      },
+      "html": {
+        "href": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503801416"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503801416/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": 86,
+    "original_start_line": 86,
+    "start_side": "RIGHT",
+    "line": 90,
+    "original_line": 90,
+    "side": "RIGHT",
+    "author_association": "NONE",
+    "original_position": 37,
+    "position": 1,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807148",
+    "pull_request_review_id": 4606453938,
+    "id": 3503807148,
+    "node_id": "PRRC_kwDOTG6tAM7Q19qs",
+    "diff_hunk": "@@ -22,7 +21,17 @@ import TrendChart from '../components/TrendChart'\n import TokenUsageCard from '../components/TokenUsageCard'\n import type { SummaryStats, CategoryCount, WeeklyTrend, ReviewRun } from '../types'\n \n-const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4']\n+const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#14b8a6']",
+    "path": "frontend/src/pages/Dashboard.tsx",
+    "commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "original_commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "user": {
+      "login": "Wayne0607",
+      "id": 166493970,
+      "node_id": "U_kgDOCex_Eg",
+      "avatar_url": "https://avatars.githubusercontent.com/u/166493970?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Wayne0607",
+      "html_url": "https://github.com/Wayne0607",
+      "followers_url": "https://api.github.com/users/Wayne0607/followers",
+      "following_url": "https://api.github.com/users/Wayne0607/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Wayne0607/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Wayne0607/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Wayne0607/subscriptions",
+      "organizations_url": "https://api.github.com/users/Wayne0607/orgs",
+      "repos_url": "https://api.github.com/users/Wayne0607/repos",
+      "events_url": "https://api.github.com/users/Wayne0607/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Wayne0607/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "🟡 **[magic-number]** (置信度: 90%)\n\n函数groupCategories中的参数topN默认值为6，这是一个魔法数字，其含义未明确说明，可能影响代码可读性和可维护性。\n\n**建议:** 将默认值定义为一个命名常量，例如 `const DEFAULT_TOP_N = 6;`，然后在函数签名中使用它：`function groupCategories(data: CategoryCount[], topN = DEFAULT_TOP_N): CategoryCount[]`。\n\n<sub>ReviewForge • style_reviewer</sub>",
+    "created_at": "2026-07-01T06:45:57Z",
+    "updated_at": "2026-07-01T06:45:57Z",
+    "html_url": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503807148",
+    "pull_request_url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807148"
+      },
+      "html": {
+        "href": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503807148"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807148/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 24,
+    "original_line": 24,
+    "side": "RIGHT",
+    "author_association": "OWNER",
+    "original_position": 19,
+    "position": 19,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807226",
+    "pull_request_review_id": 4606454017,
+    "id": 3503807226,
+    "node_id": "PRRC_kwDOTG6tAM7Q19r6",
+    "diff_hunk": "@@ -119,28 +130,42 @@ export default function Dashboard() {\n           <div className=\"card-header\">问题分类分布</div>\n           <div className=\"card-body\">\n             {categories.length > 0 ? (\n-              <ResponsiveContainer width=\"100%\" height={250}>\n-                <PieChart>\n-                  <Pie\n-                    data={categories}\n-                    dataKey=\"count\"\n-                    nameKey=\"category\"\n-                    cx=\"50%\"\n-                    cy=\"50%\"\n-                    outerRadius={80}\n-                    label={({ category, percent }) =>\n-                      `${category} ${(percent * 100).toFixed(0)}%`\n-                    }\n-                    labelLine={false}\n-                    fontSize={11}\n-                  >\n-                    {categories.map((_, i) => (\n-                      <Cell key={i} fill={COLORS[i % COLORS.length]} />\n-                    ))}\n-                  </Pie>\n-                  <Tooltip />\n-                </PieChart>\n-              </ResponsiveContainer>\n+              <div className=\"flex flex-col items-center\">\n+                <ResponsiveContainer width=\"100%\" height={220}>\n+                  <PieChart>\n+                    <Pie\n+                      data={grouped}\n+                      dataKey=\"count\"\n+                      nameKey=\"category\"\n+                      cx=\"50%\"\n+                      cy=\"50%\"\n+                      innerRadius={50}\n+                      outerRadius={80}\n+                      paddingAngle={2}\n+                    >\n+                      {grouped.map((_, i) => (\n+                        <Cell key={i} fill={COLORS[i % COLORS.length]} />\n+                      ))}\n+                    </Pie>\n+                    <Tooltip\n+                      formatter={(value: number, name: string) => [`${value} 个`, name]}\n+                    />\n+                  </PieChart>\n+                </ResponsiveContainer>\n+                {/* Custom legend */}",
+    "path": "frontend/src/pages/Dashboard.tsx",
+    "commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "original_commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "user": {
+      "login": "Wayne0607",
+      "id": 166493970,
+      "node_id": "U_kgDOCex_Eg",
+      "avatar_url": "https://avatars.githubusercontent.com/u/166493970?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Wayne0607",
+      "html_url": "https://github.com/Wayne0607",
+      "followers_url": "https://api.github.com/users/Wayne0607/followers",
+      "following_url": "https://api.github.com/users/Wayne0607/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Wayne0607/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Wayne0607/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Wayne0607/subscriptions",
+      "organizations_url": "https://api.github.com/users/Wayne0607/orgs",
+      "repos_url": "https://api.github.com/users/Wayne0607/repos",
+      "events_url": "https://api.github.com/users/Wayne0607/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Wayne0607/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "🟡 **[a11y]** (置信度: 80%)\n\n自定义图例使用div元素而非语义化HTML，缺少ARIA标签，屏幕阅读器可能无法理解图表数据的含义。\n\n**建议:** 将图例容器改为<ul>，图例项改为<li>，并添加aria-label属性描述图表，例如：<ul aria-label=\"问题分类分布图例\"> ... </ul>。每个图例项可添加role=\"listitem\"。\n\n<sub>ReviewForge • accessibility_reviewer</sub>",
+    "created_at": "2026-07-01T06:45:58Z",
+    "updated_at": "2026-07-01T06:45:58Z",
+    "html_url": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503807226",
+    "pull_request_url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807226"
+      },
+      "html": {
+        "href": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503807226"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807226/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 155,
+    "original_line": 155,
+    "side": "RIGHT",
+    "author_association": "OWNER",
+    "original_position": 90,
+    "position": 90,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807292",
+    "pull_request_review_id": 4606454095,
+    "id": 3503807292,
+    "node_id": "PRRC_kwDOTG6tAM7Q19s8",
+    "diff_hunk": "@@ -119,28 +130,42 @@ export default function Dashboard() {\n           <div className=\"card-header\">问题分类分布</div>\n           <div className=\"card-body\">\n             {categories.length > 0 ? (\n-              <ResponsiveContainer width=\"100%\" height={250}>\n-                <PieChart>\n-                  <Pie\n-                    data={categories}\n-                    dataKey=\"count\"\n-                    nameKey=\"category\"\n-                    cx=\"50%\"\n-                    cy=\"50%\"\n-                    outerRadius={80}\n-                    label={({ category, percent }) =>\n-                      `${category} ${(percent * 100).toFixed(0)}%`\n-                    }\n-                    labelLine={false}\n-                    fontSize={11}\n-                  >\n-                    {categories.map((_, i) => (\n-                      <Cell key={i} fill={COLORS[i % COLORS.length]} />\n-                    ))}\n-                  </Pie>\n-                  <Tooltip />\n-                </PieChart>\n-              </ResponsiveContainer>\n+              <div className=\"flex flex-col items-center\">\n+                <ResponsiveContainer width=\"100%\" height={220}>\n+                  <PieChart>\n+                    <Pie\n+                      data={grouped}\n+                      dataKey=\"count\"\n+                      nameKey=\"category\"\n+                      cx=\"50%\"\n+                      cy=\"50%\"\n+                      innerRadius={50}\n+                      outerRadius={80}\n+                      paddingAngle={2}\n+                    >\n+                      {grouped.map((_, i) => (\n+                        <Cell key={i} fill={COLORS[i % COLORS.length]} />\n+                      ))}\n+                    </Pie>\n+                    <Tooltip\n+                      formatter={(value: number, name: string) => [`${value} 个`, name]}\n+                    />\n+                  </PieChart>\n+                </ResponsiveContainer>\n+                {/* Custom legend */}\n+                <div className=\"flex flex-wrap justify-center gap-x-4 gap-y-1 mt-2\">",
+    "path": "frontend/src/pages/Dashboard.tsx",
+    "commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "original_commit_id": "2c3f82706e8f681ff613f2d2846af47d50ebd1de",
+    "user": {
+      "login": "Wayne0607",
+      "id": 166493970,
+      "node_id": "U_kgDOCex_Eg",
+      "avatar_url": "https://avatars.githubusercontent.com/u/166493970?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Wayne0607",
+      "html_url": "https://github.com/Wayne0607",
+      "followers_url": "https://api.github.com/users/Wayne0607/followers",
+      "following_url": "https://api.github.com/users/Wayne0607/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Wayne0607/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Wayne0607/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Wayne0607/subscriptions",
+      "organizations_url": "https://api.github.com/users/Wayne0607/orgs",
+      "repos_url": "https://api.github.com/users/Wayne0607/repos",
+      "events_url": "https://api.github.com/users/Wayne0607/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Wayne0607/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "🟡 **[color-contrast]** (置信度: 70%)\n\n图例中计数文本的颜色类text-gray-400在白色背景上可能对比度不足（约3.0:1），不符合WCAG对小文本至少4.5:1的要求。\n\n**建议:** 改用更深的颜色，如text-gray-600，或直接使用Tailwind CSS的颜色值如text-gray-500（#6b7280），并确保与背景色的对比度符合标准。\n\n<sub>ReviewForge • accessibility_reviewer</sub>",
+    "created_at": "2026-07-01T06:45:59Z",
+    "updated_at": "2026-07-01T06:45:59Z",
+    "html_url": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503807292",
+    "pull_request_url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807292"
+      },
+      "html": {
+        "href": "https://github.com/Wayne0607/ReviewForge/pull/42#discussion_r3503807292"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/42"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/Wayne0607/ReviewForge/pulls/comments/3503807292/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 156,
+    "original_line": 156,
+    "side": "RIGHT",
+    "author_association": "OWNER",
+    "original_position": 91,
+    "position": 91,
+    "subject_type": "line"
+  }
+]

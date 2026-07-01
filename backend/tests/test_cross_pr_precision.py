@@ -44,14 +44,33 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
         "    return pickle.loads(blob)\n"
     )
     state_a = StateStore(
-        pr_number=1, repo="o/r", head_sha="A",
-        files_changed=["demo_app/db.py"], diff_summary=_diff("demo_app/db.py", db_src),
+        pr_number=1,
+        repo="o/r",
+        head_sha="A",
+        files_changed=["demo_app/db.py"],
+        diff_summary=_diff("demo_app/db.py", db_src),
     )
     findings_a = [
-        Finding(file="demo_app/db.py", line=5, severity="error", category="sql-injection",
-                message="string-concat SQL", confidence=0.9, reviewer="security_reviewer", status="confirmed"),
-        Finding(file="demo_app/db.py", line=7, severity="error", category="insecure-deserialization",
-                message="pickle.loads", confidence=0.9, reviewer="security_reviewer", status="confirmed"),
+        Finding(
+            file="demo_app/db.py",
+            line=5,
+            severity="error",
+            category="sql-injection",
+            message="string-concat SQL",
+            confidence=0.9,
+            reviewer="security_reviewer",
+            status="confirmed",
+        ),
+        Finding(
+            file="demo_app/db.py",
+            line=7,
+            severity="error",
+            category="insecure-deserialization",
+            message="pickle.loads",
+            confidence=0.9,
+            reviewer="security_reviewer",
+            status="confirmed",
+        ),
     ]
     await analyzer.analyze("runA", state_a, findings_a)
 
@@ -62,14 +81,13 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
     assert "insecure-deserialization" in cl["risk_categories"] and "sql-injection" not in cl["risk_categories"]
 
     # --- PR-C: session.py imports ONLY cache_load ---
-    sess_src = (
-        "from demo_app.db import cache_load\n"
-        "def load_session(cookie):\n"
-        "    return cache_load(cookie)\n"
-    )
+    sess_src = "from demo_app.db import cache_load\ndef load_session(cookie):\n    return cache_load(cookie)\n"
     state_c = StateStore(
-        pr_number=3, repo="o/r", head_sha="C",
-        files_changed=["demo_app/session.py"], diff_summary=_diff("demo_app/session.py", sess_src),
+        pr_number=3,
+        repo="o/r",
+        head_sha="C",
+        files_changed=["demo_app/session.py"],
+        diff_summary=_diff("demo_app/session.py", sess_src),
     )
     cross = await analyzer.analyze("runC", state_c, existing_findings=[])
     cats = {f.category for f in cross}

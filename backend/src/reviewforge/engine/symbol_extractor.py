@@ -176,9 +176,7 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
                     name = name.split(" as ")[0].strip() if " as " in name else name
                     imports.append(ImportInfo(source=source, name=name, file_path=file_path, import_type="named"))
             elif imp_type == "wildcard":
-                imports.append(
-                    ImportInfo(source=match.group(1), name="*", file_path=file_path, import_type="wildcard")
-                )
+                imports.append(ImportInfo(source=match.group(1), name="*", file_path=file_path, import_type="wildcard"))
             elif imp_type == "named":
                 # group(2) may be a comma-separated list: "a, b as c, d"
                 source = match.group(1)

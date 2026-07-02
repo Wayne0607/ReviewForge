@@ -34,6 +34,43 @@ reviewforge/
 3. **Prompt 动态生成** — 不硬编码 reviewer/tool 名，从 spec 读取
 4. **文档同步** — 改架构 → docs/architecture.md；改 API → docs/api.md
 
+## 多语言支持
+
+### Skill 路由
+
+每个 Skill 通过 frontmatter 声明 `languages` 和 `frameworks` 字段：
+
+```yaml
+# 语言特定（无框架要求）
+languages: [go]
+
+# 语言 + 框架
+languages: [typescript, javascript]
+frameworks: [vue, nuxt]
+
+# 通用（空列表）
+languages: []
+```
+
+路由优先级（`Orchestrator._resolve_skill`）：
+1. `(language, framework)` — 精确匹配
+2. `(language)` — 语言匹配且无框架限制
+3. `(framework)` — 框架匹配（语言放宽）
+4. `()` — 通用 skill（无语言/框架约束）
+
+### 审查 Mission 语言感知
+
+`_reviewer_mission` 根据 `target_language` 返回语言特定的审查目标：
+- **Go**: error handling, goroutine lifecycle, interface design
+- **Rust**: ownership, unsafe, error propagation, trait design
+- **Java**: try-with-resources, Optional, Stream API
+- **Python**: type hints, exception precision, function complexity
+- **Ruby**: metaprogramming, block usage, enumerables
+
+### Planner 语言感知模式
+
+`_detect_patterns` 按语言分组安全/依赖模式，只对匹配语言的文件应用对应规则。支持 Python/Go/Java/Rust/Ruby/JavaScript/TypeScript，另有通用模式覆盖硬编码密钥、SQL 注入等。
+
 ## 架构设计
 
 ### 执行管线

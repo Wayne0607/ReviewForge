@@ -43,5 +43,6 @@ def test_skill_attached_to_reviewer():
     # #6 integration: security reviewer gets its SKILL.md attached via the orchestrator
     orch = _orch(agentic_default=False)
     r = orch._create_reviewer("security_reviewer")
+    orch._attach_skill(r)  # language-aware routing; security_rules is universal so matches without language
     assert r._skill_name == "security_rules"
     assert len(r._skill_body) > 50

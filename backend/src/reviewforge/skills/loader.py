@@ -25,6 +25,8 @@ class SkillMeta:
     description: str = ""
     category: str = ""  # security / performance / style / methodology
     reviewer_type: str = ""  # security / performance / style
+    languages: list[str] = field(default_factory=list)  # ["python"], ["go"], [] = universal
+    frameworks: list[str] = field(default_factory=list)  # ["react", "next"], ["vue"], [] = any
     references: list[str] = field(default_factory=list)
     path: Path = field(default_factory=Path)
 
@@ -129,12 +131,13 @@ class SkillLoader:
         """Parse YAML frontmatter from SKILL.md."""
         try:
             content = skill_md.read_text(encoding="utf-8")
+            fallback = SkillMeta(name=skill_md.parent.name, path=skill_md.parent)
             if not content.startswith("---"):
-                return SkillMeta(name=skill_md.parent.name, path=skill_md.parent)
+                return fallback
 
             parts = content.split("---", 2)
             if len(parts) < 3:
-                return SkillMeta(name=skill_md.parent.name, path=skill_md.parent)
+                return fallback
 
             frontmatter = yaml.safe_load(parts[1]) or {}
             return SkillMeta(
@@ -142,6 +145,8 @@ class SkillLoader:
                 description=frontmatter.get("description", ""),
                 category=frontmatter.get("category", ""),
                 reviewer_type=frontmatter.get("reviewer_type", ""),
+                languages=frontmatter.get("languages", []),
+                frameworks=frontmatter.get("frameworks", []),
                 references=frontmatter.get("references", []),
                 path=skill_md.parent,
             )

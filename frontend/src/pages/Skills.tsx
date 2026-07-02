@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { BookOpen, Plus, Trash2, Lock, Save, X } from 'lucide-react'
 import { admin, type SkillMeta } from '../api/client'
 
-const EMPTY = { name: '', reviewer_type: '', description: '', body: '' }
+const EMPTY = { name: '', reviewer_type: '', description: '', body: '', languages: '', frameworks: '' }
 
 export default function Skills() {
   const [skills, setSkills] = useState<SkillMeta[]>([])
@@ -33,7 +33,7 @@ export default function Skills() {
     setError('')
     try {
       const s = await admin.getSkill(name)
-      setForm({ name: s.name, reviewer_type: s.meta.reviewer_type, description: s.meta.description, body: s.body })
+      setForm({ name: s.name, reviewer_type: s.meta.reviewer_type, description: s.meta.description, body: s.body, languages: (s.meta.languages || []).join(', '), frameworks: (s.meta.frameworks || []).join(', ') })
       setEditing(true)
     } catch (e) {
       setError(String(e))
@@ -44,7 +44,11 @@ export default function Skills() {
     setBusy(true)
     setError('')
     try {
-      await admin.saveSkill(form)
+      await admin.saveSkill({
+        ...form,
+        languages: form.languages ? form.languages.split(',').map((s) => s.trim()).filter(Boolean) : [],
+        frameworks: form.frameworks ? form.frameworks.split(',').map((s) => s.trim()).filter(Boolean) : [],
+      })
       setEditing(false)
       await refresh()
     } catch (e) {
@@ -98,6 +102,14 @@ export default function Skills() {
                 <span className="text-gray-600">reviewer_type（挂到哪个审查维度，可空）</span>
                 <input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.reviewer_type} onChange={(e) => setForm({ ...form, reviewer_type: e.target.value })} placeholder="compliance" />
               </label>
+              <label className="block text-sm">
+                <span className="text-gray-600">languages（逗号分隔，空=通用）</span>
+                <input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.languages} onChange={(e) => setForm({ ...form, languages: e.target.value })} placeholder="python, go" />
+              </label>
+              <label className="block text-sm">
+                <span className="text-gray-600">frameworks（逗号分隔，空=不限）</span>
+                <input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.frameworks} onChange={(e) => setForm({ ...form, frameworks: e.target.value })} placeholder="react, next" />
+              </label>
             </div>
             <label className="block text-sm">
               <span className="text-gray-600">描述</span>
@@ -124,9 +136,15 @@ export default function Skills() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {skills.map((s) => (
               <div key={s.name} className="p-4 border border-gray-200 rounded-lg">
-                <div className="flex items-center gap-2 mb-1">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <span className="font-medium text-sm">{s.name}</span>
                   {s.reviewer_type && <span className="badge badge-gray text-xs">{s.reviewer_type}</span>}
+                  {s.languages && s.languages.length > 0 && s.languages.map((l) => (
+                    <span key={l} className="badge badge-info text-xs">{l}</span>
+                  ))}
+                  {s.frameworks && s.frameworks.length > 0 && s.frameworks.map((f) => (
+                    <span key={f} className="badge badge-success text-xs">{f}</span>
+                  ))}
                   {s.is_builtin && (
                     <span className="inline-flex items-center gap-1 text-xs text-gray-400">
                       <Lock className="w-3 h-3" /> 内置

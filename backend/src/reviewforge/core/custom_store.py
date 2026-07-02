@@ -77,6 +77,8 @@ class SkillStore:
         reviewer_type: str,
         body: str,
         category: str = "",
+        languages: list[str] | None = None,
+        frameworks: list[str] | None = None,
         references: list[str] | None = None,
     ) -> Path:
         name = _require_slug(name, "skill name")
@@ -89,6 +91,10 @@ class SkillStore:
             frontmatter["category"] = category
         if reviewer_type:
             frontmatter["reviewer_type"] = reviewer_type
+        if languages:
+            frontmatter["languages"] = languages
+        if frameworks:
+            frontmatter["frameworks"] = frameworks
         if references:
             frontmatter["references"] = references
         fm = yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False).strip()

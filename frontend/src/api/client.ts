@@ -123,6 +123,8 @@ export interface SkillMeta {
   description: string
   category: string
   reviewer_type: string
+  languages: string[]
+  frameworks: string[]
   references: string[]
   is_builtin: boolean
 }
@@ -147,10 +149,10 @@ export interface BuiltinAgent {
 export const admin = {
   listSkills: () => get<{ skills: SkillMeta[] }>('/admin/skills'),
   getSkill: (name: string) =>
-    get<{ name: string; raw: string; body: string; meta: { description: string; reviewer_type: string; category: string }; is_builtin: boolean }>(
+    get<{ name: string; raw: string; body: string; meta: { description: string; reviewer_type: string; category: string; languages: string[]; frameworks: string[] }; is_builtin: boolean }>(
       `/admin/skills/${name}`
     ),
-  saveSkill: (s: { name: string; description: string; reviewer_type?: string; category?: string; body: string }) =>
+  saveSkill: (s: { name: string; description: string; reviewer_type?: string; category?: string; body: string; languages?: string[]; frameworks?: string[] }) =>
     post<{ ok: boolean; skills_loaded: number }>('/admin/skills', s),
   deleteSkill: (name: string) => post<{ ok: boolean }>(`/admin/skills/${name}/delete`, {}),
   listAgents: () => get<{ custom: CustomAgent[]; builtin: BuiltinAgent[]; available_tools: string[] }>('/admin/agents'),

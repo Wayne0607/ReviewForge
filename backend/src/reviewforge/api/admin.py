@@ -20,7 +20,20 @@ from reviewforge.core.custom_store import ValidationError, normalize_agent
 router = APIRouter(prefix="/api/v1/admin")
 
 # Built-in skills shipped with the package — manage via files, not the console.
-BUILTIN_SKILLS = {"python_best_practices", "react_patterns", "security_rules"}
+BUILTIN_SKILLS = {
+    "angular_patterns",
+    "code_quality",
+    "go_best_practices",
+    "java_best_practices",
+    "python_best_practices",
+    "react_patterns",
+    "ruby_best_practices",
+    "rust_best_practices",
+    "security_rules",
+    "svelte_patterns",
+    "testing_rules",
+    "vue_patterns",
+}
 
 
 class SkillPayload(BaseModel):
@@ -29,6 +42,8 @@ class SkillPayload(BaseModel):
     reviewer_type: str = ""
     category: str = ""
     body: str
+    languages: list[str] = Field(default_factory=list)
+    frameworks: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
 
 
@@ -64,6 +79,8 @@ async def list_skills(request: Request) -> dict[str, Any]:
                 "description": m.description,
                 "category": m.category,
                 "reviewer_type": m.reviewer_type,
+                "languages": m.languages,
+                "frameworks": m.frameworks,
                 "references": m.references,
                 "is_builtin": m.name in BUILTIN_SKILLS,
             }
@@ -90,6 +107,8 @@ async def get_skill(name: str, request: Request) -> dict[str, Any]:
             "description": meta.description if meta else "",
             "reviewer_type": meta.reviewer_type if meta else "",
             "category": meta.category if meta else "",
+            "languages": meta.languages if meta else [],
+            "frameworks": meta.frameworks if meta else [],
         },
         "is_builtin": name in BUILTIN_SKILLS,
     }
@@ -107,6 +126,8 @@ async def upsert_skill(payload: SkillPayload, request: Request) -> dict[str, Any
             reviewer_type=payload.reviewer_type,
             category=payload.category,
             body=payload.body,
+            languages=payload.languages,
+            frameworks=payload.frameworks,
             references=payload.references,
         )
     except ValidationError as e:

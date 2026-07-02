@@ -8,44 +8,53 @@ languages: [rust]
 
 # Rust Best Practices Review
 
-## Key Areas
+## Security（必查，最高优先级）
 
-### Ownership & Borrowing
-- Avoid unnecessary `.clone()` — pass references or use `Cow` when ownership is ambiguous
-- Know the difference: `clone()` duplicates heap data; `Copy` is a bitwise copy for small types
-- `Rc<RefCell<T>>` is not a substitute for proper ownership design; prefer restructured types
-- Watch for accidental moves in closures: use `move` only when needed, or capture by reference
-- In hot paths, prefer `&str` over `String`, `&[T]` over `Vec<T>` for read-only parameters
+### Command Injection
+- `std::process::Command::new(user_input)` — 用户控制命令名，直接可执行任意程序
+- `Command::arg(user_input)` 拼接 `-c` 再传入 shell — 绕过参数分离，可注入任意命令
+- 任何 `Command` 的 executable/args 来自用户输入且未白名单校验 → **error**
 
-### Error Handling
-- Use `Result<T, E>` for recoverable errors, not `panic!` or `unwrap()`
-- `unwrap()` / `expect()` are only acceptable in tests, examples, or truly unrecoverable states
-- Implement `std::error::Error` for custom error types to integrate with the ecosystem
-- Use `thiserror` crate for deriving Error; use `anyhow` in applications, not libraries
-- Chain errors with `?` operator; don't manually `.map_err()` for simple propagation
+### Hardcoded Secrets
+- API key、token、password 以字符串字面量或 `const`/`static` 写在源码中 → **error**
+- JWT secret、数据库密码、云服务凭证的硬编码 → **error**
 
 ### Unsafe Code
-- Every `unsafe` block must have a `// SAFETY:` comment explaining invariants being upheld
-- Minimize `unsafe` scope: wrap only the minimal operation, not surrounding safe code
-- Never use `transmute` when safe casts or `From`/`Into` exist
-- Raw pointer dereference must be guarded by null/alignment/lifetime checks
-- Prefer safe abstractions from `std` over custom unsafe implementations
+- `unsafe { ... }` 块如果没有 `// SAFETY:` 注释说明不变量 → **warning**
+- `transmute` 在非 FFI 代码中 → **warning**（优先用 safe cast 或 `From`/`Into`）
+- 对原始指针解引用前没有 null/alignment 检查 → **error**
+- `MaybeUninit::assume_init()` 没有确保初始化 → **error**
 
-### Traits & Generics
-- Follow the orphan rule: implement your trait for your type, or their trait for your type
-- Avoid trait objects (`dyn Trait`) in performance-sensitive paths; prefer generics with static dispatch
-- Use `impl Trait` in return position for simple cases, named generics when constraints grow
-- Don't over-trait; if there's only one implementation, no need for abstraction yet
+### Panic in Production
+- 库代码 (`lib.rs`) 中使用 `panic!`、`unreachable!`、`todo!` → **error**
+- `unwrap()` / `expect()` 在非测试代码中 → **warning**（应用代码酌情，库代码严格）
+
+## Key Areas
+
+### Error Handling
+- 库代码：`unwrap()` / `expect()` 只允许在测试和示例中；其他地方用 `?` 传播或用 `match` 处理
+- `Result` 不能用 `let _ = ...` 吞掉；必须显式处理或用 `#[must_use]` lint
+- 应用代码：`unwrap()` 在初始化阶段可接受（如配置加载），在请求处理路径中不可接受
+- 实现 `std::error::Error` 用于自定义错误类型；库中用 `thiserror`，应用中用 `anyhow`
+
+### Ownership & Borrowing
+- 不必要的 `.clone()` — 优先传引用 `&T`，或用 `Cow` 处理可选所有权
+- 返回 `Vec<T>` 而调用方只需要遍历 → 考虑返回 `impl Iterator<Item=T>` 或 `&[T]`
+- `Rc<RefCell<T>>` 不是所有权设计问题的解决方案；优先重构类型层次
 
 ### Idiomatic Rust
-- Use `match` exhaustively; consider `#[non_exhaustive]` for library enums
-- Prefer iterator combinators over manual `for` + mutable accumulator
-- Use `if let` and `while let` instead of single-arm `match`
-- Derive common traits: `#[derive(Debug, Clone, PartialEq, Eq, Hash)]`
-- `const` over `static` when possible; prefer `lazy_static` / `once_cell` over mutable statics
+- 优先用 iterator combinators（`.map`, `.filter`, `.collect`）替代手动 `for` + `push`
+- `if let` / `while let` 替代单臂 `match`
+- 自动 derive 常见 trait：`#[derive(Debug, Clone, PartialEq, Eq, Hash)]`
+- `const` 优于 `static`（除非需要固定内存地址）
+
+### Testing Patterns
+- `unwrap()` 在测试中是惯用法，不报告
+- 测试函数标注 `#[test]` 或 `#[tokio::test]`
+- 不应有 `#[ignore]` 测试长期未修复
 
 ## Validation Criteria
 
-**True Positive**: The pattern causes unsafety, panics in production, or violates Rust's ownership guarantees.
+**True Positive**: 代码在生产路径上会导致 panic、unsafety 或违反 Rust 安全保证。
 
-**False Positive**: The pattern is intentional (e.g., `unwrap()` in test code), or forced by FFI boundaries.
+**False Positive**: 代码在 `#[cfg(test)]` 块中、FFI 边界必需的 unsafe、或初始化阶段的 unwrap。

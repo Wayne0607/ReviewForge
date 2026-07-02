@@ -16,9 +16,38 @@ PromptSection = Callable[[dict[str, Any]], str | None]
 
 def _identity(ctx: dict[str, Any]) -> str:
     role = ctx.get("role", "reviewer")
+    reviewer_type = ctx.get("reviewer_type", "代码")
+    language = ctx.get("target_language", "")
+
+    # Per-language reviewer title for better context anchoring
+    _lang_display: dict[str, str] = {
+        "python": "Python",
+        "go": "Go",
+        "rust": "Rust",
+        "java": "Java",
+        "ruby": "Ruby",
+        "javascript": "JavaScript",
+        "typescript": "TypeScript",
+    }
+    lang_hint = _lang_display.get(language, language.capitalize()) if language else ""
+
+    _type_display: dict[str, str] = {
+        "security": "安全",
+        "performance": "性能",
+        "style": "代码风格",
+        "testing": "测试质量",
+        "documentation": "文档",
+        "dependency": "依赖风险",
+        "accessibility": "可访问性",
+    }
+    type_hint = _type_display.get(reviewer_type, reviewer_type)
+
     identities = {
         "planner": "你是 ReviewForge 的 Planner。你分析 PR diff，决定派哪些专门的 Reviewer 去审查。",
-        "reviewer": f"你是 ReviewForge 的 {ctx.get('reviewer_type', '代码')}审查员。你检查代码变更并报告发现的问题。",
+        "reviewer": (
+            f"你是 ReviewForge 的 {lang_hint + ' ' if lang_hint else ''}{type_hint}审查员。"
+            f"你检查代码变更并报告发现的问题。"
+        ),
         "verifier": "你是 ReviewForge 的 Verifier。你审查候选发现，判断是真实问题还是误报。",
         "commenter": "你是 ReviewForge 的 Commenter。你将确认的发现格式化为清晰、可操作的 GitHub review 评论。",
     }
@@ -83,7 +112,9 @@ def _planner_mission(ctx: dict[str, Any]) -> str:
 
 def _reviewer_mission(ctx: dict[str, Any]) -> str:
     reviewer_type = ctx.get("reviewer_type", "general")
-    missions = {
+    language = ctx.get("target_language", "")
+
+    missions: dict[str, str] = {
         "security": """## 任务
 
 审查代码中的安全漏洞：
@@ -100,14 +131,6 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - N+1 查询模式
 - 不必要的内存分配
 - 在 async 上下文中使用阻塞 I/O""",
-        "style": """## 任务
-
-审查代码的可读性和可维护性：
-- 命名不清晰、魔法数字
-- 公共 API 缺少文档字符串
-- 过于复杂的函数（>30 行）
-- 死代码、未使用的导入
-- 与代码库其他部分的模式不一致""",
         "testing": """## 任务
 
 审查代码变更的测试质量：
@@ -150,6 +173,82 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - 语义化 HTML 使用不当（用 div 代替 button）
 - 屏幕阅读器无法理解的动态内容更新""",
     }
+
+    # ── 语言特定的 Style 审查主题（按语言切换审查姿态）────────────────
+    _style_mission_by_lang: dict[str, str] = {
+        "go": """## 任务
+
+审查 Go 代码的惯用性和可维护性：
+- Error 返回值是否被正确处理（禁止 _ = err、未检查的 error）
+- Interface 设计是否合理（小接口 1-3 方法，消费端定义，避免过度抽象）
+- Goroutine 是否有退出机制（context 传递、channel 关闭、sync.WaitGroup）
+- 命名是否符合 Go 惯例（包名小写无下划线，导出名 PascalCase，缩写全大写 ID/URL）
+- 避免在循环中使用 defer（改用函数包裹）
+- nil 检查是否遗漏（map/slice 的 nil vs empty 语义）""",
+        "rust": """## 任务
+
+审查 Rust 代码的安全性和惯用性：
+- 不必要的 clone() 或所有权转移（应优先借用）
+- unwrap()/expect() 在非示例/测试代码中的使用（应改用 ? 或更优雅的错误处理）
+- unsafe 块是否可以消除或缩小作用域
+- 生命周期标注是否最小化（依赖编译器的 lifetime elision）
+- Error 类型是否实现了 std::error::Error trait
+- 是否合理使用 Option vs Result vs panic
+- 不必要的 mut 声明""",
+        "python": """## 任务
+
+审查 Python 代码的可读性和可维护性：
+- 命名不清晰、魔法数字
+- 公共 API 缺少文档字符串
+- 类型注解是否完整（参数和返回值）
+- 异常处理是否精确（禁止 bare except:、except Exception: pass）
+- 函数复杂度是否可控（>30 行应拆分，嵌套 >3 层是警告）
+- 死代码、未使用的导入
+- 与代码库其他部分的模式不一致""",
+        "java": """## 任务
+
+审查 Java 代码的惯用性和可维护性：
+- 异常处理是否合理（禁止 catch Exception 后吞掉，finally 中不应抛异常）
+- 资源是否用 try-with-resources 正确关闭（Stream, Connection, Reader/Writer）
+- Optional 是否滥用（禁止 Optional 作为参数/字段，应只用于返回值）
+- Stream API 使用是否得当（避免在 stream 中抛 checked exception）
+- 命名是否符合 Java 惯例（类 PascalCase，方法 camelCase，常量 UPPER_SNAKE）
+- equals/hashCode 是否成对重写
+- 可变对象是否暴露了内部引用（防御性拷贝）""",
+        "ruby": """## 任务
+
+审查 Ruby 代码的惯用性和可维护性：
+- 是否过度使用元编程（method_missing, instance_eval, define_method）
+- 代码块（block）使用是否合理（优先用 yield 而非 &block 传参）
+- 异常处理是否精确（禁止 rescue Exception，应 rescue StandardError 子类）
+- 命名是否符合 Ruby 惯例（方法 snake_case，类 PascalCase，谓词方法 ? 结尾）
+- 是否合理使用 Enumerable 方法替代手动循环""",
+        "javascript": """## 任务
+
+审查 JavaScript/TypeScript 代码的可读性和可维护性：
+- 回调地狱是否改用 async/await 或 Promise 链
+- 事件监听器是否在组件销毁时清理（内存泄漏）
+- 对象/数组是否不当使用可变操作（优先不可变模式）
+- 类型声明是否完整（TypeScript 应避免 any，使用泛型或 unknown 替代）
+- 模块导入是否冗余或循环引用""",
+    }
+
+    if reviewer_type == "style" and language in _style_mission_by_lang:
+        return _style_mission_by_lang[language]
+
+    # Fallback: generic style mission
+    _generic_style = """## 任务
+
+审查代码的可读性和可维护性：
+- 命名不清晰、魔法数字
+- 公共 API 缺少文档
+- 过于复杂的函数
+- 死代码、未使用的导入
+- 与代码库其他部分的模式不一致"""
+
+    if reviewer_type == "style":
+        return _generic_style
+
     return missions.get(reviewer_type, "## 任务\n\n审查代码变更并报告发现。")
 
 
@@ -235,6 +334,7 @@ def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
 **仓库**: {ctx.get("repo", "unknown")}
 **PR #{ctx.get("pr_number", "?")}**: {ctx.get("pr_title", "")}
 **变更文件**: {", ".join(ctx.get("files_changed", []))}
+**检测到的语言**: {ctx.get("language_summary", "未识别")}
 
 ## Diff 摘要
 

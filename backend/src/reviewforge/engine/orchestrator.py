@@ -95,17 +95,17 @@ class Orchestrator:
         # Plugin-loaded reviewers (merged at init time)
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
 
-        # 渐进式 Skill 加载（Level 1）：发现 skills，建立 reviewer_type -> SkillMeta 映射
+        # 渐进式 Skill 加载（Level 1）：发现 skills，建立 reviewer_type -> [SkillMeta] 1:N 映射
         from pathlib import Path
 
         from reviewforge.skills.loader import SkillLoader
 
         self._skill_loader = SkillLoader(Path(__file__).resolve().parent.parent / "skills")
-        self._skills_by_type: dict[str, Any] = {}
+        self._skills_by_type: dict[str, list[Any]] = {}
         try:
             for meta in self._skill_loader.discover():
-                if meta.reviewer_type and meta.reviewer_type not in self._skills_by_type:
-                    self._skills_by_type[meta.reviewer_type] = meta
+                if meta.reviewer_type:
+                    self._skills_by_type.setdefault(meta.reviewer_type, []).append(meta)
         except Exception as e:
             logger.warning(f"Skill discovery failed: {e}")
 
@@ -119,7 +119,7 @@ class Orchestrator:
         return self._skill_loader._skills_dir
 
     def reload_skills(self) -> int:
-        """Re-scan the skills directory and rebuild the reviewer_type → SkillMeta map.
+        """Re-scan the skills directory and rebuild the reviewer_type → [SkillMeta] map.
 
         Skill *bodies* are already read fresh per run; this picks up new skills and
         changed frontmatter (the type mapping) without a restart. Returns skill count.
@@ -127,8 +127,8 @@ class Orchestrator:
         self._skills_by_type = {}
         metas = self._skill_loader.discover()
         for meta in metas:
-            if meta.reviewer_type and meta.reviewer_type not in self._skills_by_type:
-                self._skills_by_type[meta.reviewer_type] = meta
+            if meta.reviewer_type:
+                self._skills_by_type.setdefault(meta.reviewer_type, []).append(meta)
         return len(metas)
 
     def register_config_agent(
@@ -170,6 +170,92 @@ class Orchestrator:
         removed = self._extra_reviewers.pop(name, None) is not None
         self._registry.unregister_agent(name)
         return removed
+
+    def _resolve_skill(self, metas: list[Any], language: str | None = None, framework: str | None = None) -> Any | None:
+        """从同 reviewer_type 的多个 skill 中按语言/框架选出最佳匹配。
+
+        优先级:
+          1. (lang, fw)   精确匹配 — 例如 Vue TS 文件走 vue_patterns
+          2. (lang, none)  语言匹配且无框架限制 — 例如 Go 文件走 go_best_practices
+          3. (*, fw)      框架匹配（语言不限）— 例如 Vue JS 文件也走 vue_patterns
+          4. (*, *)       通用 skill（无语言无框架限制）— 例如 security_rules, code_quality
+          5. 兜底: 同类型任意一个
+        """
+        if not metas:
+            return None
+
+        # 1. (language, framework) exact
+        if language and framework:
+            for m in metas:
+                if language in m.languages and framework in m.frameworks:
+                    return m
+
+        # 2. (language, no framework restriction) — best when we know the language
+        if language:
+            for m in metas:
+                if language in m.languages and not m.frameworks:
+                    return m
+
+        # 3. (*, framework) — framework match with any (or no) language
+        if framework:
+            for m in metas:
+                langs = m.languages
+                has_lang_match = (not langs) or (language and language in langs)
+                if framework in m.frameworks and has_lang_match:
+                    return m
+
+        # 4. (language, *) only when framework IS known but no exact (lang,fw) match
+        if language and framework:
+            for m in metas:
+                if language in m.languages:
+                    return m
+
+        # 5. Universal — no language or framework constraints
+        for m in metas:
+            if not m.languages and not m.frameworks:
+                return m
+
+        # 6. Any skill of this type
+        for m in metas:
+            return m
+
+        return None
+
+    def _detect_task_language(self, task: Any) -> str | None:
+        """从 task 文件列表检测主导语言（多数投票）。"""
+        from collections import Counter
+
+        from reviewforge.engine.symbol_extractor import detect_language
+
+        if not task.files:
+            return None
+        langs = [detect_language(f) for f in task.files]
+        known = [lang for lang in langs if lang and lang != "unknown"]
+        if not known:
+            return None
+        return Counter(known).most_common(1)[0][0]
+
+    def _detect_task_framework(self, task: Any) -> str | None:
+        """从前端文件中检测使用的框架。
+
+        仅处理 JS/TS 文件，通过特征导入或文件扩展名判断框架。
+        """
+        if not task.files:
+            return None
+
+        # 扩展名特征（最强信号）
+        ext_fw = {".vue": "vue", ".svelte": "svelte"}
+        for f in task.files:
+            for ext, fw in ext_fw.items():
+                if f.endswith(ext):
+                    return fw
+
+        # JSX/TSX 默认 React（后续可通过 import 内容精判）
+        has_jsx = any(f.endswith((".jsx", ".tsx")) for f in task.files)
+        if has_jsx:
+            return "react"
+
+        return None
 
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
@@ -230,6 +316,12 @@ class Orchestrator:
                                 run_id, task.reviewer, status="failed", error=f"unknown reviewer: {task.reviewer}"
                             )
                         return
+                    # 按 task 文件检测语言/框架，注入匹配的 skill
+                    lang = self._detect_task_language(task)
+                    fw = self._detect_task_framework(task)
+                    self._attach_skill(reviewer, lang, fw)
+                    reviewer._target_language = lang or ""
+                    reviewer._target_framework = fw or ""
                     findings = await reviewer.execute(task, state)
                     for f in findings:
                         state.add_finding(f)
@@ -455,16 +547,20 @@ class Orchestrator:
             reviewer = cls(llm, self._registry, self._gateway)
             reviewer._agentic = agentic
             reviewer._events = self._events
-            self._attach_skill(reviewer)
             return reviewer
         return None
 
-    def _attach_skill(self, reviewer: BaseReviewer) -> None:
-        """渐进式 Skill 加载（Level 2）：把匹配 reviewer_type 的 SKILL.md 注入该 reviewer。"""
+    def _attach_skill(
+        self, reviewer: BaseReviewer, target_language: str | None = None, target_framework: str | None = None
+    ) -> None:
+        """渐进式 Skill 加载（Level 2）：按语言/框架选出最佳 SKILL.md 注入 reviewer。"""
         # Config-type agents carry inline instructions as their skill body — don't clobber.
         if getattr(reviewer, "_skill_body", ""):
             return
-        meta = self._skills_by_type.get(reviewer.reviewer_type)
+        metas = self._skills_by_type.get(reviewer.reviewer_type, [])
+        if not metas:
+            return
+        meta = self._resolve_skill(metas, target_language, target_framework)
         if not meta:
             return
         try:

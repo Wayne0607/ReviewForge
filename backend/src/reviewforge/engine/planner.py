@@ -1,7 +1,8 @@
 """Planner Agent — single-shot LLM decision maker with deterministic security detection.
 
 Reads PR diff summary, outputs task proposals for reviewers.
-Security patterns are detected deterministically before LLM call.
+Patterns are language-aware: each pattern carries a language marker so Go code
+triggers Go-specific security checks, Rust code triggers Rust-specific ones, etc.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -16,47 +18,110 @@ from langchain_openai import ChatOpenAI
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import ReviewTask, StateStore
 from reviewforge.engine.prompt import build_planner_prompt
+from reviewforge.engine.symbol_extractor import detect_language
 
 logger = logging.getLogger(__name__)
 
-# Deterministic security patterns — if any match, security_reviewer is forced
-SECURITY_PATTERNS = [
-    (r"os\.system\s*\(", "command-injection"),
-    (r"subprocess\.\w+\(.*shell\s*=\s*True", "command-injection"),
-    (r"os\.popen\s*\(", "command-injection"),
-    (r"eval\s*\(", "code-injection"),
-    (r"exec\s*\(", "code-injection"),
-    (r"pickle\.loads?\s*\(", "insecure-deserialization"),
-    (r"yaml\.load\s*\([^)]*\)", "insecure-deserialization"),  # missing Loader=SafeLoader
+# ── 通用安全模式（不限语言）────────────────────────────────────────────
+_UNIVERSAL_SECURITY = [
+    (r"(?:password|secret|api_key|token)\s*=\s*['\"\"][^'\"]{8,}['\"\"]", "hardcoded-secrets"),
     (r"(?:SELECT|INSERT|UPDATE|DELETE).*\+\s*(?:str\(|f['\"])", "sql-injection"),
     (r"f['\"].*(?:SELECT|INSERT|UPDATE|DELETE).*\{", "sql-injection"),
-    (r"(?:API_KEY|SECRET_KEY|PASSWORD|TOKEN)\s*=\s*['\"][^'\"]{8,}['\"]", "hardcoded-secrets"),
     (r"open\s*\([^)]*\+.*['\"]r['\"]", "path-traversal"),
-    (r"(?:innerHTML|dangerouslySetInnerHTML|v-html)", "xss"),
-    (r"subprocess\.(?:call|run|Popen)\s*\(", "command-injection"),
 ]
 
-# Performance patterns
-PERFORMANCE_PATTERNS = [
+# ── 语言特定安全模式 ──────────────────────────────────────────────────
+_SECURITY_BY_LANG = {
+    "python": [
+        (r"os\.system\s*\(", "command-injection"),
+        (r"subprocess\.\w+\(.*shell\s*=\s*True", "command-injection"),
+        (r"os\.popen\s*\(", "command-injection"),
+        (r"subprocess\.(?:call|run|Popen)\s*\(", "command-injection"),
+        (r"pickle\.loads?\s*\(", "insecure-deserialization"),
+        (r"yaml\.load\s*\([^)]*\)", "insecure-deserialization"),
+        (r"eval\s*\(", "code-injection"),
+        (r"exec\s*\(", "code-injection"),
+    ],
+    "go": [
+        (r"exec\.Command\(", "command-injection"),
+        (r"os/exec", "command-injection"),
+        (r"template\.HTML\(", "xss"),
+        (r"unsafe\b", "unsafe-usage"),
+        (r"db\.Query\(.*\+", "sql-injection"),
+        (r"fmt\.Sprintf\(.*SELECT", "sql-injection"),
+    ],
+    "java": [
+        (r"Runtime\.getRuntime\(\)\.exec", "command-injection"),
+        (r"ProcessBuilder", "command-injection"),
+        (r"ObjectInputStream", "insecure-deserialization"),
+        (r"ScriptEngine", "code-injection"),
+        (r"Statement\.executeQuery\(.*\+", "sql-injection"),
+    ],
+    "rust": [
+        (r"unsafe\s*\{", "unsafe-block"),
+        (r"std::process::Command", "command-injection"),
+        (r"unwrap\(\)", "unchecked-unwrap"),
+        (r"transmute\s*<", "unsafe-transmute"),
+    ],
+    "ruby": [
+        (r"system\s*\(", "command-injection"),
+        (r"exec\s*\(", "code-injection"),
+        (r"`.*`", "command-injection"),
+        (r"eval\s*\(", "code-injection"),
+        (r"YAML\.load", "insecure-deserialization"),
+    ],
+    "javascript": [
+        (r"eval\s*\(", "code-injection"),
+        (r"innerHTML\s*=", "xss"),
+        (r"child_process", "command-injection"),
+        (r"document\.write\(", "xss"),
+    ],
+    "typescript": [
+        (r"eval\s*\(", "code-injection"),
+        (r"innerHTML\s*=", "xss"),
+        (r"dangerouslySetInnerHTML", "xss"),
+    ],
+}
+
+# ── 通用依赖模式 ──────────────────────────────────────────────────────
+_UNIVERSAL_DEPENDENCY = [
+    (r"package\.json", "dep-change"),
+    (r"(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml)", "dep-file-change"),
+]
+
+_DEPENDENCY_BY_LANG = {
+    "python": [
+        (r"(?:pip install|requirements.*\.txt|pyproject\.toml|setup\.py|Pipfile|poetry\.lock)", "dep-change"),
+    ],
+    "go": [
+        (r"(?:go\.mod|go\.sum|go\s+(?:get|mod)\s)", "dep-change"),
+    ],
+    "java": [
+        (r"(?:pom\.xml|build\.gradle|mvn\s|gradle\s)", "dep-change"),
+    ],
+    "rust": [
+        (r"(?:Cargo\.toml|Cargo\.lock|cargo\s+(?:add|install))", "dep-change"),
+    ],
+    "ruby": [
+        (r"(?:Gemfile|\.gemspec|bundle\s+install|gem\s+install)", "dep-change"),
+    ],
+}
+
+# ── 性能模式（通用）───────────────────────────────────────────────────
+_PERFORMANCE_PATTERNS = [
     (r"for\s+\w+\s+in\s+range.*\n.*for\s+\w+\s+in\s+range", "nested-loop"),
     (r"(?:urllib\.request\.urlopen|requests\.get)\s*\(.*\n.*for\s+", "blocking-io-in-loop"),
     (r"sqlite3\.connect\s*\(.*\n.*for\s+", "db-in-loop"),
 ]
 
-# Testing patterns — trigger testing_reviewer
-TESTING_PATTERNS = [
-    (r"def\s+\w+\([^)]*\)\s*->", "has-type-hints"),  # new function with type hints
-    (r"class\s+\w+:", "new-class"),  # new class definition
+# ── 测试模式（通用）───────────────────────────────────────────────────
+_TESTING_PATTERNS = [
+    (r"def\s+\w+\([^)]*\)\s*->", "has-type-hints"),
+    (r"class\s+\w+:", "new-class"),
 ]
 
-# Dependency patterns — trigger dependency_reviewer
-DEPENDENCY_PATTERNS = [
-    (r"(?:pip install|add\(|dependencies|pyproject)", "dep-change"),
-    (r"(?:requirements.*\.txt|Pipfile|poetry\.lock|package\.json)", "dep-file-change"),
-]
-
-# Accessibility patterns — trigger accessibility_reviewer
-ACCESSIBILITY_PATTERNS = [
+# ── 可访问性模式（仅前端文件）─────────────────────────────────────────
+_A11Y_PATTERNS = [
     (r"(?:<img|<Image|<picture)", "image-element"),
     (r"(?:<input|<select|<textarea|<button)", "form-element"),
     (r"(?:onClick|onChange|onSubmit)", "interactive-handler"),
@@ -65,7 +130,7 @@ ACCESSIBILITY_PATTERNS = [
 
 
 class Planner:
-    """Single-shot planner with deterministic pattern detection."""
+    """Single-shot planner with deterministic, language-aware pattern detection."""
 
     def __init__(self, llm: ChatOpenAI, registry: SpecRegistry) -> None:
         self._llm = llm
@@ -84,6 +149,9 @@ class Planner:
         # Step 1: Deterministic pattern detection (skip already-dispatched reviewers)
         forced_reviewers = self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers
 
+        # Detect language summary for the planner prompt
+        file_langs = self._detect_file_languages(state.files_changed)
+
         # Step 2: LLM decision for additional reviewers
         ctx = {
             "registry": self._registry,
@@ -92,6 +160,7 @@ class Planner:
             "pr_title": "",
             "files_changed": state.files_changed,
             "diff_summary": state.diff_summary,
+            "language_summary": file_langs,
             "done_reviewers": sorted(done_reviewers),
             "notes": [{"from": n.from_agent, "type": n.type, "content": n.content} for n in (notes or [])],
         }
@@ -106,42 +175,80 @@ class Planner:
         # Step 3: Merge — include forced reviewers; default style only on the first round
         return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed, first_round)
 
+    @staticmethod
+    def _detect_file_languages(files: list[str]) -> str:
+        """Return a human-readable language summary of the changed files."""
+        langs = [detect_language(f) for f in files]
+        known = [lang for lang in langs if lang and lang != "unknown"]
+        if not known:
+            return "未识别"
+        counts = Counter(known)
+        parts = [f"{lang}({count})" if count > 1 else lang for lang, count in counts.most_common()]
+        return ", ".join(parts)
+
     def _detect_patterns(self, files: list[str], diff: str) -> set[str]:
-        """Deterministically detect patterns and force relevant reviewers."""
-        forced = set()
+        """Language-aware deterministic pattern detection."""
+        forced: set[str] = set()
         file_set = set(files)
+        file_langs = {detect_language(f) for f in file_set}
         is_frontend = any(f.endswith((".tsx", ".jsx", ".vue", ".html", ".svelte")) for f in file_set)
 
-        for pattern, label in SECURITY_PATTERNS:
+        # --- Security ---
+        security_hit = False
+        # 1. Universal patterns
+        for pattern, label in _UNIVERSAL_SECURITY:
             if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                 forced.add("security_reviewer")
-                logger.info(f"Security pattern detected: {label}")
+                security_hit = True
+                logger.info(f"Universal security pattern: {label}")
                 break
+        # 2. Language-specific patterns
+        if not security_hit:
+            for lang in file_langs:
+                for pattern, label in _SECURITY_BY_LANG.get(lang, []):
+                    if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                        forced.add("security_reviewer")
+                        logger.info(f"[{lang}] Security pattern: {label}")
+                        break
 
-        for pattern, label in PERFORMANCE_PATTERNS:
+        # --- Performance ---
+        for pattern, label in _PERFORMANCE_PATTERNS:
             if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                 forced.add("performance_reviewer")
-                logger.info(f"Performance pattern detected: {label}")
+                logger.info(f"Performance pattern: {label}")
                 break
 
-        for pattern, label in TESTING_PATTERNS:
+        # --- Testing ---
+        for pattern, label in _TESTING_PATTERNS:
             if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                 forced.add("testing_reviewer")
-                logger.info(f"Testing pattern detected: {label}")
+                logger.info(f"Testing pattern: {label}")
                 break
 
-        for pattern, label in DEPENDENCY_PATTERNS:
+        # --- Dependency ---
+        dep_hit = False
+        # 1. Universal
+        for pattern, label in _UNIVERSAL_DEPENDENCY:
             if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                 forced.add("dependency_reviewer")
-                logger.info(f"Dependency pattern detected: {label}")
+                dep_hit = True
+                logger.info(f"Universal dependency pattern: {label}")
                 break
+        # 2. Language-specific
+        if not dep_hit:
+            for lang in file_langs:
+                for pattern, label in _DEPENDENCY_BY_LANG.get(lang, []):
+                    if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                        forced.add("dependency_reviewer")
+                        logger.info(f"[{lang}] Dependency pattern: {label}")
+                        break
 
-        # Only force accessibility reviewer for frontend files
+        # --- Accessibility (frontend only) ---
         if is_frontend:
-            for pattern, label in ACCESSIBILITY_PATTERNS:
+            for pattern, label in _A11Y_PATTERNS:
                 if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                     forced.add("accessibility_reviewer")
-                    logger.info(f"Accessibility pattern detected: {label}")
+                    logger.info(f"Accessibility pattern: {label}")
                     break
 
         return forced

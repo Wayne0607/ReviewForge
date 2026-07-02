@@ -160,6 +160,8 @@ class BaseReviewer:
             "diffs": diffs,
             "skill_body": self._skill_body,
             "skill_refs": self._skill_refs,
+            "target_language": getattr(self, "_target_language", ""),
+            "target_framework": getattr(self, "_target_framework", ""),
         }
         messages = build_reviewer_prompt(ctx)
 
@@ -190,6 +192,8 @@ class BaseReviewer:
             "tools_enabled": True,
             "skill_body": self._skill_body,
             "skill_refs": self._skill_refs,
+            "target_language": getattr(self, "_target_language", ""),
+            "target_framework": getattr(self, "_target_framework", ""),
         }
         messages = build_reviewer_prompt(ctx)
         chat = [

@@ -63,7 +63,7 @@ _SECURITY_BY_LANG = {
         (r"Command::new", "command-injection"),
         (r"unwrap\(\)", "unchecked-unwrap"),
         (r"panic!\(", "production-panic"),
-        (r"transmute\s*<", "unsafe-transmute"),
+        (r"transmute\s*(::)?\s*<", "unsafe-transmute"),
         (r"\.unwrap\(\)", "unchecked-unwrap"),
     ],
     "ruby": [
@@ -203,6 +203,7 @@ class Planner:
         parts = [f"{lang}({count})" if count > 1 else lang for lang, count in counts.most_common()]
         return ", ".join(parts)
 
+
     def _detect_patterns(self, files: list[str], diff: str) -> set[str]:
         """Language-aware deterministic pattern detection."""
         forced: set[str] = set()
@@ -235,12 +236,13 @@ class Planner:
                 logger.info(f"Performance pattern: {label}")
                 break
 
-        # --- Testing ---
-        for pattern, label in _TESTING_PATTERNS:
-            if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
-                forced.add("testing_reviewer")
-                logger.info(f"Testing pattern: {label}")
-                break
+        # --- Testing (only for non-test files) ---
+        if not all(_is_test_file(f) for f in file_set):
+            for pattern, label in _TESTING_PATTERNS:
+                if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
+                    forced.add("testing_reviewer")
+                    logger.info(f"Testing pattern: {label}")
+                    break
 
         # --- Dependency ---
         dep_hit = False
@@ -363,3 +365,33 @@ class Planner:
             )
 
         return tasks
+
+
+def _is_test_file(file_path: str) -> bool:
+    """Check if a file is a test file by common naming conventions."""
+    name = file_path.lower()
+    return any(
+        name.endswith(suffix)
+        for suffix in (
+            "_test.py",
+            "test_.py",
+            "_test.go",
+            "test.go",
+            "test.java",
+            "tests.java",
+            "test.rs",
+            "_test.rs",
+            "test.rb",
+            "_test.rb",
+            "spec.rb",
+            "_spec.rb",
+            "test.ts",
+            "spec.ts",
+            "test.tsx",
+            "spec.tsx",
+            "test.js",
+            "spec.js",
+            "test.jsx",
+            "spec.jsx",
+        )
+    ) or name.startswith(("test_", "spec/", "tests/", "__tests__/", "test/"))

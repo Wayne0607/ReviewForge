@@ -22,6 +22,8 @@ LANG_MAP = {
     ".mjs": "javascript",
     ".ts": "typescript",
     ".tsx": "typescript",
+    ".vue": "typescript",
+    ".svelte": "typescript",
     ".go": "go",
     ".java": "java",
     ".rs": "rust",

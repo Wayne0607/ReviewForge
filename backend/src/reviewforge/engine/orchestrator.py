@@ -553,7 +553,12 @@ class Orchestrator:
     def _attach_skill(
         self, reviewer: BaseReviewer, target_language: str | None = None, target_framework: str | None = None
     ) -> None:
-        """渐进式 Skill 加载（Level 2）：按语言/框架选出最佳 SKILL.md 注入 reviewer。"""
+        """渐进式 Skill 加载（Level 2）：按语言/框架选出最佳 SKILL.md 注入 reviewer。
+
+        对于通用 skill（如 security_rules），如果知道目标语言，还会将对应的
+        语言特定参考文件（如 rust_patterns.md）内联注入，确保 single-shot 模式
+        下也能获得语言特定的漏洞模式。
+        """
         # Config-type agents carry inline instructions as their skill body — don't clobber.
         if getattr(reviewer, "_skill_body", ""):
             return
@@ -565,7 +570,33 @@ class Orchestrator:
             return
         try:
             content = self._skill_loader.load(meta.name)
-            reviewer._skill_body = content.body
+            body = content.body
+
+            # For universal skills with language-specific references, inline the
+            # matching reference so single-shot reviewers see language patterns.
+            if target_language and meta.references:
+                lang_ref_map = {
+                    "python": "patterns.md",
+                    "go": "go_patterns.md",
+                    "java": "java_patterns.md",
+                    "rust": "rust_patterns.md",
+                    "ruby": "patterns.md",
+                    "javascript": "frontend_patterns.md",
+                    "typescript": "frontend_patterns.md",
+                }
+                ref_name = lang_ref_map.get(target_language)
+                if ref_name and ref_name in meta.references:
+                    try:
+                        ref_body = self._skill_loader.read_ref(meta.name, ref_name)
+                        body += (
+                            f"\n\n## 语言特定安全规则 ({target_language})\n\n"
+                            f"以下是针对 {target_language} 的详细安全检测模式：\n\n{ref_body}"
+                        )
+                        logger.debug(f"Inlined {ref_name} for {reviewer.name} ({target_language})")
+                    except Exception:
+                        pass
+
+            reviewer._skill_body = body
             reviewer._skill_name = meta.name
             reviewer._skill_refs = list(meta.references or [])
             reviewer._skill_loader = self._skill_loader

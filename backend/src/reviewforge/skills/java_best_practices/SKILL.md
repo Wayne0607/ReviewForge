@@ -1,6 +1,6 @@
 ---
 name: java_best_practices
-description: Java code style and best practices review rules
+description: Java 代码审查规则。当审查 .java 文件时套用。检查异常处理、资源管理（try-with-resources）、Optional 使用、Stream API、安全漏洞。
 category: style
 reviewer_type: style
 languages: [java]
@@ -8,47 +8,71 @@ languages: [java]
 
 # Java Best Practices Review
 
+## When to Apply
+- 审查 `.java` 文件（非测试文件）
+- 审查 Java 项目的安全性、惯用性、资源管理
+
+## When NOT to Apply
+- **测试文件**（`*Test.java`, `*Tests.java`, `src/test/`）→ 测试中的异常处理、资源管理规则放宽
+- **生成的代码**（`target/generated-sources/`, Lombok `@Data` 生成的 getter/setter）→ 不审查
+- **JNI/FFI 代码** → 遵循 C 的惯例
+- **框架样板**（Spring `@Configuration`、JPA Entity）→ 框架约定优先
+- **遗留兼容性代码** → 标注 `@Deprecated` 的代码不强制现代化
+
+## Security（必查，最高优先级）
+
+### Command Injection
+- `Runtime.getRuntime().exec(userInput)` → **error**
+- `ProcessBuilder` 参数来自用户输入且未白名单 → **error**
+
+### SQL Injection
+- `Statement.executeQuery("SELECT ... WHERE name = '" + userInput + "'")` → **error**
+- JPA native query / Hibernate HQL 用字符串拼接 → **error**
+- 动态表名/列名必须白名单（`?` 占位符不支持标识符）
+
+### Insecure Deserialization
+- `ObjectInputStream` 处理不可信数据 → **error**
+- `XStream`, `Kryo` 反序列化用户数据 → **error**
+
+### Hardcoded Secrets
+- 密码、API key、token 在源码中作为字符串常量 → **error**
+
+### Path Traversal
+- `new File(base, userInput)` 未规范化检查 → **error**
+
 ## Key Areas
 
 ### Exception Handling
-- Never catch `Exception` and swallow silently — at minimum, log with context
-- Never throw from a `finally` block; it masks the original exception
-- Use checked exceptions for recoverable conditions, unchecked for programming errors
-- Don't use exceptions for control flow; they are expensive and obscure intent
+- 禁止 `catch (Exception e) {}` 空吞异常 — 至少 log warning
+- 禁止 `finally` 块中抛异常 — 掩盖原始异常
+- 不用异常做控制流
 
 ### Resource Management
-- Always close resources with try-with-resources (`AutoCloseable`)
-- Resources at risk: `InputStream`, `OutputStream`, `Reader`, `Writer`, `Connection`, `Statement`, `ResultSet`
-- Nesting try-with-resources: declare resources in reverse order of dependency
+- 所有 `AutoCloseable` 必须用 try-with-resources
+- 风险资源: `InputStream/OutputStream`, `Reader/Writer`, `Connection`, `Statement`, `ResultSet`
+
+### Optional
+- 只用 `Optional` 做返回值，不用作字段或参数
+- 用 `orElseThrow()` 而非裸 `get()`
+- `Optional.of()` 在 null 上抛 NPE → 用 `ofNullable()`
 
 ### Collections & Streams
-- Prefer `List.of()` / `Set.of()` / `Map.of()` over `Collections.unmodifiable*` for small immutable collections
-- Avoid `null` returns from collections methods; return empty collections instead
-- Stream: don't mutate external state inside lambdas; use `collect()` instead
-- Avoid `peek()` for side effects outside debugging — it's not guaranteed to execute
-- Parallel streams: only for CPU-bound, stateless, independent operations on large datasets
+- 返回空集合（`Collections.emptyList()`）而非 `null`
+- Stream: 不在 lambda 中修改外部状态
+- 用 `collect()` 而非 `forEach` + mutable accumulator
 
-### Optional Usage
-- Only use `Optional` as a return type, never as a field or method parameter
-- Prefer `orElseThrow()` over `get()` to make failure explicit
-- Don't use `Optional` for conditional logic; use `ifPresentOrElse` or map/flatMap chains
-- `Optional.of()` throws NPE on null; use `Optional.ofNullable()` for uncertain inputs
-
-### Naming & Style
-- Classes: PascalCase, interfaces don't need `I` prefix
-- Methods: camelCase, should read as verb phrases
-- Constants: `UPPER_SNAKE_CASE`
-- Package names: lowercase, reverse domain, no underscores
-- Always override `hashCode()` when overriding `equals()`
-
-### Defensive Programming
-- Never expose internal mutable state; return defensive copies or unmodifiable views
-- Constructor parameters: validate and copy mutable objects on entry
-- Use `Objects.requireNonNull()` at API boundaries for explicit null rejection
-- Be aware of `SimpleDateFormat` thread-safety; use `DateTimeFormatter` instead
+### Naming
+- 方法: camelCase；类: PascalCase；常量: UPPER_SNAKE
+- 永远成对覆写 `equals()` 和 `hashCode()`
 
 ## Validation Criteria
 
-**True Positive**: The pattern introduces bugs, resource leaks, or makes the code harder to reason about.
+**True Positive**: 会引入 bug、资源泄漏或安全隐患。Confidence > 0.7。
 
-**False Positive**: The pattern is intentional (e.g., null return as a domain concept), or constrained by a framework contract.
+**False Positive**:
+- `catch (Exception e) { throw new RuntimeException(e); }` — 有意义的包装
+- `null` 返回是域概念（如"未找到"）
+- `Optional` 用作字段是 ORM/JPA 的限制
+- 方法名 snake_case 是因为映射到数据库列名
+- 生成的 EqualsAndHashCode（Lombok）不算遗漏
+- 测试代码中的资源不强制 try-with-resources

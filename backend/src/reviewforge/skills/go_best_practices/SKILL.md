@@ -1,12 +1,42 @@
 ---
 name: go_best_practices
-description: Go code style and best practices review rules
+description: Go 代码审查规则。当审查 .go 文件时套用。检查错误处理、goroutine 生命周期、接口设计、命名惯例、defer 使用。
 category: style
 reviewer_type: style
 languages: [go]
 ---
 
 # Go Best Practices Review
+
+## When to Apply
+- 审查 `.go` 文件（非测试文件）
+- 审查 Go 项目的代码风格、惯用性、可维护性
+
+## When NOT to Apply
+- **测试文件**（`*_test.go`）→ 测试中的 `_ = err` 有时是故意忽略不重要的错误；表驱动测试的长函数是惯用法
+- **生成的代码**（`*.pb.go`, `*_string.go`）→ 不审查
+- **vendor/ 目录** → 第三方依赖
+- **main.go 初始化代码** → `panic` 和 `os.Exit` 在 CLI 入口是合理的
+- **CGo 绑定代码** → 遵循 C 的惯例而非纯 Go 惯例
+
+## Security（必查，最高优先级）
+
+### Command Injection
+- `exec.Command()` with user-controlled command name → **error**
+- Shell invocation: `exec.Command("bash", "-c", userInput)` → **error**
+- Check: is user input passed to exec.Command without whitelisting?
+
+### SQL Injection
+- `fmt.Sprintf("SELECT ... WHERE name = '%s'", userInput)` → **error**
+- String concatenation in query strings → **error**
+- Check: is every variable passed via `?` placeholders, not string formatting?
+
+### Hardcoded Secrets
+- API keys, tokens, passwords as string literals → **error**
+
+### XSS (html/template)
+- `template.HTML(userInput)` marks untrusted content as safe → **error**
+- Using `text/template` for HTML output → **error**
 
 ## Key Areas
 
@@ -17,39 +47,33 @@ languages: [go]
 - Avoid `panic` in library code; use it only for truly unrecoverable states
 
 ### Goroutine Lifecycle
-- Every goroutine must have a clear exit path (context cancellation, channel close, done signal)
-- Use `context.Context` for cancellation propagation across goroutines
-- Avoid starting goroutines in `init()` or global scope — no way to stop them
-- Always `defer wg.Done()` immediately after `wg.Add(1)` before starting goroutine
+- Every goroutine must have a clear exit path (context cancellation, channel close)
+- Use `context.Context` for cancellation propagation
+- Never leak goroutines: verify there's a `<-ctx.Done()` or `defer close(ch)` path
+- Always `defer wg.Done()` immediately after `wg.Add(1)`
 
 ### Interface Design
-- Interfaces should be small (1-3 methods); prefer single-method interfaces
-- Define interfaces where they are consumed, not where the implementation lives
-- Accept interfaces, return concrete types — this gives callers flexibility
-- Don't export interfaces for mocks; let consumers define what they need
+- Interfaces should be small (1-3 methods); single-method interfaces preferred
+- Define interfaces where consumed, not where implemented
+- Accept interfaces, return concrete types
 
-### Naming Conventions
-- Package names: lowercase, single word, no underscores (e.g., `http`, `json`)
-- Exported names: PascalCase with initialisms all-caps (e.g., `HTTPServer`, `UserID`)
-- Unexported names: camelCase
-- Getters: prefer `Owner()` over `GetOwner()`
-- Avoid stutter: `user.UserName` → `user.Name`; don't repeat package name in symbols
+### Naming
+- Package: lowercase, single word, no underscores
+- Exported: PascalCase, initialisms all-caps (`HTTPServer`, `UserID`)
+- Avoid stutter: `user.UserName` → `user.Name`
+- Getters: `Owner()` not `GetOwner()`
 
-### Memory & Performance
-- Avoid allocations in hot paths: prefer value types over pointers when possible
-- Use `sync.Pool` for frequently-allocated short-lived objects
-- Pre-allocate slice capacity when size is known: `make([]T, 0, expectedSize)`
-- Avoid boxing values into interfaces in tight loops
-- `defer` in a loop delays execution until function exit — wrap in a closure to scope it
-
-### Testing Patterns
-- Use table-driven tests: define a slice of test cases and iterate
-- Name test functions `Test<Function>_<Scenario>` for clarity
-- Use `t.Run()` for subtests to enable parallel execution and fine-grained output
-- Avoid `time.Sleep` in tests; use channels or `time.After` with explicit waits
+### Performance
+- Pre-allocate slice capacity when size is known: `make([]T, 0, n)`
+- `defer` in a loop delays execution until function exit — wrap in closure
 
 ## Validation Criteria
 
-**True Positive**: The pattern violates Go conventions and causes bugs, leaks, or maintainability issues.
+**True Positive**: Violates Go conventions and causes bugs, leaks, or maintainability issues. Confidence > 0.7.
 
-**False Positive**: The pattern is justified in context (e.g., `panic` in an `init` function for must-parse templates), or it's in generated code.
+**False Positive**:
+- `panic` in `init()` for must-parse templates/configs
+- `_ = err` in test code or where the error is truly irrelevant (e.g., `defer f.Close()`)
+- Long functions in table-driven tests are idiomatic
+- Generated code (`*.pb.go`, `*_string.go`, `*_mock.go`)
+- Interface defined at implementation site because it mirrors an external API contract

@@ -1,6 +1,6 @@
 ---
 name: angular_patterns
-description: Angular code review rules (components, DI, RxJS)
+description: Angular 代码审查规则。当审查 Angular 项目的 .ts 文件（组件/服务/Directive）时套用。检查 DI、RxJS 订阅管理、Signals、Change Detection、模板安全（[innerHTML] XSS）。
 category: style
 reviewer_type: style
 languages: [typescript]
@@ -9,46 +9,61 @@ frameworks: [angular]
 
 # Angular Patterns Review
 
+## When to Apply
+- 审查 Angular 项目的 `.ts` 组件、服务、指令、管道文件
+- 审查包含 `@Component`/`@Injectable`/`@Directive` 装饰器的文件
+
+## When NOT to Apply
+- **测试文件**（`*.spec.ts`）→ 测试规则放宽
+- **配置文件**（`angular.json`, `environment.*.ts`）→ 不同规则
+- **生成的代码**（`*.ngfactory.ts`, 自动生成的 service proxies）→ 不审查
+- **纯工具/helper 文件**（无 Angular 装饰器的 TypeScript）→ Angular 特定规则不适用；用 `code_quality` 或 `typescript_best_practices`
+- **NgModule 定义文件**（仅包含 `declarations`/`imports`/`providers` 数组）→ 样板代码
+
+## Security（必查，最高优先级）
+
+### XSS
+- `[innerHTML]="userContent"` 绑定用户内容 → **error**
+- `bypassSecurityTrustHtml(userContent)` 清洗不可信数据 → **error**
+- `bypassSecurityTrustScript/Style/ResourceUrl/Url` → **error**
+
+### Client-Side Secrets
+- API key、token 在组件/服务中硬编码 → **error**
+- Environment 文件中的敏感值 → **error**
+
 ## Key Areas
 
-### Component Design
-- Use `OnPush` change detection strategy by default for performance
-- Avoid complex logic in templates; move to component class or pipes
-- Inputs: prefer `input()` signal-based API (Angular 17+); use `@Input()` for older versions
-- Avoid calling functions in template bindings — they execute on every change detection cycle
+### Change Detection
+- Default: use `OnPush` strategy unless specifically needed
+- Avoid function calls in template bindings — they run on every CD cycle
+- `runOutsideAngular` for non-Angular async operations
 
 ### Dependency Injection
-- Prefer `inject()` function over constructor injection for cleaner code (Angular 14+)
-- Services should be provided at the appropriate level: `root` for singletons, component-level for scoped state
-- Avoid injecting components into services — creates circular dependencies
-- Use injection tokens for non-class dependencies to maintain type safety
+- Prefer `inject()` over constructor injection (Angular 14+)
+- Services: `providedIn: 'root'` for singletons, component-level for scoped state
+- Avoid circular DI (Service A → Service B → Service A)
 
 ### RxJS & Observables
-- Always unsubscribe from long-lived observables: use `takeUntilDestroyed()`, `async` pipe, or `Subscription.add()`
-- The `async` pipe auto-subscribes and unsubscribes — prefer it in templates
-- Avoid nested subscriptions; use `switchMap`/`concatMap`/`mergeMap` for flattening
-- Don't use `subscribe()` just to set a local variable; use `| async` or signals
-- Handle errors in observable chains with `catchError` — unhandled errors kill the stream
+- Always unsubscribe from long-lived observables
+- `async` pipe auto-subscribes — prefer in templates
+- No nested subscriptions; use `switchMap`/`concatMap`/`mergeMap`
+- Handle errors: `catchError` prevents stream death
 
 ### Signals (Angular 16+)
-- Use `signal()` for local reactive state; `computed()` for derived values
-- `effect()` for side effects; prefer declarative patterns over imperative effects
-- Don't mix signals and RxJS without explicit conversion: `toSignal()` / `toObservable()`
+- `signal()` for local reactive state; `computed()` for derived values
+- `effect()` with caution; prefer declarative over imperative
 
 ### Template
-- Avoid calling methods from templates that have side effects
-- `[innerHTML]` binding is an XSS risk; use `DomSanitizer` only with trusted content
-- Use `@defer` blocks for lazy-loading heavy template sections (Angular 17+)
-- Structural directives: prefer `@if`/`@for` control flow over `*ngIf`/`*ngFor` (Angular 17+)
-
-### Performance
-- Use `trackBy` with `@for` / `*ngFor` for stable DOM reuse in lists
-- Lazy-load feature modules with `loadChildren`; avoid eager-loading everything
-- Beware of memory leaks from non-cancelled subscriptions and un-detached event listeners
-- `runOutsideAngular` for non-Angular async operations to avoid triggering change detection
+- New control flow: `@if`/`@for`/`@switch` over `*ngIf`/`*ngFor` (Angular 17+)
+- `trackBy` with `@for` / `*ngFor` for list stability
+- Lazy-load with `loadChildren`; `@defer` for heavy sections
 
 ## Validation Criteria
 
-**True Positive**: The pattern causes memory leaks, change detection issues, or security vulnerabilities.
+**True Positive**: Causes memory leaks, CD issues, or security vulnerabilities. Confidence > 0.7.
 
-**False Positive**: The pattern is required by a specific Angular version constraint or library integration.
+**False Positive**:
+- `*ngIf`/`*ngFor` in Angular < 17 项目（新语法不可用）
+- `subscribe()` 后手动 unsubscribe — 不用 `async` pipe 但正确处理了清理
+- 服务没有 `providedIn: 'root'` 而是 module-provided — 在 NgModule 架构中这是正常的
+- `any` 类型在复杂的 generic 推导或第三方类型不完善时

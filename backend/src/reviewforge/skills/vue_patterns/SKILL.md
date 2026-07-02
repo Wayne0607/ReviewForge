@@ -1,65 +1,68 @@
 ---
 name: vue_patterns
-description: Vue.js code review rules (Composition API, SFC, reactivity)
+description: Vue/Nuxt 代码审查规则。当审查 .vue 文件或 Vue 项目的 TS/JS 文件时套用。检查组件设计、响应式、Composition API、模板安全（v-html XSS）。
 category: style
 reviewer_type: style
 languages: [typescript, javascript]
 frameworks: [vue, nuxt]
 ---
 
-# Vue Patterns Review
+# Vue/Nuxt Patterns Review
+
+## When to Apply
+- 审查 `.vue` 单文件组件
+- 审查 Vue/Nuxt 项目的 composable 和组件逻辑
+
+## When NOT to Apply
+- **测试文件**（`*.test.ts`, `*.spec.ts`）→ 测试规则放宽
+- **配置文件**（`nuxt.config.*`, `vite.config.*`）→ 不同规则
+- **生成的类型**（`*.d.ts`）→ 不审查
+- **纯工具函数**（`utils/`, `helpers/` 中的非 Vue 代码）→ Vue 特定规则不适用
+- **SSR-only 代码**（`server/` 目录下的 Nitro handlers）→ 组件规则不适用
 
 ## Security（必查，最高优先级）
 
 ### XSS
-- `v-html="userContent"` — 用户内容渲染为原始 HTML，XSS 风险 → **error**
-- `v-bind:innerHTML` / `:innerHTML` — 等效于 `v-html` → **error**
-- 动态组件 `<component :is="userInput">` 组件名来自用户输入 → **warning**
-- URL 来自用户输入且用于 `window.location.href` / `router.push` → **error**（开放重定向）
+- `v-html="userContent"` — 用户内容渲染为原始 HTML → **error**
+- `:innerHTML="userContent"` — 等效于 v-html → **error**
+- 动态组件 `<component :is="userInput">` 组件名来自用户 → **warning**
 
 ### Client-Side Secrets
-- 硬编码的 API key、token、密钥放在 `<script setup>` 或 composable 中 → **error**
-- `NEXT_PUBLIC_` / `VITE_` 前缀的环境变量包含敏感凭证 → **error**（这些会被打包进客户端 JS）
-- `localStorage.setItem('token', ...)` 将 JWT 存在本地存储 → **warning**（XSS 可窃取）
+- API key、token 在 `<script setup>` 或 composable 中硬编码 → **error**
+- `NUXT_PUBLIC_*` / `VITE_*` 前缀变量包含敏感凭证 → **error**
 
-### Template Security
-- `v-html` 的任何用户控制内容必须先用 DOMPurify/sanitize-html 清洗
-- SSR 渲染的用户内容未转义 → **error**
-- 第三方 script 动态加载 `<script :src="userUrl">` → **error**
+### Open Redirect
+- `router.push(userInput)` 跳转目标未白名单 → **warning**
 
 ## Key Areas
 
 ### Component Design
-- Use `<script setup>` syntax for new components — cleaner, better TypeScript support
-- Props must be typed: use `defineProps<{...}>()` with TypeScript or `validator` in Options API
-- Avoid mutating props directly; use `v-model` / `defineModel` or emit events upward
-- Components > 300 lines should be split; extract composables for reusable logic
+- Use `<script setup>` for new components
+- Props typed with `defineProps<T>()`
+- Never mutate props directly; use emit or `defineModel`
+- > 300 lines → split into composables or sub-components
 
 ### Reactivity
-- `ref()` vs `reactive()`: prefer `ref()` for primitives, `reactive()` only for complex objects with nested refs
-- Avoid destructuring reactive objects — breaks reactivity; use `toRefs()` or `.value` access
-- `computed()` must not have side effects (no mutations, no API calls)
-- `watch()` vs `watchEffect()`: use `watchEffect` for automatic dependency tracking, `watch` for explicit deps
-- Memory leaks: clean up watchers, event listeners, and timers in `onUnmounted`
+- `ref()` vs `reactive()`: prefer `ref()` for primitives
+- Don't destructure reactive objects — use `toRefs()`
+- `computed()` must have no side effects
+- Clean up watchers/timers/listeners in `onUnmounted`
 
 ### Template
-- `v-if` vs `v-show`: `v-if` for rarely-toggled or heavy content; `v-show` for frequent toggles
-- Always provide `:key` in `v-for`; use unique IDs, not array indices
-- Avoid `v-if` and `v-for` on the same element; use `<template>` wrapper
-- `v-html` is an XSS risk; use `v-text` or template interpolation unless content is sanitized
+- `v-if` vs `v-show`: `v-if` for heavy/rare, `v-show` for frequent toggles
+- Always `:key` in `v-for`; use unique IDs, not array indices
+- Don't use `v-if` and `v-for` on the same element
 
-### State Management
-- Use Pinia for global state; prefer composables for component-local or shared state
-- Don't store derived state; use `storeToRefs()` + computed for reactive destructuring
-- Avoid deep watchers on large objects; watch specific paths instead
-
-### TypeScript
-- Use typed props, emits, and slots: `defineProps<T>()`, `defineEmits<T>()`, `defineSlots<T>()`
-- Avoid `any` in composable return types; use generics for reusable patterns
-- Template ref typing: `const el = ref<HTMLDivElement>()` and use `el.value?.focus()`
+### State Management (Pinia)
+- Don't store derived state
+- Use `storeToRefs()` for reactive destructuring
 
 ## Validation Criteria
 
-**True Positive**: The pattern causes reactivity bugs, memory leaks, or security issues.
+**True Positive**: Causes reactivity bugs, memory leaks, or security issues. Confidence > 0.7.
 
-**False Positive**: The pattern is a deliberate optimization or required by a specific edge case.
+**False Positive**:
+- `v-html` 渲染的内容来自 CMS/可信源且经过 sanitize
+- `computed` 的"副作用"是读取外部状态（不是写入）
+- 不清理 `setInterval` 但该 watch 仅触发一次且组件生命周期等同于应用
+- Props 修改发生在 `defineModel` 或 `v-model` 模式中

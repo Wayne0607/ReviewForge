@@ -3,6 +3,8 @@ name: react_patterns
 description: React and TypeScript code review rules
 category: style
 reviewer_type: style
+languages: [typescript, javascript]
+frameworks: [react, next]
 ---
 
 # React Patterns Review

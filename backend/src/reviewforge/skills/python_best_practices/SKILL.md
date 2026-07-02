@@ -3,6 +3,7 @@ name: python_best_practices
 description: Python code style and best practices review rules
 category: style
 reviewer_type: style
+languages: [python]
 ---
 
 # Python Best Practices Review

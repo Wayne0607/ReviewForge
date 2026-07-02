@@ -3,8 +3,13 @@ name: security_rules
 description: Security vulnerability detection rules for common web application patterns
 category: security
 reviewer_type: security
+languages: []
 references:
   - patterns.md
+  - go_patterns.md
+  - java_patterns.md
+  - rust_patterns.md
+  - frontend_patterns.md
 ---
 
 # Security Review Rules

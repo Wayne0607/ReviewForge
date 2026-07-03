@@ -1,0 +1,1 @@
+trigger: test/cross-pr-phase-1

@@ -1,1 +1,1 @@
-trigger: test/token-benchmark-small
+trigger: test/token-benchmark-small v3

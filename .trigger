@@ -1,1 +1,1 @@
-trigger: test/lang-detection-accuracy
+trigger: test/lang-detection-accuracy v3

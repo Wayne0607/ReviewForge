@@ -203,7 +203,6 @@ class Planner:
         parts = [f"{lang}({count})" if count > 1 else lang for lang, count in counts.most_common()]
         return ", ".join(parts)
 
-
     def _detect_patterns(self, files: list[str], diff: str) -> set[str]:
         """Language-aware deterministic pattern detection."""
         forced: set[str] = set()

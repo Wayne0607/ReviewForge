@@ -360,7 +360,7 @@ class BaseReviewer:
             if not isinstance(item, dict):
                 continue
             category = normalize_category(str(item.get("category", "")))
-            if self.reviewer_type != "security" and is_security_category(category):
+            if self.reviewer_type not in {"security", "dependency"} and is_security_category(category):
                 continue
             try:
                 findings.append(

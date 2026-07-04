@@ -13,8 +13,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from reviewforge.core.events import EventBus
 from reviewforge.core.specs import build_registry
-from reviewforge.core.state import StateStore
-from reviewforge.engine.orchestrator import Orchestrator
+from reviewforge.core.state import Finding, StateStore
+from reviewforge.engine.orchestrator import Orchestrator, _should_escalate_finding
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.mock_github import MockGitHubClient
 
@@ -61,6 +61,30 @@ class _VerdictLLM(BaseChatModel):
 
     def bind_tools(self, tools, **kw):
         return self
+
+
+def test_high_confidence_security_skips_agentic_escalation():
+    high_confidence = Finding(
+        file="a.py",
+        line=5,
+        severity="error",
+        category="sql-injection",
+        message="string-concat SQL",
+        confidence=0.8,
+        reviewer="security_reviewer",
+    )
+    fuzzy_confidence = Finding(
+        file="a.py",
+        line=5,
+        severity="error",
+        category="sql-injection",
+        message="string-concat SQL",
+        confidence=0.6,
+        reviewer="security_reviewer",
+    )
+
+    assert _should_escalate_finding(high_confidence, 0.4, 0.7) is False
+    assert _should_escalate_finding(fuzzy_confidence, 0.4, 0.7) is True
 
 
 async def test_escalation_verdict_survives_calibrator():

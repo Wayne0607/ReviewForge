@@ -27,11 +27,24 @@ from reviewforge.engine.escalation import EscalationReviewer
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
+from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 from reviewforge.engine.verifier import Verifier
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
+
+
+def _should_escalate_finding(
+    finding: Finding,
+    confidence_min: float,
+    confidence_max: float,
+    high_confidence_security_threshold: float = 0.75,
+) -> bool:
+    """Route only ambiguous findings into the expensive agentic verifier."""
+    if is_security_category(finding.category) and finding.confidence >= high_confidence_security_threshold:
+        return False
+    return EscalationReviewer.should_escalate(finding, confidence_min, confidence_max)
 
 
 class Orchestrator:
@@ -428,9 +441,7 @@ class Orchestrator:
                 for f in candidates:
                     bucket = (
                         esc_set
-                        if EscalationReviewer.should_escalate(
-                            f, self._escalation_confidence_min, self._escalation_confidence_max
-                        )
+                        if _should_escalate_finding(f, self._escalation_confidence_min, self._escalation_confidence_max)
                         else calib_set
                     )
                     bucket.append(f)

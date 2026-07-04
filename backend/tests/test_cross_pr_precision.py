@@ -139,3 +139,63 @@ async def test_cross_pr_normalizes_security_category_aliases(tmp_path):
     cross = await analyzer.analyze("aliasB", state_b, existing_findings=[])
     assert {f.category for f in cross} == {"cross-pr-code-injection"}
     await db.close()
+
+
+async def test_cross_pr_ignores_stdlib_import_fuzzy_matches(tmp_path):
+    db = Database(tmp_path / "stdlib.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+    await db.upsert_file_risk("cross_pr_live/risky_ops.py", "critical", ["sql-injection"], 1, "old")
+
+    state = StateStore(
+        pr_number=20,
+        repo="o/r",
+        head_sha="S",
+        files_changed=["demo_app/std_import.py"],
+        diff_summary=_diff("demo_app/std_import.py", "import os\n\ndef run():\n    return os.getcwd()\n"),
+    )
+
+    assert await analyzer.analyze("stdlib", state, existing_findings=[]) == []
+    await db.close()
+
+
+async def test_symbol_risk_prefers_function_name_over_drifted_line(tmp_path):
+    db = Database(tmp_path / "symbol_text.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+
+    seed_src = (
+        "def safe_first(value):\n"
+        "    return value\n"
+        "def risky_second(conn, raw):\n"
+        "    return conn.execute(f'SELECT * FROM users WHERE name = {raw}')\n"
+    )
+    state_a = StateStore(
+        pr_number=30,
+        repo="o/r",
+        head_sha="A",
+        files_changed=["demo_app/sinks.py"],
+        diff_summary=_diff("demo_app/sinks.py", seed_src),
+    )
+    await analyzer.analyze(
+        "textA",
+        state_a,
+        [
+            Finding(
+                file="demo_app/sinks.py",
+                line=1,
+                severity="error",
+                category="sql-injection",
+                message="risky_second 函数拼接 SQL，存在注入风险",
+                confidence=0.9,
+                reviewer="security_reviewer",
+                status="confirmed",
+            )
+        ],
+    )
+
+    safe = await db.get_symbol("demo_app/sinks.py", "safe_first")
+    risky = await db.get_symbol("demo_app/sinks.py", "risky_second")
+    assert safe["risk_categories"] == "[]"
+    assert "sql-injection" in risky["risk_categories"]
+    await db.close()

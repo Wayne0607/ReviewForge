@@ -36,6 +36,35 @@ MAX_DEPTH = {
     "low": 0,
 }
 
+_IGNORED_IMPORTS = {
+    "@angular/core",
+    "@angular/platform-browser",
+    "crypto",
+    "database/sql",
+    "fmt",
+    "hashlib",
+    "html/template",
+    "java.io",
+    "java.sql",
+    "javax",
+    "json",
+    "net/http",
+    "open3",
+    "os",
+    "os/exec",
+    "pathlib",
+    "pickle",
+    "react",
+    "re",
+    "std",
+    "subprocess",
+    "sys",
+    "typing",
+    "urllib",
+    "urllib.request",
+    "yaml",
+}
+
 
 @dataclass
 class CrossPRChain:
@@ -166,6 +195,9 @@ class CrossPRAnalyzer:
 
     def _resolve_import_to_file(self, import_source: str, known_files: list[str]) -> str | None:
         """Resolve an import path to a file path in the repo."""
+        if _is_ignored_import(import_source):
+            return None
+
         # Convert dots to slashes and try matching
         as_path = import_source.replace(".", "/")
 
@@ -205,13 +237,11 @@ class CrossPRAnalyzer:
 
             risk_level = self._category_to_risk(category)
 
-            # (a) Attribute to the enclosing symbol = last definition at/above the finding line.
-            enclosing: SymbolInfo | None = None
-            for s in defs_by_file.get(finding.file, []):
-                if s.line <= (finding.line or 0):
-                    enclosing = s
-                else:
-                    break
+            # (a) Attribute to the named/enclosing symbol. LLM line numbers can drift
+            # on new-file diffs, so prefer explicit symbol names mentioned in the finding.
+            enclosing = self._match_symbol_by_finding_text(finding, defs_by_file.get(finding.file, []))
+            if enclosing is None:
+                enclosing = self._enclosing_symbol_by_line(finding, defs_by_file.get(finding.file, []))
             if enclosing is not None:
                 key = (enclosing.file_path, enclosing.name)
                 symbol_cats.setdefault(key, (enclosing, set()))[1].add(category)
@@ -264,6 +294,9 @@ class CrossPRAnalyzer:
         chains = []
 
         for imp in imports:
+            if _is_ignored_import(imp.source):
+                continue
+
             # Check if the import target has known risks
             target_file = self._resolve_import_to_file(imp.source, known_files)
             if not target_file:
@@ -378,6 +411,25 @@ class CrossPRAnalyzer:
                 unique.append(c)
 
         return unique
+
+    @staticmethod
+    def _match_symbol_by_finding_text(finding: Finding, symbols: list[SymbolInfo]) -> SymbolInfo | None:
+        text = f"{finding.message}\n{finding.suggestion}".lower()
+        matches = [s for s in symbols if s.name and s.name.lower() in text]
+        if not matches:
+            return None
+        # Prefer the longest name when one symbol name is a substring of another.
+        return max(matches, key=lambda s: len(s.name))
+
+    @staticmethod
+    def _enclosing_symbol_by_line(finding: Finding, symbols: list[SymbolInfo]) -> SymbolInfo | None:
+        enclosing = None
+        for s in symbols:
+            if s.line <= (finding.line or 0):
+                enclosing = s
+            else:
+                break
+        return enclosing
 
     def _chains_to_findings(self, chains: list[CrossPRChain]) -> list[Finding]:
         """Convert suspicious chains directly to findings without LLM confirmation."""
@@ -596,3 +648,13 @@ class CrossPRAnalyzer:
     def _higher_risk(a: str, b: str) -> str:
         order = {"safe": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
         return a if order.get(a, 0) >= order.get(b, 0) else b
+
+
+def _is_ignored_import(import_source: str) -> bool:
+    source = (import_source or "").strip().strip("\"'")
+    if not source:
+        return True
+    if source.startswith((".", "/")):
+        return False
+    first = re.split(r"[./]", source, maxsplit=1)[0]
+    return source in _IGNORED_IMPORTS or first in _IGNORED_IMPORTS

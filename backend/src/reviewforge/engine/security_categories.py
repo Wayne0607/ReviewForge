@@ -30,7 +30,9 @@ SECURITY_CATEGORIES = {
 
 _ALIASES = {
     "arbitrary-code-execution": "rce",
+    "client-secrets": "hardcoded-secrets",
     "client-side-code-execution": "code-injection",
+    "code-execution": "code-injection",
     "directory-traversal": "path-traversal",
     "file-disclosure": "path-traversal",
     "file-path-traversal": "path-traversal",

@@ -51,7 +51,10 @@ class DynamicCalibrator:
         "xss",
         "csrf",
         "command-injection",
+        "code-injection",
+        "data-leak",
         "path-traversal",
+        "open-redirect",
         "hardcoded-secrets",
         "insecure-deserialization",
         "security",
@@ -59,6 +62,7 @@ class DynamicCalibrator:
         "authorization",
         "crypto",
         "ssrf",
+        "xss-bypass",
         "xxe",
     }
 

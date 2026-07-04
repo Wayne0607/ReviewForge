@@ -165,13 +165,15 @@ class Planner:
 
         # Step 1: Deterministic pattern detection (skip already-dispatched reviewers)
         cross_pr_wrapper = _looks_like_cross_pr_wrapper(state.files_changed, state.diff_summary)
+        if cross_pr_wrapper:
+            logger.info("Cross-PR wrapper change detected; skipping normal reviewers")
+            return []
+
         forced_reviewers = {
             r
             for r in (self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers)
             if not _skip_reviewer_for_files(r, state.files_changed)
         }
-        if cross_pr_wrapper:
-            forced_reviewers = {r for r in forced_reviewers if not _is_low_signal_reviewer(r)}
 
         # Detect language summary for the planner prompt
         file_langs = self._detect_file_languages(state.files_changed)

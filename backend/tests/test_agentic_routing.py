@@ -2,6 +2,7 @@
 
 from reviewforge.core.events import EventBus
 from reviewforge.core.specs import build_registry
+from reviewforge.core.state import StateStore
 from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.planner import Planner, _looks_like_cross_pr_wrapper, _skip_reviewer_for_files
@@ -96,3 +97,20 @@ def test_direct_security_code_is_not_treated_as_wrapper():
 """
 
     assert not _looks_like_cross_pr_wrapper(["cross_pr_live/risky_ops.py"], diff)
+
+
+async def test_planner_returns_no_tasks_for_cross_pr_wrapper():
+    planner = Planner(MockChatLLM(), build_registry())
+    state = StateStore(
+        pr_number=1,
+        repo="o/r",
+        files_changed=["cross_pr_live/report_endpoint.py"],
+        diff_summary="""--- cross_pr_live/report_endpoint.py (+5 -0)
++from cross_pr_live.risky_ops import run_report_query
++
++def export_report(conn, account_id):
++    return run_report_query(conn, "reports", account_id)
+""",
+    )
+
+    assert await planner.plan(state) == []

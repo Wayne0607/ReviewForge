@@ -3,14 +3,11 @@ name: Deploy
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}   # deploy runs manual-only (see condition on the deploy job)
+  workflow_dispatch: {}
 
 jobs:
   deploy:
     needs: [lint, test]
-    # Auto-deploy on push is disabled: server runs system-python uvicorn while
-    # deploy.sh assumed uv (mismatch). Re-arm once the pipeline is verified consistent.
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

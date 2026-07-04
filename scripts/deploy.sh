@@ -10,6 +10,15 @@ FRONTEND_DIR="$APP_DIR/frontend"
 echo "=== ReviewForge Deploy ==="
 echo "Commit: $(git rev-parse --short HEAD)"
 
+# Load the same environment used by the systemd service so spec-check sees
+# production secrets without baking them into the script.
+if [ -f "$APP_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$APP_DIR/.env"
+    set +a
+fi
+
 # 1. Build frontend (if Node.js available)
 if command -v node &> /dev/null && [ -d "$FRONTEND_DIR" ]; then
     echo "--- Building frontend ---"

@@ -16,6 +16,7 @@ def test_named_import_list_extracts_all_symbols():
     imps = extract_imports("from demo_app.db import connect, run_query\n", "demo_app/user_routes.py")
     names = sorted(i.name for i in imps if i.source == "demo_app.db")
     assert names == ["connect", "run_query"]
+    assert {i.line for i in imps} == {1}
 
 
 def test_named_import_handles_aliases():
@@ -81,7 +82,7 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
     assert "insecure-deserialization" in cl["risk_categories"] and "sql-injection" not in cl["risk_categories"]
 
     # --- PR-C: session.py imports ONLY cache_load ---
-    sess_src = "from demo_app.db import cache_load\ndef load_session(cookie):\n    return cache_load(cookie)\n"
+    sess_src = "\nfrom demo_app.db import cache_load\ndef load_session(cookie):\n    return cache_load(cookie)\n"
     state_c = StateStore(
         pr_number=3,
         repo="o/r",
@@ -93,4 +94,5 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
     cats = {f.category for f in cross}
     assert "cross-pr-insecure-deserialization" in cats  # the real propagation is still detected
     assert "cross-pr-sql-injection" not in cats  # the phantom risk is gone (precision fix)
+    assert all(f.line == 2 for f in cross)
     await db.close()

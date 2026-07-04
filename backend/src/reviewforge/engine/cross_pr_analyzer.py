@@ -63,6 +63,7 @@ class CrossPRChain:
 
     source_file: str
     source_symbol: str
+    source_line: int
     target_file: str
     target_symbol: str
     risk_category: str
@@ -324,6 +325,7 @@ class CrossPRAnalyzer:
                         chain = CrossPRChain(
                             source_file=imp.file_path,
                             source_symbol=imp.name or "<import>",
+                            source_line=imp.line,
                             target_file=target_file,
                             target_symbol=sym["symbol_name"],
                             risk_category=cat,
@@ -344,6 +346,7 @@ class CrossPRAnalyzer:
                     chain = CrossPRChain(
                         source_file=imp.file_path,
                         source_symbol=imp.name or "<import>",
+                        source_line=imp.line,
                         target_file=target_file,
                         target_symbol=imp.name or "<module>",
                         risk_category=cat,
@@ -370,6 +373,7 @@ class CrossPRAnalyzer:
                             chain = CrossPRChain(
                                 source_file=imp.file_path,
                                 source_symbol=imp.name or "<import>",
+                                source_line=imp.line,
                                 target_file=sub_target,
                                 target_symbol=ti.get("target_symbol", ""),
                                 risk_category=cat,
@@ -402,7 +406,7 @@ class CrossPRAnalyzer:
             findings.append(
                 Finding(
                     file=chain.source_file,
-                    line=0,
+                    line=chain.source_line or 1,
                     severity="error",
                     category=f"cross-pr-{chain.risk_category}",
                     message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"
@@ -548,7 +552,7 @@ class CrossPRAnalyzer:
             findings.append(
                 Finding(
                     file=chain.source_file,
-                    line=0,
+                    line=chain.source_line or 1,
                     severity="error",
                     category=f"cross-pr-{chain.risk_category}",
                     message=f"[跨 PR] {chain.source_symbol}() 调用了 {chain.target_symbol}()，"

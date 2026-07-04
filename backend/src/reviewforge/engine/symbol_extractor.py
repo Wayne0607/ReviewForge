@@ -142,6 +142,7 @@ class ImportInfo:
     name: str  # specific symbol imported
     file_path: str
     import_type: str = "named"  # named / wildcard / module / destructured
+    line: int = 0
 
 
 @dataclass
@@ -163,22 +164,31 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
 
     for pattern, imp_type in patterns:
         for match in re.finditer(pattern, content, re.MULTILINE):
+            line_no = content[: match.start()].count("\n") + 1
             if imp_type == "destructured":
                 # import { a, b, c } from 'module'
                 names = [n.strip() for n in match.group(1).split(",")]
                 source = match.group(2)
                 for name in names:
                     actual = name.split(" as ")[0].strip() if " as " in name else name
-                    imports.append(ImportInfo(source=source, name=actual, file_path=file_path, import_type=imp_type))
+                    imports.append(
+                        ImportInfo(source=source, name=actual, file_path=file_path, import_type=imp_type, line=line_no)
+                    )
             elif imp_type == "multi":
                 # from x.y import (a, b, c)
                 source = match.group(1)
                 names = [n.strip() for n in match.group(2).split(",") if n.strip()]
                 for name in names:
                     name = name.split(" as ")[0].strip() if " as " in name else name
-                    imports.append(ImportInfo(source=source, name=name, file_path=file_path, import_type="named"))
+                    imports.append(
+                        ImportInfo(source=source, name=name, file_path=file_path, import_type="named", line=line_no)
+                    )
             elif imp_type == "wildcard":
-                imports.append(ImportInfo(source=match.group(1), name="*", file_path=file_path, import_type="wildcard"))
+                imports.append(
+                    ImportInfo(
+                        source=match.group(1), name="*", file_path=file_path, import_type="wildcard", line=line_no
+                    )
+                )
             elif imp_type == "named":
                 # group(2) may be a comma-separated list: "a, b as c, d"
                 source = match.group(1)
@@ -187,17 +197,31 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
                     if not piece:
                         continue
                     actual = piece.split(" as ")[0].strip() if " as " in piece else piece
-                    imports.append(ImportInfo(source=source, name=actual, file_path=file_path, import_type="named"))
+                    imports.append(
+                        ImportInfo(source=source, name=actual, file_path=file_path, import_type="named", line=line_no)
+                    )
             elif imp_type in ("module", "single"):
-                imports.append(ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type))
+                imports.append(
+                    ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type, line=line_no)
+                )
             elif imp_type == "default":
                 imports.append(
-                    ImportInfo(source=match.group(2), name=match.group(1), file_path=file_path, import_type=imp_type)
+                    ImportInfo(
+                        source=match.group(2),
+                        name=match.group(1),
+                        file_path=file_path,
+                        import_type=imp_type,
+                        line=line_no,
+                    )
                 )
             elif imp_type == "require":
-                imports.append(ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type))
+                imports.append(
+                    ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type, line=line_no)
+                )
             elif imp_type == "side_effect":
-                imports.append(ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type))
+                imports.append(
+                    ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type, line=line_no)
+                )
 
     return imports
 

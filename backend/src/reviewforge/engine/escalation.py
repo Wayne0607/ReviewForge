@@ -27,6 +27,7 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.budget import MAX_TOOL_OUTPUT_CHARS, TokenBudget
 from reviewforge.engine.reviewers import build_reviewer_tools
+from reviewforge.engine.security_categories import normalize_category
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
@@ -127,7 +128,7 @@ class EscalationReviewer:
         - category is a trace-type AND confidence is uncertain (< 0.85)
         """
         cats = escalation_categories or TRACE_CATEGORIES
-        cat_normalized = finding.category.lower().replace(" ", "-")
+        cat_normalized = normalize_category(finding.category)
 
         # Trace-type category: only escalate if confidence is not high
         if cat_normalized in cats and finding.confidence < 0.85:

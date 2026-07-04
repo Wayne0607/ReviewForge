@@ -19,6 +19,7 @@ from langchain_openai import ChatOpenAI
 
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding
+from reviewforge.engine.security_categories import is_security_category, normalize_category
 
 logger = logging.getLogger(__name__)
 
@@ -45,27 +46,6 @@ class DynamicCalibrator:
     and should never be filtered by adversarial verification.
     """
 
-    # Security categories that skip calibration
-    SECURITY_CATEGORIES = {
-        "sql-injection",
-        "xss",
-        "csrf",
-        "command-injection",
-        "code-injection",
-        "data-leak",
-        "path-traversal",
-        "open-redirect",
-        "hardcoded-secrets",
-        "insecure-deserialization",
-        "security",
-        "authentication",
-        "authorization",
-        "crypto",
-        "ssrf",
-        "xss-bypass",
-        "xxe",
-    }
-
     def __init__(
         self,
         llm: ChatOpenAI,
@@ -90,7 +70,8 @@ class DynamicCalibrator:
         security = []
         need_calibration = []
         for f in findings:
-            if f.category.lower().replace(" ", "-") in self.SECURITY_CATEGORIES:
+            f.category = normalize_category(f.category)
+            if is_security_category(f.category):
                 f.status = "confirmed"
                 f.verified_by = "security-auto"
                 f.verify_reason = "安全问题直接确认，不经过对抗性校准"

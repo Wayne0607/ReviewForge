@@ -96,3 +96,46 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
     assert "cross-pr-sql-injection" not in cats  # the phantom risk is gone (precision fix)
     assert all(f.line == 2 for f in cross)
     await db.close()
+
+
+async def test_cross_pr_normalizes_security_category_aliases(tmp_path):
+    db = Database(tmp_path / "aliases.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+
+    seed_src = "def risky_eval(expr):\n    return eval(expr)\n"
+    state_a = StateStore(
+        pr_number=10,
+        repo="o/r",
+        head_sha="A",
+        files_changed=["demo_app/eval_sink.py"],
+        diff_summary=_diff("demo_app/eval_sink.py", seed_src),
+    )
+    findings_a = [
+        Finding(
+            file="demo_app/eval_sink.py",
+            line=2,
+            severity="error",
+            category="client-side-code-execution",
+            message="eval executes attacker-controlled code",
+            confidence=0.9,
+            reviewer="security_reviewer",
+            status="confirmed",
+        )
+    ]
+    await analyzer.analyze("aliasA", state_a, findings_a)
+
+    sym = await db.get_symbol("demo_app/eval_sink.py", "risky_eval")
+    assert "code-injection" in sym["risk_categories"]
+
+    consumer_src = "from demo_app.eval_sink import risky_eval\ndef run(expr):\n    return risky_eval(expr)\n"
+    state_b = StateStore(
+        pr_number=11,
+        repo="o/r",
+        head_sha="B",
+        files_changed=["demo_app/eval_consumer.py"],
+        diff_summary=_diff("demo_app/eval_consumer.py", consumer_src),
+    )
+    cross = await analyzer.analyze("aliasB", state_b, existing_findings=[])
+    assert {f.category for f in cross} == {"cross-pr-code-injection"}
+    await db.close()

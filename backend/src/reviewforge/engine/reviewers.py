@@ -21,6 +21,7 @@ from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.budget import MAX_TOOL_CALLS_PER_FILE, MAX_TOOL_OUTPUT_CHARS, TokenBudget
 from reviewforge.engine.prompt import build_reviewer_prompt
+from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
@@ -104,25 +105,6 @@ _MAX_FINDINGS_BY_TYPE = {
     "style": 5,
 }
 _SEVERITY_RANK = {"error": 3, "warning": 2, "info": 1}
-_SECURITY_CATEGORIES = {
-    "authentication",
-    "authorization",
-    "code-injection",
-    "command-injection",
-    "csrf",
-    "data-leak",
-    "hardcoded-secrets",
-    "insecure-deserialization",
-    "open-redirect",
-    "path-traversal",
-    "sql-injection",
-    "ssrf",
-    "unsafe-block",
-    "unsafe-transmute",
-    "unsafe-usage",
-    "xss",
-    "xss-bypass",
-}
 
 
 class BaseReviewer:
@@ -377,8 +359,8 @@ class BaseReviewer:
         for item in raw_findings:
             if not isinstance(item, dict):
                 continue
-            category = str(item.get("category", ""))
-            if self.reviewer_type != "security" and category in _SECURITY_CATEGORIES:
+            category = normalize_category(str(item.get("category", "")))
+            if self.reviewer_type != "security" and is_security_category(category):
                 continue
             try:
                 findings.append(
@@ -386,7 +368,7 @@ class BaseReviewer:
                         file=item.get("file", ""),
                         line=item.get("line", 0),
                         severity=item.get("severity", "info"),
-                        category=item.get("category", ""),
+                        category=category,
                         message=item.get("message", ""),
                         suggestion=item.get("suggestion", ""),
                         confidence=item.get("confidence", 0.5),

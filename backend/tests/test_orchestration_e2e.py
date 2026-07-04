@@ -39,9 +39,9 @@ async def test_orchestrator_runs_and_converges():
     # The re-planning loop converged (returned a summary rather than hanging).
     assert set(summary) >= {"total_findings", "confirmed", "false_positives", "tasks_completed", "tasks_failed"}
     assert summary["tasks_completed"] >= 1
-    # Verifier (#5) merged the duplicate security findings the reviewers each produced.
-    assert summary["false_positives"] >= 1
-    # The surviving security finding passed verification and was reported (commented).
+    # Security aliases from non-security reviewers are filtered before they can create duplicate noise.
+    assert summary["false_positives"] == 0
+    # The security finding passed verification and was reported (commented).
     statuses = {f.status for f in state.list_findings()}
     assert "reported" in statuses or summary["confirmed"] >= 1
 

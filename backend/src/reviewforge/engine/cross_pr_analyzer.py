@@ -18,6 +18,7 @@ from langchain_openai import ChatOpenAI
 
 from reviewforge.core.database import Database
 from reviewforge.core.state import Finding, StateStore
+from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.engine.symbol_extractor import (
     ImportInfo,
     SymbolInfo,
@@ -26,27 +27,6 @@ from reviewforge.engine.symbol_extractor import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Security categories that propagate across PRs
-SECURITY_CATEGORIES = {
-    "sql-injection",
-    "xss",
-    "csrf",
-    "command-injection",
-    "path-traversal",
-    "hardcoded-secrets",
-    "insecure-deserialization",
-    "unsafe-deserialization",
-    "security",
-    "authentication",
-    "authorization",
-    "crypto",
-    "ssrf",
-    "xxe",
-    "rce",
-    "config-injection",
-    "code-injection",
-}
 
 # Max propagation depth by risk level
 MAX_DEPTH = {
@@ -219,10 +199,11 @@ class CrossPRAnalyzer:
         symbol_cats: dict[tuple[str, str], tuple[SymbolInfo, set[str]]] = {}
 
         for finding in findings:
-            if finding.category not in SECURITY_CATEGORIES:
+            category = normalize_category(finding.category)
+            if not is_security_category(category):
                 continue
 
-            risk_level = self._category_to_risk(finding.category)
+            risk_level = self._category_to_risk(category)
 
             # (a) Attribute to the enclosing symbol = last definition at/above the finding line.
             enclosing: SymbolInfo | None = None
@@ -233,14 +214,14 @@ class CrossPRAnalyzer:
                     break
             if enclosing is not None:
                 key = (enclosing.file_path, enclosing.name)
-                symbol_cats.setdefault(key, (enclosing, set()))[1].add(finding.category)
+                symbol_cats.setdefault(key, (enclosing, set()))[1].add(category)
 
             # (b) File risk summary (coarse fallback for fuzzy import matching + depth-2).
             existing = await self._db.get_file_risk(finding.file)
             if existing:
                 cats = json.loads(existing.get("risk_categories", "[]"))
-                if finding.category not in cats:
-                    cats.append(finding.category)
+                if category not in cats:
+                    cats.append(category)
                 max_risk = self._higher_risk(existing.get("max_risk", "safe"), risk_level)
                 await self._db.upsert_file_risk(
                     finding.file,
@@ -253,7 +234,7 @@ class CrossPRAnalyzer:
                 await self._db.upsert_file_risk(
                     finding.file,
                     risk_level,
-                    [finding.category],
+                    [category],
                     1,
                     run_id,
                 )
@@ -319,7 +300,7 @@ class CrossPRAnalyzer:
                 for sym in matched:
                     sym_categories = json.loads(sym.get("risk_categories", "[]"))
                     for cat in sym_categories:
-                        if cat not in SECURITY_CATEGORIES:
+                        if not is_security_category(cat):
                             continue
 
                         chain = CrossPRChain(
@@ -340,7 +321,7 @@ class CrossPRAnalyzer:
             else:
                 # No symbol-level data — use file-level risk
                 for cat in risk_categories:
-                    if cat not in SECURITY_CATEGORIES:
+                    if not is_security_category(cat):
                         continue
 
                     chain = CrossPRChain(
@@ -368,7 +349,7 @@ class CrossPRAnalyzer:
                     if sub_risk and sub_risk.get("max_risk", "safe") != "safe":
                         sub_cats = json.loads(sub_risk.get("risk_categories", "[]"))
                         for cat in sub_cats:
-                            if cat not in SECURITY_CATEGORIES:
+                            if not is_security_category(cat):
                                 continue
                             chain = CrossPRChain(
                                 source_file=imp.file_path,
@@ -599,6 +580,7 @@ class CrossPRAnalyzer:
 
     @staticmethod
     def _category_to_risk(category: str) -> str:
+        category = normalize_category(category)
         critical = {"rce", "sql-injection", "command-injection", "insecure-deserialization"}
         high = {"xss", "csrf", "path-traversal", "unsafe-deserialization", "ssrf", "xxe", "code-injection"}
         medium = {"hardcoded-secrets", "authentication", "authorization", "crypto", "config-injection"}

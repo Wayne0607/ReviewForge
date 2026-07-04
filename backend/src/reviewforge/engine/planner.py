@@ -164,11 +164,14 @@ class Planner:
         first_round = not done_reviewers
 
         # Step 1: Deterministic pattern detection (skip already-dispatched reviewers)
+        cross_pr_wrapper = _looks_like_cross_pr_wrapper(state.files_changed, state.diff_summary)
         forced_reviewers = {
             r
             for r in (self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers)
             if not _skip_reviewer_for_files(r, state.files_changed)
         }
+        if cross_pr_wrapper:
+            forced_reviewers = {r for r in forced_reviewers if not _is_low_signal_reviewer(r)}
 
         # Detect language summary for the planner prompt
         file_langs = self._detect_file_languages(state.files_changed)
@@ -196,10 +199,17 @@ class Planner:
             for t in self._parse_response(response.content)
             if t.reviewer not in done_reviewers
             and not _skip_reviewer_for_files(t.reviewer, t.files or state.files_changed)
+            and not (cross_pr_wrapper and _is_low_signal_reviewer(t.reviewer))
         ]
 
         # Step 3: Merge — include forced reviewers; default style only on the first round
-        return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed, first_round)
+        return self._merge_tasks(
+            forced_reviewers,
+            llm_tasks,
+            state.files_changed,
+            first_round,
+            style_fallback=not cross_pr_wrapper,
+        )
 
     @staticmethod
     def _detect_file_languages(files: list[str]) -> str:
@@ -281,7 +291,12 @@ class Planner:
         return forced
 
     def _merge_tasks(
-        self, forced: set[str], llm_tasks: list[ReviewTask], files: list[str], first_round: bool = True
+        self,
+        forced: set[str],
+        llm_tasks: list[ReviewTask],
+        files: list[str],
+        first_round: bool = True,
+        style_fallback: bool = True,
     ) -> list[ReviewTask]:
         """Merge forced reviewers with LLM decisions.
 
@@ -303,7 +318,7 @@ class Planner:
                 )
                 logger.info(f"Forced reviewer added: {reviewer}")
 
-        if first_round and not merged:
+        if first_round and style_fallback and not merged:
             merged.append(
                 ReviewTask(
                     reviewer="style_reviewer",
@@ -312,7 +327,7 @@ class Planner:
                 )
             )
 
-        if first_round:
+        if first_round and style_fallback:
             return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
         return merged
 
@@ -413,3 +428,48 @@ def _skip_reviewer_for_files(reviewer: str, files: list[str]) -> bool:
         return False
     fixture_prefixes = ("test_fixtures/", "examples/", "docs/")
     return all(f.replace("\\", "/").startswith(fixture_prefixes) for f in files)
+
+
+def _is_low_signal_reviewer(reviewer: str) -> bool:
+    return reviewer in {
+        "style_reviewer",
+        "testing_reviewer",
+        "doc_reviewer",
+        "performance_reviewer",
+        "accessibility_reviewer",
+    }
+
+
+def _looks_like_cross_pr_wrapper(files: list[str], diff: str) -> bool:
+    """Detect tiny import/wrapper PRs where cross-PR graph analysis is higher value.
+
+    These changes are commonly follow-up PRs that wire an existing helper into a
+    new call site. Running style/doc/testing reviewers on them mostly produces
+    low-value comments; the cross-PR analyzer can still inspect imports later.
+    """
+    if not files:
+        return False
+    source_exts = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".rb", ".rs")
+    if not all(f.endswith(source_exts) for f in files):
+        return False
+
+    added = [
+        line[1:].strip()
+        for line in diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++") and line[1:].strip()
+    ]
+    code = [line for line in added if not line.startswith(("#", "//", "*", '"""', "'''"))]
+    if not code or len(code) > 14:
+        return False
+
+    has_import = any(
+        re.match(r"(?:from\s+[\w.]+\s+import\s+\w|import\s+[\w.{]|import\s*\{|const\s+\w+\s*=\s*require)", line)
+        for line in code
+    )
+    if not has_import:
+        return False
+
+    dangerous_patterns = [p for p, _ in _UNIVERSAL_SECURITY]
+    for patterns in _SECURITY_BY_LANG.values():
+        dangerous_patterns.extend(p for p, _ in patterns)
+    return not any(re.search(pattern, diff, re.IGNORECASE | re.MULTILINE) for pattern in dangerous_patterns)

@@ -4,7 +4,7 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.specs import build_registry
 from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.orchestrator import Orchestrator
-from reviewforge.engine.planner import Planner, _skip_reviewer_for_files
+from reviewforge.engine.planner import Planner, _looks_like_cross_pr_wrapper, _skip_reviewer_for_files
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.mock_github import MockGitHubClient
 
@@ -67,3 +67,32 @@ def test_planner_skips_low_signal_reviewers_for_fixtures():
     assert _skip_reviewer_for_files("testing_reviewer", files)
     assert _skip_reviewer_for_files("accessibility_reviewer", files)
     assert not _skip_reviewer_for_files("security_reviewer", files)
+
+
+def test_cross_pr_wrapper_changes_skip_style_fallback():
+    planner = Planner(MockChatLLM(), build_registry())
+    tasks = planner._merge_tasks(
+        set(), [], ["cross_pr_live/report_endpoint.py"], first_round=True, style_fallback=False
+    )
+
+    assert tasks == []
+
+
+def test_detects_tiny_cross_pr_wrapper_diff():
+    diff = """--- cross_pr_live/report_endpoint.py (+5 -0)
++from cross_pr_live.risky_ops import run_report_query
++
++def export_report(conn, account_id):
++    return run_report_query(conn, "reports", account_id)
+"""
+
+    assert _looks_like_cross_pr_wrapper(["cross_pr_live/report_endpoint.py"], diff)
+
+
+def test_direct_security_code_is_not_treated_as_wrapper():
+    diff = """--- cross_pr_live/risky_ops.py (+3 -0)
++def run(conn, table):
++    return conn.execute(f"SELECT * FROM {table}")
+"""
+
+    assert not _looks_like_cross_pr_wrapper(["cross_pr_live/risky_ops.py"], diff)

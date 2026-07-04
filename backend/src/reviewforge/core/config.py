@@ -87,7 +87,8 @@ class ReviewForgeConfig:
         if config_path:
             path = Path(config_path)
         else:
-            path = Path("reviewforge.yaml")
+            path = cls._find_default_config_path()
+        config_base = path.parent.resolve() if path.exists() else Path.cwd().resolve()
 
         if path.exists():
             with open(path, encoding="utf-8") as f:
@@ -96,6 +97,7 @@ class ReviewForgeConfig:
 
         # 2. Environment variable overrides
         cfg._apply_env()
+        cfg._normalize_paths(config_base)
 
         # 3. Set defaults for reviewers if empty
         if not cfg.reviewers:
@@ -110,6 +112,33 @@ class ReviewForgeConfig:
             ]
 
         return cfg
+
+    @staticmethod
+    def _find_default_config_path() -> Path:
+        """Find reviewforge.yaml from cwd or its parents, falling back to cwd."""
+        cwd = Path.cwd().resolve()
+        for base in (cwd, *cwd.parents):
+            candidate = base / "reviewforge.yaml"
+            if candidate.exists():
+                return candidate
+        return cwd / "reviewforge.yaml"
+
+    def _normalize_paths(self, config_base: Path) -> None:
+        """Resolve relative runtime paths so commands work from repo root or backend/."""
+        package_skills = Path(__file__).resolve().parent.parent / "skills"
+
+        skills = Path(self.skills_dir)
+        if not skills.is_absolute():
+            candidates = [
+                config_base / skills,
+                Path.cwd().resolve() / skills,
+                package_skills,
+            ]
+            self.skills_dir = str(next((p for p in candidates if p.exists()), candidates[0]))
+
+        events = Path(self.events_dir)
+        if not events.is_absolute():
+            self.events_dir = str(config_base / events)
 
     def _apply_dict(self, data: dict[str, Any]) -> None:
         """Apply values from a dict."""

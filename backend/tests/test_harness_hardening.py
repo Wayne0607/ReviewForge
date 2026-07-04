@@ -105,3 +105,17 @@ async def test_resume_skips_completed_reviewers_and_keeps_findings(tmp_path):
     # prior finding survived the resumed run
     assert any(f.id == "f1" for f in state.list_findings())
     await db.close()
+
+
+async def test_fail_running_runs_marks_orphaned_reviews(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.connect()
+    await db.create_run(run_id="running1", repo="o/r", pr_number=6, head_sha="H", base_sha="B")
+
+    assert (await db.get_run("running1"))["status"] == "running"
+    assert await db.fail_running_runs("orphaned by restart") == 1
+
+    run = await db.get_run("running1")
+    assert run["status"] == "failed"
+    assert "orphaned by restart" in run["summary_json"]
+    await db.close()

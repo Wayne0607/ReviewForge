@@ -182,6 +182,16 @@ class Database:
         )
         await self._db.commit()
 
+    async def fail_running_runs(self, error: str) -> int:
+        """Mark orphaned running runs as failed, returning the affected count."""
+        now = datetime.now(UTC).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE review_runs SET status='failed', completed_at=?, summary_json=? WHERE status='running'",
+            (now, json.dumps({"error": error}, ensure_ascii=False)),
+        )
+        await self._db.commit()
+        return cursor.rowcount or 0
+
     async def get_runs(
         self,
         repo: str | None = None,

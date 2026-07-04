@@ -6,9 +6,11 @@ Persists all results to the database for dashboard consumption.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -54,6 +56,7 @@ class Orchestrator:
         escalation_confidence_max: float = 0.7,
         escalation_max_steps: int = 3,
         escalation_max_tokens: int = 5000,
+        skills_dir: str | Path | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -96,11 +99,9 @@ class Orchestrator:
         self._extra_reviewers: dict[str, type[BaseReviewer]] = {}
 
         # 渐进式 Skill 加载（Level 1）：发现 skills，建立 reviewer_type -> [SkillMeta] 1:N 映射
-        from pathlib import Path
-
         from reviewforge.skills.loader import SkillLoader
 
-        self._skill_loader = SkillLoader(Path(__file__).resolve().parent.parent / "skills")
+        self._skill_loader = SkillLoader(skills_dir or Path(__file__).resolve().parent.parent / "skills")
         self._skills_by_type: dict[str, list[Any]] = {}
         try:
             for meta in self._skill_loader.discover():
@@ -524,6 +525,10 @@ class Orchestrator:
 
             return summary
 
+        except asyncio.CancelledError:
+            if self._db:
+                await self._db.fail_run(run_id, "review task cancelled")
+            raise
         except Exception as e:
             if self._db:
                 await self._db.fail_run(run_id, str(e))

@@ -81,6 +81,9 @@ def create_app(config_path: str | None = None) -> FastAPI:
         # Database
         db = Database(Path(cfg.events_dir).parent / "reviewforge.db")
         await db.connect()
+        orphaned = await db.fail_running_runs("orphaned by service restart")
+        if orphaned:
+            logger.warning(f"Marked {orphaned} orphaned running review(s) as failed")
         logger.info("Database initialized")
 
         # Event bus
@@ -111,6 +114,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             escalation_confidence_max=cfg.escalation_confidence_max,
             escalation_max_steps=cfg.escalation_max_steps,
             escalation_max_tokens=cfg.escalation_max_tokens,
+            skills_dir=cfg.skills_dir,
         )
 
         # S4: 插件默认关闭，靠显式 env 开启
@@ -207,10 +211,16 @@ def create_app(config_path: str | None = None) -> FastAPI:
     @app.get("/api/v1/specs", dependencies=[Depends(require_token)])
     async def get_specs():
         registry: SpecRegistry = app.state.registry
+        orchestrator = getattr(app.state, "orchestrator", None)
+        if orchestrator is not None:
+            orchestrator.reload_skills()
+            skills = [m.name for m in orchestrator._skill_loader.list_all()]
+        else:
+            skills = list(registry.skills)
         return {
             "agents": {k: {"role": v.role, "description": v.description} for k, v in registry.agents.items()},
             "tools": {k: {"description": v.description} for k, v in registry.tools.items()},
-            "skills": list(registry.skills),
+            "skills": skills,
         }
 
     @app.get("/api/v1/config", dependencies=[Depends(require_token)])

@@ -27,7 +27,7 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.budget import MAX_TOOL_OUTPUT_CHARS, TokenBudget
 from reviewforge.engine.reviewers import build_reviewer_tools
-from reviewforge.engine.security_categories import normalize_category
+from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ class EscalationReviewer:
         """Deterministic check: does this finding need agentic verification?
 
         Returns True if:
-        - confidence is in the fuzzy zone [min, max], OR
+        - security confidence is in the fuzzy zone [min, max], OR
         - category is a trace-type AND confidence is uncertain (< 0.85)
         """
         cats = escalation_categories or TRACE_CATEGORIES
@@ -134,8 +134,9 @@ class EscalationReviewer:
         if cat_normalized in cats and finding.confidence < 0.85:
             return True
 
-        # Fuzzy confidence: uncertain findings need deeper investigation
-        if confidence_min <= finding.confidence <= confidence_max:
+        # Fuzzy confidence: only security-sensitive findings need the expensive
+        # tool loop. Low-signal style/doc/a11y findings can be batch-calibrated.
+        if is_security_category(cat_normalized) and confidence_min <= finding.confidence <= confidence_max:
             return True
 
         return False

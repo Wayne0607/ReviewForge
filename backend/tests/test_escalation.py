@@ -47,9 +47,9 @@ def _make_finding(**overrides) -> Finding:
 
 
 class TestShouldEscalate:
-    def test_fuzzy_confidence_triggers(self):
-        """Confidence in [0.4, 0.7] should trigger escalation."""
-        f = _make_finding(confidence=0.5, category="naming")
+    def test_fuzzy_security_confidence_triggers(self):
+        """Security confidence in [0.4, 0.7] should trigger escalation."""
+        f = _make_finding(confidence=0.5, category="sql-injection")
         assert EscalationReviewer.should_escalate(f) is True
 
     def test_high_confidence_no_escalate(self):
@@ -74,25 +74,25 @@ class TestShouldEscalate:
             f = _make_finding(confidence=0.95, category=cat)
             assert EscalationReviewer.should_escalate(f) is False, f"{cat} should not escalate at conf=0.95"
 
-    def test_style_category_only_on_fuzzy(self):
-        """Non-trace categories only escalate when confidence is fuzzy."""
+    def test_style_category_does_not_escalate_on_fuzzy(self):
+        """Non-security categories do not use the expensive agentic escalation path."""
         f_high = _make_finding(confidence=0.9, category="naming")
         f_low = _make_finding(confidence=0.2, category="naming")
         f_fuzzy = _make_finding(confidence=0.5, category="naming")
         assert EscalationReviewer.should_escalate(f_high) is False
         assert EscalationReviewer.should_escalate(f_low) is False
-        assert EscalationReviewer.should_escalate(f_fuzzy) is True
+        assert EscalationReviewer.should_escalate(f_fuzzy) is False
 
     def test_custom_confidence_range(self):
-        """Custom confidence range should be respected."""
-        f = _make_finding(confidence=0.55, category="naming")
+        """Custom confidence range should be respected for security findings."""
+        f = _make_finding(confidence=0.55, category="hardcoded-secrets")
         assert EscalationReviewer.should_escalate(f, confidence_min=0.5, confidence_max=0.6) is True
         assert EscalationReviewer.should_escalate(f, confidence_min=0.6, confidence_max=0.8) is False
 
     def test_boundary_values(self):
-        """Boundary confidence values should trigger."""
-        f_min = _make_finding(confidence=0.4, category="naming")
-        f_max = _make_finding(confidence=0.7, category="naming")
+        """Security boundary confidence values should trigger."""
+        f_min = _make_finding(confidence=0.4, category="sql-injection")
+        f_max = _make_finding(confidence=0.7, category="sql-injection")
         assert EscalationReviewer.should_escalate(f_min) is True
         assert EscalationReviewer.should_escalate(f_max) is True
 

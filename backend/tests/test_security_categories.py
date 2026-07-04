@@ -13,6 +13,9 @@ def test_security_category_aliases_normalize():
     assert normalize_category("security-xss") == "xss"
     assert normalize_category("供应链攻击风险") == "supply-chain-risk"
     assert normalize_category("已知漏洞依赖") == "dependency-vulnerability"
+    assert normalize_category("known-vulnerability") == "dependency-vulnerability"
+    assert normalize_category("version-unpinned") == "dependency-version-range"
+    assert normalize_category("dangerously-set-innerHTML") == "xss"
     assert is_security_category("unsafe-code")
     assert is_security_category("supply-chain")
     assert is_security_category("版本范围不安全")

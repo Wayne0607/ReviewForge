@@ -18,7 +18,7 @@ async def _enrich_run(db, run: dict) -> dict:
     findings = await db.get_findings(run_id=run_id)
 
     total = len(findings)
-    confirmed = len([f for f in findings if f.get("status") == "confirmed"])
+    confirmed = len([f for f in findings if f.get("status") in ("confirmed", "reported")])
     false_pos = len([f for f in findings if f.get("status") == "false_positive"])
 
     # Override summary with actual DB counts

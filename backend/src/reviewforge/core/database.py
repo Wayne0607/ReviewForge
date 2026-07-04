@@ -333,9 +333,9 @@ class Database:
             SELECT
                 COUNT(DISTINCT r.run_id) as total_runs,
                 COUNT(f.id) as total_findings,
-                SUM(CASE WHEN f.status='confirmed' THEN 1 ELSE 0 END) as confirmed,
+                SUM(CASE WHEN f.status IN ('confirmed', 'reported') THEN 1 ELSE 0 END) as confirmed,
                 SUM(CASE WHEN f.status='false_positive' THEN 1 ELSE 0 END) as false_positives,
-                AVG(CASE WHEN f.status='confirmed' THEN f.confidence END) as avg_confidence
+                AVG(CASE WHEN f.status IN ('confirmed', 'reported') THEN f.confidence END) as avg_confidence
             FROM review_runs r
             LEFT JOIN review_findings f ON f.run_id = r.run_id
             {repo_filter}
@@ -370,7 +370,7 @@ class Database:
             SELECT
                 strftime('%Y-W%W', r.started_at) as week,
                 COUNT(f.id) as total,
-                SUM(CASE WHEN f.status='confirmed' THEN 1 ELSE 0 END) as confirmed
+                SUM(CASE WHEN f.status IN ('confirmed', 'reported') THEN 1 ELSE 0 END) as confirmed
             FROM review_runs r
             LEFT JOIN review_findings f ON f.run_id = r.run_id
             WHERE r.started_at > datetime('now', ?)
@@ -388,7 +388,7 @@ class Database:
         cursor = await self._db.execute(
             f"""
             SELECT file, COUNT(*) as count,
-                   SUM(CASE WHEN f.status='confirmed' THEN 1 ELSE 0 END) as confirmed
+                   SUM(CASE WHEN f.status IN ('confirmed', 'reported') THEN 1 ELSE 0 END) as confirmed
             FROM review_findings f
             {repo_join}
             GROUP BY file ORDER BY count DESC LIMIT ?

@@ -187,9 +187,9 @@ async def test_singleshot_parse_valid_findings(registry, gateway):
                     "file": "test.py",
                     "line": 5,
                     "severity": "error",
-                    "category": "sql-injection",
-                    "message": "SQL injection risk",
-                    "suggestion": "Use parameterized queries",
+                    "category": "readability",
+                    "message": "Readability issue",
+                    "suggestion": "Rename for clarity",
                     "confidence": 0.95,
                 }
             ]
@@ -201,5 +201,46 @@ async def test_singleshot_parse_valid_findings(registry, gateway):
     assert findings[0].file == "test.py"
     assert findings[0].line == 5
     assert findings[0].severity == "error"
-    assert findings[0].category == "sql-injection"
+    assert findings[0].category == "readability"
     assert findings[0].confidence == 0.95
+
+
+@pytest.mark.asyncio
+async def test_parse_findings_accepts_top_level_list_and_filters_cross_dimension(registry, gateway):
+    """LLM sometimes returns a bare list; non-security reviewers should not keep security categories."""
+    import json
+
+    from reviewforge.engine.reviewers import BaseReviewer
+
+    reviewer = BaseReviewer(
+        name="style_reviewer",
+        reviewer_type="style",
+        llm=MockChatLLM(),
+        registry=registry,
+        gateway=gateway,
+    )
+    content = json.dumps(
+        [
+            {
+                "file": "app.py",
+                "line": 1,
+                "severity": "error",
+                "category": "sql-injection",
+                "message": "wrong dimension",
+                "confidence": 0.9,
+            },
+            {
+                "file": "app.py",
+                "line": 2,
+                "severity": "warning",
+                "category": "readability",
+                "message": "real style issue",
+                "confidence": 0.8,
+            },
+        ]
+    )
+
+    findings = reviewer._parse_findings(content)
+
+    assert len(findings) == 1
+    assert findings[0].category == "readability"

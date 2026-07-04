@@ -164,7 +164,11 @@ class Planner:
         first_round = not done_reviewers
 
         # Step 1: Deterministic pattern detection (skip already-dispatched reviewers)
-        forced_reviewers = self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers
+        forced_reviewers = {
+            r
+            for r in (self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers)
+            if not _skip_reviewer_for_files(r, state.files_changed)
+        }
 
         # Detect language summary for the planner prompt
         file_langs = self._detect_file_languages(state.files_changed)
@@ -187,7 +191,12 @@ class Planner:
             [SystemMessage(content=messages[0]["content"]), HumanMessage(content=messages[1]["content"])]
         )
 
-        llm_tasks = [t for t in self._parse_response(response.content) if t.reviewer not in done_reviewers]
+        llm_tasks = [
+            t
+            for t in self._parse_response(response.content)
+            if t.reviewer not in done_reviewers
+            and not _skip_reviewer_for_files(t.reviewer, t.files or state.files_changed)
+        ]
 
         # Step 3: Merge — include forced reviewers; default style only on the first round
         return self._merge_tasks(forced_reviewers, llm_tasks, state.files_changed, first_round)
@@ -294,12 +303,12 @@ class Planner:
                 )
                 logger.info(f"Forced reviewer added: {reviewer}")
 
-        if first_round and "style_reviewer" not in {t.reviewer for t in merged}:
+        if first_round and not merged:
             merged.append(
                 ReviewTask(
                     reviewer="style_reviewer",
                     files=files,
-                    rationale="默认风格审查",
+                    rationale="fallback style review",
                 )
             )
 
@@ -394,3 +403,13 @@ def _is_test_file(file_path: str) -> bool:
             "spec.jsx",
         )
     ) or name.startswith(("test_", "spec/", "tests/", "__tests__/", "test/"))
+
+
+def _skip_reviewer_for_files(reviewer: str, files: list[str]) -> bool:
+    """Skip low-signal reviewers for fixtures/examples where product UX/tests do not apply."""
+    if reviewer in {"security_reviewer", "dependency_reviewer"}:
+        return False
+    if not files:
+        return False
+    fixture_prefixes = ("test_fixtures/", "examples/", "docs/")
+    return all(f.replace("\\", "/").startswith(fixture_prefixes) for f in files)

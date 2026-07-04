@@ -119,3 +119,29 @@ async def test_fail_running_runs_marks_orphaned_reviews(tmp_path):
     assert run["status"] == "failed"
     assert "orphaned by restart" in run["summary_json"]
     await db.close()
+
+
+async def test_reported_findings_count_as_confirmed_in_summary(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.connect()
+    await db.create_run(run_id="r2", repo="o/r", pr_number=7, head_sha="H", base_sha="B")
+    await db.insert_finding(
+        "r2",
+        {
+            "id": "f_reported",
+            "file": "a.py",
+            "line": 1,
+            "severity": "error",
+            "category": "security",
+            "message": "reported finding",
+            "confidence": 0.9,
+            "reviewer": "security_reviewer",
+            "status": "reported",
+        },
+    )
+
+    stats = await db.get_summary_stats(repo="o/r")
+
+    assert stats["confirmed"] == 1
+    assert stats["avg_confidence"] == 0.9
+    await db.close()

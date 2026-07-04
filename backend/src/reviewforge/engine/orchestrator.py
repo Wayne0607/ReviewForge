@@ -512,7 +512,7 @@ class Orchestrator:
 
             summary = {
                 "total_findings": len(state.findings),
-                "confirmed": len(state.list_findings(status="confirmed")),
+                "confirmed": len(state.list_findings(status="confirmed")) + len(state.list_findings(status="reported")),
                 "false_positives": len(state.list_findings(status="false_positive")),
                 "tasks_completed": len(state.list_tasks(status="completed")),
                 "tasks_failed": len(state.list_tasks(status="failed")),

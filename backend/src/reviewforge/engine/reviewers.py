@@ -104,6 +104,25 @@ _MAX_FINDINGS_BY_TYPE = {
     "style": 5,
 }
 _SEVERITY_RANK = {"error": 3, "warning": 2, "info": 1}
+_SECURITY_CATEGORIES = {
+    "authentication",
+    "authorization",
+    "code-injection",
+    "command-injection",
+    "csrf",
+    "data-leak",
+    "hardcoded-secrets",
+    "insecure-deserialization",
+    "open-redirect",
+    "path-traversal",
+    "sql-injection",
+    "ssrf",
+    "unsafe-block",
+    "unsafe-transmute",
+    "unsafe-usage",
+    "xss",
+    "xss-bypass",
+}
 
 
 class BaseReviewer:
@@ -308,7 +327,7 @@ class BaseReviewer:
         )
 
     @staticmethod
-    def _extract_json(content: str) -> dict | None:
+    def _extract_json(content: str) -> Any:
         """Extract JSON from LLM output, handling extra text around it."""
         content = content.strip()
         if content.startswith("```"):
@@ -322,7 +341,7 @@ class BaseReviewer:
         except json.JSONDecodeError:
             pass
 
-        match = re.search(r"\{.*\}", content, re.DOTALL)
+        match = re.search(r"(\{.*\}|\[.*\])", content, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
@@ -347,7 +366,20 @@ class BaseReviewer:
             return []
 
         findings = []
-        for item in data.get("findings", []):
+        if isinstance(data, list):
+            raw_findings = data
+        elif isinstance(data, dict):
+            raw_findings = data.get("findings", [])
+        else:
+            logger.warning(f"{self.name}: JSON output was {type(data).__name__}, expected object or list")
+            return []
+
+        for item in raw_findings:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category", ""))
+            if self.reviewer_type != "security" and category in _SECURITY_CATEGORIES:
+                continue
             try:
                 findings.append(
                     Finding(

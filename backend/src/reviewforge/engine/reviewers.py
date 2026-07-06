@@ -20,6 +20,7 @@ from langchain_openai import ChatOpenAI
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.budget import MAX_TOOL_CALLS_PER_FILE, MAX_TOOL_OUTPUT_CHARS, TokenBudget
+from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
 from reviewforge.engine.prompt import build_reviewer_prompt
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.tools.gateway import ToolGateway
@@ -175,7 +176,7 @@ class BaseReviewer:
         findings = self._parse_findings(response.content)
         for f in findings:
             f.reviewer = self.name
-        return findings
+        return self._merge_detector_findings(findings, diffs)
 
     async def execute_agentic(self, task: ReviewTask, state: StateStore) -> list[Finding]:
         """Agentic tool loop — model drives tool calls in real time."""
@@ -227,7 +228,7 @@ class BaseReviewer:
                 if findings:
                     for fd in findings:
                         fd.reviewer = self.name
-                    return findings
+                    return self._merge_detector_findings(findings, diffs)
                 # No tool calls and no findings: nudge
                 chat.append(HumanMessage(content="请基于已收集的信息，现在只输出 findings JSON（无问题则空数组）。"))
                 continue
@@ -276,7 +277,7 @@ class BaseReviewer:
 
         for fd in findings:
             fd.reviewer = self.name
-        return findings
+        return self._merge_detector_findings(findings, diffs)
 
     def _build_tools(self, state: StateStore) -> list[StructuredTool]:
         """Wrap gateway read-only tools as LangChain tools (no post_comment)."""
@@ -376,13 +377,57 @@ class BaseReviewer:
                 )
             except Exception as e:
                 logger.warning(f"{self.name}: skipped invalid finding {item!r}: {e}")
-        # Cut nitpick noise: keep only the top-N findings per reviewer (by severity then
-        # confidence), so doc/style don't flood with per-line comments.
+        return self._cap_findings(findings)
+
+    def _merge_detector_findings(self, findings: list[Finding], diffs: dict[str, str]) -> list[Finding]:
+        """Merge zero-token deterministic findings into reviewer output."""
+
+        if self.reviewer_type == "security":
+            detected = detect_security_findings(diffs)
+        elif self.reviewer_type == "dependency":
+            detected = detect_dependency_findings(diffs)
+        else:
+            return findings
+
+        merged = list(findings)
+        for item in detected:
+            merged.append(
+                Finding(
+                    file=item.file,
+                    line=max(1, item.line),
+                    severity=item.severity,
+                    category=normalize_category(item.category),
+                    message=item.message,
+                    suggestion=item.suggestion,
+                    confidence=item.confidence,
+                    reviewer=self.name,
+                    status="candidate",
+                    verified_by="detector",
+                )
+            )
+        return self._cap_findings(self._dedupe_findings(merged))
+
+    def _cap_findings(self, findings: list[Finding]) -> list[Finding]:
+        """Keep the highest-value findings for this reviewer type."""
+
         cap = _MAX_FINDINGS_BY_TYPE.get(self.reviewer_type, 8)
         if len(findings) > cap:
             findings.sort(key=lambda f: (_SEVERITY_RANK.get(f.severity, 0), f.confidence), reverse=True)
             findings = findings[:cap]
         return findings
+
+    @staticmethod
+    def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
+        """Keep strongest duplicate per `(file, line, category)`."""
+
+        deduped: dict[tuple[str, int, str], Finding] = {}
+        for item in findings:
+            item.category = normalize_category(item.category)
+            key = (item.file, item.line, item.category)
+            current = deduped.get(key)
+            if current is None or item.confidence > current.confidence:
+                deduped[key] = item
+        return list(deduped.values())
 
 
 class SecurityReviewer(BaseReviewer):

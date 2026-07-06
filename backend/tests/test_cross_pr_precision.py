@@ -6,6 +6,8 @@ Regression guard for two bugs found during the 3-PR live demo:
      in a *different* symbol of the same file (file-level over-propagation).
 """
 
+import aiosqlite
+
 from reviewforge.core.database import Database
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
@@ -94,7 +96,7 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
     cats = {f.category for f in cross}
     assert "cross-pr-insecure-deserialization" in cats  # the real propagation is still detected
     assert "cross-pr-sql-injection" not in cats  # the phantom risk is gone (precision fix)
-    assert all(f.line == 2 for f in cross)
+    assert all(f.line == 4 for f in cross)
     await db.close()
 
 
@@ -138,6 +140,8 @@ async def test_cross_pr_normalizes_security_category_aliases(tmp_path):
     )
     cross = await analyzer.analyze("aliasB", state_b, existing_findings=[])
     assert {f.category for f in cross} == {"cross-pr-code-injection"}
+    relations = await db.get_relations_from_symbol("demo_app/eval_consumer.py", "run")
+    assert any(r["relation_type"] == "call" and r["target_symbol"] == "risky_eval" for r in relations)
     await db.close()
 
 
@@ -198,4 +202,33 @@ async def test_symbol_risk_prefers_function_name_over_drifted_line(tmp_path):
     risky = await db.get_symbol("demo_app/sinks.py", "risky_second")
     assert safe["risk_categories"] == "[]"
     assert "sql-injection" in risky["risk_categories"]
+    await db.close()
+
+
+async def test_code_relations_migration_preserves_multiple_source_symbols(tmp_path):
+    db_path = tmp_path / "old_relations.db"
+    old = await aiosqlite.connect(db_path)
+    await old.execute(
+        """
+        CREATE TABLE code_relations (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id        TEXT NOT NULL,
+            source_file   TEXT NOT NULL,
+            target_file   TEXT NOT NULL DEFAULT '',
+            target_symbol TEXT NOT NULL DEFAULT '',
+            relation_type TEXT NOT NULL,
+            UNIQUE(run_id, source_file, target_file, target_symbol)
+        )
+        """
+    )
+    await old.commit()
+    await old.close()
+
+    db = Database(db_path)
+    await db.connect()
+    await db.upsert_relation("r1", "consumer.py", "sink.py", "danger", "call", source_symbol="route_a")
+    await db.upsert_relation("r1", "consumer.py", "sink.py", "danger", "call", source_symbol="route_b")
+
+    rows = await db.get_relations_from("consumer.py")
+    assert sorted(r["source_symbol"] for r in rows) == ["route_a", "route_b"]
     await db.close()

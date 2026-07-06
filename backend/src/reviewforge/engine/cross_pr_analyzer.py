@@ -20,9 +20,11 @@ from reviewforge.core.database import Database
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.engine.symbol_extractor import (
+    CallInfo,
     ImportInfo,
     SymbolInfo,
     detect_language,
+    extract_calls,
     extract_diff_symbols,
 )
 
@@ -110,6 +112,7 @@ class CrossPRAnalyzer:
         # Step 1: Extract symbols from diff (zero tokens)
         all_symbols: list[SymbolInfo] = []
         all_imports: list[ImportInfo] = []
+        all_calls: list[CallInfo] = []
 
         for file_path in state.files_changed:
             # Extract from the diff portion
@@ -118,8 +121,11 @@ class CrossPRAnalyzer:
                 symbols, imports = extract_diff_symbols(file_diff, file_path)
                 all_symbols.extend(symbols)
                 all_imports.extend(imports)
+                all_calls.extend(extract_calls(_added_content(file_diff), file_path))
 
-        logger.info(f"Cross-PR: extracted {len(all_symbols)} symbols, {len(all_imports)} imports")
+        logger.info(
+            f"Cross-PR: extracted {len(all_symbols)} symbols, {len(all_imports)} imports, {len(all_calls)} calls"
+        )
 
         # Step 2: Store symbols and relations in graph
         for sym in all_symbols:
@@ -140,13 +146,33 @@ class CrossPRAnalyzer:
                 target_file=target_file or imp.source,
                 target_symbol=imp.name,
                 relation_type="import",
+                source_symbol=imp.name or "<module>",
+            )
+
+        imports_by_file: dict[str, dict[str, ImportInfo]] = {}
+        for imp in all_imports:
+            if imp.name:
+                imports_by_file.setdefault(imp.file_path, {})[imp.name] = imp
+
+        for call in all_calls:
+            imported = imports_by_file.get(call.file_path, {}).get(call.callee)
+            target_file = ""
+            if imported:
+                target_file = self._resolve_import_to_file(imported.source, state.files_changed) or imported.source
+            await self._db.upsert_relation(
+                run_id=run_id,
+                source_file=call.file_path,
+                source_symbol=call.caller,
+                target_file=target_file,
+                target_symbol=call.callee,
+                relation_type="call",
             )
 
         # Step 3: Mark symbols with risk from current findings
         await self._mark_symbol_risks(existing_findings, all_symbols, run_id, pr_number)
 
         # Step 4: Find suspicious cross-PR connections (zero tokens)
-        suspicious_chains = await self._find_suspicious_chains(all_imports, state.files_changed)
+        suspicious_chains = await self._find_suspicious_chains(all_imports, all_calls, state.files_changed)
 
         if not suspicious_chains:
             logger.info("Cross-PR: no suspicious chains found")
@@ -288,6 +314,7 @@ class CrossPRAnalyzer:
     async def _find_suspicious_chains(
         self,
         imports: list[ImportInfo],
+        calls: list[CallInfo],
         known_files: list[str],
     ) -> list[CrossPRChain]:
         """Find import chains that connect to historically risky code."""
@@ -401,16 +428,78 @@ class CrossPRAnalyzer:
                             )
                             chains.append(chain)
 
-        # Deduplicate
-        seen = set()
-        unique = []
+        chains.extend(await self._find_suspicious_call_chains(calls, imports, known_files))
+
+        # Deduplicate, preferring call-chain evidence over a bare import.
+        unique_by_key: dict[tuple[str, str, str, int], CrossPRChain] = {}
         for c in chains:
             key = (c.source_file, c.target_file, c.risk_category, c.depth)
-            if key not in seen:
-                seen.add(key)
-                unique.append(c)
+            current = unique_by_key.get(key)
+            if current is None or _chain_specificity(c) > _chain_specificity(current):
+                unique_by_key[key] = c
 
-        return unique
+        return list(unique_by_key.values())
+
+    async def _find_suspicious_call_chains(
+        self,
+        calls: list[CallInfo],
+        imports: list[ImportInfo],
+        known_files: list[str],
+    ) -> list[CrossPRChain]:
+        """Find new calls that target a historically risky confirmed symbol."""
+
+        chains: list[CrossPRChain] = []
+        imports_by_file: dict[str, dict[str, ImportInfo]] = {}
+        for imp in imports:
+            if imp.name:
+                imports_by_file.setdefault(imp.file_path, {})[imp.name] = imp
+
+        for call in calls:
+            if not call.callee or call.callee.startswith("_"):
+                continue
+
+            imported = imports_by_file.get(call.file_path, {}).get(call.callee)
+            target_file = ""
+            risky_symbols: list[dict[str, Any]] = []
+
+            if imported and not _is_ignored_import(imported.source):
+                target_file = self._resolve_import_to_file(imported.source, known_files) or ""
+                if not target_file:
+                    risky_files = await self._db.find_risky_files_for_import(imported.source)
+                    target_file = risky_files[0]["file_path"] if risky_files else ""
+                if not target_file:
+                    continue
+                risky_symbols = [
+                    s for s in await self._db.get_risky_symbols(target_file) if s.get("symbol_name") == call.callee
+                ]
+
+            if not imported and not risky_symbols:
+                risky_symbols = await self._db.find_risky_symbols_by_name(call.callee)
+
+            for sym in risky_symbols:
+                sym_categories = json.loads(sym.get("risk_categories", "[]"))
+                for cat in sym_categories:
+                    if not is_security_category(cat):
+                        continue
+                    resolved_target = sym.get("file_path") or target_file
+                    chains.append(
+                        CrossPRChain(
+                            source_file=call.file_path,
+                            source_symbol=call.caller or "<module>",
+                            source_line=call.line,
+                            target_file=resolved_target,
+                            target_symbol=call.callee,
+                            risk_category=cat,
+                            risk_level=sym.get("risk_level", self._category_to_risk(cat)),
+                            depth=1,
+                            path=[
+                                {"file": call.file_path, "symbol": call.caller or "<module>"},
+                                {"file": resolved_target, "symbol": call.callee, "risk": cat},
+                            ],
+                        )
+                    )
+
+        return chains
 
     @staticmethod
     def _match_symbol_by_finding_text(finding: Finding, symbols: list[SymbolInfo]) -> SymbolInfo | None:
@@ -658,3 +747,19 @@ def _is_ignored_import(import_source: str) -> bool:
         return False
     first = re.split(r"[./]", source, maxsplit=1)[0]
     return source in _IGNORED_IMPORTS or first in _IGNORED_IMPORTS
+
+
+def _chain_specificity(chain: CrossPRChain) -> int:
+    if chain.source_symbol and chain.source_symbol not in {"<import>", "<module>", chain.target_symbol, "*"}:
+        return 2
+    if chain.target_symbol and chain.target_symbol not in {"<module>", "*"}:
+        return 1
+    return 0
+
+
+def _added_content(diff_content: str) -> str:
+    """Return added source lines from a unified diff-like snippet."""
+
+    return "\n".join(
+        line[1:] for line in (diff_content or "").splitlines() if line.startswith("+") and not line.startswith("+++")
+    )

@@ -92,10 +92,11 @@ CREATE TABLE IF NOT EXISTS code_relations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id        TEXT NOT NULL,
     source_file   TEXT NOT NULL,
+    source_symbol TEXT NOT NULL DEFAULT '',
     target_file   TEXT NOT NULL DEFAULT '',
     target_symbol TEXT NOT NULL DEFAULT '',
     relation_type TEXT NOT NULL,
-    UNIQUE(run_id, source_file, target_file, target_symbol)
+    UNIQUE(run_id, source_file, source_symbol, target_file, target_symbol, relation_type)
 );
 
 -- File risk summary cache
@@ -140,6 +141,7 @@ class Database:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.executescript(SCHEMA_SQL)
+        await self._migrate_schema()
         await self._db.commit()
         logger.info(f"Database connected: {self._db_path}")
 
@@ -147,6 +149,44 @@ class Database:
         if self._db:
             await self._db.close()
             self._db = None
+
+    async def _migrate_schema(self) -> None:
+        """Apply additive schema migrations for existing SQLite databases."""
+
+        cursor = await self._db.execute("PRAGMA table_info(code_relations)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "source_symbol" not in columns:
+            await self._db.execute("ALTER TABLE code_relations RENAME TO code_relations_old")
+            await self._db.execute(
+                """
+                CREATE TABLE code_relations (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id        TEXT NOT NULL,
+                    source_file   TEXT NOT NULL,
+                    source_symbol TEXT NOT NULL DEFAULT '',
+                    target_file   TEXT NOT NULL DEFAULT '',
+                    target_symbol TEXT NOT NULL DEFAULT '',
+                    relation_type TEXT NOT NULL,
+                    UNIQUE(run_id, source_file, source_symbol, target_file, target_symbol, relation_type)
+                )
+                """
+            )
+            await self._db.execute(
+                """
+                INSERT OR IGNORE INTO code_relations
+                    (run_id, source_file, source_symbol, target_file, target_symbol, relation_type)
+                SELECT run_id, source_file, '', target_file, target_symbol, relation_type
+                FROM code_relations_old
+                """
+            )
+            await self._db.execute("DROP TABLE code_relations_old")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_relations_source ON code_relations(source_file)")
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_relations_target ON code_relations(target_file, target_symbol)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_relations_source_symbol ON code_relations(source_file, source_symbol)"
+        )
 
     # ── Review Runs ──────────────────────────────────────────────
 
@@ -554,6 +594,13 @@ class Database:
             )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
+    async def find_risky_symbols_by_name(self, symbol_name: str) -> list[dict[str, Any]]:
+        cursor = await self._db.execute(
+            "SELECT * FROM code_symbols WHERE symbol_name=? AND risk_level != 'safe' ORDER BY pr_number DESC LIMIT 50",
+            (symbol_name,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
     async def upsert_relation(
         self,
         run_id: str,
@@ -561,12 +608,13 @@ class Database:
         target_file: str,
         target_symbol: str,
         relation_type: str,
+        source_symbol: str = "",
     ) -> None:
         await self._db.execute(
-            "INSERT INTO code_relations (run_id, source_file, target_file, target_symbol, relation_type) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(run_id, source_file, target_file, target_symbol) DO UPDATE SET relation_type=excluded.relation_type",  # noqa: E501
-            (run_id, source_file, target_file, target_symbol, relation_type),
+            "INSERT OR REPLACE INTO code_relations "
+            "(run_id, source_file, source_symbol, target_file, target_symbol, relation_type) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, source_file, source_symbol, target_file, target_symbol, relation_type),
         )
         await self._db.commit()
 
@@ -574,6 +622,13 @@ class Database:
         cursor = await self._db.execute(
             "SELECT * FROM code_relations WHERE source_file=?",
             (source_file,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def get_relations_from_symbol(self, source_file: str, source_symbol: str) -> list[dict[str, Any]]:
+        cursor = await self._db.execute(
+            "SELECT * FROM code_relations WHERE source_file=? AND source_symbol=?",
+            (source_file, source_symbol),
         )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 

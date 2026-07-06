@@ -102,8 +102,15 @@ _SECURITY_BY_LANG = {
 
 # ── 通用依赖模式 ──────────────────────────────────────────────────────
 _UNIVERSAL_DEPENDENCY = [
-    (r"package\.json", "dep-change"),
-    (r"(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml)", "dep-file-change"),
+    (
+        r"(?:^|/)(?:package\.json|requirements\.txt|pyproject\.toml|pom\.xml|Gemfile|go\.mod|Cargo\.toml)\b",
+        "dep-change",
+    ),
+    (
+        r"(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock|go\.sum|Gemfile\.lock)",
+        "dep-file-change",
+    ),
+    (r"\.github/workflows/.+\.ya?ml", "ci-change"),
 ]
 
 _DEPENDENCY_BY_LANG = {

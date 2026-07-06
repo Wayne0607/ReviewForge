@@ -71,6 +71,14 @@ IMPORT_PATTERNS: dict[str, list[tuple[str, str]]] = {
         # import com.example.Class;
         (r"import\s+([\w.]+)\s*;", "single"),
     ],
+    "ruby": [
+        (r"require_relative\s+['\"]([^'\"]+)['\"]", "single"),
+        (r"require\s+['\"]([^'\"]+)['\"]", "single"),
+    ],
+    "rust": [
+        (r"use\s+([\w:]+)::(\w+)\s*;", "rust_use"),
+        (r"use\s+([\w:]+)\s*;", "single"),
+    ],
 }
 
 # TS inherits JS patterns
@@ -98,6 +106,16 @@ DEFINITION_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"(?:public|private|protected)?\s*(?:static\s+)?(?:\w+\s+)+(\w+)\s*\(", "function"),
         (r"class\s+(\w+)", "class"),
     ],
+    "ruby": [
+        (r"def\s+(\w+[!?=]?)\s*(?:\(|$)", "function"),
+        (r"class\s+(\w+)", "class"),
+        (r"module\s+(\w+)", "class"),
+    ],
+    "rust": [
+        (r"(?:pub\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*\(", "function"),
+        (r"(?:pub\s+)?struct\s+(\w+)", "class"),
+        (r"(?:pub\s+)?enum\s+(\w+)", "class"),
+    ],
 }
 
 DEFINITION_PATTERNS["typescript"] = DEFINITION_PATTERNS["javascript"]
@@ -119,6 +137,13 @@ CALL_PATTERNS: dict[str, list[str]] = {
     ],
     "java": [
         r"(\w+)\s*\(",
+    ],
+    "ruby": [
+        r"(\w+[!?=]?)\s*\(",
+    ],
+    "rust": [
+        r"(\w+)\s*\(",
+        r"(\w+)::\w+\s*\(",
     ],
 }
 
@@ -203,6 +228,16 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
             elif imp_type in ("module", "single"):
                 imports.append(
                     ImportInfo(source=match.group(1), name="", file_path=file_path, import_type=imp_type, line=line_no)
+                )
+            elif imp_type == "rust_use":
+                imports.append(
+                    ImportInfo(
+                        source=match.group(1).replace("::", "."),
+                        name=match.group(2),
+                        file_path=file_path,
+                        import_type=imp_type,
+                        line=line_no,
+                    )
                 )
             elif imp_type == "default":
                 imports.append(

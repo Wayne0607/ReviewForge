@@ -11,4 +11,3 @@ __all__ = [
     "detect_dependency_findings",
     "detect_security_findings",
 ]
-

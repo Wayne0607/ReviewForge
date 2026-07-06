@@ -1,0 +1,68 @@
+# ReviewForge Configuration
+#
+# Environment-specific settings for deployment and runtime.
+# Sensitive values should be overridden via environment variables.
+
+default:
+  app_name: reviewforge
+  version: "1.0.0"
+  log_level: info
+  # BUG: Hardcoded API key — should use environment variable
+  api_key: "sk_live_4242424242424242"
+  # BUG: Hardcoded database password
+  database:
+    host: localhost
+    port: 5432
+    name: reviewforge
+    user: postgres
+    password: "admin123"
+  services:
+    - reviewforge-api
+    - reviewforge-worker
+    - reviewforge-scheduler
+
+development:
+  <<: *default
+  log_level: debug
+  debug: true
+  health_check_url: "http://localhost:8000/health"
+
+staging:
+  <<: *default
+  log_level: info
+  health_check_url: "https://staging-api.reviewforge.local/health"
+  # BUG: Hardcoded staging credentials
+  api_key: "sk_test_staging_key_12345"
+  database:
+    host: staging-db.reviewforge.local
+    port: 5432
+    name: reviewforge_staging
+    user: reviewforge_app
+    password: "staging_pass_2024"
+
+production:
+  <<: *default
+  log_level: warning
+  health_check_url: "https://api.reviewforge.com/health"
+  # BUG: Hardcoded production credentials — critical security issue
+  api_key: "sk_live_prod_key_67890"
+  database:
+    host: prod-db.reviewforge.com
+    port: 5432
+    name: reviewforge_prod
+    user: reviewforge_app
+    password: "prod_password_secure_2024"
+
+  # BUG: Snapshot script allows arbitrary code execution
+  snapshot_script: |
+    `tar czf /tmp/snapshot.tar.gz .`
+
+  branch: main
+  requirements_file: requirements.txt
+  migration_command: "subprocess.call('python scripts/migrate.py', shell=True)"
+
+session:
+  timeout: 3600
+  max_sessions: 5
+  secure: true
+  same_site: strict

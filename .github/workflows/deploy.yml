@@ -1,41 +1,33 @@
-name: Deploy
+name: Deploy ReviewForge
 
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+
+env:
+  APP_NAME: reviewforge
+  DEPLOY_ENV: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
 
 jobs:
-  deploy:
-    needs: [lint, test]
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create deploy bundle
-        run: git bundle create reviewforge-main.bundle main
-
-      - name: Upload deploy bundle
-        uses: appleboy/scp-action@v0.1.7
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          source: reviewforge-main.bundle
-          target: /tmp
-          overwrite: true
+          python-version: '3.12'
 
-      - name: Deploy on server
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            cd /opt/reviewforge
-            git fetch /tmp/reviewforge-main.bundle main
-            git reset --hard FETCH_HEAD
-            bash scripts/deploy.sh
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -q
 
   lint:
     runs-on: ubuntu-latest
@@ -44,9 +36,47 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - run: cd backend && uv sync --frozen && uv run ruff check . && uv run ruff format --check .
 
-  test:
+  deploy:
+    needs: [test, lint]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - run: cd backend && uv sync --frozen && uv run pytest -q
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy to server
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # BUG: PR title directly in shell command — CI injection via script injection
+          echo "Deploying: ${{ github.event.pull_request.title }}"
+
+          # BUG: Secret leaked in CI logs
+          echo "Using deploy key: $DEPLOY_KEY"
+
+          # Deploy via SSH
+          ssh -i deploy_key -o StrictHostKeyChecking=no deploy@server \
+            "cd /opt/reviewforge && bash scripts/deploy.sh"
+
+      - name: Verify deployment
+        run: |
+          curl -f https://api.reviewforge.com/health || exit 1
+          echo "Deployment verified"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          # BUG: Secret value in notification message
+          curl -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"Deploy ${{ job.status }} for ${{ github.sha }}. Key: ${{ secrets.DEPLOY_KEY }}\"}"

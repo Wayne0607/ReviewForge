@@ -241,7 +241,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
     # Serve frontend static files (if built)
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
-        from fastapi.responses import FileResponse
+        from fastapi.responses import FileResponse, JSONResponse
 
         app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="static-assets")
 
@@ -249,12 +249,12 @@ def create_app(config_path: str | None = None) -> FastAPI:
         async def spa_fallback(request, exc):
             path = request.url.path
             if path.startswith("/api/") or path.startswith("/webhook") or path.startswith("/health"):
-                return exc
+                return JSONResponse(status_code=404, content={"detail": "Not Found"})
             if _is_sensitive_fallback_path(path):
-                return exc
+                return JSONResponse(status_code=404, content={"detail": "Not Found"})
             index_path = static_dir / "index.html"
             if index_path.exists():
                 return FileResponse(str(index_path))
-            return exc
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
     return app

@@ -1,0 +1,60 @@
+# ReviewForge Data Pipeline Configuration
+#
+# Configuration for the data pipeline components:
+# ingester, transformer, loader, and scheduler.
+
+[pipeline]
+name = "reviewforge-data-pipeline"
+version = "1.0.0"
+log_level = "info"
+
+[ingester]
+batch_size = 100
+flush_interval_seconds = 30
+max_buffer_size = 10000
+# BUG: Hardcoded webhook secret
+webhook_secret = "whsec_pipeline_webhook_key_2024"
+
+[ingester.sources]
+github.enabled = true
+github.webhook_path = "/api/webhooks/github"
+jira.enabled = false
+
+[transformer]
+output_format = "json"
+max_record_size = 1048576  # 1MB
+enrichment_timeout_ms = 5000
+
+[transformer.filters]
+exclude_bots = true
+min_diff_lines = 1
+
+[loader]
+batch_size = 50
+connection_pool_size = 10
+# BUG: Hardcoded database credentials
+db_host = "pipeline-db.internal"
+db_port = 5432
+db_name = "pipeline"
+db_user = "pipeline_app"
+db_password = "pipeline_db_pass_2024"
+
+[scheduler]
+max_concurrent_jobs = 5
+job_timeout_seconds = 300
+retry_max = 3
+retry_delay_seconds = 60
+
+[scheduler.jobs.ingest]
+command = "Pipeline::Ingester.new.run"
+schedule = "*/5 * * * *"
+
+[scheduler.jobs.transform]
+command = "Pipeline::Transformer.new.run"
+schedule = "*/10 * * * *"
+dependencies = ["ingest"]
+
+[scheduler.jobs.load]
+command = "Pipeline::Loader.new.run"
+schedule = "*/15 * * * *"
+dependencies = ["transform"]

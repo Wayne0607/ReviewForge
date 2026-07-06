@@ -29,6 +29,12 @@ from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.github_api import GitHubClient
 
 
+def _is_sensitive_fallback_path(path: str) -> bool:
+    parts = [part for part in path.split("/") if part]
+    sensitive_names = {".env", ".git", ".svn", "wp-config.php"}
+    return any(part.startswith(".") or part in sensitive_names for part in parts)
+
+
 def create_app(config_path: str | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -243,6 +249,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
         async def spa_fallback(request, exc):
             path = request.url.path
             if path.startswith("/api/") or path.startswith("/webhook") or path.startswith("/health"):
+                return exc
+            if _is_sensitive_fallback_path(path):
                 return exc
             index_path = static_dir / "index.html"
             if index_path.exists():

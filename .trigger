@@ -1,0 +1,1 @@
+trigger: test/security-vuln-coverage v3

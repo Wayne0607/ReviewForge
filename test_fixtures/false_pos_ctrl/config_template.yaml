@@ -1,0 +1,33 @@
+# Application configuration template
+# SAFE: These are placeholder/template values, not real secrets
+# Should NOT trigger hardcoded-secrets finding
+
+database:
+  host: localhost
+  port: 5432
+  name: myapp
+  user: myapp_user
+  password: ${DB_PASSWORD}  # SAFE: environment variable reference
+
+api:
+  base_url: https://api.example.com
+  timeout_seconds: 30
+
+auth:
+  jwt_secret: ${JWT_SECRET}  # SAFE: env var reference, not hardcoded
+  token_expiry: 3600
+
+external_services:
+  aws:
+    region: us-east-1
+    access_key_id: ${AWS_ACCESS_KEY_ID}  # SAFE: env var
+    secret_access_key: ${AWS_SECRET_ACCESS_KEY}  # SAFE: env var
+
+logging:
+  level: info
+  format: json
+
+# Development overrides (not used in production)
+development:
+  debug: true
+  mock_services: true

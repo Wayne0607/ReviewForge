@@ -1,0 +1,1 @@
+trigger: test/token-benchmark-medium v3

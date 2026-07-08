@@ -24,7 +24,14 @@ logger = logging.getLogger(__name__)
 
 # ── 通用安全模式（不限语言）────────────────────────────────────────────
 _UNIVERSAL_SECURITY = [
-    (r"(?:password|secret|api_key|token)\s*=\s*['\"\"][^'\"]{8,}['\"\"]", "hardcoded-secrets"),
+    # Hardcoded secrets — exclude env vars, placeholders, empty/template values
+    (
+        r"(?:password|secret|api_key|token)\s*=\s*['\"\"]"
+        r"(?![\s'\"]*\}|process\.env|os\.environ|\$\{)"
+        r"(?!(?:xxx|changeme|placeholder|your_|TODO|REPLACE|example|test|dummy|fake|sample))"
+        r"[^'\"]{8,}['\"\"]",
+        "hardcoded-secrets",
+    ),
     (r"(?:SELECT|INSERT|UPDATE|DELETE).*\+\s*(?:str\(|f['\"])", "sql-injection"),
     (r"f['\"].*(?:SELECT|INSERT|UPDATE|DELETE).*\{", "sql-injection"),
     (r"open\s*\([^)]*\+.*['\"]r['\"]", "path-traversal"),
@@ -401,7 +408,10 @@ class Planner:
 
 def _is_test_file(file_path: str) -> bool:
     """Check if a file is a test file by common naming conventions."""
-    name = file_path.lower()
+    name = file_path.lower().replace("\\", "/")
+    # Test fixture directories — planted code for testing the review system
+    if "test_fixtures/" in name or "test-fixtures/" in name:
+        return True
     return any(
         name.endswith(suffix)
         for suffix in (

@@ -25,7 +25,7 @@ from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.escalation import EscalationReviewer
 from reviewforge.engine.model_router import ModelRouter
-from reviewforge.engine.planner import Planner
+from reviewforge.engine.planner import Planner, _is_test_file
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
@@ -330,6 +330,19 @@ class Orchestrator:
                                 run_id, task.reviewer, status="failed", error=f"unknown reviewer: {task.reviewer}"
                             )
                         return
+                    # Skip test files for testing_reviewer — test fixtures and
+                    # test code should not be flagged for missing tests.
+                    if task.reviewer == "testing_reviewer":
+                        non_test = [f for f in task.files if not _is_test_file(f)]
+                        if not non_test:
+                            state.update_task(task.id, status="completed")
+                            return
+                        task = ReviewTask(
+                            id=task.id,
+                            reviewer=task.reviewer,
+                            files=non_test,
+                            rationale=task.rationale,
+                        )
                     # 按 task 文件检测语言/框架，注入匹配的 skill
                     lang = self._detect_task_language(task)
                     fw = self._detect_task_framework(task)

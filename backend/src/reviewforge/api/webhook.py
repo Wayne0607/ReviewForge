@@ -57,6 +57,14 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
                 raise HTTPException(status_code=400, detail="Invalid repository name")
 
+            # Dedup: GitHub redelivers webhooks and fires opened+synchronize for the
+            # same head. If this exact commit was already reviewed (or a review is
+            # in-flight), skip instead of spawning a duplicate run + wasting tokens.
+            db = getattr(request.app.state, "db", None)
+            if db is not None and await db.has_active_run_for_head(repo, int(pr_number), head_sha):
+                logger.info(f"PR #{pr_number} @ {head_sha[:8]} already reviewed/in-flight, skipping duplicate")
+                return {"status": "duplicate_skipped", "pr": str(pr_number)}
+
             logger.info(f"PR #{pr_number} {action} on {repo}, triggering review")
 
             # S7: 持引用 + 并发上限，IO 移入后台

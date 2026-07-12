@@ -42,16 +42,31 @@ async def list_reviews(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ):
-    """List review runs with pagination."""
+    """List review runs with pagination.
+
+    Runs are already de-duplicated per commit by the DB layer. Finding counts
+    and token totals are fetched in two batched queries (not one-per-run), so
+    the list stays fast even with a full page of results.
+    """
     db = request.app.state.db
     runs = await db.get_runs(repo=repo, limit=limit, offset=offset)
 
-    # Enrich each run with accurate counts
-    enriched = []
-    for r in runs:
-        enriched.append(await _enrich_run(db, r))
+    run_ids = [r["run_id"] for r in runs]
+    counts = await db.get_findings_counts(run_ids)
+    token_totals = await db.get_token_totals(run_ids)
 
-    return {"runs": enriched, "limit": limit, "offset": offset}
+    for r in runs:
+        c = counts.get(r["run_id"], {})
+        r["summary"] = {
+            "total_findings": c.get("total", 0),
+            "confirmed": c.get("confirmed", 0),
+            "false_positives": c.get("false_positives", 0),
+            "tasks_completed": 0,  # Not tracked in findings table
+            "tasks_failed": 0,
+        }
+        r["total_tokens"] = token_totals.get(r["run_id"], 0)
+
+    return {"runs": runs, "limit": limit, "offset": offset}
 
 
 @router.get("/reviews/{run_id}")

@@ -238,16 +238,33 @@ class Database:
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        if repo:
-            cursor = await self._db.execute(
-                "SELECT * FROM review_runs WHERE repo=? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                (repo, limit, offset),
+        """List runs, collapsing duplicate runs for the same commit.
+
+        A single PR commit can accumulate several runs — a redelivered webhook,
+        an ``opened``+``synchronize`` pair, or a resumed/failed retry. Those all
+        share the same (repo, pr_number, head_sha), so we keep only the most
+        recent run per commit here; distinct commits still each get a row.
+        """
+        where = "WHERE repo=?" if repo else ""
+        params: list[Any] = [repo] if repo else []
+        cursor = await self._db.execute(
+            f"""
+            SELECT run_id, repo, pr_number, head_sha, base_sha, status,
+                   started_at, completed_at, summary_json
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY repo, pr_number, head_sha
+                    ORDER BY started_at DESC, run_id DESC
+                ) AS _rn
+                FROM review_runs
+                {where}
             )
-        else:
-            cursor = await self._db.execute(
-                "SELECT * FROM review_runs ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            )
+            WHERE _rn = 1
+            ORDER BY started_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        )
         rows = await cursor.fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -274,6 +291,23 @@ class Database:
         )
         row = await cursor.fetchone()
         return self._row_to_dict(row) if row else None
+
+    async def has_active_run_for_head(self, repo: str, pr_number: int, head_sha: str) -> bool:
+        """True if this exact commit was already reviewed or is being reviewed now.
+
+        Complements get_resumable_run: a 'completed' run (already reviewed) or a
+        freshly 'running' one (in-flight, <15 min) means a redelivered webhook
+        should be ignored instead of spawning a duplicate review. A 'failed' or
+        stale 'running' run is NOT active — those are left for get_resumable_run
+        to resume.
+        """
+        cursor = await self._db.execute(
+            "SELECT 1 FROM review_runs WHERE repo=? AND pr_number=? AND head_sha=? "
+            "AND (status = 'completed' OR (status = 'running' AND started_at > datetime('now', '-15 minutes'))) "
+            "LIMIT 1",
+            (repo, pr_number, head_sha),
+        )
+        return await cursor.fetchone() is not None
 
     # ── Findings ─────────────────────────────────────────────────
 
@@ -331,6 +365,33 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [self._row_to_dict(r) for r in rows]
+
+    async def get_findings_counts(self, run_ids: list[str]) -> dict[str, dict[str, int]]:
+        """Finding totals per run in a single query (avoids N+1 when listing runs)."""
+        if not run_ids:
+            return {}
+        placeholders = ",".join("?" * len(run_ids))
+        cursor = await self._db.execute(
+            f"""
+            SELECT run_id,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN status IN ('confirmed', 'reported') THEN 1 ELSE 0 END) AS confirmed,
+                   SUM(CASE WHEN status = 'false_positive' THEN 1 ELSE 0 END) AS false_positives
+            FROM review_findings
+            WHERE run_id IN ({placeholders})
+            GROUP BY run_id
+            """,
+            tuple(run_ids),
+        )
+        out: dict[str, dict[str, int]] = {}
+        for r in await cursor.fetchall():
+            d = self._row_to_dict(r)
+            out[d["run_id"]] = {
+                "total": d["total"] or 0,
+                "confirmed": d["confirmed"] or 0,
+                "false_positives": d["false_positives"] or 0,
+            }
+        return out
 
     # ── Reviewer Metrics ─────────────────────────────────────────
 
@@ -513,6 +574,22 @@ class Database:
                 "SELECT * FROM token_usage ORDER BY created_at DESC LIMIT 500",
             )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def get_token_totals(self, run_ids: list[str]) -> dict[str, int]:
+        """Total tokens per run in a single query (avoids N+1 when listing runs)."""
+        if not run_ids:
+            return {}
+        placeholders = ",".join("?" * len(run_ids))
+        cursor = await self._db.execute(
+            f"SELECT run_id, SUM(total_tokens) AS total FROM token_usage "
+            f"WHERE run_id IN ({placeholders}) GROUP BY run_id",
+            tuple(run_ids),
+        )
+        out: dict[str, int] = {}
+        for r in await cursor.fetchall():
+            d = self._row_to_dict(r)
+            out[d["run_id"]] = d["total"] or 0
+        return out
 
     async def get_token_summary(self, repo: str | None = None) -> dict[str, Any]:
         repo_join = "JOIN review_runs r ON t.run_id=r.run_id WHERE r.repo=?" if repo else ""

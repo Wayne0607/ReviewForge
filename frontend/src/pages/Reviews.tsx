@@ -5,7 +5,7 @@ import {
   Search,
   Zap,
 } from 'lucide-react'
-import { reviews, tokens } from '../api/client'
+import { reviews } from '../api/client'
 import type { ReviewRun } from '../types'
 
 const STATUS_BADGE: Record<string, { cls: string; label: string }> = {
@@ -23,29 +23,13 @@ function formatTokens(n: number): string {
 
 export default function Reviews() {
   const [runs, setRuns] = useState<ReviewRun[]>([])
-  const [tokenMap, setTokenMap] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
 
   useEffect(() => {
     reviews
       .list({ limit: 100 })
-      .then(async (r) => {
-        setRuns(r.runs)
-        // Fetch token usage for each run
-        const map: Record<string, number> = {}
-        await Promise.all(
-          r.runs.map(async (run) => {
-            try {
-              const t = await tokens.byRun(run.run_id)
-              map[run.run_id] = t.total_tokens || 0
-            } catch {
-              map[run.run_id] = 0
-            }
-          })
-        )
-        setTokenMap(map)
-      })
+      .then((r) => setRuns(r.runs))
       .catch(console.error)
       .finally(() => setLoading(false))
   }, [])
@@ -110,7 +94,7 @@ export default function Reviews() {
             <tbody className="divide-y divide-gray-100">
               {filtered.map((run) => {
                 const badge = STATUS_BADGE[run.status] ?? { cls: 'badge-gray', label: run.status }
-                const tok = tokenMap[run.run_id]
+                const tok = run.total_tokens ?? 0
                 return (
                   <tr
                     key={run.run_id}

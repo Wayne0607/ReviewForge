@@ -10,6 +10,7 @@ export interface ReviewRun {
   started_at: string
   completed_at: string | null
   summary: ReviewSummary
+  total_tokens?: number
 }
 
 export interface ReviewSummary {

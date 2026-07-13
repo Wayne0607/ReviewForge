@@ -380,7 +380,16 @@ class BaseReviewer:
         return self._cap_findings(findings)
 
     def _merge_detector_findings(self, findings: list[Finding], diffs: dict[str, str]) -> list[Finding]:
-        """Merge zero-token deterministic findings into reviewer output."""
+        """Merge zero-token deterministic findings into reviewer output.
+
+        Detector findings are deterministic and high-precision, so they are NOT
+        subject to the per-reviewer cap. The cap exists to trim verbose LLM nitpick
+        noise — not to drop real vulnerabilities the scanners already found. When the
+        LLM fills every cap slot with high-confidence findings, re-capping the merged
+        set silently discarded *all* detector findings (secrets, path-traversal, unsafe,
+        xss …), which tanked security recall. Cap only the LLM findings; keep every
+        deduped detector finding.
+        """
 
         if self.reviewer_type == "security":
             detected = detect_security_findings(diffs)
@@ -389,23 +398,25 @@ class BaseReviewer:
         else:
             return findings
 
-        merged = list(findings)
-        for item in detected:
-            merged.append(
-                Finding(
-                    file=item.file,
-                    line=max(1, item.line),
-                    severity=item.severity,
-                    category=normalize_category(item.category),
-                    message=item.message,
-                    suggestion=item.suggestion,
-                    confidence=item.confidence,
-                    reviewer=self.name,
-                    status="candidate",
-                    verified_by="detector",
-                )
+        detector_findings = [
+            Finding(
+                file=item.file,
+                line=max(1, item.line),
+                severity=item.severity,
+                category=normalize_category(item.category),
+                message=item.message,
+                suggestion=item.suggestion,
+                confidence=item.confidence,
+                reviewer=self.name,
+                status="candidate",
+                verified_by="detector",
             )
-        return self._cap_findings(self._dedupe_findings(merged))
+            for item in detected
+        ]
+        # `findings` (LLM output) is already capped by _parse_findings; detector
+        # findings are appended uncapped. Dedupe keeps the higher-confidence finding
+        # per (file, line, category), so LLM+detector overlaps collapse cleanly.
+        return self._dedupe_findings(list(findings) + detector_findings)
 
     def _cap_findings(self, findings: list[Finding]) -> list[Finding]:
         """Keep the highest-value findings for this reviewer type."""

@@ -44,6 +44,30 @@ def test_security_findings_capped_higher():
     assert len(out) == 12  # under the cap → all kept
 
 
+def test_detector_findings_survive_when_llm_fills_cap():
+    """Deterministic detector findings must not be capped away by verbose LLM output."""
+    rv = _reviewer(SecurityReviewer)
+    # LLM emits 20 high-confidence findings → capped to the security limit of 15.
+    llm_findings = rv._parse_findings(_many("sql-injection", 20, severity="error"))
+    assert len(llm_findings) == 15  # cap fully consumed by LLM output
+
+    # A diff the zero-token detector flags (hardcoded secret + command injection).
+    diffs = {
+        "svc.py": (
+            "@@ -0,0 +1,3 @@\n"
+            "+API_TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789'\n"
+            "+import os\n"
+            "+os.system(user_input)\n"
+        )
+    }
+    merged = rv._merge_detector_findings(llm_findings, diffs)
+    detector = [f for f in merged if f.verified_by == "detector"]
+    assert detector, "detector findings were dropped by the cap"
+    assert "hardcoded-secrets" in {f.category for f in detector}
+    # The merged set exceeds the cap — detector findings are additive, not truncated.
+    assert len(merged) > 15
+
+
 def test_cap_keeps_highest_severity_first():
     rv = _reviewer(DocumentationReviewer)
     payload = {

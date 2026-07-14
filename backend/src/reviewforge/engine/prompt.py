@@ -100,12 +100,15 @@ def _planner_mission(ctx: dict[str, Any]) -> str:
   - open() 用用户输入的路径（路径遍历）
   - 用户输入未经验证就使用
   - 网络请求、加密操作
-- Performance Reviewer：涉及循环、数据处理、缓存、数据库查询的文件
-- Style Reviewer：始终派发，检查可读性
-- Testing Reviewer：新增了公共函数/类、修改了业务逻辑
-- Documentation Reviewer：新增了公共 API、修改了配置项
+- Performance Reviewer：diff 显示无界工作、泄漏、N+1、高阶热路径、事件循环阻塞，
+  或在重复路径上用线性遍历替代常数时间操作时派发；仅局部少一次分配不必派发
+- Style Reviewer：对源代码变更默认派发，覆盖语言级 anti-pattern、误导性 API/命名、
+  computed/getter 副作用、Optional 误用、Rust unwrap/panic/clone 和资源生命周期错误；只排除纯排版偏好
+- Testing Reviewer：只有测试断言/测试文件被修改或安全修复删除了既有保护时派发
+- Documentation Reviewer：只有文档文件被修改且可能与行为契约矛盾时派发
 - Dependency Reviewer：修改了依赖文件（requirements.txt, pyproject.toml 等）
-- Accessibility Reviewer：涉及前端 UI 组件（图片、表单、交互元素）
+- Accessibility Reviewer：仅为自定义交互、键盘/焦点管理、ARIA 契约、媒体或动画等复杂语义派发
+  普通 img 的 missing-alt 已由确定性扫描覆盖；input label 候选仍需上下文校准
 - 每个 task 要列出具体文件
 - 每轮最多 6 个 task"""
 
@@ -122,15 +125,24 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - 硬编码密钥、不安全的默认配置
 - 缺少输入验证/清理
 - 不安全的加密、弱认证模式
-- 依赖漏洞""",
+- 依赖漏洞
+
+路径遍历必须有请求/攻击者来源或动态 join/format/拼接到文件 sink 的证据；
+Rust `fs::read(path)` 仅接收普通函数参数时不构成路径遍历；Axum `Path(...)` extractor 是请求来源证据。
+固定内部片段（如 `base.join(FILE_NAME)`）不是动态路径；
+confinement guard 必须验证 sink 实际读取的同一 candidate，且位于 sink 之前。""",
         "performance": """## 任务
 
 审查代码中的性能问题：
-- 热路径中的 O(n²) 或更高复杂度
-- 缺少缓存机会
-- N+1 查询模式
-- 不必要的内存分配
-- 在 async 上下文中使用阻塞 I/O""",
+- 已有证据表明位于热路径的 O(n²) 或更高复杂度
+- 循环内数据库/网络访问形成 N+1 或无界外部工作
+- 无限循环、缺少退出/取消机制、连接池或句柄耗尽
+- 定时器、goroutine、listener、流或大对象持续保留造成资源/内存泄漏
+- 在 async/event-loop 上下文中执行可证实的长时间阻塞 I/O
+- Node.js event-loop 中的 `readFileSync` 等同步 I/O，以及没有匹配清理的 `addEventListener`
+
+手写线性计数若处于重复/热路径，或容器本身提供常数时间长度，应作为可量化问题审查；
+仅局部少一次分配、没有调用频率/规模证据的猜测性缓存建议不报告。""",
         "testing": """## 任务
 
 审查代码变更的测试质量：
@@ -168,14 +180,17 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
         "accessibility": """## 任务
 
 审查代码的可访问性（a11y）问题：
-- 图片缺少 alt 属性
-- 交互元素缺少 aria 标签
-- 表单控件缺少 label 关联
+- 确定性扫描未覆盖的复杂交互元素缺少可访问名称
 - 颜色对比度不足（文本/背景）
 - 缺少键盘导航支持（tabindex, focus 管理）
 - 动画缺少 prefers-reduced-motion 适配
 - 语义化 HTML 使用不当（用 div 代替 button）
-- 屏幕阅读器无法理解的动态内容更新""",
+- 自定义控件的 ARIA 状态与交互行为不一致
+
+普通原生 `<img>` missing-alt 已由确定性扫描负责，不要重复报告；大写 `<Image>` 通常是自定义组件。
+表单控件的外部 `<label>` 可能位于 hunk 外，`title` 也可提供名称，只有上下文足以证明缺失时才报告。
+仅看到 `textContent`/`innerHTML` 动态更新不能证明承载元素缺少 live region，因为元素可能定义在 diff 外；
+本次 diff 若同时新增动态更新及其不带 `aria-live`/`role=status` 的承载元素，则可报告；删除通知契约也可报告。""",
     }
 
     # ── 语言特定的 Style 审查主题（按语言切换审查姿态）────────────────
@@ -237,8 +252,17 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - 模块导入是否冗余或循环引用""",
     }
 
+    style_actionability = """
+
+## 可操作性门槛
+
+报告可观察错误、异常/崩溃、资源泄漏、错误生命周期、明确架构边界破坏，
+以及能从语言语义直接验证的 anti-pattern（例如 Optional 字段/参数、computed/getter 副作用、
+生产路径 unwrap/panic、无必要 clone）和会误导调用方的 API/命名。
+纯排版、import 排序或没有具体影响的审美偏好不报告。"""
+
     if reviewer_type == "style" and language in _style_mission_by_lang:
-        return _style_mission_by_lang[language]
+        return _style_mission_by_lang[language] + style_actionability
 
     # Fallback: generic style mission
     _generic_style = """## 任务
@@ -252,7 +276,7 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 不要把公共 API 缺少文档或测试作为 style finding；文档只有与实际行为矛盾时才可报告。"""
 
     if reviewer_type == "style":
-        return _generic_style
+        return _generic_style + style_actionability
 
     return missions.get(reviewer_type, "## 任务\n\n审查代码变更并报告发现。")
 
@@ -276,6 +300,8 @@ def _anti_patterns(ctx: dict[str, Any]) -> str:
 - 不要在不同文件中重复同一个发现
 - 不要建议与 PR 目的无关的重构
 - 不要仅因 diff 没附带测试/文档，就报告缺测试、缺注释或缺文档
+- 不要报告纯排版/导入排序偏好、无证据的微优化，或仅凭动态文本更新推断缺少 live region；
+  但会导致编译失败的缺失 import、同步 event-loop I/O、未清理 listener 和 diff 内完整可见的新 live carrier 不是偏好
 - 不要在建议中留占位符文本"""
 
 

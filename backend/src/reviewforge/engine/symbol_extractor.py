@@ -90,6 +90,25 @@ IMPORT_PATTERNS["typescript"] = IMPORT_PATTERNS["javascript"]
 
 # ── Function/class definition patterns ──────────────────────
 
+
+# Bounded approximations of balanced generic argument lists.  The alternatives
+# are delimiter-disjoint, and malformed input cannot wander into the next
+# declaration. Eight levels comfortably cover generated nested collection types.
+def _bounded_delimited_group(open_char: str, close_char: str, *, max_depth: int = 8) -> str:
+    escaped_open = re.escape(open_char)
+    escaped_close = re.escape(close_char)
+    plain = rf"[^{escaped_open}{escaped_close}]"
+    group = rf"{escaped_open}{plain}*{escaped_close}"
+    for _ in range(max_depth - 1):
+        group = rf"{escaped_open}(?:{plain}|{group})*{escaped_close}"
+    return group
+
+
+_ANGLE_GROUP = _bounded_delimited_group("<", ">")
+_SQUARE_GROUP = _bounded_delimited_group("[", "]")
+_JAVA_TYPE = rf"[\w$?.]+(?:\s*{_ANGLE_GROUP})?(?:\s*\[\s*\])*"
+
+
 DEFINITION_PATTERNS: dict[str, list[tuple[str, str]]] = {
     "python": [
         (r"(?:async\s+)?def\s+(\w+)\s*\(", "function"),
@@ -108,14 +127,18 @@ DEFINITION_PATTERNS: dict[str, list[tuple[str, str]]] = {
     ],
     "typescript": [],
     "go": [
-        (r"func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(", "function"),
-        (r"type\s+(\w+)\s+struct", "class"),
+        (
+            rf"func\s+(?:\(\s*\w+\s+\*?\w+(?:{_SQUARE_GROUP})?\s*\)\s+)?"
+            rf"(\w+)\s*(?:{_SQUARE_GROUP})?\s*\(",
+            "function",
+        ),
+        (rf"type\s+(\w+)\s*(?:{_SQUARE_GROUP})?\s+struct", "class"),
     ],
     "java": [
         (
-            r"^\s*(?:(?:public|private|protected|static|final|synchronized|native|abstract)\s+)*"
-            r"(?:<[^>]+>\s+)?[\w<>\[\],.?]+\s+(\w+)\s*\([^;{}]*\)"
-            r"\s*(?:throws\s+[^\{]+)?\{?",
+            r"^\s*(?!new\b|return\b|throw\b)"
+            r"(?:(?:public|private|protected|static|final|synchronized|native|abstract|default|strictfp)\s+)*"
+            rf"(?:{_ANGLE_GROUP}\s+)?{_JAVA_TYPE}\s+(\w+)\s*\(",
             "function",
         ),
         (r"class\s+(\w+)", "class"),
@@ -126,13 +149,27 @@ DEFINITION_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"module\s+(\w+)", "class"),
     ],
     "rust": [
-        (r"(?:pub\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*\(", "function"),
+        (
+            rf"(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+            rf"(?:extern\s+\"[^\"]+\"\s+)?fn\s+(\w+)\s*(?:{_ANGLE_GROUP})?\s*\(",
+            "function",
+        ),
         (r"(?:pub\s+)?struct\s+(\w+)", "class"),
         (r"(?:pub\s+)?enum\s+(\w+)", "class"),
     ],
 }
 
-DEFINITION_PATTERNS["typescript"] = DEFINITION_PATTERNS["javascript"]
+DEFINITION_PATTERNS["typescript"] = [
+    (
+        rf"(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(\w+)\s*{_ANGLE_GROUP}\s*\(",
+        "function",
+    ),
+    (
+        rf"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?{_ANGLE_GROUP}\s*\(",
+        "function",
+    ),
+    *DEFINITION_PATTERNS["javascript"],
+]
 
 
 # ── Function call patterns ──────────────────────────────────
@@ -421,10 +458,29 @@ def _populate_symbol_ranges(content: str, lang: str, symbols: list[SymbolInfo]) 
     if lang == "python" and _populate_python_ranges(content, symbols):
         return
 
-    for symbol in symbols:
+    for symbol_index, symbol in enumerate(symbols):
         symbol.start_line = _leading_declaration_start(lines, symbol.start_line or symbol.line, lang)
         if lang in {"go", "java", "javascript", "typescript", "rust"}:
-            symbol.end_line = _find_braced_symbol_end(lines, symbol.line)
+            # A body-less/unsupported declaration must never borrow the opening
+            # brace of the following declaration.  Classes and outer functions
+            # may legitimately contain later symbols, so the boundary only
+            # applies while the scanner is still looking for this symbol's body.
+            next_declaration_line = next(
+                (
+                    candidate.start_line or candidate.line
+                    for candidate in symbols[symbol_index + 1 :]
+                    if candidate.line > symbol.line
+                ),
+                0,
+            )
+            symbol.end_line = _find_braced_symbol_end(
+                lines,
+                symbol.line,
+                declaration_start_line=symbol.start_line,
+                next_declaration_line=next_declaration_line,
+                lang=lang,
+                symbol_name=symbol.name,
+            )
         elif lang == "ruby":
             symbol.end_line = _find_ruby_symbol_end(lines, symbol.line)
 
@@ -507,16 +563,58 @@ def _multiline_annotation_start(lines: list[str], end_index: int) -> int | None:
     return None
 
 
-def _find_braced_symbol_end(lines: list[str], definition_line: int) -> int:
+def _find_braced_symbol_end(
+    lines: list[str],
+    definition_line: int,
+    *,
+    declaration_start_line: int = 0,
+    next_declaration_line: int = 0,
+    lang: str = "",
+    symbol_name: str = "",
+) -> int:
     """Find a balanced brace body's inclusive end, ignoring strings/comments."""
 
     depth = 0
     started = False
+    # Braces inside a function signature are not the function body.  This is
+    # common in TypeScript destructured parameters and inline object types, e.g.
+    # ``function Card({ html }: { html: string }) {``.  Treating ``{ html }`` as
+    # the body made the range end on the declaration line, so a finding on the
+    # first real statement could not be attributed to the symbol.
+    paren_depth = 0
+    bracket_depth = 0
+    angle_depth = 0
+    declaration_start_line = declaration_start_line or definition_line
+    declaration_end_line = next_declaration_line - 1 if next_declaration_line else definition_line + 12
+    declaration = "\n".join(lines[declaration_start_line - 1 : declaration_end_line])
+    arrow_declaration = bool(
+        symbol_name
+        and lang in {"javascript", "typescript"}
+        and re.search(
+            rf"\b(?:const|let|var)\s+{re.escape(symbol_name)}\s*=",
+            declaration,
+            re.MULTILINE,
+        )
+    )
+    arrow_seen = False
+    arrow_pending = False
+    arrow_expression = False
+    expression_brace_depth = 0
+    expression_last_line = 0
+    type_brace_depth = 0
+    saw_parameters = False
+    parameters_closed = False
+    return_type_start = -1
+    signature: list[str] = []
     quote = ""
     escaped = False
     block_comment = False
 
     for line_index in range(definition_line - 1, len(lines)):
+        source_line = line_index + 1
+        if next_declaration_line and source_line >= next_declaration_line and not started:
+            return expression_last_line if arrow_expression else 0
+
         line = lines[line_index]
         index = 0
         while index < len(line):
@@ -531,6 +629,8 @@ def _find_braced_symbol_end(lines: list[str], definition_line: int) -> int:
                     index += 1
                 continue
             if quote:
+                if arrow_expression and not char.isspace():
+                    expression_last_line = source_line
                 if escaped:
                     escaped = False
                 elif char == "\\" and quote != "`":
@@ -545,25 +645,145 @@ def _find_braced_symbol_end(lines: list[str], definition_line: int) -> int:
                 block_comment = True
                 index += 2
                 continue
+            if arrow_pending and not char.isspace():
+                if char == "{" and paren_depth == 0 and bracket_depth == 0 and angle_depth == 0:
+                    depth = 1
+                    started = True
+                    arrow_pending = False
+                    signature.append(char)
+                    index += 1
+                    continue
+                arrow_pending = False
+                arrow_expression = True
             if char in {'"', "'", "`"}:
+                if arrow_expression:
+                    expression_last_line = source_line
                 quote = char
+                signature.append(char)
                 index += 1
                 continue
-            if char == "{":
-                depth += 1
-                started = True
+            if not started and type_brace_depth:
+                signature.append(char)
+                if char == "{":
+                    type_brace_depth += 1
+                elif char == "}":
+                    type_brace_depth -= 1
+                index += 1
+                continue
+
+            if arrow_expression:
+                if not char.isspace():
+                    expression_last_line = source_line
+                if char == "(":
+                    paren_depth += 1
+                elif char == ")":
+                    paren_depth = max(0, paren_depth - 1)
+                elif char == "[":
+                    bracket_depth += 1
+                elif char == "]":
+                    bracket_depth = max(0, bracket_depth - 1)
+                elif char == "{":
+                    expression_brace_depth += 1
+                elif char == "}":
+                    expression_brace_depth = max(0, expression_brace_depth - 1)
+                elif char == ";" and paren_depth == 0 and bracket_depth == 0 and expression_brace_depth == 0:
+                    return source_line
+                index += 1
+                continue
+
+            if (
+                not started
+                and arrow_declaration
+                and pair == "=>"
+                and paren_depth == 0
+                and bracket_depth == 0
+                and angle_depth == 0
+            ):
+                arrow_seen = True
+                arrow_pending = True
+                signature.extend(pair)
+                index += 2
+                continue
+            if not started and char == "(":
+                paren_depth += 1
+                saw_parameters = True
+            elif not started and char == ")":
+                paren_depth = max(0, paren_depth - 1)
+                if saw_parameters and paren_depth == 0:
+                    parameters_closed = True
+            elif not started and char == "[":
+                bracket_depth += 1
+            elif not started and char == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif (
+                not started
+                and char == "<"
+                and paren_depth == 0
+                and bracket_depth == 0
+                and lang in {"java", "javascript", "typescript", "rust"}
+            ):
+                angle_depth += 1
+            elif not started and char == ">" and angle_depth:
+                angle_depth -= 1
+            elif (
+                not started
+                and char == ":"
+                and lang == "typescript"
+                and parameters_closed
+                and paren_depth == 0
+                and bracket_depth == 0
+                and angle_depth == 0
+                and return_type_start < 0
+            ):
+                return_type_start = len(signature)
+            elif char == "{":
+                top_level = paren_depth == 0 and bracket_depth == 0 and angle_depth == 0
+                type_literal = top_level and (
+                    (lang == "go" and re.search(r"\b(?:struct|interface)\s*$", "".join(signature)))
+                    or (
+                        lang == "typescript"
+                        and return_type_start >= 0
+                        and _typescript_type_literal_brace("".join(signature[return_type_start:]))
+                    )
+                    # Before an arrow's top-level ``=>``, any brace belongs to
+                    # a parameter/generic/return type rather than its body.
+                    or (arrow_declaration and not arrow_seen)
+                )
+                if not started and type_literal:
+                    type_brace_depth = 1
+                elif started or top_level:
+                    depth += 1
+                    started = True
             elif char == "}" and started:
                 depth -= 1
                 if depth == 0:
-                    return line_index + 1
+                    return source_line
+            signature.append(char)
             index += 1
+
+        signature.append("\n")
 
         # A declaration without an opening brace should not scan arbitrarily
         # far into another symbol and manufacture a range.
         if not started and line_index + 1 - definition_line >= 12:
-            return 0
+            return expression_last_line if arrow_expression else 0
 
-    return 0
+    return expression_last_line if arrow_expression else 0
+
+
+def _typescript_type_literal_brace(return_type_prefix: str) -> bool:
+    """Whether a top-level brace continues a TypeScript return type."""
+
+    prefix = return_type_prefix.strip()
+    if not prefix.startswith(":"):
+        return False
+    type_prefix = prefix[1:].rstrip()
+    if not type_prefix:
+        return True
+    return bool(
+        re.search(r"(?:=>|[<|&?:,(=])\s*$", type_prefix)
+        or re.search(r"\b(?:extends|infer|keyof|typeof)\s*$", type_prefix)
+    )
 
 
 def _find_ruby_symbol_end(lines: list[str], definition_line: int) -> int:

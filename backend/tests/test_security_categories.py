@@ -15,6 +15,8 @@ def test_security_category_aliases_normalize():
     assert normalize_category("已知漏洞依赖") == "dependency-vulnerability"
     assert normalize_category("known-vulnerability") == "dependency-vulnerability"
     assert normalize_category("version-unpinned") == "dependency-version-range"
+    assert normalize_category("version-range") == "dependency-version-range"
+    assert normalize_category("secret-leakage") == "data-leak"
     assert normalize_category("dangerously-set-innerHTML") == "xss"
     assert normalize_category("missing-alt-text") == "missing-alt"
     assert normalize_category("alt-text") == "missing-alt"

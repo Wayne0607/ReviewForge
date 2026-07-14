@@ -1,6 +1,6 @@
 """Zero-token deterministic scanning that runs independently of LLM routing.
 
-The security and dependency scanners are intentionally executed before the
+The security, dependency, and concrete accessibility scanners are intentionally executed before the
 Planner. This keeps their coverage available when planning fails, returns no
 tasks, or simply omits the corresponding reviewer.
 """
@@ -12,7 +12,11 @@ import logging
 from dataclasses import dataclass, field
 
 from reviewforge.core.state import Finding, StateStore
-from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
+from reviewforge.engine.detectors import (
+    detect_dependency_findings,
+    detect_security_findings,
+)
+from reviewforge.engine.detectors.accessibility import detect_accessibility_findings
 from reviewforge.engine.security_categories import normalize_category
 from reviewforge.tools.gateway import ToolGateway
 
@@ -27,7 +31,7 @@ def finding_identity(finding: Finding) -> tuple[str, int, str]:
 
 @dataclass
 class Phase0ScanResult:
-    """Outcome of reading changed diffs and running both deterministic scanners."""
+    """Outcome of reading changed diffs and running deterministic scanners."""
 
     findings: list[Finding] = field(default_factory=list)
     files_scanned: int = 0
@@ -78,6 +82,7 @@ async def scan_changed_files(
     scanner_specs = (
         ("security", "security_reviewer", detect_security_findings),
         ("dependency", "dependency_reviewer", detect_dependency_findings),
+        ("accessibility", "accessibility_reviewer", detect_accessibility_findings),
     )
     deduped: dict[tuple[str, int, str], Finding] = {}
     for scanner_name, reviewer_name, scanner in scanner_specs:

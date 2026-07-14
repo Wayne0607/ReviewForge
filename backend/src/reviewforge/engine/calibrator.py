@@ -20,6 +20,7 @@ from langchain_openai import ChatOpenAI
 
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding
+from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 
@@ -70,6 +71,32 @@ _GENERIC_DOC_CATEGORIES = {
     "missing-parameter-doc",
     "safety-doc",
 }
+_GENERIC_A11Y_ABSENCE_CATEGORIES = {
+    "aria-live",
+    "dynamic-content-update",
+    "live-region",
+    "missing-aria-live",
+    "missing-live-region",
+    "status-announcement",
+}
+_GENERIC_STYLE_CATEGORIES = {
+    "code-style",
+    "convention",
+    "idiom",
+    "imports",
+    "naming",
+    "optional-misuse",
+    "readability",
+    "style",
+}
+_GENERIC_PERFORMANCE_CATEGORIES = {
+    "efficiency",
+    "micro-optimization",
+    "optimization",
+    "performance",
+    "unnecessary-computation",
+}
+_DETERMINISTIC_A11Y_CATEGORIES = {"missing-alt"}
 _TEST_FILE = re.compile(
     r"(?:^|/)(?:tests?|specs?)(?:/|$)|(?:^|[._-])test(?:[._-]|$)|"
     r"(?:^|[._-])spec(?:[._-]|$)|_test\.go$|test\.java$",
@@ -98,22 +125,13 @@ _SECURITY_GUARD_CODE = re.compile(
     r"白名单|鉴权|认证|授权)",
     re.IGNORECASE,
 )
-_SAFETY_CONTRACT = re.compile(
-    r"(?:#\s*safety|safety contract|preconditions?|invariants?|caller must|"
-    r"安全契约|前置条件|不变量|调用者必须)",
-    re.IGNORECASE,
-)
-_RUST_UNSAFE_API = re.compile(r"\bpub(?:\([^)]*\))?\s+unsafe\s+fn\b", re.IGNORECASE)
-_DOCUMENTATION_MISMATCH = re.compile(
-    r"\b(?:incorrect|outdated|stale|mismatch|contradict(?:s|ion|ory)?|wrong|inaccurate)\b|"
-    r"错误|过时|陈旧|不一致|矛盾|不准确",
-    re.IGNORECASE,
-)
 _REMOVED_TEST_CODE = re.compile(
     r"\b(?:assert|expect|should|test|it|describe|pytest|unittest|t\.run)\b|"
     r"断言|测试",
     re.IGNORECASE,
 )
+_RUST_FUNCTION = re.compile(r"\bfn\s+(?P<name>[A-Za-z_]\w*)\b")
+_RUST_FS_SINK = re.compile(r"\b(?:std::)?fs::(?:read|read_to_string|read_dir)\s*\(", re.IGNORECASE)
 
 
 @dataclass
@@ -136,6 +154,15 @@ class _PythonCodeEvidence:
     unsafe_command_scopes: tuple[tuple[int, int], ...]
     suspicious_path_scopes: tuple[tuple[int, int], ...]
     constant_shell_scopes: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _RustPathScope:
+    name: str
+    start: int
+    end: int
+    has_sink: bool
+    dynamic: bool
 
 
 def _extract_file_patch(diff_summary: str, file_path: str) -> str:
@@ -318,6 +345,90 @@ def _reject_by_code_evidence(finding: Finding, evidence: _PythonCodeEvidence | N
     return ""
 
 
+def _rust_line_for_braces(line: str) -> str:
+    """Remove comments/string bodies so Rust format strings do not change brace depth."""
+
+    without_comment = line.split("//", 1)[0]
+    return re.sub(r'r?#*"(?:\\.|[^"\\])*"#*', '""', without_comment)
+
+
+def _rust_path_scopes(diff_summary: str, file_path: str) -> tuple[_RustPathScope, ...]:
+    if not file_path.lower().endswith(".rs"):
+        return ()
+    patch = _extract_file_patch(diff_summary, file_path)
+    additions = iter_added_lines(patch)
+    dynamic_sink_lines = set(_rust_dynamic_path_sinks(patch))
+    scopes: list[_RustPathScope] = []
+    current_name = ""
+    current_start = 0
+    current_lines: list[str] = []
+    depth = 0
+    saw_open = False
+
+    for line_no, content in additions:
+        if not current_name:
+            match = _RUST_FUNCTION.search(content)
+            if not match:
+                continue
+            current_name = match.group("name")
+            current_start = line_no
+            current_lines = []
+            depth = 0
+            saw_open = False
+
+        current_lines.append(content)
+        structural = _rust_line_for_braces(content)
+        opens = structural.count("{")
+        closes = structural.count("}")
+        if opens:
+            saw_open = True
+        depth += opens - closes
+        if not saw_open or depth > 0:
+            continue
+
+        body = "\n".join(current_lines)
+        has_sink = bool(_RUST_FS_SINK.search(body))
+        dynamic = has_sink and any(current_start <= sink_line <= line_no for sink_line in dynamic_sink_lines)
+        scopes.append(
+            _RustPathScope(
+                name=current_name,
+                start=current_start,
+                end=line_no,
+                has_sink=has_sink,
+                dynamic=dynamic,
+            )
+        )
+        current_name = ""
+        current_lines = []
+        depth = 0
+        saw_open = False
+
+    return tuple(scopes)
+
+
+def _reject_rust_direct_path_claim(finding: Finding, code_diff: str) -> str:
+    """Reject Rust path claims backed only by a direct path parameter at an fs sink."""
+
+    if finding.category != "path-traversal" or not finding.file.lower().endswith(".rs"):
+        return ""
+    sink_scopes = [scope for scope in _rust_path_scopes(code_diff, finding.file) if scope.has_sink]
+    if not sink_scopes:
+        return ""
+
+    text = f"{finding.message}\n{finding.suggestion}"
+    related = [
+        scope
+        for scope in sink_scopes
+        if scope.start - 2 <= finding.line <= scope.end + 2
+        or re.search(rf"\b{re.escape(scope.name)}\b", text, re.IGNORECASE)
+    ]
+    if not related and all(not scope.dynamic for scope in sink_scopes):
+        related = sink_scopes
+    if related and all(not scope.dynamic for scope in related):
+        return "Rust 文件中仅有直接路径参数传入 fs 读取；diff 未显示请求来源、动态 join/format 构造或越界路径数据流"
+    return ""
+
+
 def _generic_quality_kind(finding: Finding) -> str:
     """Classify absence-only test/doc findings without touching other dimensions."""
 
@@ -330,6 +441,12 @@ def _generic_quality_kind(finding: Finding) -> str:
         r"(?:missing|lack-of)-.*(?:docs?|docstring|documentation)", category
     ):
         return "doc"
+    if category in _GENERIC_A11Y_ABSENCE_CATEGORIES:
+        return "a11y-absence"
+    if category in _GENERIC_STYLE_CATEGORIES:
+        return "style"
+    if category in _GENERIC_PERFORMANCE_CATEGORIES:
+        return "performance"
     return ""
 
 
@@ -362,12 +479,11 @@ def _has_removed_test_code(diff_summary: str, file_path: str) -> bool:
 
 
 def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
-    """Reject absence-only quality advice unless the diff contains actionable evidence.
+    """Reject only narrow test-absence noise at the zero-token stage.
 
-    A missing test or doc is not an inline defect by itself.  We retain only cases
-    where the changed test is concretely wrong, a real test was removed, a security
-    fix lacks a named regression contract, or a Rust unsafe API lacks its required
-    safety contract.  Those retained cases still go through adversarial calibration.
+    Style, imports, performance, accessibility, and documentation require broader
+    repository context. A finite keyword allow-list cannot prove those findings
+    false, so they always continue to adversarial calibration.
     """
 
     kind = _generic_quality_kind(finding)
@@ -401,16 +517,7 @@ def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
             return ""
         return "仅指出缺少测试/覆盖率，没有在可评论的变更行上证明具体错误断言、测试删除或安全回归契约"
 
-    rust_safety_contract = (
-        has_anchor
-        and finding.file.lower().endswith(".rs")
-        and bool(_RUST_UNSAFE_API.search(nearby_code))
-        and bool(_SAFETY_CONTRACT.search(text))
-    )
-    documentation_mismatch = has_anchor and bool(_DOCUMENTATION_MISMATCH.search(text))
-    if rust_safety_contract or documentation_mismatch:
-        return ""
-    return "仅指出缺少注释或文档，没有在锚点处证明错误文档或语言要求的具体安全契约"
+    return ""
 
 
 def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[list[Finding], list[Finding]]:
@@ -426,7 +533,9 @@ def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[l
     rejected: list[Finding] = []
     for finding in findings:
         finding.category = normalize_category(finding.category)
-        reason = _reject_generic_quality_finding(finding, code_diff)
+        reason = _reject_rust_direct_path_claim(finding, code_diff) or _reject_generic_quality_finding(
+            finding, code_diff
+        )
         if reason:
             finding.status = "false_positive"
             finding.verified_by = "actionability-gate"
@@ -487,12 +596,12 @@ class DynamicCalibrator:
             detector_backed = f.verified_by == "detector"
             if (
                 detector_backed
-                and is_security_category(f.category)
                 and f.confidence >= _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE
+                and (is_security_category(f.category) or f.category in _DETERMINISTIC_A11Y_CATEGORIES)
             ):
                 f.status = "confirmed"
                 f.verified_by = "detector-auto"
-                f.verify_reason = "高置信确定性安全规则命中"
+                f.verify_reason = "高置信确定性安全/可访问性规则命中"
                 auto_confirmed.append(f)
             else:
                 need_calibration.append(f)
@@ -558,8 +667,10 @@ class DynamicCalibrator:
 - 仅出现危险 API 不等于存在漏洞；必须有可信的攻击者可控输入到危险 sink
 - 参数数组且未启用 shell 的进程调用不会发生 shell 注入；固定常量命令也不是命令注入
 - 测试/示例中的明显占位凭据或固定字符串执行通常不是生产漏洞，但像真实密钥仍需确认
-- 经转义/可信 sanitizer 处理后再写入 HTML、经过 allow-list 的跳转目标应判为误报
+- 经 DOMPurify 等可信 sanitizer 处理后再写入 HTML、经 Shellwords.escape 转义的命令片段、经过 allow-list 的跳转目标应判为误报
 - 变量文件路径本身不等于路径穿越；需证明攻击者可越过受控根目录
+- Rust `fs::read(path)`/`fs::read_to_string(path)` 仅接收函数路径参数时不是路径穿越证据；Axum `Path(...)` extractor 或动态 join/format 可证明来源；固定内部 join 片段不可
+- Rust confinement guard 必须验证 sink 读取的同一 canonicalized candidate 且位于 sink 之前；无关变量或 sink 后的 guard 不是反证
 - 动态 SQL 标识符若经过 allow-list 且所有值仍使用绑定参数，应判为误报
 
 质量类 finding 必须满足可操作的证据门槛：
@@ -567,8 +678,12 @@ class DynamicCalibrator:
 - 缺文档只有两类可确认：已有文档被本次行为变更改成错误陈述，或语言规范要求的安全契约（例如 Rust `pub unsafe fn` 的 `# Safety`）确实缺失
 - 不能仅因当前 diff 没有附带测试或文档而确认
 - “新增公共/高风险函数但 diff 没测试/注释”“危险实现还应写风险说明”均是噪声；后者应直接报告漏洞，不能再确认重复的测试/文档建议
-- 命名和风格偏好本身不是可操作 bug，除非违反明确规范并造成真实歧义或行为风险
+- 纯排版、import 排序或无影响的风格/命名审美偏好应判为误报；但语言级 anti-pattern、computed/getter 副作用、
+  Optional 字段/参数、生产路径 unwrap/panic、无必要 clone 和误导调用方的 API/命名可以确认
+- 性能 finding 必须证明无界工作、N+1、高阶/重复热路径、阻塞或资源/内存泄漏；
+  重复线性计数替代容器常数时间长度也可确认，不能仅按“微优化”标签删除
 - 可访问性结论必须结合元素的交互语义；普通静态文本、textContent 或已转义 HTML 不能单凭 API 名称判错
+- 仅因 textContent/innerHTML 更新而建议 live region 属于 absence-only 噪声；但 diff 同时新增动态更新及其无通知语义的承载元素，或明确删除 ARIA 通知契约时可以确认
 - 明确缺失的图片 alt、表单 label 或交互控件名称仍是有效的可访问性问题
 
 语言要求：challenge 字段使用中文。
@@ -628,14 +743,22 @@ class DynamicCalibrator:
 - 严重程度是否合理
 - 安全类结论必须有攻击者可控 source 到危险 sink 的完整证据；安全 API、allow-list、
   sanitizer、绑定参数和测试占位值都应作为反证，不能仅凭危险 API 名称确认
+- Rust 文件读取仅接收 `path` 参数不等于路径穿越；Axum `Path(...)` extractor 是请求来源，
+  动态 join/format 也可构成证据；固定内部 join 片段不可
+- guard 只有在 sink 之前约束同一 canonicalized candidate 才能反驳路径穿越；无关变量或事后检查无效
 - 缺测试只有在修改后的测试断言错误、实际删除/削弱既有测试，或安全修复缺少明确契约的回归测试时才能确认
 - 缺文档只有在已有文档与新行为矛盾，或语言规范要求的安全契约（如 Rust `pub unsafe fn` 的 `# Safety`）缺失时才能确认
 - 不能仅因当前 diff 没有附带测试或文档而确认
 - 仅因新增公共/高风险函数且 diff 没有测试/注释，或因危险代码应再写风险说明，必须判为 false_positive
 - 对危险代码应直接确认对应行为漏洞，而不是重复测试或文档建议
-- 命名/风格偏好不构成 bug，除非违反明确规范并造成真实歧义或风险
+- 纯排版、import 排序或无影响的风格/命名审美偏好判为 false_positive；但可验证的语言 anti-pattern、
+  computed/getter 副作用、Optional 误用、生产路径 unwrap/panic、无必要 clone 和误导性 API/命名可以确认
+- 猜测性微优化不得确认；性能 finding 应有无界工作、N+1、阻塞、泄漏、高阶/重复热路径，
+  或线性遍历替代容器常数时间长度的证据
 - 可访问性必须结合交互语义；普通静态文本、textContent、已转义 HTML 不应被判错，
   但明确缺失的图片 alt、表单 label 或控件可访问名称仍应确认
+- 仅看到 textContent/innerHTML 更新不能推断承载元素缺少 live region
+- 若 diff 同时新增动态更新和无通知语义的承载元素，或删除 ARIA 通知契约，此类 finding 可以确认；否则判为 false_positive
 
 语言要求：reason 字段使用中文。
 

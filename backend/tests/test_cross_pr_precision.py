@@ -392,6 +392,278 @@ String execute(
     java_symbols, _ = extract_diff_symbols(_diff("Runner.java", java_source), "Runner.java")
     assert [(item.name, item.line, item.start_line, item.end_line) for item in java_symbols] == [("execute", 5, 1, 9)]
 
+    destructured_typescript = """export function RawProfileCard({ html }: { html: string }) {
+  return <article dangerouslySetInnerHTML={{ __html: html }} />;
+}
+"""
+    destructured_symbols, _ = extract_diff_symbols(
+        _diff("seed_frontend.tsx", destructured_typescript),
+        "seed_frontend.tsx",
+    )
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in destructured_symbols] == [
+        ("RawProfileCard", 1, 1, 3)
+    ]
+    online_anchor = Finding(
+        file="seed_frontend.tsx",
+        line=2,
+        category="xss",
+        message="dangerouslySetInnerHTML renders potentially unsafe DOM content.",
+        status="confirmed",
+        verified_by="judge",
+    )
+    assert CrossPRAnalyzer._enclosing_symbol_by_line(online_anchor, destructured_symbols).name == "RawProfileCard"
+
+    expression_arrow = """export const buildPayload = (value: string) => ({
+  raw: value,
+  render: () => value,
+});
+"""
+    arrow_symbols, _ = extract_diff_symbols(_diff("payload.ts", expression_arrow), "payload.ts")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in arrow_symbols] == [
+        ("buildPayload", 1, 1, 4)
+    ]
+
+    object_return_types = {
+        "factory.ts": """export function make(): { html: string } {
+  return { html: "safe" };
+}
+""",
+        "factory.go": """package factory
+func makeValue() struct { X int } {
+  return struct { X int }{X: 1}
+}
+""",
+    }
+    expected_ranges = {"factory.ts": ("make", 1, 1, 3), "factory.go": ("makeValue", 2, 2, 4)}
+    for file_path, source in object_return_types.items():
+        symbols, _ = extract_diff_symbols(_diff(file_path, source), file_path)
+        assert [(item.name, item.line, item.start_line, item.end_line) for item in symbols] == [
+            expected_ranges[file_path]
+        ]
+
+
+def test_braced_symbol_ranges_do_not_borrow_an_adjacent_declaration_body():
+    typescript_cases = {
+        "multiline-arrow.ts": (
+            """export const
+build = ({ raw }: { raw: string }): { value: string } => ({
+  value: raw,
+});
+
+export function next() {
+  return 1;
+}
+""",
+            [("build", 2, 1, 4), ("next", 6, 6, 8)],
+        ),
+        "callback-return.ts": (
+            """export function make(): () => { ok: boolean } {
+  return () => ({ ok: true });
+}
+export function next() { return 1; }
+""",
+            [("make", 1, 1, 3), ("next", 4, 4, 4)],
+        ),
+        "generic-class.ts": (
+            """export class Store<T extends { id: string }> {
+  get(value: T) { return value; }
+}
+export function next() { return 1; }
+""",
+            [("Store", 1, 1, 3), ("get", 2, 2, 2), ("next", 4, 4, 4)],
+        ),
+        "expression-arrow.ts": (
+            """export const increment = (value: number) =>
+  value + 1;
+export const payload = () => ({ ok: true });
+""",
+            [("increment", 1, 1, 2), ("payload", 3, 3, 3)],
+        ),
+        "comparison-default.ts": (
+            """export function choose(value = left < right ? left : right) {
+  return value;
+}
+export const chooseArrow = (value = left < right ? left : right) => ({ value });
+""",
+            [("choose", 1, 1, 3), ("chooseArrow", 4, 4, 4)],
+        ),
+        "generic-functions.ts": (
+            """export function select<T extends Outer<Middle<Inner<{ id: string }>>>>(value: T): T {
+  return value;
+}
+export const project = <T extends { value: U }, U = string>(value: T) => ({ value: value.value });
+export function next() { return 1; }
+""",
+            [("select", 1, 1, 3), ("project", 4, 4, 4), ("next", 5, 5, 5)],
+        ),
+        "bodyless-generic.ts": (
+            """declare function missing<T extends { id: string }>(value: T): void;
+export function next() { return 1; }
+""",
+            [("missing", 1, 1, 0), ("next", 2, 2, 2)],
+        ),
+    }
+    for file_path, (source, expected) in typescript_cases.items():
+        symbols, _ = extract_diff_symbols(_diff(file_path, source), file_path)
+        assert [(item.name, item.line, item.start_line, item.end_line) for item in symbols] == expected
+
+    go_source = """package factory
+func makeValue() struct {
+  X int
+  Nested struct { Y string }
+} {
+  return struct { X int; Nested struct { Y string } }{}
+}
+func next() {}
+"""
+    go_symbols, _ = extract_diff_symbols(_diff("factory.go", go_source), "factory.go")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in go_symbols] == [
+        ("makeValue", 2, 2, 7),
+        ("next", 8, 8, 8),
+    ]
+
+    generic_go_source = """package factory
+func Build[T any, U interface { Value() T }](value T) interface { Run() U } {
+  return nil
+}
+func bodyless[T any](value T)
+func next() {}
+"""
+    generic_go_symbols, _ = extract_diff_symbols(_diff("generic.go", generic_go_source), "generic.go")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in generic_go_symbols] == [
+        ("Build", 2, 2, 4),
+        ("bodyless", 5, 5, 0),
+        ("next", 6, 6, 6),
+    ]
+
+    java_source = """abstract class Runner {
+  abstract void missing();
+  void next() { Runnable task = new Runnable() { public void run() {} }; }
+}
+"""
+    java_symbols, _ = extract_diff_symbols(_diff("Runner.java", java_source), "Runner.java")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in java_symbols] == [
+        ("Runner", 1, 1, 4),
+        ("missing", 2, 2, 0),
+        ("next", 3, 3, 3),
+    ]
+
+    generic_java_source = """abstract class Factory {
+  public static <T extends Comparable<? super T>>
+  java.util.Map<String, java.util.List<java.util.Map<String, java.util.Set<T>>>>
+  make(
+      T value
+  ) {
+    return java.util.Map.of();
+  }
+  abstract <T extends Comparable<? super T>> java.util.List<T> missing(T value);
+  void next() {}
+}
+"""
+    generic_java_symbols, _ = extract_diff_symbols(
+        _diff("Factory.java", generic_java_source),
+        "Factory.java",
+    )
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in generic_java_symbols] == [
+        ("Factory", 1, 1, 11),
+        ("make", 4, 2, 8),
+        ("missing", 9, 9, 0),
+        ("next", 10, 10, 10),
+    ]
+
+    rust_source = """extern "C" {
+  fn missing();
+}
+fn next() {
+  let config = Config { value: 1 };
+  if ready() { work(); }
+}
+"""
+    rust_symbols, _ = extract_diff_symbols(_diff("runner.rs", rust_source), "runner.rs")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in rust_symbols] == [
+        ("missing", 2, 2, 0),
+        ("next", 4, 4, 7),
+    ]
+
+    generic_rust_source = """pub fn select<T: Into<Option<Result<Item, Error>>>, const N: usize>(value: T) -> Item {
+  value.into()
+}
+fn bodyless<T: Copy>(value: T);
+fn next() {}
+"""
+    generic_rust_symbols, _ = extract_diff_symbols(_diff("generic.rs", generic_rust_source), "generic.rs")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in generic_rust_symbols] == [
+        ("select", 1, 1, 3),
+        ("bodyless", 4, 4, 0),
+        ("next", 5, 5, 5),
+    ]
+
+
+async def test_online_detector_finding_in_destructured_typescript_function_seeds_cross_pr_risk(tmp_path):
+    db = Database(tmp_path / "destructured-typescript.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+    repo = "Wayne0607/ReviewForge"
+    seed_file = "gauntlet_fullstack/seed_frontend.tsx"
+    seed_source = """import React from "react";
+
+export function RawProfileCard({ html }: { html: string }) {
+  return <article dangerouslySetInnerHTML={{ __html: html }} />;
+}
+"""
+    seed_state = StateStore(
+        pr_number=83,
+        repo=repo,
+        head_sha="seed-head",
+        base_sha="main-head",
+        files_changed=[seed_file],
+        diff_summary=_diff(seed_file, seed_source),
+    )
+    await db.create_run("online-seed", repo, 83, "seed-head", "main-head")
+    await analyzer.analyze(
+        "online-seed",
+        seed_state,
+        [
+            Finding(
+                file=seed_file,
+                line=4,
+                severity="error",
+                category="xss",
+                message="dangerouslySetInnerHTML renders potentially unsafe DOM content.",
+                confidence=0.9,
+                reviewer="security_reviewer",
+                status="confirmed",
+                verified_by="judge",
+            )
+        ],
+    )
+    await db.complete_run("online-seed", {})
+
+    symbol = await db.get_symbol(seed_file, "RawProfileCard")
+    assert json.loads(symbol["risk_categories"]) == ["xss"]
+
+    consumer_file = "gauntlet_consumers/bridge.ts"
+    consumer_source = """import { RawProfileCard } from "gauntlet_fullstack/seed_frontend";
+
+export function bridge(html: string) {
+  return RawProfileCard({ html });
+}
+"""
+    consumer_state = StateStore(
+        pr_number=84,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=[consumer_file],
+        diff_summary=_diff(consumer_file, consumer_source),
+    )
+    cross_findings = await analyzer.analyze("online-consumer", consumer_state, [])
+
+    assert {(finding.file, finding.line, finding.category) for finding in cross_findings} == {
+        (consumer_file, 4, "cross-pr-xss")
+    }
+    await db.close()
+
 
 async def test_adjacent_symbol_boundary_does_not_leak_next_sink_into_previous_symbol(tmp_path):
     db = Database(tmp_path / "adjacent-symbols.db")
@@ -1364,10 +1636,19 @@ async def test_real_pr73_to_pr74_stacked_fixture_hits_all_manifest_cross_pr_trut
             line=line,
             severity="error",
             category=category,
-            message=f"{symbol} contains the manifest security risk",
+            # RawProfileCard mirrors the live detector row: its message names
+            # the concrete DOM sink but not the enclosing symbol.  This prevents
+            # the fixture from accidentally bypassing line-range attribution via
+            # `_match_symbol_by_finding_text`.
+            message=(
+                "dangerouslySetInnerHTML renders potentially unsafe DOM content."
+                if symbol == "RawProfileCard"
+                else f"{symbol} contains the manifest security risk"
+            ),
             confidence=0.99,
             reviewer="manifest_truth",
             status="confirmed",
+            verified_by="judge" if symbol == "RawProfileCard" else "",
         )
         for file_path, line, category, symbol in _REAL_PR73_RISKS
     ]

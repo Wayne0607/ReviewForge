@@ -62,6 +62,341 @@ def test_rust_unwrap_is_not_mislabeled_as_unsafe_security_usage():
     assert findings == []
 
 
+def test_rust_path_detector_requires_dynamic_construction_or_request_provenance():
+    findings = detect_security_findings(
+        {
+            "direct.rs": _diff(
+                "use std::fs;\n"
+                "pub fn load_config(path: &str) -> Result<String, std::io::Error> {\n"
+                "    fs::read_to_string(path)\n"
+                "}"
+            ),
+            "dynamic.rs": _diff(
+                "use std::fs;\n"
+                "pub fn load(base: &str, filename: &str) -> Result<String, std::io::Error> {\n"
+                '    let path = format!("{}/{}", base, filename);\n'
+                "    fs::read_to_string(&path)\n"
+                "}"
+            ),
+            "joined.rs": _diff(
+                "use std::fs;\n"
+                "pub fn load(base: &Path, filename: &str) -> Result<Vec<u8>, std::io::Error> {\n"
+                "    let candidate = base.join(filename);\n"
+                "    fs::read(&candidate)\n"
+                "}"
+            ),
+            "guarded.rs": _diff(
+                "use std::fs;\n"
+                "pub fn load(base: &Path, filename: &str) -> Result<Vec<u8>, std::io::Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    if !candidate.starts_with(base) { return Err(std::io::ErrorKind::InvalidInput.into()); }\n"
+                "    fs::read(&candidate)\n"
+                "}"
+            ),
+        }
+    )
+
+    paths = [finding for finding in findings if finding.category == "path-traversal"]
+    assert {(finding.file, finding.line) for finding in paths} == {("dynamic.rs", 4), ("joined.rs", 4)}
+    assert all(finding.confidence >= 0.96 for finding in paths)
+
+
+def test_high_signal_browser_storage_raw_html_and_ruby_backticks_are_detector_auto_quality():
+    findings = detect_security_findings(
+        {
+            "storage.tsx": _diff(
+                'localStorage.setItem("token", token)\n'
+                'localStorage.setItem("token", "cleared")\n'
+                'localStorage.setItem("last-token-check", "done")\n'
+                "const html = response.data.html\n"
+                "return <article dangerouslySetInnerHTML={{ __html: html }} />\n"
+                "return <article dangerouslySetInnerHTML={{ __html: sanitizedHtml }} />"
+            ),
+            "command.rb": _diff("`echo #{user_input}`\n`echo fixed`"),
+        }
+    )
+
+    storage = [finding for finding in findings if finding.file == "storage.tsx"]
+    raw_token = next(finding for finding in storage if finding.category == "data-leak" and finding.line == 1)
+    cleared_token = next(finding for finding in storage if finding.category == "data-leak" and finding.line == 2)
+    raw_html = next(finding for finding in storage if finding.category == "xss" and finding.line == 5)
+    sanitized_html = next(finding for finding in storage if finding.category == "xss" and finding.line == 6)
+    dynamic_backtick = next(finding for finding in findings if finding.file == "command.rb" and finding.line == 1)
+    constant_backtick = next(finding for finding in findings if finding.file == "command.rb" and finding.line == 2)
+
+    assert raw_token.confidence >= 0.96
+    assert cleared_token.confidence < 0.96
+    assert raw_html.confidence >= 0.96
+    assert sanitized_html.confidence < 0.96
+    assert dynamic_backtick.confidence >= 0.96
+    assert constant_backtick.confidence < 0.96
+
+
+def test_browser_storage_static_nullable_and_logout_values_are_contextual():
+    findings = detect_security_findings(
+        {
+            "logout.ts": _diff(
+                "const token = 'logged-out';\n"
+                "let password: string | null = null;\n"
+                "localStorage.setItem('token', token);\n"
+                "sessionStorage.setItem('password', password);\n"
+                "localStorage.setItem('token', response.data.token);"
+            )
+        }
+    )
+
+    storage = {finding.line: finding.confidence for finding in findings if finding.category == "data-leak"}
+    assert storage[3] < 0.96
+    assert storage[4] < 0.96
+    # The current high-signal rule intentionally accepts only a simple value
+    # identifier; property expressions remain contextual rather than being
+    # promoted from their name alone.
+    assert storage[5] < 0.96
+
+
+def test_high_confidence_html_and_ruby_rules_trace_explicit_sanitizers():
+    findings = detect_security_findings(
+        {
+            "safe.tsx": _diff(
+                "const html = DOMPurify.sanitize(userHtml);\n"
+                "return <article dangerouslySetInnerHTML={{ __html: html }} />;"
+            ),
+            "safe.rb": _diff(
+                "escaped = Shellwords.escape(user_input)\n`echo #{escaped}`\n`echo #{Shellwords.escape(other_input)}`"
+            ),
+        }
+    )
+
+    relevant = [finding for finding in findings if finding.category in {"xss", "command-injection"}]
+    assert {(finding.file, finding.line) for finding in relevant} == {
+        ("safe.tsx", 2),
+        ("safe.rb", 2),
+        ("safe.rb", 3),
+    }
+    assert all(finding.confidence < 0.96 for finding in relevant)
+
+
+def test_high_confidence_html_and_ruby_rules_do_not_auto_confirm_static_or_scalar_values():
+    findings = detect_security_findings(
+        {
+            "safe.tsx": _diff(
+                'const html = "<strong>Service status</strong>";\n'
+                "return <article dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "const cleaned = sanitizeHtml(userHtml);\n"
+                "return <article dangerouslySetInnerHTML={{ __html: cleaned }} />;"
+            ),
+            "safe.rb": _diff(
+                "count = 7\nsafe_name = 'daily-report'\n`echo #{count}`\n`echo #{safe_name}`\n`echo #{user_input}`"
+            ),
+        }
+    )
+
+    relevant = [finding for finding in findings if finding.category in {"xss", "command-injection"}]
+    by_location = {(finding.file, finding.line): finding.confidence for finding in relevant}
+    assert by_location[("safe.tsx", 2)] < 0.96
+    assert by_location[("safe.tsx", 4)] < 0.96
+    assert by_location[("safe.rb", 3)] < 0.96
+    assert by_location[("safe.rb", 4)] < 0.96
+    assert by_location[("safe.rb", 5)] >= 0.96
+
+
+def test_raw_html_requires_strong_source_and_ruby_fixed_scalars_are_contextual():
+    findings = detect_security_findings(
+        {
+            "html.tsx": _diff(
+                "const SAFE_HTML = '<strong>ready</strong>';\n"
+                "const networkHtml = response.data.html;\n"
+                "return <div dangerouslySetInnerHTML={{ __html: SAFE_HTML }} />;\n"
+                "return <div dangerouslySetInnerHTML={{ __html: props.safeHtml }} />;\n"
+                "return <div dangerouslySetInnerHTML={{ __html: networkHtml }} />;\n"
+                "return <div dangerouslySetInnerHTML={{ __html: html }} />;"
+            ),
+            "scalar.rb": _diff(
+                "count = -1\nstate = :ready\n`echo #{count}`\n`echo #{state}`\n`echo #{'fixed'}`\n`echo #{user_input}`"
+            ),
+        }
+    )
+
+    confidence = {
+        (finding.file, finding.line): finding.confidence
+        for finding in findings
+        if finding.category in {"xss", "command-injection"}
+    }
+    assert confidence[("html.tsx", 3)] < 0.96
+    assert confidence[("html.tsx", 4)] < 0.96
+    assert confidence[("html.tsx", 5)] >= 0.96
+    assert confidence[("html.tsx", 6)] < 0.96
+    assert confidence[("scalar.rb", 3)] < 0.96
+    assert confidence[("scalar.rb", 4)] < 0.96
+    assert confidence[("scalar.rb", 5)] < 0.96
+    assert confidence[("scalar.rb", 6)] >= 0.96
+
+
+def test_rust_path_detector_distinguishes_internal_constants_and_axum_extractors():
+    findings = detect_security_findings(
+        {
+            "constant.rs": _diff(
+                'const FILE_NAME: &str = "config.toml";\n'
+                "pub fn load(base: &Path) -> Result<Vec<u8>, std::io::Error> {\n"
+                "    let candidate = base.join(FILE_NAME);\n"
+                "    fs::read(&candidate)\n"
+                "}"
+            ),
+            "handler.rs": _diff(
+                "async fn download(Path(filename): Path<String>) -> Result<Vec<u8>, Error> {\n"
+                "    fs::read(filename).map_err(Error::from)\n"
+                "}"
+            ),
+        }
+    )
+
+    paths = [finding for finding in findings if finding.category == "path-traversal"]
+    assert [(finding.file, finding.line) for finding in paths] == [("handler.rs", 2)]
+    assert paths[0].confidence >= 0.96
+
+
+def test_rust_path_guard_must_constrain_same_candidate_before_sink():
+    findings = detect_security_findings(
+        {
+            "guarded.rs": _diff(
+                "pub fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    if !candidate.starts_with(base) { return Err(Error::Traversal); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}"
+            ),
+            "late.rs": _diff(
+                "pub fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    let content = fs::read(&candidate)?;\n"
+                "    if !candidate.starts_with(base) { return Err(Error::Traversal); }\n"
+                "    Ok(content)\n"
+                "}"
+            ),
+            "unrelated.rs": _diff(
+                "pub fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                '    let safe = base.join("known.txt").canonicalize()?;\n'
+                "    if !safe.starts_with(base) { return Err(Error::Traversal); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}"
+            ),
+        }
+    )
+
+    paths = {(finding.file, finding.line) for finding in findings if finding.category == "path-traversal"}
+    assert paths == {("late.rs", 3), ("unrelated.rs", 5)}
+
+
+def test_rust_path_detector_accepts_dominating_branches_and_actix_request_sources():
+    findings = detect_security_findings(
+        {
+            "positive.rs": _diff(
+                "fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    if candidate.starts_with(base) {\n"
+                "        return fs::read(&candidate).map_err(Error::from);\n"
+                "    }\n"
+                "    Err(Error::Traversal)\n"
+                "}"
+            ),
+            "strip.rs": _diff(
+                "fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename);\n"
+                "    if candidate.strip_prefix(base).is_err() { return Err(Error::Traversal); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}"
+            ),
+            "actix.rs": _diff(
+                "async fn download(web::Path(filename): web::Path<String>) -> Result<Vec<u8>, Error> {\n"
+                "    fs::read(filename).map_err(Error::from)\n"
+                "}"
+            ),
+        }
+    )
+
+    paths = [finding for finding in findings if finding.category == "path-traversal"]
+    assert [(finding.file, finding.line) for finding in paths] == [("strip.rs", 4), ("actix.rs", 2)]
+    assert all(finding.confidence >= 0.96 for finding in paths)
+
+
+def test_rust_existing_handler_context_and_balanced_sink_do_not_cross_functions():
+    findings = detect_security_findings(
+        {
+            "existing.rs": (
+                "@@ -10,2 +10,3 @@\n"
+                " async fn download(Path(filename): Path<String>) -> Result<Vec<u8>, Error> {\n"
+                '+    fs::read(Path::new("/srv/files").join(filename)).map_err(Error::from)\n'
+                " }"
+            ),
+            "separate.rs": (
+                "@@ -1,5 +1,6 @@\n"
+                " async fn request_handler(Path(filename): Path<String>) {\n"
+                "     consume(filename);\n"
+                " }\n"
+                " fn internal(filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "+    fs::read(filename).map_err(Error::from)\n"
+                " }"
+            ),
+        }
+    )
+
+    paths = [(finding.file, finding.line) for finding in findings if finding.category == "path-traversal"]
+    assert paths == [("existing.rs", 11)]
+
+
+def test_rust_existing_handler_without_signature_keeps_inline_sink_contextual():
+    findings = detect_security_findings(
+        {
+            "existing.rs": (
+                "@@ -97,6 +97,7 @@\n"
+                "     audit_download(filename);\n"
+                '     let base = Path::new("/srv/files");\n'
+                "     metrics.increment();\n"
+                "+    fs::read(base.join(filename)).map_err(Error::from)\n"
+                "     finalize();\n"
+                " }"
+            ),
+            "fixed.rs": (
+                "@@ -40,3 +40,5 @@\n"
+                "     metrics.increment();\n"
+                '+    fs::read(base.join("known.txt"))?;\n'
+                '+    fs::read(format!("/srv/files/config.json"))?;\n'
+                "     finalize();"
+            ),
+        }
+    )
+
+    paths = [finding for finding in findings if finding.category == "path-traversal"]
+    assert [(finding.file, finding.line) for finding in paths] == [("existing.rs", 100)]
+    assert paths[0].confidence < 0.96
+
+
+def test_rust_strip_prefix_needs_canonicalization_and_guard_local_termination():
+    findings = detect_security_findings(
+        {
+            "canonical_strip.rs": _diff(
+                "fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    if candidate.strip_prefix(base).is_err() { return Err(Error::Traversal); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}"
+            ),
+            "unrelated_return.rs": _diff(
+                "fn load(base: &Path, filename: &str, stop: bool) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    if !candidate.starts_with(base) { audit(&candidate); }\n"
+                "    if stop { return Err(Error::Stopped); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}"
+            ),
+        }
+    )
+
+    paths = [(finding.file, finding.line) for finding in findings if finding.category == "path-traversal"]
+    assert paths == [("unrelated_return.rs", 5)]
+
+
 def test_browser_redirect_detector_requires_a_dynamic_destination():
     findings = detect_security_findings(
         {
@@ -160,16 +495,19 @@ def test_python_redirect_helper_requires_destination_validation():
                 "def build_redirect_url(next_url: str) -> str:\n"
                 "    return next_url\n"
                 "\n"
-                "def safe_redirect(next_url: str) -> str:\n"
-                "    if next_url.startswith('/'):\n"
-                "        return next_url\n"
-                "    return '/home'\n"
+                "def unsafe_redirect(next_url: str):\n"
+                "    return redirect(next_url)\n"
                 "\n"
-                "def validated_redirect(next_url: str) -> str:\n"
+                "def safe_redirect(next_url: str):\n"
+                "    if next_url.startswith('/') and not next_url.startswith('//'):\n"
+                "        return redirect(next_url)\n"
+                "    return redirect('/home')\n"
+                "\n"
+                "def validated_redirect(next_url: str):\n"
                 "    parsed = urlparse(next_url)\n"
                 "    if parsed.netloc or not parsed.path.startswith('/app/'):\n"
-                "        return '/app/home'\n"
-                "    return next_url\n"
+                "        return RedirectResponse('/app/home')\n"
+                "    return RedirectResponse(next_url)\n"
                 "\n"
                 "def redirect_destination(next_url: str) -> str:\n"
                 "    return next_url"
@@ -178,8 +516,82 @@ def test_python_redirect_helper_requires_destination_validation():
     )
 
     redirects = [finding for finding in findings if finding.category == "open-redirect"]
-    assert [(finding.file, finding.line) for finding in redirects] == [("redirects.py", 2)]
+    assert [(finding.file, finding.line) for finding in redirects] == [("redirects.py", 5)]
     assert redirects[0].confidence >= 0.96
+
+
+def test_python_url_builder_without_redirect_sink_is_not_an_open_redirect():
+    findings = detect_security_findings(
+        {"seed_sinks.py": _diff("def build_redirect_url(next_url: str) -> str:\n    return next_url")}
+    )
+
+    assert not [finding for finding in findings if finding.category == "open-redirect"]
+
+
+def test_python_redirect_guard_must_dominate_sink_and_parameter_name_is_irrelevant():
+    findings = detect_security_findings(
+        {
+            "redirect_flow.py": _diff(
+                "def unsafe(path):\n"
+                "    return redirect(path)\n"
+                "\n"
+                "def guard_after_sink(path):\n"
+                "    response = RedirectResponse(path)\n"
+                "    if path.startswith('/'):\n"
+                "        return response\n"
+                "    return RedirectResponse('/home')\n"
+                "\n"
+                "def unrelated_guard(path, other):\n"
+                "    if other.startswith('/'):\n"
+                "        audit(other)\n"
+                "    return redirect(path)\n"
+                "\n"
+                "def dominated(path):\n"
+                "    if not path.startswith('/') or path.startswith('//'):\n"
+                "        return redirect('/home')\n"
+                "    return redirect(path)\n"
+                "\n"
+                "def value_only(path):\n"
+                "    return path"
+            )
+        }
+    )
+
+    redirects = [finding for finding in findings if finding.category == "open-redirect"]
+    assert [(finding.file, finding.line) for finding in redirects] == [
+        ("redirect_flow.py", 2),
+        ("redirect_flow.py", 5),
+        ("redirect_flow.py", 13),
+    ]
+    assert all(finding.confidence >= 0.96 for finding in redirects)
+
+
+def test_python_redirect_requires_local_guard_and_supports_keyword_destination():
+    findings = detect_security_findings(
+        {
+            "slash.py": _diff(
+                "def go(target):\n"
+                "    if target.startswith('/'):\n"
+                "        return redirect(target)\n"
+                "    return redirect('/home')"
+            ),
+            "arbitrary.py": _diff(
+                "def go(target):\n"
+                "    if target.startswith('https'):\n"
+                "        return RedirectResponse(url=target)\n"
+                "    return RedirectResponse(url='/home')"
+            ),
+            "local.py": _diff(
+                "def go(target):\n"
+                "    if target.startswith('/') and not target.startswith('//'):\n"
+                "        return RedirectResponse(url=target)\n"
+                "    return RedirectResponse(url='/home')"
+            ),
+        }
+    )
+
+    redirects = [(finding.file, finding.line) for finding in findings if finding.category == "open-redirect"]
+    assert redirects == [("slash.py", 3), ("arbitrary.py", 3)]
 
 
 def test_dependency_detector_covers_manifests_and_ci_without_exact_pin_noise():

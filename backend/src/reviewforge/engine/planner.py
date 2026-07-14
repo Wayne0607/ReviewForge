@@ -144,12 +144,14 @@ _PERFORMANCE_PATTERNS = [
 ]
 
 # ── 测试模式（通用）───────────────────────────────────────────────────
-# ── 可访问性模式（仅前端文件）─────────────────────────────────────────
-_A11Y_PATTERNS = [
-    (r"(?:<img|<Image|<picture)", "image-element"),
-    (r"(?:<input|<select|<textarea|<button)", "form-element"),
-    (r"(?:onClick|onChange|onSubmit)", "interactive-handler"),
-    (r"(?:aria-|role=)", "aria-usage"),
+# ── 复杂可访问性模式（明确 alt/label 由 Phase0 零 token detector 负责）──
+_COMPLEX_A11Y_PATTERNS = [
+    (r"<(?:div|span|li|a)\b[^>]*(?:onClick|onKeyDown|onKeyPress|tabIndex)", "custom-interactive"),
+    (r"<(?:button|video|audio|canvas|dialog)\b", "semantic-interactive"),
+    (r"\b(?:onKeyDown|onKeyPress|tabIndex|contentEditable|autoFocus)\b", "keyboard-focus"),
+    (r"\b(?:aria-|role\s*=)", "aria-contract"),
+    (r"(?:\bfocus\s*\(|\.focus\s*\(|\bmodal\b|\bdialog\b)", "focus-management"),
+    (r"(?:@keyframes|animation\s*:|transition\s*:)", "motion"),
 ]
 
 
@@ -288,7 +290,7 @@ class Planner:
 
         # --- Accessibility (frontend only) ---
         if is_frontend:
-            for pattern, label in _A11Y_PATTERNS:
+            for pattern, label in _COMPLEX_A11Y_PATTERNS:
                 if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
                     forced.add("accessibility_reviewer")
                     logger.info(f"Accessibility pattern: {label}")
@@ -535,7 +537,17 @@ def _skip_reviewer_for_change(reviewer: str, files: list[str], diff: str) -> boo
         return not any(_is_test_file(file_path) for file_path in files) and not _looks_like_security_test_regression(
             diff
         )
+    if reviewer == "accessibility_reviewer":
+        return not _has_complex_accessibility_evidence(diff)
     return False
+
+
+def _has_complex_accessibility_evidence(diff: str) -> bool:
+    """Whether semantic/keyboard/focus analysis is needed beyond Phase0 sinks."""
+
+    return any(
+        re.search(pattern, diff or "", re.IGNORECASE | re.MULTILINE) for pattern, _label in _COMPLEX_A11Y_PATTERNS
+    )
 
 
 def _looks_like_security_test_regression(diff: str) -> bool:

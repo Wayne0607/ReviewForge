@@ -96,6 +96,25 @@ def test_planner_routes_test_and_doc_reviewers_only_with_changed_evidence():
     )
 
 
+def test_planner_leaves_simple_alt_and_label_sinks_to_phase0_detector():
+    simple = """+export function Form() {
++  return <><img src={avatar} /><input name="email" onChange={save} /></>;
++}
+"""
+
+    assert _skip_reviewer_for_change("accessibility_reviewer", ["src/form.tsx"], simple)
+
+
+def test_planner_keeps_accessibility_reviewer_for_complex_interaction_semantics():
+    custom_control = '+<div onClick={activate} tabIndex={0} role="button">Open</div>'
+    keyboard_flow = "+modalRef.current?.focus()"
+    native_button = "+<button><Icon /></button>"
+
+    assert not _skip_reviewer_for_change("accessibility_reviewer", ["src/control.tsx"], custom_control)
+    assert not _skip_reviewer_for_change("accessibility_reviewer", ["src/modal.tsx"], keyboard_flow)
+    assert not _skip_reviewer_for_change("accessibility_reviewer", ["src/button.tsx"], native_button)
+
+
 def test_planner_keeps_testing_review_for_an_actual_security_fix():
     diff = """@@ -1,2 +1,3 @@
 -return eval(user_input)

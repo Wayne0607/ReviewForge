@@ -111,7 +111,11 @@ def _has_associated_label(control_tag: str, patch: str, control_line: int) -> bo
     before_control = "\n".join(nearby).split(control_tag.split("\n", 1)[0], 1)[0]
     if before_control.lower().rfind("<label") > before_control.lower().rfind("</label"):
         return True
-    return any("<mat-label" in content.lower() for content in nearby)
+    # ``mat-label`` names a control only through Angular Material's
+    # ``mat-form-field``/``matInput`` contract.  The caller already exempts an
+    # actual ``matInput`` tag; an unrelated nearby ``mat-label`` must not hide a
+    # native input that still lacks a label.
+    return False
 
 
 def _missing_label_candidates(patch: str) -> list[int]:

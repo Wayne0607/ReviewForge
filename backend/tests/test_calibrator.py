@@ -190,8 +190,8 @@ async def test_quality_evidence_contract_is_present_in_both_calibration_rounds()
         file="component.tsx",
         line=8,
         severity="warning",
-        category="naming",
-        message="prefer another name",
+        category="architecture",
+        message="a concrete dependency boundary is violated",
         confidence=0.8,
         reviewer="style_reviewer",
     )
@@ -348,7 +348,7 @@ def execute(command: str, user_path: str) -> str:
     assert {finding.verified_by for finding in result} == {"judge"}
 
 
-async def test_actionability_gate_rejects_pr77_pr78_style_missing_test_and_doc_noise():
+def test_actionability_gate_only_rejects_narrow_missing_test_noise_before_calibration():
     diffs = "\n".join(
         [
             _summary(
@@ -412,12 +412,11 @@ async def test_actionability_gate_rejects_pr77_pr78_style_missing_test_and_doc_n
         ),
     ]
 
-    result = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(findings, diffs)
+    actionable, rejected = apply_actionability_gate(findings, diffs)
 
-    assert len(result) == 4
-    assert {finding.status for finding in result} == {"false_positive"}
-    assert {finding.verified_by for finding in result} == {"actionability-gate"}
-    assert all("锚点" in finding.verify_reason or "可评论" in finding.verify_reason for finding in result)
+    assert {finding.id for finding in rejected} == {"missing_query_tests", "missing_java_tests"}
+    assert {finding.id for finding in actionable} == {"duplicate_safety_doc", "missing_python_doc"}
+    assert {finding.verified_by for finding in rejected} == {"actionability-gate"}
 
 
 async def test_actionability_gate_preserves_concrete_changed_assertion_defect():
@@ -548,7 +547,7 @@ async def test_actionability_gate_does_not_touch_other_review_dimensions():
             file="src/view.tsx",
             line=1,
             category=category,
-            message=f"具体的 {category} 行为缺陷",
+            message=("该命名导致 API caller 失败" if category == "naming" else f"具体的 {category} 行为缺陷"),
             confidence=0.85,
             reviewer="relevant_reviewer",
         )
@@ -565,6 +564,377 @@ async def test_actionability_gate_does_not_touch_other_review_dimensions():
     assert {finding.category for finding in result} == set(categories)
     assert {finding.status for finding in result} == {"confirmed"}
     assert "actionability-gate" not in {finding.verified_by for finding in result}
+
+
+async def test_rust_direct_path_parameters_are_rejected_without_suppressing_dynamic_construction():
+    safe_source = """use std::fs;
+
+pub fn load_config(path: &str) -> Result<String, std::io::Error> {
+    fs::read_to_string(path)
+}
+
+pub fn read_user_data(path: &str) -> Result<String, std::io::Error> {
+    fs::read_to_string(path)
+}
+"""
+    safe_findings = [
+        Finding(
+            id="safe_rust_sink",
+            file="binary_reader.rs",
+            line=4,
+            category="path-traversal",
+            message="Filesystem access uses a variable path.",
+            confidence=0.8,
+            reviewer="security_reviewer",
+        ),
+        Finding(
+            id="safe_rust_wrong_anchor",
+            file="binary_reader.rs",
+            line=9,
+            category="path-traversal",
+            message="load_config directly reads a caller-provided path.",
+            confidence=0.8,
+            reviewer="security_reviewer",
+        ),
+    ]
+
+    safe = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(
+        safe_findings, _summary("binary_reader.rs", safe_source)
+    )
+
+    assert {finding.status for finding in safe} == {"false_positive"}
+    assert {finding.verified_by for finding in safe} == {"actionability-gate"}
+
+    dynamic_source = """use std::fs;
+pub fn load_config(base_path: &str, filename: &str) -> Result<String, std::io::Error> {
+    let path = format!("{}/{}", base_path, filename);
+    fs::read_to_string(&path)
+}
+"""
+    dynamic = Finding(
+        id="dynamic_rust_path",
+        file="config_loader.rs",
+        line=4,
+        category="path-traversal",
+        message="base_path and filename are dynamically combined before the filesystem read.",
+        confidence=0.9,
+        reviewer="security_reviewer",
+    )
+    llm = ConfirmingBatchLLM([dynamic.id])
+
+    preserved = await DynamicCalibrator(llm, build_registry()).calibrate(
+        [dynamic], _summary("config_loader.rs", dynamic_source)
+    )
+
+    assert llm.calls == 2
+    assert preserved[0].status == "confirmed"
+
+
+def test_contextual_live_region_style_and_performance_findings_are_not_irreversibly_filtered():
+    source = """function showStatus(message: string) {
+  document.getElementById('status')!.textContent = message;
+}
+
+def count_lines(path: str) -> str:
+    return run_wc(path)
+
+pub fn count_items(items: &[String]) -> usize {
+    let mut count = 0;
+    for _item in items { count += 1; }
+    count
+}
+"""
+    findings = [
+        Finding(
+            id="live_region",
+            file="mixed.txt",
+            line=2,
+            category="dynamic-content-update",
+            message="textContent updates status but no ARIA live region is visible in this diff.",
+            confidence=0.95,
+            reviewer="accessibility_reviewer",
+        ),
+        Finding(
+            id="naming_preference",
+            file="mixed.txt",
+            line=5,
+            category="naming",
+            message="count_lines promises a count but returns raw stdout, so the name is imprecise.",
+            confidence=0.85,
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="micro_optimization",
+            file="mixed.txt",
+            line=8,
+            category="performance",
+            message="The manual count loop can be replaced by len() for O(1) access.",
+            confidence=1.0,
+            reviewer="performance_reviewer",
+        ),
+    ]
+
+    actionable, rejected = apply_actionability_gate(findings, _summary("mixed.txt", source))
+
+    assert actionable == findings
+    assert rejected == []
+
+
+async def test_actionability_gate_preserves_concrete_style_performance_and_removed_aria_failures():
+    source = """func worker(ctx context.Context) {
+    for {
+        db.Query("SELECT 1")
+    }
+}
+
+def parse(value):
+    raise ValueError(value)
+"""
+    diff = _summary("worker.txt", source)
+    diff += '\n--- view.tsx (+0 -1)\n@@ -1,2 +1,1 @@\n-<div role="status" aria-live="polite" />\n+<div />'
+    findings = [
+        Finding(
+            id="infinite_work",
+            file="worker.txt",
+            line=2,
+            category="performance",
+            message="Infinite loop performs an unbounded database query and can exhaust the connection pool.",
+            confidence=0.9,
+            reviewer="performance_reviewer",
+        ),
+        Finding(
+            id="observable_style_failure",
+            file="worker.txt",
+            line=7,
+            category="naming",
+            message="The misleading dispatch name causes the API caller to reject valid values and fail.",
+            confidence=0.85,
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="removed_live_contract",
+            file="view.tsx",
+            line=1,
+            category="missing-live-region",
+            message="This change removed aria-live, so status updates are no longer announced.",
+            confidence=0.9,
+            reviewer="accessibility_reviewer",
+        ),
+    ]
+    llm = ConfirmingBatchLLM([finding.id for finding in findings])
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
+
+    assert llm.calls == 2
+    assert {finding.status for finding in result} == {"confirmed"}
+
+
+def test_actionability_gate_preserves_new_live_carrier_blocking_io_listener_import_and_default_contracts():
+    diff = "\n".join(
+        [
+            _summary(
+                "view.tsx",
+                "const status = document.getElementById('status');\n"
+                "status.textContent = message;\n"
+                'return <div id="status" />;',
+            ),
+            _summary(
+                "server.ts",
+                "window.addEventListener('resize', onResize);\nconst config = readFileSync(configPath, 'utf8');",
+            ),
+            _summary("compile.ts", "export const value: Widget = makeWidget();"),
+            _summary("README.md", "The request timeout defaults to 5 seconds."),
+        ]
+    )
+    findings = [
+        Finding(
+            id="new_live_region",
+            file="view.tsx",
+            line=2,
+            category="missing-live-region",
+            message="The newly added status carrier is updated dynamically but has no live-region semantics.",
+            confidence=0.9,
+            reviewer="accessibility_reviewer",
+        ),
+        Finding(
+            id="listener_leak",
+            file="server.ts",
+            line=1,
+            category="performance",
+            message="The listener is never removed, causing a memory leak across mounts.",
+            confidence=0.9,
+            reviewer="performance_reviewer",
+        ),
+        Finding(
+            id="event_loop_block",
+            file="server.ts",
+            line=2,
+            category="performance",
+            message="readFileSync blocks the event loop for every request.",
+            confidence=0.9,
+            reviewer="performance_reviewer",
+        ),
+        Finding(
+            id="missing_import",
+            file="compile.ts",
+            line=1,
+            category="imports",
+            message="Widget is used without its import, causing a compilation failure.",
+            confidence=0.9,
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="stale_default",
+            file="README.md",
+            line=1,
+            category="documentation",
+            message="This default value is outdated: the implementation now defaults to 30 seconds.",
+            confidence=0.9,
+            reviewer="documentation_reviewer",
+        ),
+    ]
+
+    actionable, rejected = apply_actionability_gate(findings, diff)
+
+    assert {finding.id for finding in actionable} == {finding.id for finding in findings}
+    assert rejected == []
+
+
+def test_rust_actionability_uses_extractor_and_fragment_provenance():
+    diff = "\n".join(
+        [
+            _summary(
+                "handler.rs",
+                "async fn download(Path(filename): Path<String>) -> Result<Vec<u8>, Error> {\n"
+                "    fs::read(filename).map_err(Error::from)\n"
+                "}",
+            ),
+            _summary(
+                "constant.rs",
+                'const FILE_NAME: &str = "config.toml";\n'
+                "fn load(base: &Path) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(FILE_NAME);\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}",
+            ),
+        ]
+    )
+    axum = Finding(
+        id="axum_path",
+        file="handler.rs",
+        line=2,
+        category="path-traversal",
+        message="The Axum Path extractor reaches fs::read without confinement.",
+        confidence=0.9,
+        reviewer="security_reviewer",
+    )
+    fixed = Finding(
+        id="fixed_fragment",
+        file="constant.rs",
+        line=4,
+        category="path-traversal",
+        message="base.join(FILE_NAME) reaches fs::read.",
+        confidence=0.9,
+        reviewer="security_reviewer",
+    )
+
+    actionable, rejected = apply_actionability_gate([axum, fixed], diff)
+
+    assert actionable == [axum]
+    assert rejected == [fixed]
+
+
+def test_rust_actionability_guard_requires_same_candidate_before_sink():
+    diff = "\n".join(
+        [
+            _summary(
+                "guarded.rs",
+                "fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    if !candidate.starts_with(base) { return Err(Error::Traversal); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}",
+            ),
+            _summary(
+                "late.rs",
+                "fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                "    let result = fs::read(&candidate)?;\n"
+                "    if !candidate.starts_with(base) { return Err(Error::Traversal); }\n"
+                "    Ok(result)\n"
+                "}",
+            ),
+            _summary(
+                "unrelated.rs",
+                "fn load(base: &Path, filename: &str) -> Result<Vec<u8>, Error> {\n"
+                "    let candidate = base.join(filename).canonicalize()?;\n"
+                '    let safe = base.join("known.txt").canonicalize()?;\n'
+                "    if !safe.starts_with(base) { return Err(Error::Traversal); }\n"
+                "    fs::read(&candidate).map_err(Error::from)\n"
+                "}",
+            ),
+        ]
+    )
+    findings = [
+        Finding(
+            id=file_name,
+            file=f"{file_name}.rs",
+            line=line,
+            category="path-traversal",
+            message="A dynamically joined filename reaches fs::read.",
+            confidence=0.9,
+            reviewer="security_reviewer",
+        )
+        for file_name, line in (("guarded", 4), ("late", 3), ("unrelated", 5))
+    ]
+
+    actionable, rejected = apply_actionability_gate(findings, diff)
+
+    assert {finding.id for finding in actionable} == {"late", "unrelated"}
+    assert {finding.id for finding in rejected} == {"guarded"}
+
+
+async def test_high_confidence_detector_missing_alt_auto_confirms_without_llm():
+    finding = Finding(
+        id="detector_alt",
+        file="view.tsx",
+        line=1,
+        category="missing-alt",
+        message="img has no alt",
+        confidence=0.97,
+        reviewer="accessibility_reviewer",
+        verified_by="detector",
+    )
+
+    result = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(
+        [finding],
+        _summary("view.tsx", '<img src="/avatar.png" />'),
+    )
+
+    assert {finding.status for finding in result} == {"confirmed"}
+    assert {finding.verified_by for finding in result} == {"detector-auto"}
+
+
+async def test_detector_missing_label_still_requires_contextual_calibration():
+    finding = Finding(
+        id="detector_label",
+        file="view.tsx",
+        line=1,
+        category="missing-label",
+        message="input has no accessible label",
+        confidence=0.99,
+        reviewer="accessibility_reviewer",
+        verified_by="detector",
+    )
+    llm = ConfirmingBatchLLM([finding.id])
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(
+        [finding],
+        _summary("view.tsx", '<input name="email" />'),
+    )
+
+    assert llm.calls == 2
+    assert result[0].verified_by == "judge"
 
 
 def test_reviewer_prompts_require_concrete_test_and_documentation_evidence():

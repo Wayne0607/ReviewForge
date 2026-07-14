@@ -123,6 +123,17 @@ run_deploy() {
       bash "$DEPLOY_SCRIPT"
 }
 
+run_legacy_deploy() {
+    local bundle_path="$1"
+    REVIEWFORGE_APP_DIR="$APP_DIR" \
+      REVIEWFORGE_DEPLOY_LOCK="$TEST_ROOT/deploy.lock" \
+      REVIEWFORGE_UV_BIN="$MOCK_BIN/uv" \
+      REVIEWFORGE_BUNDLE_PATH="$bundle_path" \
+      REVIEWFORGE_HEALTH_ATTEMPTS=1 \
+      REVIEWFORGE_HEALTH_INTERVAL_SECONDS=1 \
+      bash "$DEPLOY_SCRIPT"
+}
+
 # A failed health check must restore, rebuild, restart, and verify the old SHA.
 BROKEN_BUNDLE="$TEST_ROOT/broken.bundle"
 touch "$BROKEN_BUNDLE"
@@ -161,5 +172,17 @@ assert_eq "$HEALTHY_SHA" "$(git -C "$APP_DIR" rev-parse HEAD)" "stale run rolled
 [[ ! -s "$COMMAND_LOG" ]] || fail "stale deployment executed build or service commands"
 [[ ! -e "$STALE_BUNDLE" ]] || fail "stale deployment bundle was not removed"
 grep -q "Skipping stale deployment" "$TEST_ROOT/stale.out" || fail "stale deployment was not reported"
+
+# The legacy workflow supplies only a fixed-name bundle. The script must read
+# its main SHA and deploy it even when the workflow did not pass TARGET_SHA.
+git -C "$APP_DIR" update-ref refs/heads/main "$HEALTHY_SHA"
+git -C "$APP_DIR" reset -q --hard "$PREVIOUS_SHA"
+LEGACY_BUNDLE="$TEST_ROOT/legacy.bundle"
+git -C "$APP_DIR" bundle create "$LEGACY_BUNDLE" main
+run_legacy_deploy "$LEGACY_BUNDLE" > "$TEST_ROOT/legacy.out" 2>&1
+assert_eq "$HEALTHY_SHA" "$(git -C "$APP_DIR" rev-parse HEAD)" "legacy bundle target was not deployed"
+[[ ! -e "$LEGACY_BUNDLE" ]] || fail "legacy deployment bundle was not removed"
+grep -q "Deployment completed successfully" "$TEST_ROOT/legacy.out" || \
+  fail "legacy deployment success was not reported"
 
 printf 'deploy tests: OK\n'

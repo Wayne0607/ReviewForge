@@ -115,6 +115,36 @@ load_service_environment() {
     fi
 }
 
+resolve_legacy_bundle_target() {
+    local bundle_sha=""
+    local bundle_ref=""
+
+    [[ -z "$TARGET_SHA" ]] || return 0
+    [[ -f "$BUNDLE_PATH" ]] || return 0
+
+    # The legacy workflow does not pass GITHUB_SHA and may have failed its
+    # shallow `git fetch` before invoking this script. Read the intended SHA
+    # directly from the bundle, then fetch missing ancestors from public
+    # origin/main when necessary. This makes missed deployments catch up even
+    # before the workflow itself can be upgraded to fetch-depth: 0.
+    while read -r bundle_sha bundle_ref; do
+        if [[ "$bundle_ref" == "refs/heads/main" || "$bundle_ref" == "main" ]]; then
+            TARGET_SHA="$bundle_sha"
+            break
+        fi
+    done < <(git bundle list-heads "$BUNDLE_PATH" 2> /dev/null || true)
+
+    [[ -n "$TARGET_SHA" ]] || die "Cannot resolve main SHA from deployment bundle: $BUNDLE_PATH"
+    [[ "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || die "Deployment bundle contains an invalid main SHA"
+    TARGET_SHA="${TARGET_SHA,,}"
+
+    if ! git_app cat-file -e "${TARGET_SHA}^{commit}" 2> /dev/null; then
+        log "--- Fetching missing shallow-bundle prerequisites from origin/main ---"
+        git_app fetch --no-tags origin main
+    fi
+    git_app cat-file -e "${TARGET_SHA}^{commit}" || die "Bundle target is unavailable: $TARGET_SHA"
+}
+
 deploy_checked_out_release() {
     local label="${1:-Deploying}"
 
@@ -206,6 +236,7 @@ main() {
 
     cd "$APP_DIR"
     current_sha="$(git_app rev-parse HEAD)"
+    resolve_legacy_bundle_target
     if [[ -z "$PREVIOUS_SHA" ]]; then
         PREVIOUS_SHA="$current_sha"
     fi

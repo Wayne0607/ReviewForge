@@ -14,7 +14,10 @@ HEALTH_ATTEMPTS="${REVIEWFORGE_HEALTH_ATTEMPTS:-20}"
 HEALTH_INTERVAL_SECONDS="${REVIEWFORGE_HEALTH_INTERVAL_SECONDS:-2}"
 TARGET_SHA="${REVIEWFORGE_TARGET_SHA:-}"
 PREVIOUS_SHA="${REVIEWFORGE_PREVIOUS_SHA:-}"
-BUNDLE_PATH="${REVIEWFORGE_BUNDLE_PATH:-}"
+# The legacy workflow always uploads this fixed path. Removing it after every
+# success/failure avoids Linux sticky-directory ownership protection blocking
+# the next tar extraction when the runner's numeric UID is preserved.
+BUNDLE_PATH="${REVIEWFORGE_BUNDLE_PATH:-/tmp/reviewforge-main.bundle}"
 UV_BIN=""
 ROLLBACK_ARMED=0
 ROLLBACK_RUNNING=0

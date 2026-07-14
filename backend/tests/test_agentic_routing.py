@@ -5,7 +5,12 @@ from reviewforge.core.specs import build_registry
 from reviewforge.core.state import StateStore
 from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.orchestrator import Orchestrator
-from reviewforge.engine.planner import Planner, _looks_like_cross_pr_wrapper, _skip_reviewer_for_files
+from reviewforge.engine.planner import (
+    Planner,
+    _looks_like_cross_pr_wrapper,
+    _skip_reviewer_for_change,
+    _skip_reviewer_for_files,
+)
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.mock_github import MockGitHubClient
 
@@ -68,6 +73,37 @@ def test_planner_skips_low_signal_reviewers_for_fixtures():
     assert _skip_reviewer_for_files("testing_reviewer", files)
     assert _skip_reviewer_for_files("accessibility_reviewer", files)
     assert not _skip_reviewer_for_files("security_reviewer", files)
+
+
+def test_planner_routes_test_and_doc_reviewers_only_with_changed_evidence():
+    source_files = ["src/service.py"]
+    assert _skip_reviewer_for_change("testing_reviewer", source_files, "+def service(): pass")
+    assert _skip_reviewer_for_change("doc_reviewer", source_files, "+def service(): pass")
+    assert not _skip_reviewer_for_change(
+        "testing_reviewer",
+        ["tests/test_service.py"],
+        "+def test_service(): assert service()",
+    )
+    assert not _skip_reviewer_for_change(
+        "doc_reviewer",
+        ["README.md"],
+        "+The service returns a result.",
+    )
+    assert _skip_reviewer_for_change(
+        "doc_reviewer",
+        ["src/raw.rs"],
+        "+pub unsafe fn read_raw(ptr: *const u8) -> u8 { *ptr }",
+    )
+
+
+def test_planner_keeps_testing_review_for_an_actual_security_fix():
+    diff = """@@ -1,2 +1,3 @@
+-return eval(user_input)
++safe_value = sanitize(user_input)
++return safe_value
+"""
+
+    assert not _skip_reviewer_for_change("testing_reviewer", ["src/parser.py"], diff)
 
 
 def test_cross_pr_wrapper_changes_skip_style_fallback():

@@ -42,7 +42,7 @@ Focus on: user input handling, authentication flows, data serialization, file op
 
 ### XSS (Cross-Site Scripting)
 - Unsanitized user input rendered in HTML/templates
-- `dangerouslySetInnerHTML` in React, `v-html` in Vue, `{@html}` in Svelte, `[innerHTML]` in Angular
+- `dangerouslySetInnerHTML` in React, `v-html` in Vue, `{@html}` in Svelte; for Angular, ordinary `[innerHTML]` is sanitized by default, so require `bypassSecurityTrustHtml` or concrete sanitizer-bypass evidence
 - Missing Content-Security-Policy headers
 
 ### Path Traversal

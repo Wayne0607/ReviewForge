@@ -1,4 +1,4 @@
-from reviewforge.engine.detectors.unified_diff import iter_added_lines
+from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 
 
 def test_maps_multiple_hunks_with_context_and_deletions():
@@ -54,3 +54,13 @@ def test_does_not_treat_file_headers_as_added_source():
     patch = "--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new\n"
 
     assert iter_added_lines(patch) == [(1, "new")]
+
+
+def test_maps_added_and_context_lines_on_right_but_excludes_deletions():
+    patch = "@@ -10,3 +20,3 @@\n context\n-removed\n+added\n tail\n"
+
+    assert iter_right_lines(patch) == [
+        (20, "context"),
+        (21, "added"),
+        (22, "tail"),
+    ]

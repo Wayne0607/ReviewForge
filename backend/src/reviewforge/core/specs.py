@@ -149,6 +149,34 @@ def build_registry() -> SpecRegistry:
         )
     )
 
+    registry.register_tool(
+        ToolSpec(
+            name="post_review",
+            description="Create one GitHub review containing multiple inline comments",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "comments": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 40,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "body": {"type": "string"},
+                            },
+                            "required": ["file_path", "line", "body"],
+                        },
+                    }
+                },
+                "required": ["comments"],
+            },
+            risk_level="medium",
+        )
+    )
+
     # --- Agents ---
     registry.register_agent(
         AgentSpec(
@@ -313,7 +341,7 @@ def build_registry() -> SpecRegistry:
             name="commenter",
             role="synthesizer",
             description="Formats confirmed findings into GitHub review comments",
-            allowed_tools=["post_comment"],
+            allowed_tools=["post_comment", "post_review"],
             model_profile="commenter",
             max_steps=1,
         )

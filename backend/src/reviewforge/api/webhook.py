@@ -57,13 +57,10 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
                 raise HTTPException(status_code=400, detail="Invalid repository name")
 
-            # Dedup: GitHub redelivers webhooks and fires opened+synchronize for the
-            # same head. If this exact commit was already reviewed (or a review is
-            # in-flight), skip instead of spawning a duplicate run + wasting tokens.
+            # Persistent dedup may wait on the shared SQLite connection. Keep it
+            # out of the request path so GitHub receives a prompt 2xx response;
+            # the in-memory key below closes the queueing race synchronously.
             db = getattr(request.app.state, "db", None)
-            if db is not None and await db.has_active_run_for_head(repo, int(pr_number), head_sha):
-                logger.info(f"PR #{pr_number} @ {head_sha[:8]} already reviewed/in-flight, skipping duplicate")
-                return {"status": "duplicate_skipped", "pr": str(pr_number)}
 
             # S7: 持引用 + 并发上限，IO 移入后台
             sem = request.app.state.review_semaphore
@@ -87,6 +84,24 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             async def _run_review():
                 try:
                     async with sem:
+                        if db is not None:
+                            try:
+                                already_active = await db.has_active_run_for_head(repo, int(pr_number), head_sha)
+                            except Exception as exc:
+                                # A transient dedup read must not discard a webhook
+                                # that GitHub has already been told was accepted.
+                                logger.warning(
+                                    "Background dedup check failed for PR #%s; continuing review: %s",
+                                    pr_number,
+                                    exc,
+                                )
+                            else:
+                                if already_active:
+                                    logger.info(
+                                        f"PR #{pr_number} @ {head_sha[:8]} already reviewed/in-flight, "
+                                        "skipping duplicate in background"
+                                    )
+                                    return
                         orchestrator = request.app.state.orchestrator
                         github = request.app.state.github_client
 

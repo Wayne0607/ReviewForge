@@ -905,13 +905,63 @@ class CrossPRAnalyzer:
 
     @staticmethod
     def _enclosing_symbol_by_line(finding: Finding, symbols: list[SymbolInfo]) -> SymbolInfo | None:
-        enclosing = None
-        for s in symbols:
-            if s.line <= (finding.line or 0):
-                enclosing = s
-            else:
-                break
-        return enclosing
+        """Return the symbol that reliably owns a finding's source anchor.
+
+        Security reviewers occasionally anchor a finding one line before the
+        actual sink (for example, on the blank line immediately before the next
+        function). The old "last declaration at or before line" heuristic then
+        poisoned the previous function. Prefer proven declaration/body ranges;
+        permit only a one-line forward drift into the immediately adjacent next
+        function, and otherwise leave the finding unscoped.
+        """
+
+        line = finding.line or 0
+        if line <= 0:
+            return None
+
+        ranged = [symbol for symbol in symbols if symbol.end_line >= (symbol.start_line or symbol.line) > 0]
+
+        # Functions/methods are narrower and more useful graph nodes than an
+        # enclosing class. Nested definitions are resolved to the smallest body.
+        containing_functions = [
+            symbol
+            for symbol in ranged
+            if symbol.symbol_type != "class" and (symbol.start_line or symbol.line) <= line <= symbol.end_line
+        ]
+        if containing_functions:
+            return min(
+                containing_functions,
+                key=lambda symbol: (
+                    symbol.end_line - (symbol.start_line or symbol.line),
+                    -(symbol.start_line or symbol.line),
+                ),
+            )
+
+        # A finding on the sole separator line before a declaration is a common
+        # LLM line-drift shape. Attribute it forward only when the next symbol's
+        # own range is reliable. Never use a gap to extend the previous symbol.
+        next_functions = sorted(
+            (
+                symbol
+                for symbol in ranged
+                if symbol.symbol_type != "class" and (symbol.start_line or symbol.line) > line
+            ),
+            key=lambda symbol: symbol.start_line or symbol.line,
+        )
+        if next_functions and (next_functions[0].start_line or next_functions[0].line) == line + 1:
+            return next_functions[0]
+
+        containing_classes = [
+            symbol
+            for symbol in ranged
+            if symbol.symbol_type == "class" and (symbol.start_line or symbol.line) <= line <= symbol.end_line
+        ]
+        if containing_classes:
+            return min(
+                containing_classes,
+                key=lambda symbol: symbol.end_line - (symbol.start_line or symbol.line),
+            )
+        return None
 
     def _chains_to_findings(self, chains: list[CrossPRChain]) -> list[Finding]:
         """Convert suspicious chains directly to findings without LLM confirmation."""

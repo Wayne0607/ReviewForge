@@ -318,6 +318,173 @@ async def test_symbol_risk_prefers_function_name_over_drifted_line(tmp_path):
     await db.close()
 
 
+def test_symbol_ranges_cover_decorators_multiline_signatures_and_real_body_ends():
+    python_source = """@security_boundary(
+    \"operator\",
+)
+async def run_tool(
+    command: str,
+) -> int:
+    return await execute(command)
+"""
+    python_symbols, _ = extract_diff_symbols(_diff("seed.py", python_source), "seed.py")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in python_symbols] == [
+        ("run_tool", 4, 1, 7)
+    ]
+
+    go_source = """package seed
+
+// FetchInternal performs the network request.
+func FetchInternal(
+    url string,
+) (string, error) {
+    return url, nil
+}
+
+
+// RunMaintenance executes the selected maintenance tool.
+func RunMaintenance(binary string) error {
+    return nil
+}
+"""
+    go_symbols, _ = extract_diff_symbols(_diff("seed.go", go_source), "seed.go")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in go_symbols] == [
+        ("FetchInternal", 4, 3, 8),
+        ("RunMaintenance", 12, 11, 14),
+    ]
+    unscoped_gap = Finding(file="seed.go", line=9, message="anchor too far from either declaration")
+    assert CrossPRAnalyzer._enclosing_symbol_by_line(unscoped_gap, go_symbols) is None
+
+    typescript_source = """export class Runner {
+  first(value: string) {
+    return value;
+  }
+
+  @Audit(
+    \"security\",
+  )
+  run(
+    command: string,
+  ): string {
+    return command;
+  }
+}
+"""
+    typescript_symbols, _ = extract_diff_symbols(_diff("runner.ts", typescript_source), "runner.ts")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in typescript_symbols] == [
+        ("Runner", 1, 1, 14),
+        ("first", 2, 2, 4),
+        ("run", 9, 6, 13),
+    ]
+    between_methods = Finding(file="runner.ts", line=5, message="anchor drift before decorated method")
+    assert CrossPRAnalyzer._enclosing_symbol_by_line(between_methods, typescript_symbols).name == "run"
+
+    java_source = """@Guarded(
+    value = \"operator\"
+)
+public static
+String execute(
+    String command
+) throws Exception {
+    return command;
+}
+"""
+    java_symbols, _ = extract_diff_symbols(_diff("Runner.java", java_source), "Runner.java")
+    assert [(item.name, item.line, item.start_line, item.end_line) for item in java_symbols] == [("execute", 5, 1, 9)]
+
+
+async def test_adjacent_symbol_boundary_does_not_leak_next_sink_into_previous_symbol(tmp_path):
+    db = Database(tmp_path / "adjacent-symbols.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+
+    seed_source = """package gauntlet_fullstack
+
+import (
+    \"net/http\"
+    \"os/exec\"
+)
+
+func FetchInternal(url string) (*http.Response, error) {
+    return http.Get(url)
+}
+
+func RunMaintenance(binary string) error {
+    return exec.Command(binary, \"--repair\").Run()
+}
+"""
+    seed_lines = seed_source.splitlines()
+    fetch_line = next(index for index, line in enumerate(seed_lines, 1) if line.startswith("func FetchInternal"))
+    maintenance_line = next(index for index, line in enumerate(seed_lines, 1) if line.startswith("func RunMaintenance"))
+    seed_state = StateStore(
+        pr_number=78,
+        repo="o/r",
+        head_sha="seed",
+        files_changed=["gauntlet_fullstack/seed_go.go"],
+        diff_summary=_diff("gauntlet_fullstack/seed_go.go", seed_source),
+    )
+    seed_findings = [
+        Finding(
+            file="gauntlet_fullstack/seed_go.go",
+            line=fetch_line + 1,
+            severity="error",
+            category="ssrf",
+            message="A dynamic URL is passed to http.Get.",
+            status="confirmed",
+        ),
+        # Mirrors PR #78: the LLM anchored the RunMaintenance issue on the
+        # separator line immediately before its declaration.
+        Finding(
+            file="gauntlet_fullstack/seed_go.go",
+            line=maintenance_line - 1,
+            severity="error",
+            category="command-injection",
+            message="binary is passed directly to exec.Command.",
+            status="confirmed",
+        ),
+        Finding(
+            file="gauntlet_fullstack/seed_go.go",
+            line=maintenance_line + 1,
+            severity="error",
+            category="command-injection",
+            message="Go exec.Command is used.",
+            status="confirmed",
+        ),
+    ]
+    await analyzer.analyze("seed-boundary", seed_state, seed_findings)
+
+    fetch = await db.get_symbol("gauntlet_fullstack/seed_go.go", "FetchInternal")
+    maintenance = await db.get_symbol("gauntlet_fullstack/seed_go.go", "RunMaintenance")
+    assert json.loads(fetch["risk_categories"]) == ["ssrf"]
+    assert json.loads(maintenance["risk_categories"]) == ["command-injection"]
+
+    consumer_source = """package gauntlet_services
+
+import seed \"gauntlet_fullstack/seed_go\"
+
+func CrossPRCommand(tool string) error {
+    return seed.RunMaintenance(tool)
+}
+
+func CrossPRSSRF(url string) (*http.Response, error) {
+    return seed.FetchInternal(url)
+}
+"""
+    consumer_state = StateStore(
+        pr_number=79,
+        repo="o/r",
+        head_sha="consumer",
+        files_changed=["gauntlet_services/go_consumer.go"],
+        diff_summary=_diff("gauntlet_services/go_consumer.go", consumer_source),
+    )
+    cross_findings = await analyzer.analyze("consumer-boundary", consumer_state, [])
+    assert {(finding.line, finding.category) for finding in cross_findings} == {
+        (6, "cross-pr-command-injection"),
+        (10, "cross-pr-ssrf"),
+    }
+    await db.close()
+
+
 async def test_code_relations_migration_preserves_multiple_source_symbols(tmp_path):
     db_path = tmp_path / "old_relations.db"
     old = await aiosqlite.connect(db_path)

@@ -9,6 +9,7 @@ Stops early when consensus is reached. Max 3 rounds.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -19,6 +20,7 @@ from langchain_openai import ChatOpenAI
 
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding
+from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,89 @@ logger = logging.getLogger(__name__)
 # reviewers can misread sanitizers, allow-lists, test fixtures, or safe process
 # argument APIs just like any other reviewer.
 _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE = 0.96
+_SUMMARY_FILE_HEADER = re.compile(r"^--- (?P<file>.+?) \(\+\d+ -\d+\)$")
+_SUBPROCESS_CALLS = {
+    "subprocess.run",
+    "subprocess.Popen",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+}
+_SHELL_CALLS = {"os.system", "os.popen"}
+_PATH_CALLS = {
+    "open",
+    "os.open",
+    "os.remove",
+    "os.unlink",
+    "os.rename",
+    "os.replace",
+    "pathlib.Path",
+    "Path",
+}
+_GENERIC_TEST_CATEGORIES = {
+    "missing-integration-test",
+    "missing-test",
+    "missing-tests",
+    "missing-test-coverage",
+    "missing-unit-test",
+    "test-coverage",
+    "testing",
+    "untested-code",
+}
+_GENERIC_DOC_CATEGORIES = {
+    "documentation",
+    "missing-api-documentation",
+    "missing-doc",
+    "missing-docs",
+    "missing-docstring",
+    "missing-documentation",
+    "missing-parameter-doc",
+    "safety-doc",
+}
+_TEST_FILE = re.compile(
+    r"(?:^|/)(?:tests?|specs?)(?:/|$)|(?:^|[._-])test(?:[._-]|$)|"
+    r"(?:^|[._-])spec(?:[._-]|$)|_test\.go$|test\.java$",
+    re.IGNORECASE,
+)
+_TEST_CODE = re.compile(
+    r"\b(?:assert|assertion|expect|should|test|it|describe|pytest|unittest|t\.run)\b|"
+    r"断言|测试",
+    re.IGNORECASE,
+)
+_SPECIFIC_TEST_DEFECT = re.compile(
+    r"\b(?:assert(?:ion)?|expect(?:ed|s)?|actual|returns?|throws?|raises?|fails?|"
+    r"deleted|removed|regression|mismatch|wrong)\b|"
+    r"断言|预期|实际|返回|抛出|失败|错误|不匹配|删除|移除|回归",
+    re.IGNORECASE,
+)
+_TEST_REMOVAL = re.compile(r"\b(?:deleted|removed|dropped)\b|删除|移除|删掉", re.IGNORECASE)
+_SECURITY_REGRESSION = re.compile(
+    r"(?:security|authorization|authentication|permission|saniti[sz]|escape|allow.?list|"
+    r"regression|安全|鉴权|认证|授权|权限|清理|转义|白名单|回归)",
+    re.IGNORECASE,
+)
+_SECURITY_GUARD_CODE = re.compile(
+    r"(?:saniti[sz]|escape|allow.?list|authori[sz]|authenticat|permission|"
+    r"preparedstatement|\?\s*[,)]|%s|\$\d+|regexp|regex|match\(|"
+    r"白名单|鉴权|认证|授权)",
+    re.IGNORECASE,
+)
+_SAFETY_CONTRACT = re.compile(
+    r"(?:#\s*safety|safety contract|preconditions?|invariants?|caller must|"
+    r"安全契约|前置条件|不变量|调用者必须)",
+    re.IGNORECASE,
+)
+_RUST_UNSAFE_API = re.compile(r"\bpub(?:\([^)]*\))?\s+unsafe\s+fn\b", re.IGNORECASE)
+_DOCUMENTATION_MISMATCH = re.compile(
+    r"\b(?:incorrect|outdated|stale|mismatch|contradict(?:s|ion|ory)?|wrong|inaccurate)\b|"
+    r"错误|过时|陈旧|不一致|矛盾|不准确",
+    re.IGNORECASE,
+)
+_REMOVED_TEST_CODE = re.compile(
+    r"\b(?:assert|expect|should|test|it|describe|pytest|unittest|t\.run)\b|"
+    r"断言|测试",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -39,6 +124,317 @@ class ChallengeResult:
     verdict: str  # confirmed / false_positive
     adjusted_confidence: float
     challenge: str  # reason for the verdict
+
+
+@dataclass(frozen=True)
+class _PythonCodeEvidence:
+    recognized_command_calls: int
+    unsafe_command_calls: int
+    safe_command_calls: int
+    suspicious_path_sinks: int
+    safe_command_scopes: tuple[tuple[int, int], ...]
+    unsafe_command_scopes: tuple[tuple[int, int], ...]
+    suspicious_path_scopes: tuple[tuple[int, int], ...]
+    constant_shell_scopes: tuple[tuple[int, int], ...]
+
+
+def _extract_file_patch(diff_summary: str, file_path: str) -> str:
+    """Extract one ReviewForge summary section, or accept a raw single-file patch."""
+
+    lines = (diff_summary or "").splitlines()
+    saw_summary_header = any(_SUMMARY_FILE_HEADER.match(line) for line in lines)
+    if not saw_summary_header:
+        return diff_summary or ""
+
+    selected: list[str] = []
+    in_target = False
+    for line in lines:
+        header = _SUMMARY_FILE_HEADER.match(line)
+        if header:
+            if in_target:
+                break
+            in_target = header.group("file") == file_path
+            continue
+        if in_target:
+            selected.append(line)
+    return "\n".join(selected)
+
+
+def _python_added_tree(diff_summary: str, file_path: str) -> ast.Module | None:
+    if not file_path.lower().endswith(".py"):
+        return None
+    additions = iter_added_lines(_extract_file_patch(diff_summary, file_path))
+    if not additions:
+        return None
+    last_line = max(line for line, _ in additions)
+    if last_line > 20_000:
+        return None
+    source_lines = [""] * last_line
+    for line_no, content in additions:
+        source_lines[line_no - 1] = content
+    try:
+        return ast.parse("\n".join(source_lines) + "\n")
+    except SyntaxError:
+        # Partial hunks must fail open so an incomplete view cannot suppress a
+        # potentially real finding.
+        return None
+
+
+def _call_name(call: ast.Call) -> str:
+    parts: list[str] = []
+    node: ast.expr = call.func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _constant_string(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _fixed_argv_executable(node: ast.expr | None) -> bool:
+    return isinstance(node, (ast.List, ast.Tuple)) and bool(node.elts) and _constant_string(node.elts[0])
+
+
+def _keyword_bool(call: ast.Call, name: str) -> bool | None:
+    for keyword in call.keywords:
+        if keyword.arg != name:
+            continue
+        if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
+            return keyword.value.value
+        return None
+    return False
+
+
+def _scope_for_line(tree: ast.Module, line: int) -> tuple[int, int]:
+    scopes = [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.lineno <= line <= (node.end_lineno or node.lineno)
+    ]
+    return min(scopes, key=lambda item: item[1] - item[0]) if scopes else (line, line)
+
+
+def _python_code_evidence(diff_summary: str, file_path: str) -> _PythonCodeEvidence | None:
+    tree = _python_added_tree(diff_summary, file_path)
+    if tree is None:
+        return None
+
+    recognized_commands = 0
+    unsafe_commands = 0
+    safe_commands = 0
+    suspicious_paths = 0
+    safe_command_scopes: list[tuple[int, int]] = []
+    unsafe_command_scopes: list[tuple[int, int]] = []
+    suspicious_path_scopes: list[tuple[int, int]] = []
+    constant_shell_scopes: list[tuple[int, int]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        first_arg = node.args[0] if node.args else None
+
+        if name in _SUBPROCESS_CALLS:
+            recognized_commands += 1
+            shell = _keyword_bool(node, "shell")
+            if shell is True and _constant_string(first_arg):
+                safe_commands += 1
+                scope = _scope_for_line(tree, node.lineno)
+                safe_command_scopes.append(scope)
+                constant_shell_scopes.append(scope)
+            elif shell is False and (_fixed_argv_executable(first_arg) or _constant_string(first_arg)):
+                safe_commands += 1
+                safe_command_scopes.append(_scope_for_line(tree, node.lineno))
+            else:
+                unsafe_commands += 1
+                unsafe_command_scopes.append(_scope_for_line(tree, node.lineno))
+        elif name in _SHELL_CALLS:
+            recognized_commands += 1
+            if _constant_string(first_arg):
+                safe_commands += 1
+                scope = _scope_for_line(tree, node.lineno)
+                safe_command_scopes.append(scope)
+                constant_shell_scopes.append(scope)
+            else:
+                unsafe_commands += 1
+                unsafe_command_scopes.append(_scope_for_line(tree, node.lineno))
+
+        if name in _PATH_CALLS and first_arg is not None and not _constant_string(first_arg):
+            suspicious_paths += 1
+            suspicious_path_scopes.append(_scope_for_line(tree, node.lineno))
+        elif name.rsplit(".", 1)[-1] in {
+            "read_text",
+            "read_bytes",
+            "write_text",
+            "write_bytes",
+            "unlink",
+        }:
+            suspicious_paths += 1
+            suspicious_path_scopes.append(_scope_for_line(tree, node.lineno))
+
+    return _PythonCodeEvidence(
+        recognized_command_calls=recognized_commands,
+        unsafe_command_calls=unsafe_commands,
+        safe_command_calls=safe_commands,
+        suspicious_path_sinks=suspicious_paths,
+        safe_command_scopes=tuple(set(safe_command_scopes)),
+        unsafe_command_scopes=tuple(set(unsafe_command_scopes)),
+        suspicious_path_scopes=tuple(set(suspicious_path_scopes)),
+        constant_shell_scopes=tuple(set(constant_shell_scopes)),
+    )
+
+
+def _reject_by_code_evidence(finding: Finding, evidence: _PythonCodeEvidence | None) -> str:
+    """Return a deterministic rejection reason for provably safe Python shapes."""
+
+    if evidence is None:
+        return ""
+
+    def near(scopes: tuple[tuple[int, int], ...]) -> bool:
+        return any(start - 2 <= finding.line <= end + 2 for start, end in scopes)
+
+    if (
+        finding.category == "command-injection"
+        and near(evidence.safe_command_scopes)
+        and not near(evidence.unsafe_command_scopes)
+    ):
+        return "进程调用使用固定可执行文件的参数数组，或仅执行常量 shell 字符串；不存在动态命令注入 sink"
+    if (
+        finding.category == "path-traversal"
+        and near(evidence.safe_command_scopes)
+        and not near(evidence.suspicious_path_scopes)
+    ):
+        return "路径值仅作为固定可执行文件的独立 argv 参数传入，代码中不存在动态文件路径 sink"
+    if finding.category == "design" and re.search(
+        r"shell\s*=\s*true|shell|命令注入", f"{finding.message}\n{finding.suggestion}", re.IGNORECASE
+    ):
+        if near(evidence.constant_shell_scopes):
+            return "shell=True 的命令文本是编译期常量，不存在攻击者可控的命令拼接"
+    return ""
+
+
+def _generic_quality_kind(finding: Finding) -> str:
+    """Classify absence-only test/doc findings without touching other dimensions."""
+
+    category = finding.category
+    if category in _GENERIC_TEST_CATEGORIES or re.fullmatch(
+        r"(?:missing|lack-of|insufficient)-.*tests?(?:-coverage)?", category
+    ):
+        return "test"
+    if category in _GENERIC_DOC_CATEGORIES or re.fullmatch(
+        r"(?:missing|lack-of)-.*(?:docs?|docstring|documentation)", category
+    ):
+        return "doc"
+    return ""
+
+
+def _nearby_added_code(diff_summary: str, file_path: str, line: int, radius: int = 2) -> str:
+    patch = _extract_file_patch(diff_summary, file_path)
+    return "\n".join(content for line_no, content in iter_added_lines(patch) if abs(line_no - line) <= radius)
+
+
+def _has_right_anchor(diff_summary: str, file_path: str, line: int) -> bool:
+    patch = _extract_file_patch(diff_summary, file_path)
+    return line in {line_no for line_no, _content in iter_right_lines(patch)}
+
+
+def _has_removed_test_code(diff_summary: str, file_path: str) -> bool:
+    """Conservatively recognize removed test definitions/assertions in a valid hunk."""
+
+    patch = _extract_file_patch(diff_summary, file_path)
+    in_hunk = False
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("@@ "):
+            in_hunk = True
+            continue
+        if raw_line.startswith("@@") or raw_line.startswith("diff --git "):
+            in_hunk = False
+            continue
+        if in_hunk and raw_line.startswith("-") and not raw_line.startswith("---"):
+            if _REMOVED_TEST_CODE.search(raw_line[1:]):
+                return True
+    return False
+
+
+def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
+    """Reject absence-only quality advice unless the diff contains actionable evidence.
+
+    A missing test or doc is not an inline defect by itself.  We retain only cases
+    where the changed test is concretely wrong, a real test was removed, a security
+    fix lacks a named regression contract, or a Rust unsafe API lacks its required
+    safety contract.  Those retained cases still go through adversarial calibration.
+    """
+
+    kind = _generic_quality_kind(finding)
+    if not kind:
+        return ""
+
+    text = f"{finding.message}\n{finding.suggestion}"
+    nearby_code = _nearby_added_code(code_diff, finding.file, finding.line)
+    has_anchor = _has_right_anchor(code_diff, finding.file, finding.line)
+
+    if kind == "test":
+        changed_test_defect = (
+            has_anchor
+            and bool(_TEST_FILE.search(finding.file.replace("\\", "/")))
+            and bool(_TEST_CODE.search(nearby_code))
+            and bool(_SPECIFIC_TEST_DEFECT.search(text))
+        )
+        removed_test = (
+            has_anchor
+            and bool(_TEST_FILE.search(finding.file.replace("\\", "/")))
+            and bool(_TEST_REMOVAL.search(text))
+            and _has_removed_test_code(code_diff, finding.file)
+        )
+        security_regression_contract = (
+            has_anchor
+            and bool(re.search(r"\bregression\b|回归", text, re.IGNORECASE))
+            and bool(_SECURITY_REGRESSION.search(text))
+            and bool(_SECURITY_GUARD_CODE.search(nearby_code))
+        )
+        if changed_test_defect or removed_test or security_regression_contract:
+            return ""
+        return "仅指出缺少测试/覆盖率，没有在可评论的变更行上证明具体错误断言、测试删除或安全回归契约"
+
+    rust_safety_contract = (
+        has_anchor
+        and finding.file.lower().endswith(".rs")
+        and bool(_RUST_UNSAFE_API.search(nearby_code))
+        and bool(_SAFETY_CONTRACT.search(text))
+    )
+    documentation_mismatch = has_anchor and bool(_DOCUMENTATION_MISMATCH.search(text))
+    if rust_safety_contract or documentation_mismatch:
+        return ""
+    return "仅指出缺少注释或文档，没有在锚点处证明错误文档或语言要求的具体安全契约"
+
+
+def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[list[Finding], list[Finding]]:
+    """Zero-token prefilter for generic test/documentation findings.
+
+    This function is intentionally public so orchestration can apply it before
+    deciding whether a finding enters the more expensive escalation path.
+    Findings are returned as ``(actionable, rejected)`` and rejected objects are
+    annotated with their final deterministic verdict.
+    """
+
+    actionable: list[Finding] = []
+    rejected: list[Finding] = []
+    for finding in findings:
+        finding.category = normalize_category(finding.category)
+        reason = _reject_generic_quality_finding(finding, code_diff)
+        if reason:
+            finding.status = "false_positive"
+            finding.verified_by = "actionability-gate"
+            finding.verify_reason = reason
+            rejected.append(finding)
+        else:
+            actionable.append(finding)
+    return actionable, rejected
 
 
 class DynamicCalibrator:
@@ -74,10 +470,20 @@ class DynamicCalibrator:
         if not findings:
             return []
 
+        need_actionability, evidence_rejected = apply_actionability_gate(findings, code_diff)
         auto_confirmed = []
         need_calibration = []
-        for f in findings:
-            f.category = normalize_category(f.category)
+        evidence_cache: dict[str, _PythonCodeEvidence | None] = {}
+        for f in need_actionability:
+            if f.file not in evidence_cache:
+                evidence_cache[f.file] = _python_code_evidence(code_diff, f.file)
+            rejection_reason = _reject_by_code_evidence(f, evidence_cache[f.file])
+            if rejection_reason:
+                f.status = "false_positive"
+                f.verified_by = "code-evidence"
+                f.verify_reason = rejection_reason
+                evidence_rejected.append(f)
+                continue
             detector_backed = f.verified_by == "detector"
             if (
                 detector_backed
@@ -98,7 +504,7 @@ class DynamicCalibrator:
             )
 
         if not need_calibration:
-            return auto_confirmed
+            return evidence_rejected + auto_confirmed
 
         current = need_calibration
         # 快照原始 confidence/status（在被 _apply_challenges 原地修改之前）
@@ -125,7 +531,7 @@ class DynamicCalibrator:
         else:
             logger.info("Consensus reached, skip judge round")
 
-        return auto_confirmed + updated
+        return evidence_rejected + auto_confirmed + updated
 
     async def _adversarial_round(self, findings: list[Finding], code_diff: str) -> list[ChallengeResult]:
         """Attempt to refute each finding. Returns challenge results."""
@@ -157,7 +563,10 @@ class DynamicCalibrator:
 - 动态 SQL 标识符若经过 allow-list 且所有值仍使用绑定参数，应判为误报
 
 质量类 finding 必须满足可操作的证据门槛：
-- 缺测试/缺文档必须有项目约定，或明确的公共、高风险行为及可证明的覆盖缺口；不能仅因当前 diff 未包含测试或文档就确认
+- 缺测试只有三类可确认：变更中的测试断言本身错误、diff 确实删除/削弱了既有测试、或安全修复引入了可指明的安全契约但缺少对应回归测试
+- 缺文档只有两类可确认：已有文档被本次行为变更改成错误陈述，或语言规范要求的安全契约（例如 Rust `pub unsafe fn` 的 `# Safety`）确实缺失
+- 不能仅因当前 diff 没有附带测试或文档而确认
+- “新增公共/高风险函数但 diff 没测试/注释”“危险实现还应写风险说明”均是噪声；后者应直接报告漏洞，不能再确认重复的测试/文档建议
 - 命名和风格偏好本身不是可操作 bug，除非违反明确规范并造成真实歧义或行为风险
 - 可访问性结论必须结合元素的交互语义；普通静态文本、textContent 或已转义 HTML 不能单凭 API 名称判错
 - 明确缺失的图片 alt、表单 label 或交互控件名称仍是有效的可访问性问题
@@ -219,7 +628,11 @@ class DynamicCalibrator:
 - 严重程度是否合理
 - 安全类结论必须有攻击者可控 source 到危险 sink 的完整证据；安全 API、allow-list、
   sanitizer、绑定参数和测试占位值都应作为反证，不能仅凭危险 API 名称确认
-- 缺测试/缺文档必须有项目约定或明确公共、高风险行为的可证明缺口，不能仅因 diff 未附带测试或文档确认
+- 缺测试只有在修改后的测试断言错误、实际删除/削弱既有测试，或安全修复缺少明确契约的回归测试时才能确认
+- 缺文档只有在已有文档与新行为矛盾，或语言规范要求的安全契约（如 Rust `pub unsafe fn` 的 `# Safety`）缺失时才能确认
+- 不能仅因当前 diff 没有附带测试或文档而确认
+- 仅因新增公共/高风险函数且 diff 没有测试/注释，或因危险代码应再写风险说明，必须判为 false_positive
+- 对危险代码应直接确认对应行为漏洞，而不是重复测试或文档建议
 - 命名/风格偏好不构成 bug，除非违反明确规范并造成真实歧义或风险
 - 可访问性必须结合交互语义；普通静态文本、textContent、已转义 HTML 不应被判错，
   但明确缺失的图片 alt、表单 label 或控件可访问名称仍应确认

@@ -12,7 +12,7 @@ This reference covers language-agnostic security patterns.
 - Framework-specific sinks:
   - React: `dangerouslySetInnerHTML`
   - Vue: `v-html`
-  - Angular: `[innerHTML]`, `bypassSecurityTrustHtml`
+  - Angular: `bypassSecurityTrustHtml` or another explicit sanitizer bypass; plain `[innerHTML]` is sanitized by default
   - Svelte: `{@html}`
   - Vanilla: `innerHTML`, `outerHTML`, `document.write()`
 

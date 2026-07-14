@@ -40,6 +40,24 @@ async def test_overlong_rationale_is_truncated_without_failing_plan() -> None:
     assert tasks[0].rationale.startswith("security context")
 
 
+async def test_plan_filters_absence_only_test_and_doc_tasks_for_source_only_change() -> None:
+    content = json.dumps(
+        {
+            "tasks": [
+                {"reviewer": "testing", "files": ["app.py"], "rationale": "no tests added"},
+                {"reviewer": "documentation", "files": ["app.py"], "rationale": "no docstring"},
+                {"reviewer": "security", "files": ["app.py"], "rationale": "semantic security review"},
+            ]
+        }
+    )
+    planner = Planner(_StaticPlannerLLM(content), build_registry())  # type: ignore[arg-type]
+    state = StateStore(repo="owner/repo", pr_number=75, files_changed=["app.py"], diff_summary="+value = 1")
+
+    tasks = await planner.plan(state)
+
+    assert [task.reviewer for task in tasks] == ["security_reviewer"]
+
+
 def test_malformed_task_is_skipped_without_losing_valid_siblings() -> None:
     planner = Planner(_StaticPlannerLLM("{}"), build_registry())  # type: ignore[arg-type]
     content = json.dumps(

@@ -20,6 +20,10 @@ SNAPSHOT_DATE = "2026-07-14"
 OSV_SOURCE = "https://google.github.io/osv.dev/data/"
 SERDE_YAML_SOURCE = "https://docs.rs/serde_yaml/latest/serde_yaml/"
 RAILS_POLICY_SOURCE = "https://guides.rubyonrails.org/v7.2.2.1/maintenance_policy.html"
+EVENT_STREAM_INCIDENT_SOURCE = (
+    "https://github.blog/security/vulnerability-research/"
+    "the-octopus-scanner-malware-attacking-the-open-source-supply-chain/"
+)
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,13 @@ _LIFECYCLE: tuple[LifecycleRecord, ...] = (
     ),
 )
 
+# Package-level compromise history is distinct from a version vulnerability.
+# We flag an unbounded declaration (or the known compromised release) so an
+# exact modern pin is not mislabeled merely because the package has history.
+_PACKAGE_INCIDENTS: dict[tuple[str, str], tuple[str, str, str]] = {
+    ("npm", "event-stream"): ("event-stream-compromise", "3.3.6", EVENT_STREAM_INCIDENT_SOURCE),
+}
+
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?:.*)$")
 _PLAIN_VERSION = re.compile(r"^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$")
 
@@ -201,6 +212,26 @@ class SnapshotAdvisoryProvider:
     def detect(self, coordinates: list[DependencyCoordinate]) -> list[AdvisoryDetection]:
         detections: list[AdvisoryDetection] = []
         for coordinate in coordinates:
+            incident = _PACKAGE_INCIDENTS.get(
+                (coordinate.ecosystem, _canonical_name(coordinate.ecosystem, coordinate.name))
+            )
+            if incident and (not coordinate.exact or coordinate.version.lstrip("v=") == incident[1]):
+                incident_id, compromised_version, source = incident
+                detections.append(
+                    AdvisoryDetection(
+                        line=coordinate.line,
+                        category="supply-chain-risk",
+                        severity="error",
+                        message=(
+                            f"{coordinate.name} has recorded package-compromise history ({incident_id}); "
+                            f"the declaration {coordinate.version!r} is unbounded or selects compromised "
+                            f"release {compromised_version}. Snapshot source: {source}"
+                        ),
+                        suggestion="Replace the package or pin and audit a known-safe release and lockfile.",
+                        confidence=0.97,
+                    )
+                )
+
             advisories = [record for record in _ADVISORIES if coordinate.exact and _matches_record(coordinate, record)]
             if advisories:
                 ids = sorted({record.advisory_id for record in advisories})

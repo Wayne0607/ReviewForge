@@ -10,6 +10,7 @@ import asyncio
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,11 @@ from reviewforge.core.loop_detector import LoopDetector
 from reviewforge.core.scheduler import Scheduler
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
-from reviewforge.engine.calibrator import DynamicCalibrator
+from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
+from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
+from reviewforge.engine.finding_anchors import reanchor_accessibility_findings
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.planner import Planner
@@ -32,8 +35,33 @@ from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 from reviewforge.engine.verifier import Verifier
 from reviewforge.tools.gateway import ToolGateway
+from reviewforge.tools.github_api import MAX_REVIEW_COMMENTS_PER_REQUEST
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CommentDeliveryResult:
+    """Per-finding delivery outcome used to decide whether a run is resumable."""
+
+    reported: int = 0
+    permanent_rejections: int = 0
+    transient_failures: int = 0
+    errors: tuple[str, ...] = ()
+
+    @property
+    def retryable(self) -> bool:
+        return self.transient_failures > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reported": self.reported,
+            "comments_posted": self.reported,
+            "permanent_rejections": self.permanent_rejections,
+            "transient_failures": self.transient_failures,
+            "retryable": self.retryable,
+            "errors": list(self.errors),
+        }
 
 
 def _should_escalate_finding(
@@ -479,6 +507,11 @@ class Orchestrator:
 
             # Phase 3: Verifier (#5, pure-logic de-dupe/merge) → Dynamic Calibration.
             raw_candidates = state.list_findings(status="candidate")
+            reanchored = reanchor_accessibility_findings(raw_candidates, state.diff_summary)
+            for finding in reanchored:
+                state.update_finding(finding.id, line=finding.line, category=finding.category)
+            if reanchored:
+                self._events.emit("anchors.repaired", {"count": len(reanchored)})
             candidates, dropped_ids = self._verifier.verify(raw_candidates)
             for fid in dropped_ids:
                 state.update_finding(
@@ -486,6 +519,23 @@ class Orchestrator:
                 )
             if dropped_ids:
                 self._events.emit("verifier.completed", {"kept": len(candidates), "merged": len(dropped_ids)})
+
+            # Remove generic "missing tests/docs" advice before the escalation
+            # split.  This deterministic evidence gate avoids spending an
+            # agentic tool loop on findings that cannot become actionable.
+            candidates, actionability_rejected = apply_actionability_gate(candidates, state.diff_summary)
+            for finding in actionability_rejected:
+                state.update_finding(
+                    finding.id,
+                    status="false_positive",
+                    verified_by=finding.verified_by,
+                    verify_reason=finding.verify_reason,
+                )
+            if actionability_rejected:
+                self._events.emit(
+                    "actionability.completed",
+                    {"kept": len(candidates), "filtered": len(actionability_rejected)},
+                )
 
             # Phase 3.5/4: split candidates — trace/uncertain findings → Escalation
             # (agentic verify, verdict is FINAL); the rest → Dynamic Calibration. Mutually
@@ -599,10 +649,11 @@ class Orchestrator:
 
             # Phase 4: Comment
             confirmed = state.list_findings(status="confirmed")
+            comment_result = CommentDeliveryResult()
             if confirmed:
                 self._events.emit("commenter.started", {"finding_count": len(confirmed)})
-                comment_count = await self._post_comments(confirmed, state)
-                self._events.emit("commenter.completed", {"comments_posted": comment_count})
+                comment_result = await self._post_comments(confirmed, state)
+                self._events.emit("commenter.completed", comment_result.to_dict())
 
             summary = {
                 "total_findings": len(state.findings),
@@ -610,24 +661,27 @@ class Orchestrator:
                 "false_positives": len(state.list_findings(status="false_positive")),
                 "tasks_completed": len(state.list_tasks(status="completed")),
                 "tasks_failed": len(state.list_tasks(status="failed")),
+                "comment_delivery": comment_result.to_dict(),
             }
-            if planner_errors:
+            retryable_errors = list(planner_errors)
+            if comment_result.retryable:
+                retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
+            if retryable_errors:
                 summary.update({"status": "partial", "retryable": True})
                 self._events.emit(
                     "review.partial",
-                    {**summary, "errors": planner_errors},
+                    {**summary, "errors": retryable_errors},
                 )
             self._events.emit("review.completed", summary)
 
-            # A Planner/provider outage must not permanently de-duplicate this
-            # head as reviewed. Phase-0 findings have already been persisted and
-            # delivered; keep the same run resumable so a later webhook can add
-            # the missing semantic review without reposting delivered comments.
+            # A Planner/provider or transient comment-delivery outage must not
+            # permanently de-duplicate this head as reviewed. Keep the same run
+            # resumable; already-reported findings will not be posted twice.
             if self._db:
-                if planner_errors:
+                if retryable_errors:
                     await self._db.fail_run(
                         run_id,
-                        "Planner unavailable; semantic review is retryable: " + "; ".join(planner_errors),
+                        "Review incomplete and retryable: " + "; ".join(retryable_errors),
                         summary=summary,
                     )
                 else:
@@ -749,44 +803,313 @@ class Orchestrator:
                 except Exception:
                     pass
 
-    async def _post_comments(self, findings: list[Finding], state: StateStore) -> int:
-        """Post review comments via the tool gateway."""
-        count = 0
+    async def _post_comments(self, findings: list[Finding], state: StateStore) -> CommentDeliveryResult:
+        """Post confirmed findings in serialized, bounded GitHub reviews.
+
+        Coordinates are checked against the visible RIGHT side of the PR patch
+        before making a write request. GitHub validation failures are then
+        isolated by splitting the affected batch, so one rejected coordinate
+        cannot discard otherwise valid comments. Permanent coordinate failures
+        are retired as false positives; operational failures remain confirmed
+        and make the containing run retryable.
+        """
+
+        if not findings:
+            return CommentDeliveryResult()
+
+        findings_by_id: dict[str, Finding] = {}
         for finding in findings:
-            # Validate line number — GitHub rejects line=0 or invalid lines
-            if finding.line <= 0:
-                logger.warning(f"Skipping comment for {finding.id}: invalid line {finding.line}")
+            if finding.id not in findings_by_id and finding.status != "reported":
+                findings_by_id[finding.id] = finding
+        if not findings_by_id:
+            return CommentDeliveryResult()
+
+        reported_ids: set[str] = set()
+        transient_ids: set[str] = set()
+        permanent: dict[str, tuple[str, str]] = {}
+        errors: list[str] = []
+
+        def add_error(message: str) -> None:
+            message = message[:1000]
+            if message not in errors:
+                errors.append(message)
+
+        def mark_reported(finding: Finding) -> None:
+            reported_ids.add(finding.id)
+            transient_ids.discard(finding.id)
+            permanent.pop(finding.id, None)
+
+        def mark_transient(batch: list[tuple[Finding, dict[str, Any]]], message: str) -> None:
+            add_error(message)
+            for finding, _comment in batch:
+                if finding.id not in reported_ids and finding.id not in permanent:
+                    transient_ids.add(finding.id)
+
+        def mark_permanent(finding: Finding, reason: str, verified_by: str) -> None:
+            if finding.id in reported_ids:
+                return
+            transient_ids.discard(finding.id)
+            permanent[finding.id] = (verified_by, reason[:500])
+
+        async def finalize() -> CommentDeliveryResult:
+            for finding_id in reported_ids:
+                finding = findings_by_id[finding_id]
+                state.update_finding(finding_id, status="reported")
+                if self._db:
+                    try:
+                        await self._db.update_finding_status(finding_id, "reported", finding.verified_by)
+                    except Exception as exc:
+                        logger.error(
+                            "Comment delivered but DB status update failed for %s: %s",
+                            finding_id,
+                            exc,
+                        )
+
+            for finding_id, (verified_by, reason) in permanent.items():
+                state.update_finding(
+                    finding_id,
+                    status="false_positive",
+                    verified_by=verified_by,
+                    verify_reason=reason,
+                )
+                if self._db:
+                    try:
+                        await self._db.update_finding_status(finding_id, "false_positive", verified_by)
+                    except Exception as exc:
+                        logger.error(
+                            "Permanent comment rejection recorded in memory but DB update failed for %s: %s",
+                            finding_id,
+                            exc,
+                        )
+
+            return CommentDeliveryResult(
+                reported=len(reported_ids),
+                permanent_rejections=len(permanent),
+                transient_failures=len(transient_ids),
+                errors=tuple(errors),
+            )
+
+        try:
+            await self._gateway.ensure_file_diffs(state)
+        except Exception as exc:
+            message = f"Unable to load PR patches for comment prevalidation: {exc}"
+            logger.error(message)
+            mark_transient(
+                [(finding, {}) for finding in findings_by_id.values()],
+                message,
+            )
+            return await finalize()
+
+        right_lines_by_file: dict[str, set[int]] = {}
+        patch_errors: dict[str, str] = {}
+        unique_files = {finding.file for finding in findings if finding.line > 0}
+        for file_path in unique_files:
+            patch = (state.file_diffs or {}).get(file_path)
+            if patch is None:
+                try:
+                    patch = await self._gateway.invoke(
+                        "read_diff",
+                        {"file_path": file_path},
+                        state,
+                        agent_name="orchestrator",
+                    )
+                except Exception as exc:
+                    patch_errors[file_path] = str(exc)
+                    logger.warning(
+                        "Comment prevalidation could not read %s: %s",
+                        file_path,
+                        exc,
+                    )
+                    continue
+            if not (patch or "").strip():
+                patch_errors[file_path] = "GitHub returned an empty patch"
                 continue
-            try:
-                await self._gateway.invoke(
-                    "post_comment",
+            mapped_right_lines = iter_right_lines(patch)
+            if not mapped_right_lines and "@@" not in patch:
+                patch_errors[file_path] = "GitHub returned an unanchored or truncated patch"
+                continue
+            right_lines_by_file[file_path] = {line for line, _content in mapped_right_lines}
+
+        pending: list[tuple[Finding, dict[str, Any]]] = []
+        for finding in findings_by_id.values():
+            if finding.line <= 0:
+                logger.warning(
+                    "Comment prevalidation rejected %s: invalid RIGHT line %d",
+                    finding.id,
+                    finding.line,
+                )
+                mark_permanent(
+                    finding,
+                    f"Invalid GitHub RIGHT-side line coordinate: {finding.line}",
+                    "comment-coordinate-validator",
+                )
+                continue
+            if finding.file in patch_errors:
+                message = (
+                    f"Unable to load patch for {finding.file} while delivering "
+                    f"{finding.id}: {patch_errors[finding.file]}"
+                )
+                mark_transient([(finding, {})], message)
+                continue
+            if finding.line not in right_lines_by_file.get(finding.file, set()):
+                logger.warning(
+                    "Comment prevalidation rejected %s: %s:%d is not a visible RIGHT-side diff line",
+                    finding.id,
+                    finding.file,
+                    finding.line,
+                )
+                mark_permanent(
+                    finding,
+                    f"{finding.file}:{finding.line} is not a visible RIGHT-side diff coordinate",
+                    "comment-coordinate-validator",
+                )
+                continue
+            pending.append(
+                (
+                    finding,
                     {
                         "file_path": finding.file,
                         "line": finding.line,
                         "body": self._format_comment(finding),
-                        "severity": finding.severity,
                     },
+                )
+            )
+
+        async def deliver_batch(batch: list[tuple[Finding, dict[str, Any]]]) -> None:
+            if not batch:
+                return
+            try:
+                result = await self._gateway.invoke(
+                    "post_review",
+                    {"comments": [comment for _finding, comment in batch]},
                     state,
                     agent_name="orchestrator",
                 )
-            except Exception as e:
-                error_msg = str(e)
-                if "422" in error_msg:
-                    logger.warning(f"Skipping comment for {finding.id}: line {finding.line} not in diff")
+            except Exception as exc:
+                kind = str(getattr(exc, "kind", "unknown"))
+                status_code = int(getattr(exc, "status_code", 0) or 0)
+                response_body = str(getattr(exc, "response_body", ""))
+                retryable = bool(getattr(exc, "retryable", False))
+                error_text = str(exc)
+                lowered = error_text.lower()
+                if status_code == 0 and "422" in lowered:
+                    status_code = 422
+                if kind == "unknown":
+                    if "spam" in lowered or "secondary rate limit" in lowered:
+                        kind = "spam"
+                        retryable = True
+                    elif "rate limit" in lowered:
+                        kind = "rate_limit"
+                        retryable = True
+                    elif status_code == 422:
+                        kind = "validation"
+                    elif any(marker in lowered for marker in ("network", "timeout", "connection")):
+                        kind = "network"
+                logger.error(
+                    "GitHub review delivery failed (status=%d, kind=%s, comments=%d): %s; body=%s",
+                    status_code,
+                    kind,
+                    len(batch),
+                    exc,
+                    response_body[:1000],
+                )
+                # A batch-level coordinate validation response does not identify
+                # the offending entry. Bisect serially to salvage valid comments.
+                is_validation = kind == "validation" or (
+                    status_code == 422 and not retryable and kind not in {"spam", "rate_limit"}
+                )
+                if is_validation:
+                    if len(batch) > 1:
+                        midpoint = len(batch) // 2
+                        await deliver_batch(batch[:midpoint])
+                        await deliver_batch(batch[midpoint:])
+                    else:
+                        finding = batch[0][0]
+                        mark_permanent(
+                            finding,
+                            f"GitHub permanently rejected the inline coordinate: {response_body or error_text}",
+                            "github-comment-validation",
+                        )
                 else:
-                    logger.error(f"Failed to post comment for {finding.id}: {e}")
-                continue
+                    mark_transient(
+                        batch,
+                        f"GitHub comment delivery transient failure (status={status_code}, kind={kind}): {error_text}",
+                    )
+                return
 
-            state.update_finding(finding.id, status="reported")
-            count += 1
-            if self._db:
-                try:
-                    await self._db.update_finding_status(finding.id, "reported", finding.verified_by)
-                except Exception as e:
-                    # The external delivery succeeded, so do not misclassify it as
-                    # a comment failure (which could trigger a duplicate retry).
-                    logger.error(f"Comment delivered but DB status update failed for {finding.id}: {e}")
-        return count
+            if not isinstance(result, dict):
+                logger.error("GitHub review delivery returned an invalid result: %r", result)
+                mark_transient(
+                    batch,
+                    f"GitHub review delivery returned an invalid result: {result!r}",
+                )
+                return
+
+            raw_indexes = result.get("delivered_indexes", [])
+            if not isinstance(raw_indexes, (list, tuple, set)):
+                raw_indexes = []
+            delivered_indexes = {
+                index
+                for index in raw_indexes
+                if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(batch)
+            }
+            for index in sorted(delivered_indexes):
+                mark_reported(batch[index][0])
+
+            failed_indexes: set[int] = set()
+            raw_failures = result.get("failures", [])
+            if not isinstance(raw_failures, list):
+                raw_failures = []
+            for failure in raw_failures:
+                if not isinstance(failure, dict):
+                    continue
+                index = failure.get("index")
+                if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(batch):
+                    add_error(f"GitHub comment delivery returned an invalid failure index: {index!r}")
+                    continue
+                failed_indexes.add(index)
+                finding = batch[index][0]
+                finding_id = finding.id
+                kind = str(failure.get("kind", "unknown"))
+                status_code = int(failure.get("status_code", 0) or 0)
+                retryable = bool(failure.get("retryable", False))
+                error_text = str(failure.get("error", "unknown error"))
+                response_body = str(failure.get("response_body", ""))
+                logger.error(
+                    "GitHub comment delivery failed for %s (status=%s, kind=%s): %s; body=%s",
+                    finding_id,
+                    status_code,
+                    kind,
+                    error_text,
+                    response_body[:1000],
+                )
+                is_validation = kind == "validation" or (
+                    status_code == 422 and not retryable and kind not in {"spam", "rate_limit"}
+                )
+                if is_validation:
+                    mark_permanent(
+                        finding,
+                        f"GitHub permanently rejected the inline coordinate: {response_body or error_text}",
+                        "github-comment-validation",
+                    )
+                else:
+                    mark_transient(
+                        [batch[index]],
+                        f"GitHub comment delivery transient failure (status={status_code}, kind={kind}): {error_text}",
+                    )
+
+            unresolved = set(range(len(batch))) - delivered_indexes - failed_indexes
+            if unresolved:
+                unresolved_batch = [batch[index] for index in sorted(unresolved)]
+                mark_transient(
+                    unresolved_batch,
+                    f"GitHub review result omitted delivery outcomes for {len(unresolved_batch)} comments",
+                )
+
+        for offset in range(0, len(pending), MAX_REVIEW_COMMENTS_PER_REQUEST):
+            await deliver_batch(pending[offset : offset + MAX_REVIEW_COMMENTS_PER_REQUEST])
+
+        return await finalize()
 
     @staticmethod
     def _format_comment(finding: Finding) -> str:

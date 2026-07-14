@@ -7,6 +7,8 @@ commits, and finding/token counts are batched (no per-run N+1).
 """
 
 import asyncio
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
@@ -156,12 +158,27 @@ async def test_webhook_skips_duplicate_delivery(tmp_path):
     # This exact commit already has a completed review.
     await _make_run(db, "done", "acme/app", 7, "deadbeef", status="completed")
 
+    class _GitHub:
+        calls = 0
+
+        async def get_pr_files(self, _repo, _pr_number):
+            self.calls += 1
+            return []
+
+    class _Orchestrator:
+        async def run(self, _state):
+            raise AssertionError("completed heads must not start another review")
+
+    github = _GitHub()
     app = FastAPI()
     app.include_router(webhook_router)
     app.state.db = db
     app.state.webhook_secret = "s3cret"
+    app.state.review_semaphore = asyncio.Semaphore(1)
+    app.state.review_tasks = set()
+    app.state.github_client = github
+    app.state.orchestrator = _Orchestrator()
 
-    client = TestClient(app)
     payload = {
         "action": "synchronize",
         "pull_request": {"number": 7, "head": {"sha": "deadbeef"}, "base": {"sha": "base"}},
@@ -170,14 +187,85 @@ async def test_webhook_skips_duplicate_delivery(tmp_path):
     body = json.dumps(payload).encode()
     sig = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
 
-    resp = client.post(
-        "/webhook/github",
-        content=body,
-        headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request"},
-    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhook/github",
+            content=body,
+            headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request"},
+        )
+        deadline = time.monotonic() + 2
+        while app.state.review_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+
     assert resp.status_code == 200
-    assert resp.json()["status"] == "duplicate_skipped"
+    assert resp.json()["status"] == "review_triggered"
+    assert github.calls == 0
     await db.close()
+
+
+def test_webhook_response_does_not_wait_for_slow_persistent_dedup():
+    import hashlib
+    import hmac
+    import json
+
+    from reviewforge.api.webhook import router as webhook_router
+
+    release = threading.Event()
+    started = threading.Event()
+
+    class _SlowDB:
+        async def has_active_run_for_head(self, _repo, _pr_number, _head_sha):
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return True
+
+    class _GitHub:
+        async def get_pr_files(self, _repo, _pr_number):
+            raise AssertionError("active head must be filtered before GitHub reads")
+
+    class _Orchestrator:
+        async def run(self, _state):
+            raise AssertionError("active head must not be reviewed")
+
+    app = FastAPI()
+    app.include_router(webhook_router)
+    app.state.db = _SlowDB()
+    app.state.webhook_secret = "s3cret"
+    app.state.review_semaphore = asyncio.Semaphore(1)
+    app.state.review_tasks = set()
+    app.state.github_client = _GitHub()
+    app.state.orchestrator = _Orchestrator()
+
+    payload = {
+        "action": "opened",
+        "pull_request": {"number": 9, "head": {"sha": "slowdb"}, "base": {"sha": "base"}},
+        "repository": {"full_name": "acme/app"},
+    }
+    body = json.dumps(payload).encode()
+    signature = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+
+    # The timer prevents a broken synchronous implementation from hanging the
+    # suite forever; such an implementation still takes ~1s and fails below.
+    safety_release = threading.Timer(1.0, release.set)
+    safety_release.start()
+    try:
+        with TestClient(app) as client:
+            before = time.perf_counter()
+            response = client.post(
+                "/webhook/github",
+                content=body,
+                headers={"X-Hub-Signature-256": signature, "X-GitHub-Event": "pull_request"},
+            )
+            elapsed = time.perf_counter() - before
+            assert started.wait(timeout=0.5)
+            assert response.status_code == 200
+            assert response.json()["status"] == "review_triggered"
+            assert elapsed < 0.4
+            release.set()
+    finally:
+        release.set()
+        safety_release.cancel()
 
 
 async def test_webhook_retriggers_failed_partial_run(tmp_path):

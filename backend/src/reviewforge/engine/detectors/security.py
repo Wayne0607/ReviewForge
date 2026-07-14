@@ -16,6 +16,7 @@ from reviewforge.engine.detectors.base import (
     normalize_category_for_detector,
     safe_confidence,
 )
+from reviewforge.engine.detectors.unified_diff import iter_added_lines
 from reviewforge.engine.symbol_extractor import detect_language
 
 
@@ -223,9 +224,17 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             r"\bdangerouslySetInnerHTML\b",
             "xss",
             "warning",
-            "Potentially unsafe DOM rendering call.",
+            "dangerouslySetInnerHTML renders potentially unsafe DOM content.",
             "Sanitize user HTML before rendering.",
             0.9,
+        ),
+        _Rule(
+            r"\bwindow\.location(?:\.href)?\s*=(?!\s*[\"'`])\s*",
+            "open-redirect",
+            "error",
+            "A dynamic value is assigned to the browser location.",
+            "Allow-list same-origin destinations before navigating.",
+            0.96,
         ),
         _Rule(
             r"\bchild_process\.(?:exec|execSync|spawn)\s*\(",
@@ -270,14 +279,6 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.9,
         ),
         _Rule(
-            r"\[innerHTML\]",
-            "xss",
-            "warning",
-            "Angular innerHTML binding detected.",
-            "Sanitize untrusted HTML before binding.",
-            0.91,
-        ),
-        _Rule(
             r"\bbypassSecurityTrust(?:Html|Script|Style|Url|ResourceUrl)\s*\(",
             "xss-bypass",
             "warning",
@@ -289,9 +290,17 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             r"\bdangerouslySetInnerHTML\b",
             "xss",
             "warning",
-            "Potentially unsafe DOM rendering call.",
+            "dangerouslySetInnerHTML renders potentially unsafe DOM content.",
             "Sanitize untrusted markup before render.",
             0.9,
+        ),
+        _Rule(
+            r"\bwindow\.location(?:\.href)?\s*=(?!\s*[\"'`])\s*",
+            "open-redirect",
+            "error",
+            "A dynamic value is assigned to the browser location.",
+            "Allow-list same-origin destinations before navigating.",
+            0.96,
         ),
         _Rule(
             r"\bchild_process\.(?:exec|execSync|spawn|spawnSync)\s*\(",
@@ -484,6 +493,14 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.9,
         ),
         _Rule(
+            r"\bFile\.(?:read|binread|open)\s*\(\s*(?:params|user_input|request)(?:\s*\[|\.)",
+            "path-traversal",
+            "error",
+            "A filesystem API receives a path directly from request data.",
+            "Resolve the path under an allow-listed root before opening it.",
+            0.96,
+        ),
+        _Rule(
             r"\bOpen3\.(?:capture|popen)",
             "command-injection",
             "warning",
@@ -514,8 +531,8 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             "unsafe-block",
             "warning",
             "Unsafe block or function used.",
-            "Limit unsafe scope and add safety assertions.",
-            0.72,
+            "Limit unsafe scope, document the # Safety contract for public APIs, and add safety assertions.",
+            0.96,
         ),
         _Rule(
             r"\btransmute(?:::)?\s*<",
@@ -524,14 +541,6 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             "transmute usage found.",
             "Avoid transmute unless ABI requirements are strict.",
             0.9,
-        ),
-        _Rule(
-            r"\bunwrap\(\)",
-            "unsafe-usage",
-            "warning",
-            "unwrap usage in security-sensitive code.",
-            "Propagate errors instead of unwrap.",
-            0.52,
         ),
         _Rule(
             r"\bfs::(?:read|read_to_string|read_dir)\s*\(\s*&?path",
@@ -560,12 +569,12 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.82,
         ),
         _Rule(
-            r"\bwindow\.location(?:\.href)?\s*=",
+            r"\bwindow\.location(?:\.href)?\s*=(?!\s*[\"'`])\s*",
             "open-redirect",
-            "warning",
+            "error",
             "Redirect target is assigned dynamically.",
             "Validate redirect destinations against an allow-list.",
-            0.86,
+            0.96,
         ),
         _Rule(
             r"@click\.native",
@@ -902,6 +911,245 @@ def _ignored_span_at(line_no: int, match_start: int, ignored: dict[int, list[_Ig
     )
 
 
+_PYTHON_PATH_BUILDERS = {"os.path.join", "pathlib.Path", "Path"}
+_PYTHON_PATH_SINKS = {"open", "os.open"}
+_PYTHON_PATH_SANITIZERS = {"os.path.basename", "secure_filename"}
+
+
+def _python_call_name(node: ast.Call) -> str:
+    parts: list[str] = []
+    target: ast.expr = node.func
+    while isinstance(target, ast.Attribute):
+        parts.append(target.attr)
+        target = target.value
+    if isinstance(target, ast.Name):
+        parts.append(target.id)
+    return ".".join(reversed(parts))
+
+
+def _contains_name(node: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(child, ast.Name) and child.id in names for child in ast.walk(node))
+
+
+def _assigned_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return {child.id for target in targets for child in ast.walk(target) if isinstance(child, ast.Name)}
+
+
+def _python_added_tree(diff: str) -> ast.Module | None:
+    additions = iter_added_lines(diff or "")
+    if not additions:
+        return None
+    last_line = max(line for line, _content in additions)
+    if last_line > 20_000:
+        return None
+    source = [""] * last_line
+    for line_no, content in additions:
+        source[line_no - 1] = content
+    try:
+        return ast.parse("\n".join(source) + "\n")
+    except SyntaxError:
+        return None
+
+
+def _python_dynamic_path_sinks(diff: str) -> list[int]:
+    """Find unguarded request-derived path construction reaching a file sink.
+
+    This deliberately requires a data-flow edge through a path builder. A
+    generic helper that merely accepts ``path`` and opens it is not enough to
+    claim traversal; direct request data joined beneath a root is.
+    """
+
+    tree = _python_added_tree(diff)
+    if tree is None:
+        return []
+
+    sinks: set[int] = set()
+    scopes: list[ast.AST] = [
+        tree,
+        *(node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
+    ]
+    for scope in scopes:
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            parameters = {
+                arg.arg
+                for arg in (*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs)
+                if re.search(r"(?:user|input|request|param|file|path|name)", arg.arg, re.IGNORECASE)
+            }
+            if scope.args.vararg:
+                parameters.add(scope.args.vararg.arg)
+            if scope.args.kwarg:
+                parameters.add(scope.args.kwarg.arg)
+            nodes = [node for node in ast.walk(scope) if node is not scope]
+        else:
+            parameters = set()
+            nodes = list(ast.walk(scope))
+
+        tainted = set(parameters)
+        built_paths: set[str] = set()
+        guarded: set[str] = set()
+        for node in sorted(nodes, key=lambda item: (getattr(item, "lineno", 0), getattr(item, "col_offset", 0))):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                if value is None:
+                    continue
+                names = _assigned_names(node)
+                call_name = _python_call_name(value) if isinstance(value, ast.Call) else ""
+                if call_name in _PYTHON_PATH_SANITIZERS:
+                    guarded.update(names)
+                    tainted.difference_update(names)
+                    built_paths.difference_update(names)
+                elif _contains_name(value, tainted):
+                    tainted.update(names)
+                    if call_name in _PYTHON_PATH_BUILDERS or isinstance(value, (ast.BinOp, ast.JoinedStr)):
+                        built_paths.update(names)
+
+            if isinstance(node, ast.Call):
+                call_name = _python_call_name(node)
+                method_name = call_name.rsplit(".", 1)[-1]
+                if method_name in {"is_relative_to", "relative_to", "validate_path"}:
+                    guarded.update(
+                        child.id for child in ast.walk(node) if isinstance(child, ast.Name) and child.id in tainted
+                    )
+                first_arg = node.args[0] if node.args else None
+                direct_built_path = (
+                    isinstance(first_arg, ast.Call)
+                    and _python_call_name(first_arg) in _PYTHON_PATH_BUILDERS
+                    and _contains_name(first_arg, tainted)
+                )
+                tainted_built_name = bool(first_arg is not None and _contains_name(first_arg, built_paths - guarded))
+                method_sink = method_name in {
+                    "read_text",
+                    "read_bytes",
+                    "write_text",
+                    "write_bytes",
+                    "unlink",
+                }
+                receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+                receiver_built_path = bool(
+                    method_sink
+                    and receiver is not None
+                    and (
+                        _contains_name(receiver, built_paths - guarded)
+                        or (
+                            isinstance(receiver, ast.Call)
+                            and _python_call_name(receiver) in _PYTHON_PATH_BUILDERS
+                            and _contains_name(receiver, tainted)
+                        )
+                    )
+                )
+                if (call_name in _PYTHON_PATH_SINKS or method_sink) and (
+                    direct_built_path or tainted_built_name or receiver_built_path
+                ):
+                    sinks.add(node.lineno)
+    return sorted(sinks)
+
+
+def _python_open_redirect_sinks(diff: str) -> list[int]:
+    """Find redirect helpers that return an unvalidated destination argument."""
+
+    tree = _python_added_tree(diff)
+    if tree is None:
+        return []
+    sinks: set[int] = set()
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not re.search(
+            r"(?:build|make|create|validate|safe).*redirect|redirect.*(?:url|uri)",
+            function.name,
+            re.IGNORECASE,
+        ):
+            continue
+        destination_args = {
+            arg.arg
+            for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs)
+            if re.search(r"(?:next|redirect|return|target|dest|url|location)", arg.arg, re.IGNORECASE)
+        }
+        for destination in destination_args:
+            guard_names = {destination}
+            for assignment in (node for node in ast.walk(function) if isinstance(node, (ast.Assign, ast.AnnAssign))):
+                value = assignment.value
+                if (
+                    value is not None
+                    and _contains_name(value, {destination})
+                    and isinstance(value, ast.Call)
+                    and _python_call_name(value).rsplit(".", 1)[-1].lower() == "urlparse"
+                ):
+                    guard_names.update(_assigned_names(assignment))
+            guarded = False
+            for conditional in (node for node in ast.walk(function) if isinstance(node, ast.If)):
+                if not _contains_name(conditional.test, guard_names):
+                    continue
+                guard_calls = {
+                    _python_call_name(node).rsplit(".", 1)[-1].lower()
+                    for node in ast.walk(conditional.test)
+                    if isinstance(node, ast.Call)
+                }
+                membership_guard = any(
+                    any(isinstance(operator, (ast.In, ast.NotIn)) for operator in comparison.ops)
+                    for comparison in ast.walk(conditional.test)
+                    if isinstance(comparison, ast.Compare)
+                )
+                if (
+                    guard_calls
+                    & {
+                        "startswith",
+                        "is_relative_to",
+                        "is_safe_redirect",
+                        "validate_redirect",
+                        "urlparse",
+                    }
+                    or membership_guard
+                ):
+                    guarded = True
+                    break
+            if guarded:
+                continue
+            for returned in (node for node in ast.walk(function) if isinstance(node, ast.Return)):
+                if isinstance(returned.value, ast.Name) and returned.value.id == destination:
+                    sinks.add(returned.lineno)
+    return sorted(sinks)
+
+
+def _hunk_lines_for_right_line(diff: str, line_no: int) -> tuple[list[tuple[int, str, bool]], int] | None:
+    for hunk in _postimage_hunks(diff):
+        for index, (right_line, _content, _added) in enumerate(hunk):
+            if right_line == line_no:
+                return hunk, index
+    return None
+
+
+def _rust_unsafe_has_safety_evidence(diff: str, line_no: int) -> bool:
+    location = _hunk_lines_for_right_line(diff, line_no)
+    if location is None:
+        return False
+    hunk, index = location
+    context = "\n".join(content for _line, content, _added in hunk[max(0, index - 4) : index])
+    return bool(re.search(r"\bSAFETY\s*:", context, re.IGNORECASE))
+
+
+def _browser_redirect_is_guarded(diff: str, line_no: int, source_line: str) -> bool:
+    assignment = re.search(r"=\s*(?P<target>[A-Za-z_$][\w$]*)", source_line)
+    if not assignment:
+        return False
+    target = assignment.group("target")
+    if re.search(r"=\s*(?:safe|validate|allow)\w*\s*\(", source_line, re.IGNORECASE):
+        return True
+    location = _hunk_lines_for_right_line(diff, line_no)
+    if location is None:
+        return False
+    hunk, index = location
+    context = "\n".join(content for _line, content, _added in hunk[max(0, index - 10) : index])
+    escaped = re.escape(target)
+    guards = (
+        rf"(?:allow(?:ed|list)?|safe\w*)\s*\.\s*(?:includes|has)\s*\(\s*{escaped}\s*\)",
+        rf"{escaped}\s*\.\s*startsWith\s*\(",
+        rf"(?:isSafeRedirect|validateRedirect|isAllowedUrl)\s*\(\s*{escaped}\s*\)",
+    )
+    return any(re.search(pattern, context, re.IGNORECASE) for pattern in guards)
+
+
 def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
     """Scan modified file diffs for deterministic security findings."""
 
@@ -970,6 +1218,14 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     and _is_static_python_eval(match.string, match.start())
                 ):
                     continue
+                if (
+                    language == "rust"
+                    and rule.category == "unsafe-block"
+                    and _rust_unsafe_has_safety_evidence(diff, line_no)
+                ):
+                    continue
+                if rule.category == "open-redirect" and _browser_redirect_is_guarded(diff, line_no, match.string):
+                    continue
                 findings.append(
                     DetectorFinding(
                         file=file_path,
@@ -982,7 +1238,47 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     )
                 )
 
-    return dedupe_findings(findings)
+        if language == "python":
+            for line_no in _python_dynamic_path_sinks(diff):
+                findings.append(
+                    DetectorFinding(
+                        file=file_path,
+                        line=line_no,
+                        severity="error",
+                        category="path-traversal",
+                        message="Request-derived path data reaches a filesystem sink after dynamic path construction.",
+                        suggestion="Resolve the candidate path and enforce that it remains below the intended root.",
+                        confidence=_detector_confidence(file_path, 0.96),
+                    )
+                )
+            for line_no in _python_open_redirect_sinks(diff):
+                findings.append(
+                    DetectorFinding(
+                        file=file_path,
+                        line=line_no,
+                        severity="error",
+                        category="open-redirect",
+                        message="A redirect helper returns an unvalidated destination argument.",
+                        suggestion=(
+                            "Allow-list local destinations or validate scheme, host, and origin before redirecting."
+                        ),
+                        confidence=_detector_confidence(file_path, 0.96),
+                    )
+                )
+
+    deduped = dedupe_findings(findings)
+    transmute_lines: dict[str, set[int]] = {}
+    for finding in deduped:
+        if finding.category == "unsafe-transmute":
+            transmute_lines.setdefault(finding.file, set()).add(finding.line)
+    return [
+        finding
+        for finding in deduped
+        if not (
+            finding.category == "unsafe-block"
+            and any(abs(finding.line - line) <= 1 for line in transmute_lines.get(finding.file, set()))
+        )
+    ]
 
 
 def normalize_language(file_path: str) -> str:

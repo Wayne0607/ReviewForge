@@ -5,6 +5,7 @@ Extracts from diffs and full file content. Supports Python, JavaScript/TypeScrip
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from dataclasses import dataclass
@@ -101,7 +102,7 @@ DEFINITION_PATTERNS: dict[str, list[tuple[str, str]]] = {
         # Class/object methods (including Vue methods and Angular class methods).
         (
             r"^\s*(?:(?:public|private|protected|static|readonly|override|abstract|async)\s+)*"
-            r"(?!if\b|for\b|while\b|switch\b|catch\b)(\w+)\s*\([^;]*\)\s*(?::[^={]+)?\s*\{",
+            r"(?!if\b|for\b|while\b|switch\b|catch\b)(\w+)\s*\([^;{}]*\)\s*(?::[^={]+)?\s*\{",
             "function",
         ),
     ],
@@ -172,6 +173,11 @@ class SymbolInfo:
     symbol_type: str  # 'function' / 'class'
     file_path: str
     line: int = 0
+    # Inclusive source range owned by this declaration. ``start_line`` can
+    # precede ``line`` for decorators/annotations/doc comments. A zero
+    # ``end_line`` means the extractor could not prove a safe boundary.
+    start_line: int = 0
+    end_line: int = 0
 
 
 @dataclass
@@ -364,27 +370,218 @@ def extract_imports(content: str, file_path: str) -> list[ImportInfo]:
 
 
 def extract_definitions(content: str, file_path: str) -> list[SymbolInfo]:
-    """Extract function and class definitions from file content."""
+    """Extract function/class definitions and their reliable source ranges."""
     lang = detect_language(file_path)
     patterns = DEFINITION_PATTERNS.get(lang, [])
-    symbols = []
+    symbols: list[SymbolInfo] = []
+    seen: set[tuple[str, str, int]] = set()
+
+    # Search the complete source instead of one physical line at a time. This
+    # keeps Java/TypeScript method declarations with multi-line signatures
+    # visible to patterns that intentionally span whitespace/newlines.
+    for pattern, sym_type in patterns:
+        for match in re.finditer(pattern, content, re.MULTILINE):
+            line = content[: match.start(1)].count("\n") + 1
+            key = (match.group(1), sym_type, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            symbols.append(
+                SymbolInfo(
+                    name=match.group(1),
+                    symbol_type=sym_type,
+                    file_path=file_path,
+                    line=line,
+                    start_line=_match_declaration_start(content, match, line),
+                )
+            )
+
+    symbols.sort(key=lambda item: (item.line, item.symbol_type != "class", item.name))
+    _populate_symbol_ranges(content, lang, symbols)
+    return symbols
+
+
+def _match_declaration_start(content: str, match: re.Match[str], fallback: int) -> int:
+    """Return the first non-whitespace line in a possibly multi-line signature."""
+
+    prefix = content[match.start() : match.start(1)]
+    first_token = re.search(r"\S", prefix)
+    if first_token is None:
+        return fallback
+    return content[: match.start() + first_token.start()].count("\n") + 1
+
+
+def _populate_symbol_ranges(content: str, lang: str, symbols: list[SymbolInfo]) -> None:
+    """Populate inclusive declaration ranges without guessing past unknown syntax."""
+
+    if not symbols:
+        return
     lines = content.split("\n")
 
-    for i, line in enumerate(lines):
-        for pattern, sym_type in patterns:
-            match = re.search(pattern, line)
-            if match:
-                symbols.append(
-                    SymbolInfo(
-                        name=match.group(1),
-                        symbol_type=sym_type,
-                        file_path=file_path,
-                        line=i + 1,
-                    )
-                )
-                break  # One match per line
+    if lang == "python" and _populate_python_ranges(content, symbols):
+        return
 
-    return symbols
+    for symbol in symbols:
+        symbol.start_line = _leading_declaration_start(lines, symbol.start_line or symbol.line, lang)
+        if lang in {"go", "java", "javascript", "typescript", "rust"}:
+            symbol.end_line = _find_braced_symbol_end(lines, symbol.line)
+        elif lang == "ruby":
+            symbol.end_line = _find_ruby_symbol_end(lines, symbol.line)
+
+
+def _populate_python_ranges(content: str, symbols: list[SymbolInfo]) -> bool:
+    """Use Python's parser for decorator, multi-line signature and body bounds."""
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False
+
+    by_key = {(symbol.name, symbol.line, symbol.symbol_type): symbol for symbol in symbols}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbol_type = "function"
+        elif isinstance(node, ast.ClassDef):
+            symbol_type = "class"
+        else:
+            continue
+
+        symbol = by_key.get((node.name, node.lineno, symbol_type))
+        if symbol is None:
+            continue
+        decorators = [item.lineno for item in node.decorator_list]
+        symbol.start_line = min([node.lineno, *decorators])
+        symbol.end_line = node.end_lineno or 0
+    return True
+
+
+def _leading_declaration_start(lines: list[str], definition_line: int, lang: str) -> int:
+    """Include contiguous comments/annotations that document a declaration."""
+
+    start = definition_line
+    index = definition_line - 2
+
+    while index >= 0:
+        stripped = lines[index].strip()
+        if not stripped:
+            break
+
+        is_comment = stripped.startswith(("//", "#", "/*", "*", "*/"))
+        is_annotation = lang in {"java", "javascript", "typescript"} and stripped.startswith("@")
+
+        annotation_start = None
+        if lang in {"java", "javascript", "typescript"}:
+            annotation_start = _multiline_annotation_start(lines, index)
+        if annotation_start is not None:
+            start = annotation_start
+            index = annotation_start - 2
+            continue
+
+        if not (is_comment or is_annotation):
+            break
+        start = index + 1
+        index -= 1
+
+    return start
+
+
+def _multiline_annotation_start(lines: list[str], end_index: int) -> int | None:
+    """Return a bounded ``@Annotation(...)`` start ending at ``end_index``."""
+
+    stripped = lines[end_index].strip()
+    if not stripped.endswith(")"):
+        return None
+
+    depth = 0
+    for index in range(end_index, max(-1, end_index - 20), -1):
+        candidate = lines[index].strip()
+        if not candidate:
+            return None
+        depth += candidate.count(")") - candidate.count("(")
+        if candidate.startswith("@"):
+            return index + 1 if depth == 0 else None
+        # ``foo()`` or another complete expression immediately before a
+        # declaration is not an annotation continuation.
+        if depth <= 0:
+            return None
+    return None
+
+
+def _find_braced_symbol_end(lines: list[str], definition_line: int) -> int:
+    """Find a balanced brace body's inclusive end, ignoring strings/comments."""
+
+    depth = 0
+    started = False
+    quote = ""
+    escaped = False
+    block_comment = False
+
+    for line_index in range(definition_line - 1, len(lines)):
+        line = lines[line_index]
+        index = 0
+        while index < len(line):
+            char = line[index]
+            pair = line[index : index + 2]
+
+            if block_comment:
+                if pair == "*/":
+                    block_comment = False
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\" and quote != "`":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+                index += 1
+                continue
+            if pair == "//":
+                break
+            if pair == "/*":
+                block_comment = True
+                index += 2
+                continue
+            if char in {'"', "'", "`"}:
+                quote = char
+                index += 1
+                continue
+            if char == "{":
+                depth += 1
+                started = True
+            elif char == "}" and started:
+                depth -= 1
+                if depth == 0:
+                    return line_index + 1
+            index += 1
+
+        # A declaration without an opening brace should not scan arbitrarily
+        # far into another symbol and manufacture a range.
+        if not started and line_index + 1 - definition_line >= 12:
+            return 0
+
+    return 0
+
+
+def _find_ruby_symbol_end(lines: list[str], definition_line: int) -> int:
+    """Find a Ruby declaration's matching ``end`` for common block syntax."""
+
+    depth = 0
+    opener = re.compile(r"^(?:def|class|module|if|unless|case|begin|while|until|for)\b|\bdo\s*(?:\|.*\|)?\s*$")
+    for index in range(definition_line - 1, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if opener.search(stripped):
+            depth += 1
+        if re.match(r"^end\b", stripped):
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return 0
 
 
 def extract_calls(content: str, file_path: str) -> list[CallInfo]:
@@ -561,14 +758,15 @@ def extract_diff_symbols(diff_content: str, file_path: str) -> tuple[list[Symbol
     if not added_lines:
         return [], []
 
-    # Join multi-line imports (Python: from x import (\n  a,\n  b,\n)) while
-    # retaining the first source line as the import's review-comment anchor.
+    # Definitions retain every physical line so their source ranges stay
+    # meaningful. Imports use a joined view while retaining the first source
+    # line as their review-comment anchor.
+    added_content = "\n".join(line for _line_no, line in added_lines)
     joined_lines = _join_multiline_import_lines(added_lines)
-    added_content = "\n".join(line for _line_no, line in joined_lines)
 
     symbols = extract_definitions(added_content, file_path)
-    imports = extract_imports(added_content, file_path)
-    symbols = [item for item in symbols if _remap_item_line(item, joined_lines)]
+    imports = extract_imports("\n".join(line for _line_no, line in joined_lines), file_path)
+    symbols = [item for item in symbols if _remap_symbol_range(item, added_lines)]
     imports = [item for item in imports if _remap_item_line(item, joined_lines)]
     return symbols, imports
 
@@ -598,6 +796,36 @@ def _remap_item_line(item: SymbolInfo | ImportInfo | CallInfo, mapped_lines: lis
     if relative_line <= 0 or relative_line > len(mapped_lines):
         return False
     item.line = mapped_lines[relative_line - 1][0]
+    return True
+
+
+def _remap_symbol_range(item: SymbolInfo, mapped_lines: list[tuple[int, str]]) -> bool:
+    """Remap a relative range only when every coordinate remains contiguous."""
+
+    relative_line = item.line
+    if relative_line <= 0 or relative_line > len(mapped_lines):
+        return False
+
+    item.line = mapped_lines[relative_line - 1][0]
+    relative_start = item.start_line or relative_line
+    relative_end = item.end_line
+    if relative_start <= 0 or relative_start > len(mapped_lines) or relative_end < relative_start:
+        item.start_line = item.line
+        item.end_line = 0
+        return True
+    if relative_end > len(mapped_lines):
+        item.start_line = item.line
+        item.end_line = 0
+        return True
+
+    mapped_range = [line for line, _content in mapped_lines[relative_start - 1 : relative_end]]
+    if any(right != left + 1 for left, right in zip(mapped_range, mapped_range[1:], strict=False)):
+        item.start_line = item.line
+        item.end_line = 0
+        return True
+
+    item.start_line = mapped_range[0]
+    item.end_line = mapped_range[-1]
     return True
 
 

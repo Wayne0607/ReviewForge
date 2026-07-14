@@ -15,10 +15,10 @@
 - Check: use `v-text` or `{{ }}` interpolation instead (auto-escapes)
 
 ### Angular
-- `[innerHTML]="userContent"` — raw HTML binding
+- Ordinary `[innerHTML]="userContent"` is sanitized by Angular; do not report it alone
 - `bypassSecurityTrustHtml(userContent)` — explicitly marks as safe, skipping sanitization
 - `bypassSecurityTrustScript()`, `bypassSecurityTrustStyle()`, `bypassSecurityTrustResourceUrl()`, `bypassSecurityTrustUrl()`
-- Check: only use bypass functions with trusted, static content (never user input)
+- Check: only use bypass functions with trusted, static content (never user input); require bypass evidence rather than treating every `[innerHTML]` binding as vulnerable
 
 ### Svelte
 - `{@html userContent}` — raw HTML rendering

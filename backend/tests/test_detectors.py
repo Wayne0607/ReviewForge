@@ -30,6 +30,7 @@ def test_security_detector_covers_core_languages():
             "User.java": _diff("Runtime.getRuntime().exec(cmd)\nStatement stmt = c.createStatement();"),
             "pay.rb": _diff('eval(params[:code])\nsystem("notify #{email}")\nMarshal.load(raw)'),
             "lib.rs": _diff("Command::new(cmd).output().unwrap()\nunsafe { std::mem::transmute::<[u8; 4], u32>(buf) }"),
+            "raw.rs": _diff("pub unsafe fn read(ptr: *const u8) -> u8 { *ptr }"),
         }
     )
 
@@ -43,8 +44,142 @@ def test_security_detector_covers_core_languages():
         "data-leak",
         "unsafe-block",
         "unsafe-transmute",
-        "unsafe-usage",
     } <= _cats(findings)
+
+    rust_findings = [finding for finding in findings if finding.file == "lib.rs"]
+    assert all(finding.category != "unsafe-usage" for finding in rust_findings)
+    assert [finding.category for finding in rust_findings].count("unsafe-transmute") == 1
+    assert all(finding.category != "unsafe-block" for finding in rust_findings)
+    raw_unsafe = next(
+        finding for finding in findings if finding.file == "raw.rs" and finding.category == "unsafe-block"
+    )
+    assert raw_unsafe.confidence >= 0.96
+
+
+def test_rust_unwrap_is_not_mislabeled_as_unsafe_security_usage():
+    findings = detect_security_findings({"lib.rs": _diff("let value = result.unwrap();")})
+
+    assert findings == []
+
+
+def test_browser_redirect_detector_requires_a_dynamic_destination():
+    findings = detect_security_findings(
+        {
+            "view.jsx": _diff(
+                "window.location.href = next;\n"
+                "window.location = '/account';\n"
+                'window.location.href = "https://example.invalid/help";'
+            ),
+            "view.vue": _diff("window.location.href = target"),
+            "safe.tsx": _diff(
+                "function go(url: string) {\n"
+                "  const allowed = ['/home', '/settings'];\n"
+                "  if (allowed.includes(url)) {\n"
+                "    window.location.href = url;\n"
+                "  }\n"
+                "}"
+            ),
+        }
+    )
+
+    redirects = [finding for finding in findings if finding.category == "open-redirect"]
+    assert {(finding.file, finding.line) for finding in redirects} == {("view.jsx", 1), ("view.vue", 1)}
+    assert all(finding.confidence >= 0.96 for finding in redirects)
+
+
+def test_rust_safety_comment_suppresses_generic_unsafe_audit_but_undocumented_unsafe_remains():
+    findings = detect_security_findings(
+        {
+            "safe.rs": _diff(
+                "pub fn read(data: &[u8; 4]) -> u32 {\n"
+                "    // SAFETY: the four initialized bytes are valid for this unaligned read.\n"
+                "    unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<u32>()) }\n"
+                "}"
+            ),
+            "unsafe.rs": _diff("pub unsafe fn read(ptr: *const u8) -> u8 {\n    *ptr\n}"),
+        }
+    )
+
+    unsafe_blocks = [finding for finding in findings if finding.category == "unsafe-block"]
+    assert [(finding.file, finding.line) for finding in unsafe_blocks] == [("unsafe.rs", 1)]
+
+
+def test_ruby_direct_request_path_reaching_file_read_is_detected():
+    findings = detect_security_findings(
+        {
+            "loader.rb": _diff(
+                "safe = File.read('/srv/config.yml')\nunsafe = YAML.load(File.read(user_input[:config_path]))"
+            )
+        }
+    )
+
+    assert ("loader.rb", 2, "path-traversal") in {
+        (finding.file, finding.line, finding.category) for finding in findings
+    }
+
+
+def test_python_request_path_builder_reaching_open_is_detected_but_basename_is_clean():
+    findings = detect_security_findings(
+        {
+            "loader.py": _diff(
+                "import os\n"
+                "def load(filename):\n"
+                "    path = os.path.join('/srv/data', filename)\n"
+                "    with open(path) as handle:\n"
+                "        return handle.read()"
+            ),
+            "safe_loader.py": _diff(
+                "import os\n"
+                "def load(filename):\n"
+                "    safe_name = os.path.basename(filename)\n"
+                "    path = os.path.join('/srv/data', safe_name)\n"
+                "    with open(path) as handle:\n"
+                "        return handle.read()"
+            ),
+            "path_loader.py": _diff(
+                "from pathlib import Path\n"
+                "def load(filename):\n"
+                "    path = Path('/srv/data') / filename\n"
+                "    return path.read_text()"
+            ),
+        }
+    )
+
+    traversal = [finding for finding in findings if finding.category == "path-traversal"]
+    assert {(finding.file, finding.line) for finding in traversal} == {
+        ("loader.py", 4),
+        ("path_loader.py", 4),
+    }
+    assert all(finding.confidence >= 0.96 for finding in traversal)
+
+
+def test_python_redirect_helper_requires_destination_validation():
+    findings = detect_security_findings(
+        {
+            "redirects.py": _diff(
+                "def build_redirect_url(next_url: str) -> str:\n"
+                "    return next_url\n"
+                "\n"
+                "def safe_redirect(next_url: str) -> str:\n"
+                "    if next_url.startswith('/'):\n"
+                "        return next_url\n"
+                "    return '/home'\n"
+                "\n"
+                "def validated_redirect(next_url: str) -> str:\n"
+                "    parsed = urlparse(next_url)\n"
+                "    if parsed.netloc or not parsed.path.startswith('/app/'):\n"
+                "        return '/app/home'\n"
+                "    return next_url\n"
+                "\n"
+                "def redirect_destination(next_url: str) -> str:\n"
+                "    return next_url"
+            )
+        }
+    )
+
+    redirects = [finding for finding in findings if finding.category == "open-redirect"]
+    assert [(finding.file, finding.line) for finding in redirects] == [("redirects.py", 2)]
+    assert redirects[0].confidence >= 0.96
 
 
 def test_dependency_detector_covers_manifests_and_ci_without_exact_pin_noise():
@@ -363,6 +498,7 @@ def test_xss_bypass_is_reserved_for_explicit_sanitizer_bypass():
             ),
             "view.go": _diff("return template.HTML(raw)"),
             "view.vue": _diff('<component :is="name" />'),
+            "safe-angular.ts": _diff('template: `<div [innerHTML]="raw"></div>`'),
         }
     )
 
@@ -370,6 +506,7 @@ def test_xss_bypass_is_reserved_for_explicit_sanitizer_bypass():
     bypass = [f for f in findings if f.category == "xss-bypass"]
     assert len(bypass) == 1
     assert bypass[0].file == "view.tsx"
+    assert all(finding.file != "safe-angular.ts" for finding in findings)
 
 
 class EmptyLLM:

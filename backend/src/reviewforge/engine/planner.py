@@ -144,11 +144,6 @@ _PERFORMANCE_PATTERNS = [
 ]
 
 # ── 测试模式（通用）───────────────────────────────────────────────────
-_TESTING_PATTERNS = [
-    (r"def\s+\w+\([^)]*\)\s*->", "has-type-hints"),
-    (r"class\s+\w+:", "new-class"),
-]
-
 # ── 可访问性模式（仅前端文件）─────────────────────────────────────────
 _A11Y_PATTERNS = [
     (r"(?:<img|<Image|<picture)", "image-element"),
@@ -184,7 +179,7 @@ class Planner:
         forced_reviewers = {
             r
             for r in (self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers)
-            if not _skip_reviewer_for_files(r, state.files_changed)
+            if not _skip_reviewer_for_change(r, state.files_changed, state.diff_summary)
         }
 
         # Detect language summary for the planner prompt
@@ -212,7 +207,7 @@ class Planner:
             t
             for t in self._parse_response(response.content, allowed_files=state.files_changed)
             if t.reviewer not in done_reviewers
-            and not _skip_reviewer_for_files(t.reviewer, t.files or state.files_changed)
+            and not _skip_reviewer_for_change(t.reviewer, t.files or state.files_changed, state.diff_summary)
             and not (cross_pr_wrapper and _is_low_signal_reviewer(t.reviewer))
         ]
 
@@ -268,13 +263,10 @@ class Planner:
                 logger.info(f"Performance pattern: {label}")
                 break
 
-        # --- Testing (only for non-test files) ---
-        if not all(_is_test_file(f) for f in file_set):
-            for pattern, label in _TESTING_PATTERNS:
-                if re.search(pattern, diff, re.IGNORECASE | re.MULTILINE):
-                    forced.add("testing_reviewer")
-                    logger.info(f"Testing pattern: {label}")
-                    break
+        # --- Testing (only when changed evidence can support a concrete defect) ---
+        if any(_is_test_file(file_path) for file_path in file_set) or _looks_like_security_test_regression(diff):
+            forced.add("testing_reviewer")
+            logger.info("Testing evidence changed")
 
         # --- Dependency ---
         dep_hit = False
@@ -523,6 +515,55 @@ def _skip_reviewer_for_files(reviewer: str, files: list[str]) -> bool:
         return False
     fixture_prefixes = ("test_fixtures/", "examples/", "docs/")
     return all(f.replace("\\", "/").startswith(fixture_prefixes) for f in files)
+
+
+def _skip_reviewer_for_change(reviewer: str, files: list[str], diff: str) -> bool:
+    """Apply evidence-aware routing for reviewers whose mission needs changed artifacts."""
+
+    if reviewer == "doc_reviewer":
+        normalized = [file_path.replace("\\", "/").lower() for file_path in files]
+        docs_changed = any(
+            path.startswith("docs/")
+            or path.rsplit("/", 1)[-1].startswith(("readme", "changelog", "contributing"))
+            or path.endswith((".md", ".mdx", ".rst", ".adoc"))
+            for path in normalized
+        )
+        return not docs_changed
+    if _skip_reviewer_for_files(reviewer, files):
+        return True
+    if reviewer == "testing_reviewer":
+        return not any(_is_test_file(file_path) for file_path in files) and not _looks_like_security_test_regression(
+            diff
+        )
+    return False
+
+
+def _looks_like_security_test_regression(diff: str) -> bool:
+    """Whether a security fix changed an existing guard and merits test review."""
+
+    removed_behavior = any(
+        line.startswith("-")
+        and not line.startswith("---")
+        and re.search(
+            r"(?:eval\s*\(|exec\s*\(|shell\s*=\s*true|innerhtml|yaml\.load|pickle\.load|"
+            r"authori[sz]|authenticat|permission|saniti[sz]|allow.?list)",
+            line,
+            re.IGNORECASE,
+        )
+        for line in (diff or "").splitlines()
+    )
+    added_guard = any(
+        line.startswith("+")
+        and not line.startswith("+++")
+        and re.search(
+            r"(?:saniti[sz]|escape|allow.?list|authori[sz]|authenticat|permission|"
+            r"preparedstatement|is_relative_to|safe_load)",
+            line,
+            re.IGNORECASE,
+        )
+        for line in (diff or "").splitlines()
+    )
+    return removed_behavior and added_guard
 
 
 def _is_low_signal_reviewer(reviewer: str) -> bool:

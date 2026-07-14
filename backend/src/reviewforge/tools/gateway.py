@@ -12,7 +12,7 @@ from typing import Any
 
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import StateStore
-from reviewforge.tools.github_api import GitHubClient
+from reviewforge.tools.github_api import MAX_REVIEW_COMMENTS_PER_REQUEST, GitHubClient
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ class ToolGateway:
             "read_file": self._read_file,
             "search_code": self._search_code,
             "post_comment": self._post_comment,
+            "post_review": self._post_review,
         }
         # Concurrent Phase-0 reads for one StateStore share a single PR-files
         # request. Entries live only while the bulk request is in flight; the
@@ -63,7 +64,7 @@ class ToolGateway:
                 raise PermissionError(f"{agent_name} 无权调用 {tool_name}")
 
         # D3: 策略 — 写工具仅限特定身份
-        if tool_name == "post_comment" and agent_name not in ("commenter", "orchestrator", ""):
+        if tool_name in {"post_comment", "post_review"} and agent_name not in ("commenter", "orchestrator", ""):
             raise PermissionError(f"{agent_name} 不允许直接发评论")
 
         # 四层门控第 2 层：Schema 校验 — 必填参数齐全且类型匹配 ToolSpec.input_schema
@@ -94,7 +95,7 @@ class ToolGateway:
                 raise ValueError(f"Tool '{tool_name}' param '{key}' must be {expected}")
 
     async def _read_diff(self, params: dict[str, Any], state: StateStore) -> str:
-        await self._ensure_file_diffs(state)
+        await self.ensure_file_diffs(state)
         file_path = params["file_path"]
         if state.file_diffs is not None and file_path in state.file_diffs:
             return state.file_diffs[file_path]
@@ -103,7 +104,7 @@ class ToolGateway:
         # per-run cache above and never re-fetch the paginated list.
         return await self._github.get_file_diff(state.repo, state.pr_number, file_path)
 
-    async def _ensure_file_diffs(self, state: StateStore) -> None:
+    async def ensure_file_diffs(self, state: StateStore) -> None:
         """Populate the per-run diff cache with one bulk PR-files request."""
 
         if state.file_diffs is not None:
@@ -151,3 +152,83 @@ class ToolGateway:
             line=params["line"],
             body=params["body"],
         )
+
+    async def _post_review(self, params: dict[str, Any], state: StateStore) -> dict[str, Any]:
+        comments = params["comments"]
+        if not comments or len(comments) > MAX_REVIEW_COMMENTS_PER_REQUEST:
+            raise ValueError(f"post_review requires between 1 and {MAX_REVIEW_COMMENTS_PER_REQUEST} comments")
+        for index, item in enumerate(comments):
+            if not isinstance(item, dict):
+                raise ValueError(f"post_review comment {index} must be an object")
+            if not isinstance(item.get("file_path"), str) or not item["file_path"]:
+                raise ValueError(f"post_review comment {index} has invalid file_path")
+            if isinstance(item.get("line"), bool) or not isinstance(item.get("line"), int):
+                raise ValueError(f"post_review comment {index} has invalid line")
+            if not isinstance(item.get("body"), str) or not item["body"]:
+                raise ValueError(f"post_review comment {index} has invalid body")
+
+        batch_method = getattr(self._github, "post_review_comments", None)
+        if callable(batch_method):
+            review = await batch_method(
+                repo=state.repo,
+                pr_number=state.pr_number,
+                commit_sha=state.head_sha,
+                comments=comments,
+            )
+            return {"delivered_indexes": list(range(len(comments))), "review": review, "compatibility": False}
+
+        # Compatibility for plugins/test clients that only implement the legacy
+        # single-comment method. Preserve per-item success so a later failure
+        # cannot cause already-delivered comments to be reposted.
+        delivered: list[int] = []
+        failures: list[dict[str, Any]] = []
+        for index, item in enumerate(comments):
+            try:
+                await self._github.post_review_comment(
+                    repo=state.repo,
+                    pr_number=state.pr_number,
+                    commit_sha=state.head_sha,
+                    file_path=item["file_path"],
+                    line=item["line"],
+                    body=item["body"],
+                )
+                delivered.append(index)
+            except Exception as exc:
+                error_text = str(exc)
+                lowered = error_text.lower()
+                kind = str(getattr(exc, "kind", "unknown"))
+                status_code = int(getattr(exc, "status_code", 0) or 0)
+                retryable = bool(getattr(exc, "retryable", False))
+                if status_code == 0:
+                    for candidate in (422, 429, 500, 502, 503, 504):
+                        if str(candidate) in lowered:
+                            status_code = candidate
+                            break
+                if kind == "unknown":
+                    if "spam" in lowered or "secondary rate limit" in lowered:
+                        kind = "spam"
+                    elif "rate limit" in lowered or status_code == 429:
+                        kind = "rate_limit"
+                    elif status_code == 422:
+                        kind = "validation"
+                    elif status_code >= 500:
+                        kind = "server"
+                    elif any(marker in lowered for marker in ("network", "timeout", "connection")):
+                        kind = "network"
+                if kind in {"spam", "rate_limit", "network", "server"}:
+                    retryable = True
+                failures.append(
+                    {
+                        "index": index,
+                        "error": error_text,
+                        "kind": kind,
+                        "status_code": status_code,
+                        "retryable": retryable,
+                        "response_body": str(getattr(exc, "response_body", "")),
+                    }
+                )
+        return {
+            "delivered_indexes": delivered,
+            "failures": failures,
+            "compatibility": True,
+        }

@@ -127,6 +127,18 @@ def test_mutable_ranges_are_never_reported_as_known_vulnerabilities():
     assert "dependency-version-range" in {finding.category for finding in findings}
 
 
+def test_event_stream_unbounded_or_compromised_release_reports_package_incident_history():
+    risky = detect_dependency_findings({"package.json": _diff('{"dependencies":{"event-stream":"*","safe":"1.0.0"}}')})
+    exact_safe = detect_dependency_findings({"package.json": _diff('{"dependencies":{"event-stream":"4.0.1"}}')})
+
+    supply_chain = [finding for finding in risky if finding.category == "supply-chain-risk"]
+    assert len(supply_chain) == 1
+    assert supply_chain[0].line == 1
+    assert "event-stream-compromise" in supply_chain[0].message
+    assert supply_chain[0].confidence >= 0.97
+    assert "supply-chain-risk" not in {finding.category for finding in exact_safe}
+
+
 def test_non_manifest_pr71_files_and_deletion_only_changes_are_clean():
     pr71_like = {
         "service_config.yaml": _diff("enabled: true"),

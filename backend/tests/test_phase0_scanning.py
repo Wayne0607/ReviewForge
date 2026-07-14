@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
 from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
 from reviewforge.core.specs import build_registry
@@ -269,7 +267,9 @@ async def test_successful_comment_updates_state_and_database_to_reported(tmp_pat
     finding = await _seed_confirmed_finding(db, state)
     orchestrator = _comment_orchestrator(github, db)
 
-    assert await orchestrator._post_comments([finding], state) == 1
+    result = await orchestrator._post_comments([finding], state)
+    assert result.reported == 1
+    assert result.transient_failures == 0
 
     assert state.get_finding(finding.id).status == "reported"
     rows = await db.get_findings(run_id="delivery-run")
@@ -278,18 +278,87 @@ async def test_successful_comment_updates_state_and_database_to_reported(tmp_pat
     await db.close()
 
 
-@pytest.mark.parametrize("github_type", [_RejectedCommentGitHub, _FailedCommentGitHub])
-async def test_failed_comment_leaves_state_and_database_confirmed(tmp_path, github_type):
+async def test_permanent_legacy_validation_retires_finding_in_state_and_database(tmp_path):
     db = Database(tmp_path / "rejected.db")
     await db.connect()
-    github = github_type({"app.py": _diff("import os\nos.system(user_command)")})
+    github = _RejectedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     state = _state(["app.py"])
     finding = await _seed_confirmed_finding(db, state)
     orchestrator = _comment_orchestrator(github, db)
 
-    assert await orchestrator._post_comments([finding], state) == 0
+    result = await orchestrator._post_comments([finding], state)
 
+    assert result.permanent_rejections == 1
+    assert result.transient_failures == 0
+    rejected = state.get_finding(finding.id)
+    assert rejected.status == "false_positive"
+    assert rejected.verified_by == "github-comment-validation"
+    assert "permanently rejected" in rejected.verify_reason
+    rows = await db.get_findings(run_id="delivery-run")
+    assert rows[0]["status"] == "false_positive"
+    assert rows[0]["verified_by"] == "github-comment-validation"
+    await db.close()
+
+
+async def test_transient_legacy_failure_leaves_finding_confirmed(tmp_path):
+    db = Database(tmp_path / "network.db")
+    await db.connect()
+    github = _FailedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
+    state = _state(["app.py"])
+    finding = await _seed_confirmed_finding(db, state)
+    orchestrator = _comment_orchestrator(github, db)
+
+    result = await orchestrator._post_comments([finding], state)
+
+    assert result.permanent_rejections == 0
+    assert result.transient_failures == 1
+    assert result.retryable is True
     assert state.get_finding(finding.id).status == "confirmed"
     rows = await db.get_findings(run_id="delivery-run")
     assert rows[0]["status"] == "confirmed"
+    await db.close()
+
+
+async def test_transient_comment_failure_marks_run_partial_and_resumable(tmp_path):
+    db = Database(tmp_path / "comment-retry.db")
+    await db.connect()
+    github = _FailedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
+    orchestrator, _events = _orchestrator(github, db=db)
+    orchestrator._planner = _NoTaskPlanner()
+    state = _state(["app.py"])
+
+    summary = await orchestrator.run(state)
+
+    assert summary["status"] == "partial"
+    assert summary["retryable"] is True
+    assert summary["comment_delivery"]["transient_failures"] == 1
+    assert summary["comment_delivery"]["reported"] == 0
+    assert state.list_findings(status="confirmed")
+    runs = await db.get_runs(repo=state.repo)
+    assert runs[0]["status"] == "failed"
+    assert await db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha) is False
+    assert await db.get_resumable_run(state.repo, state.pr_number, state.head_sha) is not None
+    await db.close()
+
+
+async def test_permanent_comment_validation_allows_run_to_complete(tmp_path):
+    db = Database(tmp_path / "comment-permanent.db")
+    await db.connect()
+    github = _RejectedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
+    orchestrator, _events = _orchestrator(github, db=db)
+    orchestrator._planner = _NoTaskPlanner()
+    state = _state(["app.py"])
+
+    summary = await orchestrator.run(state)
+
+    assert summary.get("status") != "partial"
+    assert summary["comment_delivery"]["permanent_rejections"] == 1
+    assert summary["comment_delivery"]["transient_failures"] == 0
+    assert summary["false_positives"] == 1
+    rejected = state.list_findings(status="false_positive")[0]
+    assert rejected.verified_by == "github-comment-validation"
+    assert rejected.verify_reason
+    runs = await db.get_runs(repo=state.repo)
+    assert runs[0]["status"] == "completed"
+    assert await db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha) is True
     await db.close()

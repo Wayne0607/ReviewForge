@@ -15,19 +15,10 @@ _HUNK_HEADER = re.compile(
 )
 
 
-def iter_added_lines(diff: str) -> list[tuple[int, str]]:
-    """Return ``(new_file_line, content)`` for mapped added lines.
+def _iter_right_lines(diff: str) -> list[tuple[int, str, bool]]:
+    """Return mapped post-image lines as ``(line, content, is_added)``."""
 
-    Only additions inside a syntactically valid unified-diff hunk are returned. If
-    GitHub omits/truncates a patch before a hunk header, there is no trustworthy
-    RIGHT-side anchor, so those ``+`` lines are intentionally ignored rather than
-    numbered relative to the patch text.
-
-    Already-parsed additions remain usable when the tail of a hunk is truncated:
-    their line numbers are fully determined by the hunk's ``+<start>`` coordinate.
-    """
-
-    additions: list[tuple[int, str]] = []
+    right_lines: list[tuple[int, str, bool]] = []
     old_line = 0
     new_line = 0
     old_remaining = 0
@@ -64,7 +55,7 @@ def iter_added_lines(diff: str) -> list[tuple[int, str]]:
             if new_remaining <= 0:
                 in_hunk = False
                 continue
-            additions.append((new_line, raw_line[1:]))
+            right_lines.append((new_line, raw_line[1:], True))
             new_line += 1
             new_remaining -= 1
         elif prefix == "-":
@@ -77,6 +68,7 @@ def iter_added_lines(diff: str) -> list[tuple[int, str]]:
             if old_remaining <= 0 or new_remaining <= 0:
                 in_hunk = False
                 continue
+            right_lines.append((new_line, raw_line[1:], False))
             old_line += 1
             new_line += 1
             old_remaining -= 1
@@ -88,4 +80,30 @@ def iter_added_lines(diff: str) -> list[tuple[int, str]]:
         if old_remaining == 0 and new_remaining == 0:
             in_hunk = False
 
-    return additions
+    return right_lines
+
+
+def iter_right_lines(diff: str) -> list[tuple[int, str]]:
+    """Return every commentable RIGHT-side line in valid unified-diff hunks.
+
+    GitHub permits inline review comments on additions and visible context lines,
+    but not deletion-only LEFT-side lines. Unanchored or malformed patch text is
+    ignored instead of inventing coordinates.
+    """
+
+    return [(line_no, content) for line_no, content, _is_added in _iter_right_lines(diff)]
+
+
+def iter_added_lines(diff: str) -> list[tuple[int, str]]:
+    """Return ``(new_file_line, content)`` for mapped added lines.
+
+    Only additions inside a syntactically valid unified-diff hunk are returned. If
+    GitHub omits/truncates a patch before a hunk header, there is no trustworthy
+    RIGHT-side anchor, so those ``+`` lines are intentionally ignored rather than
+    numbered relative to the patch text.
+
+    Already-parsed additions remain usable when the tail of a hunk is truncated:
+    their line numbers are fully determined by the hunk's ``+<start>`` coordinate.
+    """
+
+    return [(line_no, content) for line_no, content, is_added in _iter_right_lines(diff) if is_added]

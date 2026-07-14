@@ -16,8 +16,19 @@ def test_security_category_aliases_normalize():
     assert normalize_category("known-vulnerability") == "dependency-vulnerability"
     assert normalize_category("version-unpinned") == "dependency-version-range"
     assert normalize_category("dangerously-set-innerHTML") == "xss"
+    assert normalize_category("missing-alt-text") == "missing-alt"
+    assert normalize_category("alt-text") == "missing-alt"
+    assert normalize_category("missing-form-label") == "missing-label"
+    assert normalize_category("unsafe-html") == "xss"
+    assert normalize_category("dangerous-html") == "xss"
+    assert normalize_category("malicious-dependency") == "supply-chain-risk"
+    assert normalize_category("insecure-download") == "insecure-download"
     assert is_security_category("unsafe-code")
     assert is_security_category("supply-chain")
+    assert is_security_category("dangerous-html")
+    assert is_security_category("malicious-dependency")
+    assert is_security_category("insecure-download")
+    assert not is_security_category("missing-alt-text")
     assert is_security_category("版本范围不安全")
 
 

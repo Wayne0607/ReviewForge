@@ -63,6 +63,52 @@ class _VerdictLLM(BaseChatModel):
         return self
 
 
+class _MissingTestLLM(BaseChatModel):
+    """Only planner/reviewer calls are allowed; quality gating must be zero-token."""
+
+    calls: int = 0
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        self.calls += 1
+        sysmsg = messages[0].content if messages else ""
+        if "planner" in sysmsg.lower():
+            content = json.dumps({"tasks": [{"reviewer": "testing_reviewer", "files": ["service.py"]}]})
+        elif "对抗性验证器" not in sysmsg and "最终裁决者" not in sysmsg and "核实器" not in sysmsg:
+            content = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "file": "service.py",
+                            "line": 1,
+                            "severity": "warning",
+                            "category": "missing-test",
+                            "message": "新增公共函数没有测试。",
+                            "suggestion": "添加正常和异常路径测试。",
+                            "confidence": 0.6,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        else:
+            raise AssertionError("actionability finding reached escalation/calibration LLM")
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
+
+    @property
+    def _llm_type(self):
+        return "missing-test"
+
+    @property
+    def _identifying_params(self):
+        return {}
+
+    def bind_tools(self, tools, **kw):
+        return self
+
+
 def test_high_confidence_security_skips_agentic_escalation():
     high_confidence = Finding(
         file="a.py",
@@ -116,3 +162,41 @@ async def test_escalation_verdict_survives_calibrator():
     # (Duplicates may also be marked false_positive by the Verifier merge step — also fine.)
     assert all(f.status == "false_positive" for f in sqli), [f.status for f in sqli]
     assert any(f.verified_by == "escalation" for f in sqli), [f.verified_by for f in sqli]
+
+
+async def test_actionability_gate_runs_before_escalation_split():
+    reg = build_registry()
+    llm = _MissingTestLLM()
+    events = []
+    event_bus = EventBus()
+    event_bus.subscribe(events.append)
+    orch = Orchestrator(
+        registry=reg,
+        gateway=ToolGateway(reg, MockGitHubClient()),
+        event_bus=event_bus,
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        db=None,
+        agentic_default=False,
+        escalation_enabled=True,
+    )
+    state = StateStore(
+        pr_number=2,
+        repo="o/r",
+        head_sha="h2",
+        files_changed=["service.py"],
+        diff_summary="--- service.py (+2 -0)\n@@ -0,0 +1,2 @@\n+def service():\n+    return 1",
+    )
+
+    await orch.run(state)
+
+    findings = state.list_findings()
+    assert len(findings) == 1
+    assert findings[0].status == "false_positive"
+    assert findings[0].verified_by == "actionability-gate"
+    event_types = [event.event_type for event in events]
+    assert "actionability.completed" in event_types
+    assert "escalation.started" not in event_types
+    assert "calibration.started" not in event_types
+    assert llm.calls == 2

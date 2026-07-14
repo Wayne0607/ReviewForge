@@ -257,6 +257,12 @@ main() {
         if [[ "$TARGET_SHA" != "$current_sha" ]]; then
             ROLLBACK_ARMED=1
             git_app reset --hard "$TARGET_SHA"
+        elif [[ "$PREVIOUS_SHA" != "$current_sha" ]]; then
+            # A prior deployment can be interrupted after resetting HEAD but
+            # before the rebuilt service becomes healthy.  An explicit
+            # previous SHA keeps rollback available when retrying that same
+            # target instead of assuming the checked-out release is live.
+            ROLLBACK_ARMED=1
         fi
     elif [[ "$PREVIOUS_SHA" != "$current_sha" ]]; then
         # Supports a manual deployment that supplies its pre-pull SHA.

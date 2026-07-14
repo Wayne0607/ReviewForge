@@ -123,6 +123,21 @@ run_deploy() {
       bash "$DEPLOY_SCRIPT"
 }
 
+run_retry_deploy() {
+    local target_sha="$1"
+    local previous_sha="$2"
+    local bundle_path="$3"
+    REVIEWFORGE_APP_DIR="$APP_DIR" \
+      REVIEWFORGE_DEPLOY_LOCK="$TEST_ROOT/deploy.lock" \
+      REVIEWFORGE_UV_BIN="$MOCK_BIN/uv" \
+      REVIEWFORGE_TARGET_SHA="$target_sha" \
+      REVIEWFORGE_PREVIOUS_SHA="$previous_sha" \
+      REVIEWFORGE_BUNDLE_PATH="$bundle_path" \
+      REVIEWFORGE_HEALTH_ATTEMPTS=1 \
+      REVIEWFORGE_HEALTH_INTERVAL_SECONDS=1 \
+      bash "$DEPLOY_SCRIPT"
+}
+
 run_legacy_deploy() {
     local bundle_path="$1"
     REVIEWFORGE_APP_DIR="$APP_DIR" \
@@ -162,6 +177,26 @@ assert_eq "$HEALTHY_SHA" "$(git -C "$APP_DIR" rev-parse HEAD)" "healthy release 
 [[ ! -e "$HEALTHY_BUNDLE" ]] || fail "successful deployment bundle was not removed"
 grep -q "Deployment completed successfully" "$TEST_ROOT/healthy.out" || \
   fail "successful deployment was not reported"
+
+# If an earlier attempt switched HEAD but died before producing a healthy
+# service, retrying the same target must still roll back to the explicit
+# previous release when the health check fails.
+git -C "$APP_DIR" reset -q --hard "$BROKEN_SHA"
+RETRY_BUNDLE="$TEST_ROOT/retry.bundle"
+touch "$RETRY_BUNDLE"
+set +e
+run_retry_deploy "$BROKEN_SHA" "$PREVIOUS_SHA" "$RETRY_BUNDLE" > "$TEST_ROOT/retry.out" 2>&1
+retry_status=$?
+set -e
+[[ $retry_status -ne 0 ]] || fail "interrupted-release retry unexpectedly succeeded"
+assert_eq "$PREVIOUS_SHA" "$(git -C "$APP_DIR" rev-parse HEAD)" \
+  "same-target retry did not restore the explicit previous SHA"
+[[ ! -e "$RETRY_BUNDLE" ]] || fail "retry deployment bundle was not removed"
+grep -q "Rollback completed; the previous release is healthy" "$TEST_ROOT/retry.out" || \
+  fail "same-target retry rollback was not reported"
+
+# Restore the known healthy descendant for the stale-run assertion below.
+git -C "$APP_DIR" reset -q --hard "$HEALTHY_SHA"
 
 # An older queued run must not roll the healthy descendant back.
 : > "$COMMAND_LOG"

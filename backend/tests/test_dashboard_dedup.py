@@ -6,6 +6,9 @@ collapses same-commit runs when listing, the webhook skips already-reviewed
 commits, and finding/token counts are batched (no per-run N+1).
 """
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -88,6 +91,32 @@ async def test_has_active_run_for_head(tmp_path):
     await db.close()
 
 
+async def test_iso_started_at_fresh_and_stale_boundaries(tmp_path):
+    db = Database(tmp_path / "iso-time.db")
+    await db.connect()
+    await _make_run(db, "fresh", "o/r", 10, "fresh_sha", status="running")
+    await _make_run(db, "stale", "o/r", 11, "stale_sha", status="running")
+    now = datetime.now(UTC)
+    fresh_iso = (now - timedelta(minutes=14)).isoformat()
+    stale_iso = (now - timedelta(minutes=16)).isoformat()
+    await db._db.executemany(
+        "UPDATE review_runs SET started_at=? WHERE run_id=?",
+        [(fresh_iso, "fresh"), (stale_iso, "stale")],
+    )
+    await db._db.commit()
+
+    assert await db.has_active_run_for_head("o/r", 10, "fresh_sha") is True
+    assert await db.get_resumable_run("o/r", 10, "fresh_sha") is None
+    assert await db.restart_run("fresh") is False
+
+    assert await db.has_active_run_for_head("o/r", 11, "stale_sha") is False
+    assert (await db.get_resumable_run("o/r", 11, "stale_sha"))["run_id"] == "stale"
+    assert await db.restart_run("stale") is True
+    assert await db.has_active_run_for_head("o/r", 11, "stale_sha") is True
+    assert await db.get_resumable_run("o/r", 11, "stale_sha") is None
+    await db.close()
+
+
 # ── HTTP list endpoint: batched counts + tokens, no dupes ─────
 
 
@@ -148,4 +177,52 @@ async def test_webhook_skips_duplicate_delivery(tmp_path):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "duplicate_skipped"
+    await db.close()
+
+
+async def test_webhook_retriggers_failed_partial_run(tmp_path):
+    import hashlib
+    import hmac
+    import json
+
+    from reviewforge.api.webhook import router as webhook_router
+
+    class _GitHub:
+        async def get_pr_files(self, _repo, _pr_number):
+            return []
+
+    class _Orchestrator:
+        async def run(self, _state):
+            return {"status": "partial", "retryable": True}
+
+    db = Database(tmp_path / "retry-webhook.db")
+    await db.connect()
+    await _make_run(db, "partial", "acme/app", 8, "retryme", status="failed")
+
+    app = FastAPI()
+    app.include_router(webhook_router)
+    app.state.db = db
+    app.state.webhook_secret = "s3cret"
+    app.state.review_semaphore = asyncio.Semaphore(1)
+    app.state.review_tasks = set()
+    app.state.github_client = _GitHub()
+    app.state.orchestrator = _Orchestrator()
+
+    payload = {
+        "action": "synchronize",
+        "pull_request": {"number": 8, "head": {"sha": "retryme"}, "base": {"sha": "base"}},
+        "repository": {"full_name": "acme/app"},
+    }
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhook/github",
+            content=body,
+            headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "review_triggered"
     await db.close()

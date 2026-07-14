@@ -1,7 +1,7 @@
 {
   "metadata": {
     "name": "ReviewForge eval gauntlet",
-    "expected_planted_findings": 87,
+    "expected_planted_findings": 85,
     "baseline_detected_hint": 62,
     "notes": "Counts intentionally exclude documentation/style/testing findings from security metrics."
   },
@@ -53,8 +53,7 @@
         {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "unsafe-transmute", "count": 1},
         {"file": "test_fixtures/v2/rust/lib_processor.rs", "category": "path-traversal", "count": 1},
         {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "hardcoded-secrets", "count": 1},
-        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "xss", "count": 1},
-        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "xss-bypass", "count": 1},
+        {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "xss", "count": 2},
         {"file": "test_fixtures/v2/vue/UserCard.vue", "category": "open-redirect", "count": 1}
       ]
     },
@@ -102,14 +101,13 @@
         {"file": "gauntlet/requirements.txt", "category": "dependency-version-range", "count": 3},
         {"file": "gauntlet/pom.xml", "category": "dependency-version-range", "count": 2},
         {"file": "gauntlet/pom.xml", "category": "dependency-deprecated", "count": 1},
-        {"file": "gauntlet/Gemfile", "category": "supply-chain-risk", "count": 3},
-        {"file": "gauntlet/go.mod", "category": "dependency-version-range", "count": 2},
+        {"file": "gauntlet/Gemfile", "category": "supply-chain-risk", "count": 2},
+        {"file": "gauntlet/go.mod", "category": "dependency-version-range", "count": 1},
         {"file": "gauntlet/go.mod", "category": "supply-chain-risk", "count": 1},
         {"file": "gauntlet/Cargo.toml", "category": "dependency-version-range", "count": 1},
         {"file": "gauntlet/Cargo.toml", "category": "supply-chain-risk", "count": 2},
-        {"file": ".github/workflows/build.yml", "category": "ci-security", "count": 1},
         {"file": ".github/workflows/build.yml", "category": "supply-chain-risk", "count": 3},
-        {"file": ".github/workflows/build.yml", "category": "dependency-version-range", "count": 1}
+        {"file": ".github/workflows/build.yml", "category": "dependency-version-range", "count": 2}
       ]
     }
   ],

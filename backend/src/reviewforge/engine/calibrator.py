@@ -24,6 +24,13 @@ from reviewforge.engine.security_categories import is_security_category, normali
 logger = logging.getLogger(__name__)
 
 
+# Only findings backed by a deterministic detector and a near-certain rule may
+# bypass contextual calibration.  A security category by itself is not proof:
+# reviewers can misread sanitizers, allow-lists, test fixtures, or safe process
+# argument APIs just like any other reviewer.
+_DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE = 0.96
+
+
 @dataclass
 class ChallengeResult:
     """Result of adversarial verification for one finding."""
@@ -42,8 +49,9 @@ class DynamicCalibrator:
     2. Adversarial Verifier tries to refute each finding
     3. Judge rules on disputed findings (only if Round 2 disagrees with Round 1)
 
-    Security findings skip calibration entirely — they are objective facts
-    and should never be filtered by adversarial verification.
+    Near-certain deterministic security findings skip calibration.  Security
+    findings produced by an LLM, or by a contextual/low-confidence detector,
+    are calibrated like every other finding.
     """
 
     def __init__(
@@ -61,29 +69,36 @@ class DynamicCalibrator:
     async def calibrate(self, findings: list[Finding], code_diff: str) -> list[Finding]:
         """Run dynamic calibration loop. Returns calibrated findings.
 
-        Security findings are auto-confirmed and skip calibration.
+        Only near-certain detector-backed security findings are auto-confirmed.
         """
         if not findings:
             return []
 
-        # Split: security findings skip calibration
-        security = []
+        auto_confirmed = []
         need_calibration = []
         for f in findings:
             f.category = normalize_category(f.category)
-            if is_security_category(f.category):
+            detector_backed = f.verified_by == "detector"
+            if (
+                detector_backed
+                and is_security_category(f.category)
+                and f.confidence >= _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE
+            ):
                 f.status = "confirmed"
-                f.verified_by = "security-auto"
-                f.verify_reason = "安全问题直接确认，不经过对抗性校准"
-                security.append(f)
+                f.verified_by = "detector-auto"
+                f.verify_reason = "高置信确定性安全规则命中"
+                auto_confirmed.append(f)
             else:
                 need_calibration.append(f)
 
-        if security:
-            logger.info(f"Security auto-confirm: {len(security)} findings skip calibration")
+        if auto_confirmed:
+            logger.info(
+                "Detector auto-confirm: %d near-certain security findings skip calibration",
+                len(auto_confirmed),
+            )
 
         if not need_calibration:
-            return security
+            return auto_confirmed
 
         current = need_calibration
         # 快照原始 confidence/status（在被 _apply_challenges 原地修改之前）
@@ -110,13 +125,14 @@ class DynamicCalibrator:
         else:
             logger.info("Consensus reached, skip judge round")
 
-        return security + updated
+        return auto_confirmed + updated
 
     async def _adversarial_round(self, findings: list[Finding], code_diff: str) -> list[ChallengeResult]:
         """Attempt to refute each finding. Returns challenge results."""
         findings_text = "\n".join(
             f"- [{f.id}] {f.file}:{f.line} ({f.severity}) "
-            f"category={f.category} confidence={f.confidence:.2f}\n"
+            f"category={f.category} confidence={f.confidence:.2f} "
+            f"source={f.verified_by or f.reviewer or 'unknown'}\n"
             f"  message: {f.message}\n"
             f"  suggestion: {f.suggestion}"
             for f in findings
@@ -131,6 +147,20 @@ class DynamicCalibrator:
 - 如果你能找到反驳理由（比如：代码实际上没有这个问题、上下文说明这不是问题、项目惯例允许这种写法），标记为 false_positive 并降低置信度
 - 如果你无法找到反驳理由，标记为 confirmed 并保持或提高置信度
 - 如果你认为问题存在但严重程度被高估，降低置信度但保持 confirmed
+
+安全类 finding 也必须验证完整的数据流，而不是因为类别名称而确认：
+- 仅出现危险 API 不等于存在漏洞；必须有可信的攻击者可控输入到危险 sink
+- 参数数组且未启用 shell 的进程调用不会发生 shell 注入；固定常量命令也不是命令注入
+- 测试/示例中的明显占位凭据或固定字符串执行通常不是生产漏洞，但像真实密钥仍需确认
+- 经转义/可信 sanitizer 处理后再写入 HTML、经过 allow-list 的跳转目标应判为误报
+- 变量文件路径本身不等于路径穿越；需证明攻击者可越过受控根目录
+- 动态 SQL 标识符若经过 allow-list 且所有值仍使用绑定参数，应判为误报
+
+质量类 finding 必须满足可操作的证据门槛：
+- 缺测试/缺文档必须有项目约定，或明确的公共、高风险行为及可证明的覆盖缺口；不能仅因当前 diff 未包含测试或文档就确认
+- 命名和风格偏好本身不是可操作 bug，除非违反明确规范并造成真实歧义或行为风险
+- 可访问性结论必须结合元素的交互语义；普通静态文本、textContent 或已转义 HTML 不能单凭 API 名称判错
+- 明确缺失的图片 alt、表单 label 或交互控件名称仍是有效的可访问性问题
 
 语言要求：challenge 字段使用中文。
 
@@ -173,7 +203,8 @@ class DynamicCalibrator:
         """Final judgment on disputed findings."""
         disputed_text = "\n".join(
             f"- [{f.id}] {f.file}:{f.line} ({f.severity}) "
-            f"category={f.category} confidence={f.confidence:.2f}\n"
+            f"category={f.category} confidence={f.confidence:.2f} "
+            f"source={f.verified_by or f.reviewer or 'unknown'}\n"
             f"  message: {f.message}"
             for f in disputed
         )
@@ -186,6 +217,12 @@ class DynamicCalibrator:
 - 问题是否真实存在于代码中
 - 问题是否可操作（开发者能据此修复）
 - 严重程度是否合理
+- 安全类结论必须有攻击者可控 source 到危险 sink 的完整证据；安全 API、allow-list、
+  sanitizer、绑定参数和测试占位值都应作为反证，不能仅凭危险 API 名称确认
+- 缺测试/缺文档必须有项目约定或明确公共、高风险行为的可证明缺口，不能仅因 diff 未附带测试或文档确认
+- 命名/风格偏好不构成 bug，除非违反明确规范并造成真实歧义或风险
+- 可访问性必须结合交互语义；普通静态文本、textContent、已转义 HTML 不应被判错，
+  但明确缺失的图片 alt、表单 label 或控件可访问名称仍应确认
 
 语言要求：reason 字段使用中文。
 

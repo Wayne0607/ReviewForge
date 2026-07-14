@@ -121,6 +121,21 @@ async def test_fail_running_runs_marks_orphaned_reviews(tmp_path):
     await db.close()
 
 
+async def test_restart_run_atomically_claims_retry(tmp_path):
+    db = Database(tmp_path / "retry.db")
+    await db.connect()
+    await db.create_run(run_id="retry1", repo="o/r", pr_number=8, head_sha="H", base_sha="B")
+    await db.fail_run("retry1", "planner unavailable", summary={"status": "partial", "confirmed": 1})
+
+    assert await db.restart_run("retry1") is True
+    assert await db.restart_run("retry1") is False
+    run = await db.get_run("retry1")
+    assert run["status"] == "running"
+    assert run["completed_at"] is None
+    assert run["summary_json"] == "{}"
+    await db.close()
+
+
 async def test_reported_findings_count_as_confirmed_in_summary(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.connect()

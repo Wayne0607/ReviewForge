@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import io
+import re
+import token
+import tokenize
 from dataclasses import dataclass
 
 from reviewforge.engine.detectors.base import (
@@ -22,6 +27,15 @@ class _Rule:
     message: str
     suggestion: str
     confidence: float
+    allow_single_line_string_literal: bool = False
+
+
+@dataclass(frozen=True)
+class _IgnoredSpan:
+    start: int
+    end: int
+    token_type: int
+    multiline: bool
 
 
 # Conservative first-pass rules used for all files.
@@ -48,7 +62,8 @@ _UNIVERSAL_RULES: list[_Rule] = [
         "error",
         "Hard-coded token-like secret detected in added lines.",
         "Move secrets to the platform secret store or environment variables.",
-        0.9,
+        0.97,
+        True,
     ),
 ]
 
@@ -56,15 +71,23 @@ _UNIVERSAL_RULES: list[_Rule] = [
 _SECURITY_RULES: dict[str, list[_Rule]] = {
     "python": [
         _Rule(
-            r"\b(?:os\.(?:system|popen)|subprocess\.(?:call|run|Popen|check_output|check_call))\b",
+            r"\bos\.(?:system|popen)\s*\(\s*(?:f[\"']|[^\"'\s][^,)]*|[\"'][^\"']*[\"']\s*(?:\+|%|\.format\s*\())",
             "command-injection",
             "error",
-            "Command execution API used.",
-            "Avoid shell execution or strictly validate and quote every argument.",
-            0.95,
+            "Dynamic data is passed to a shell command API.",
+            "Avoid shell execution or pass validated arguments to a non-shell API.",
+            0.96,
         ),
         _Rule(
-            r"\b(?:eval|exec)\s*\(",
+            r"\bsubprocess\.(?:call|run|Popen|check_output|check_call)\s*\(\s*(?:f[\"']|[^\"'\s][^,)]*|[\"'][^\"']*[\"']\s*(?:\+|%|\.format\s*\())[^\n]*\bshell\s*=\s*True",
+            "command-injection",
+            "error",
+            "Dynamic command data is executed with shell=True.",
+            "Use an argument list with shell=False and validate the executable name.",
+            0.97,
+        ),
+        _Rule(
+            r"\b(?:eval|exec)\s*\(\s*(?![rub]*[\"'][^{}\"']*[\"']\s*(?:,|\)))",
             "code-injection",
             "error",
             "Dynamic code execution detected.",
@@ -88,12 +111,28 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.89,
         ),
         _Rule(
-            r"\bopen\([^)]*(?:\.\.|request|user|input|query|path)",
+            r"\bopen\([^)]*(?:\.\.|request|user|input|query|params?)",
             "path-traversal",
             "warning",
             "Potential path join from user-driven fragments.",
             "Validate and normalize user paths before file access.",
             0.84,
+        ),
+        _Rule(
+            r"\bopen\s*\(\s*[^,\n]*\+\s*[\"'][/\\\\][\"']\s*\+\s*(?:[A-Za-z_]\w*\.)*(?:file_?name|path|user_?path|input_?path)\b",
+            "path-traversal",
+            "error",
+            "A dynamic filename is concatenated into a filesystem path.",
+            "Resolve the candidate path and enforce that it remains under the intended root.",
+            0.96,
+        ),
+        _Rule(
+            r"\burllib\.request\.urlopen\s*\(\s*(?:f[\"'][^\"']*\{[^}]+\}[^\"']*[\"']|(?![rub]*[\"'][^\"']*[\"']\s*(?:,|\)))[^)\n]+)",
+            "ssrf",
+            "error",
+            "A dynamic URL is passed to urllib.request.urlopen.",
+            "Allow-list destinations and block private, loopback, and link-local address ranges.",
+            0.96,
         ),
         _Rule(
             r"\bcursor\.(?:execute|executemany)\s*\([^\n]*\+",
@@ -182,7 +221,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
         ),
         _Rule(
             r"\bdangerouslySetInnerHTML\b",
-            "xss-bypass",
+            "xss",
             "warning",
             "Potentially unsafe DOM rendering call.",
             "Sanitize user HTML before rendering.",
@@ -248,7 +287,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
         ),
         _Rule(
             r"\bdangerouslySetInnerHTML\b",
-            "xss-bypass",
+            "xss",
             "warning",
             "Potentially unsafe DOM rendering call.",
             "Sanitize untrusted markup before render.",
@@ -290,7 +329,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
         ),
         _Rule(
             r"\btemplate\.HTML\(",
-            "xss-bypass",
+            "xss",
             "warning",
             "Template HTML injection risk.",
             "Keep template HTML explicit and data sanitized.",
@@ -311,6 +350,14 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             "Potential file path from variable used in io call.",
             "Validate and constrain path inputs.",
             0.82,
+        ),
+        _Rule(
+            r"\bhttp\.Get\s*\(\s*(?![\"'`][^\"'`]*[\"'`]\s*\))[^)\n]+\)",
+            "ssrf",
+            "error",
+            "A dynamic URL is passed to http.Get.",
+            "Allow-list destinations and block private, loopback, and link-local address ranges.",
+            0.96,
         ),
         _Rule(
             r"\b(?:db|tx)\.(?:Exec|Query|QueryRow)\s*\([^\n]*(?:fmt\.Sprintf|\+)",
@@ -381,7 +428,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
     ],
     "ruby": [
         _Rule(
-            r"\beval\s*\(",
+            r"\beval\s*\(\s*(?![\"'][^#{}\"']*[\"']\s*\))",
             "code-injection",
             "error",
             "Ruby eval usage detected.",
@@ -506,7 +553,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
         ),
         _Rule(
             r"<component\s+[^>]*:is=",
-            "xss-bypass",
+            "xss",
             "warning",
             "Dynamic component selection from data can expand attack surface.",
             "Allow-list component names before rendering.",
@@ -562,6 +609,299 @@ def _rules_for_language(language: str) -> tuple[_Rule, ...]:
     return tuple(_SECURITY_RULES.get(language, []))
 
 
+_TEST_PATH_PARTS = {"test", "tests", "testing", "spec", "specs", "fixtures", "examples"}
+_PLACEHOLDER_SECRET_MARKERS = (
+    "not-a-real",
+    "not_real",
+    "example",
+    "dummy",
+    "placeholder",
+    "fake",
+    "changeme",
+    "test-password",
+    "test-secret",
+    "test-token",
+    "test-api",
+    "sk-test",
+)
+
+
+def _is_test_path(file_path: str) -> bool:
+    """Return whether a path is test/example code where context is essential."""
+
+    normalized = (file_path or "").replace("\\", "/").lower()
+    parts = [part for part in normalized.split("/") if part]
+    name = parts[-1] if parts else ""
+    return (
+        any(part in _TEST_PATH_PARTS for part in parts[:-1])
+        or name.startswith(("test_", "spec_"))
+        or bool(re.search(r"(?:^|[._-])(?:test|spec)(?:[._-]|$)", name))
+    )
+
+
+def _looks_like_placeholder_secret(matched_text: str) -> bool:
+    """Recognize explicit non-secret values without hiding realistic tokens."""
+
+    text = (matched_text or "").lower()
+    return any(marker in text for marker in _PLACEHOLDER_SECRET_MARKERS)
+
+
+def _detector_confidence(file_path: str, confidence: float) -> float:
+    """Route findings in tests/examples through contextual calibration."""
+
+    if _is_test_path(file_path):
+        return min(confidence, 0.75)
+    return confidence
+
+
+def _is_comment_only(line: str) -> bool:
+    """Ignore rule names that only occur in source-code comments."""
+
+    stripped = (line or "").lstrip()
+    return stripped.startswith(("#", "//", "/*", "*", "<!--", "--"))
+
+
+def _is_import_only(line: str) -> bool:
+    """Ignore dangerous API names that only select a module or type."""
+
+    stripped = (line or "").lstrip()
+    return bool(
+        re.match(
+            r"^(?:from\s+\S+\s+import\b|import\s+|use\s+|using\s+|#include\b|require\s*\()",
+            stripped,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _match_starts_inside_string(line: str, start: int) -> bool:
+    """Best-effort lexical guard against API names embedded in quoted text."""
+
+    quote = ""
+    escaped = False
+    for char in (line or "")[:start]:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in {"'", '"', "`"}:
+            quote = char
+    return bool(quote)
+
+
+def _starts_inside_javascript_template_expression(line: str, start: int) -> bool:
+    """Return whether ``start`` is executable code inside a JS ``${...}`` block."""
+
+    text = line or ""
+    index = 0
+    in_template = False
+    expression_depth = 0
+    code_quote = ""
+    escaped = False
+
+    while index < min(start, len(text)):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+
+        if not in_template:
+            if code_quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == code_quote:
+                    code_quote = ""
+            elif char in {"'", '"'}:
+                code_quote = char
+            elif char == "`":
+                in_template = True
+            index += 1
+            continue
+
+        if expression_depth == 0:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "`":
+                in_template = False
+            elif char == "$" and next_char == "{":
+                expression_depth = 1
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if code_quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == code_quote:
+                code_quote = ""
+        elif char in {"'", '"'}:
+            code_quote = char
+        elif char == "{":
+            expression_depth += 1
+        elif char == "}":
+            expression_depth -= 1
+        index += 1
+
+    return in_template and expression_depth > 0 and not code_quote
+
+
+def _is_static_python_eval(line: str, match_start: int) -> bool:
+    """Return whether eval/exec receives only a compile-time string literal."""
+
+    source = (line or "").lstrip()
+    indent = len(line or "") - len(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    adjusted_start = max(0, match_start - indent)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id not in {"eval", "exec"} or node.func.col_offset != adjusted_start:
+            continue
+        return bool(node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
+    return False
+
+
+_POSTIMAGE_HUNK_HEADER = re.compile(
+    r"^@@ -\d+(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?:.*)$"
+)
+
+
+def _postimage_hunks(diff: str) -> list[list[tuple[int, str, bool]]]:
+    """Return post-image hunk lines as ``(RIGHT line, content, added)`` tuples."""
+
+    hunks: list[list[tuple[int, str, bool]]] = []
+    current: list[tuple[int, str, bool]] = []
+    new_line = 0
+    old_remaining = 0
+    new_remaining = 0
+    in_hunk = False
+
+    for raw_line in (diff or "").splitlines():
+        header = _POSTIMAGE_HUNK_HEADER.match(raw_line)
+        if header:
+            if current:
+                hunks.append(current)
+            current = []
+            new_line = int(header.group("new_start"))
+            old_remaining = int(header.group("old_count") or 1)
+            new_remaining = int(header.group("new_count") or 1)
+            in_hunk = True
+            continue
+
+        if raw_line.startswith("@@") or raw_line.startswith("diff --git "):
+            if current:
+                hunks.append(current)
+            current = []
+            in_hunk = False
+            continue
+        if not in_hunk or raw_line.startswith("\\ No newline at end of file"):
+            continue
+        if not raw_line:
+            in_hunk = False
+            continue
+
+        prefix = raw_line[0]
+        if prefix == "+" and new_remaining > 0:
+            current.append((new_line, raw_line[1:], True))
+            new_line += 1
+            new_remaining -= 1
+        elif prefix == " " and old_remaining > 0 and new_remaining > 0:
+            current.append((new_line, raw_line[1:], False))
+            new_line += 1
+            old_remaining -= 1
+            new_remaining -= 1
+        elif prefix == "-" and old_remaining > 0:
+            old_remaining -= 1
+        else:
+            in_hunk = False
+
+        if old_remaining == 0 and new_remaining == 0:
+            in_hunk = False
+
+    if current:
+        hunks.append(current)
+    return hunks
+
+
+def _has_named_child_process_exec(diff: str) -> bool:
+    postimage = "\n".join(content for hunk in _postimage_hunks(diff) for _line, content, _added in hunk)
+    imports = re.finditer(
+        r"import\s*\{(?P<names>[^}]*)\}\s*from\s*[\"'](?:node:)?child_process[\"']",
+        postimage,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if any(re.search(r"(?:^|,)\s*exec(?:Sync)?\s*(?:,|$)", match.group("names")) for match in imports):
+        return True
+    return bool(
+        re.search(
+            r"(?:const|let|var)\s*\{[^}]*\bexec(?:Sync)?\b[^}]*\}\s*=\s*require\s*\(\s*[\"'](?:node:)?child_process[\"']\s*\)",
+            postimage,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+def _python_ignored_spans(diff: str) -> dict[int, list[_IgnoredSpan]]:
+    """Map Python STRING/COMMENT token spans to actual RIGHT-side lines.
+
+    Tokenization runs on each hunk's post-image (context plus additions), while
+    returned coordinates remain the post-image line/column coordinates used by
+    GitHub. This catches triple-quoted prompt/documentation text that starts in
+    unchanged context as well as strings added entirely by the patch.
+    """
+
+    ignored: dict[int, list[_IgnoredSpan]] = {}
+    for group in _postimage_hunks(diff):
+        source_lines = [content for _, content, _added in group]
+        source = "\n".join(source_lines) + "\n"
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+            for item in tokens:
+                if item.type not in {token.STRING, token.COMMENT}:
+                    continue
+                start_line, start_col = item.start
+                end_line, end_col = item.end
+                for synthetic_line in range(start_line, end_line + 1):
+                    if not 1 <= synthetic_line <= len(group):
+                        continue
+                    right_line = group[synthetic_line - 1][0]
+                    left = start_col if synthetic_line == start_line else 0
+                    right = end_col if synthetic_line == end_line else len(source_lines[synthetic_line - 1])
+                    ignored.setdefault(right_line, []).append(
+                        _IgnoredSpan(
+                            start=left,
+                            end=right,
+                            token_type=item.type,
+                            multiline=start_line != end_line,
+                        )
+                    )
+        except (IndentationError, tokenize.TokenError):
+            # Incomplete hunks can be syntactically partial. Tokens yielded
+            # before the failure have already populated the trustworthy spans.
+            continue
+    return ignored
+
+
+def _ignored_span_at(line_no: int, match_start: int, ignored: dict[int, list[_IgnoredSpan]]) -> _IgnoredSpan | None:
+    return next(
+        (span for span in ignored.get(line_no, ()) if span.start <= match_start < span.end),
+        None,
+    )
+
+
 def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
     """Scan modified file diffs for deterministic security findings."""
 
@@ -569,11 +909,36 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
 
     for file_path, diff in diffs.items():
         language = normalize_language(file_path)
-        rules = _rules_for_language(language)
+        rules = list(_rules_for_language(language))
+        if language in {"javascript", "typescript"} and _has_named_child_process_exec(diff):
+            rules.append(
+                _Rule(
+                    r"\bexec(?:Sync)?\s*\(\s*(?:`[^`]*\$\{[^}]+\}[^`]*`|(?![\"'`][^\"'`]*[\"'`]\s*(?:,|\)))[^)\n]+)",
+                    "command-injection",
+                    "error",
+                    "A dynamic command is passed to child_process exec.",
+                    "Use a fixed executable with an argument array and validate every dynamic argument.",
+                    0.96,
+                )
+            )
+        python_ignored = _python_ignored_spans(diff) if language == "python" else {}
 
         for rule in _UNIVERSAL_RULES:
             matches = match_lines(diff, rule.pattern)
-            for line_no, _ in matches:
+            for line_no, match in matches:
+                if language == "python":
+                    ignored_span = _ignored_span_at(line_no, match.start(), python_ignored)
+                    allow_literal = (
+                        ignored_span is not None
+                        and rule.allow_single_line_string_literal
+                        and ignored_span.token_type == token.STRING
+                        and not ignored_span.multiline
+                        and match.start() == ignored_span.start
+                    )
+                    if ignored_span is not None and not allow_literal:
+                        continue
+                if rule.category == "hardcoded-secrets" and _looks_like_placeholder_secret(match.group(0)):
+                    continue
                 findings.append(
                     DetectorFinding(
                         file=file_path,
@@ -582,12 +947,29 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                         category=normalize_category_for_detector(rule.category),
                         message=rule.message,
                         suggestion=rule.suggestion,
-                        confidence=safe_confidence(rule.confidence, len(matches)),
+                        confidence=_detector_confidence(file_path, safe_confidence(rule.confidence, 1)),
                     )
                 )
 
         for rule in rules:
-            for line_no, _ in match_lines(diff, rule.pattern):
+            for line_no, match in match_lines(diff, rule.pattern):
+                if language == "python" and _ignored_span_at(line_no, match.start(), python_ignored) is not None:
+                    continue
+                if _is_import_only(match.string):
+                    continue
+                inside_string = _match_starts_inside_string(match.string, match.start())
+                if language in {"javascript", "typescript"} and _starts_inside_javascript_template_expression(
+                    match.string, match.start()
+                ):
+                    inside_string = False
+                if language != "python" and (_is_comment_only(match.string) or inside_string):
+                    continue
+                if (
+                    language == "python"
+                    and rule.category == "code-injection"
+                    and _is_static_python_eval(match.string, match.start())
+                ):
+                    continue
                 findings.append(
                     DetectorFinding(
                         file=file_path,
@@ -596,7 +978,7 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                         category=normalize_category_for_detector(rule.category),
                         message=rule.message,
                         suggestion=rule.suggestion,
-                        confidence=safe_confidence(rule.confidence, 1),
+                        confidence=_detector_confidence(file_path, safe_confidence(rule.confidence, 1)),
                     )
                 )
 

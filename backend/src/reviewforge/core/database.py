@@ -214,13 +214,33 @@ class Database:
         )
         await self._db.commit()
 
-    async def fail_run(self, run_id: str, error: str) -> None:
+    async def fail_run(self, run_id: str, error: str, summary: dict[str, Any] | None = None) -> None:
         now = datetime.now(UTC).isoformat()
+        payload = dict(summary or {})
+        payload["error"] = error
         await self._db.execute(
             "UPDATE review_runs SET status='failed', completed_at=?, summary_json=? WHERE run_id=?",
-            (now, json.dumps({"error": error}), run_id),
+            (now, json.dumps(payload, ensure_ascii=False), run_id),
         )
         await self._db.commit()
+
+    async def restart_run(self, run_id: str) -> bool:
+        """Atomically claim a failed/stale run for retry.
+
+        Returning ``False`` means another worker already claimed or completed
+        the run, so the caller must not execute it concurrently.
+        """
+
+        now = datetime.now(UTC).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE review_runs SET status='running', started_at=?, completed_at=NULL, summary_json='{}' "
+            "WHERE run_id=? AND "
+            "(status='failed' OR "
+            "(status='running' AND julianday(started_at) <= julianday('now', '-15 minutes')))",
+            (now, run_id),
+        )
+        await self._db.commit()
+        return (cursor.rowcount or 0) == 1
 
     async def fail_running_runs(self, error: str) -> int:
         """Mark orphaned running runs as failed, returning the affected count."""
@@ -285,7 +305,8 @@ class Database:
         """
         cursor = await self._db.execute(
             "SELECT * FROM review_runs WHERE repo=? AND pr_number=? AND head_sha=? "
-            "AND (status = 'failed' OR (status = 'running' AND started_at <= datetime('now', '-15 minutes'))) "
+            "AND (status = 'failed' OR "
+            "(status = 'running' AND julianday(started_at) <= julianday('now', '-15 minutes'))) "
             "ORDER BY started_at DESC LIMIT 1",
             (repo, pr_number, head_sha),
         )
@@ -303,7 +324,8 @@ class Database:
         """
         cursor = await self._db.execute(
             "SELECT 1 FROM review_runs WHERE repo=? AND pr_number=? AND head_sha=? "
-            "AND (status = 'completed' OR (status = 'running' AND started_at > datetime('now', '-15 minutes'))) "
+            "AND (status = 'completed' OR "
+            "(status = 'running' AND julianday(started_at) > julianday('now', '-15 minutes'))) "
             "LIMIT 1",
             (repo, pr_number, head_sha),
         )

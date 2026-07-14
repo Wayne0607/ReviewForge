@@ -7,9 +7,11 @@ Two-stage approach:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,11 +26,22 @@ from reviewforge.engine.symbol_extractor import (
     ImportInfo,
     SymbolInfo,
     detect_language,
-    extract_calls,
+    extract_diff_calls,
     extract_diff_symbols,
 )
 
 logger = logging.getLogger(__name__)
+
+_SUMMARY_FILE_HEADER = re.compile(r"^--- (?P<file>.+?) \(\+\d+ -\d+\)$")
+
+_APPLICABLE_OFFLINE = 1
+_APPLICABLE_SAME_CONTENT = 2
+_APPLICABLE_BASE_HEAD = 3
+_CONTENT_CACHE_MAX_SIZE = 256
+_LLM_CHAIN_BATCH_SIZE = 5
+_LLM_CONTEXT_PARTS_PER_BATCH = 5
+_MAX_SYMBOL_CONTEXT_LINES = 30
+_MAX_SYMBOL_SIGNATURE_LINES = 6
 
 # Max propagation depth by risk level
 MAX_DEPTH = {
@@ -81,6 +94,21 @@ class CrossPRChain:
     risk_level: str
     depth: int
     path: list[dict[str, str]]  # Full chain path
+    evidence_kind: str = "import"
+
+
+@dataclass
+class _ApplicableSymbol:
+    row: dict[str, Any]
+    rank: int
+
+
+@dataclass
+class _RiskEvidence:
+    file_path: str
+    file_risk: dict[str, Any] | None
+    file_rank: int
+    symbols: list[_ApplicableSymbol]
 
 
 class CrossPRAnalyzer:
@@ -95,6 +123,12 @@ class CrossPRAnalyzer:
         self._db = db
         self._llm = llm
         self._github = github_client
+        # Git refs used here are immutable commit SHAs. Cache successes and
+        # failures alike so a missing file cannot trigger one request per graph
+        # row during the same process lifetime.
+        self._content_cache: OrderedDict[tuple[str, str, str], str | None] = OrderedDict()
+        self._content_cache_lock = asyncio.Lock()
+        self._content_inflight: dict[tuple[str, str, str], asyncio.Future[str | None]] = {}
 
     async def analyze(
         self,
@@ -121,7 +155,7 @@ class CrossPRAnalyzer:
                 symbols, imports = extract_diff_symbols(file_diff, file_path)
                 all_symbols.extend(symbols)
                 all_imports.extend(imports)
-                all_calls.extend(extract_calls(_added_content(file_diff), file_path))
+                all_calls.extend(extract_diff_calls(file_diff, file_path))
 
         logger.info(
             f"Cross-PR: extracted {len(all_symbols)} symbols, {len(all_imports)} imports, {len(all_calls)} calls"
@@ -149,13 +183,13 @@ class CrossPRAnalyzer:
                 source_symbol=imp.name or "<module>",
             )
 
-        imports_by_file: dict[str, dict[str, ImportInfo]] = {}
-        for imp in all_imports:
-            if imp.name:
-                imports_by_file.setdefault(imp.file_path, {})[imp.name] = imp
+        imports_by_file = self._imports_by_binding(all_imports)
 
         for call in all_calls:
-            imported = imports_by_file.get(call.file_path, {}).get(call.callee)
+            imported, imported_symbol = self._match_call_import(
+                call,
+                imports_by_file.get(call.file_path, {}),
+            )
             target_file = ""
             if imported:
                 target_file = self._resolve_import_to_file(imported.source, state.files_changed) or imported.source
@@ -164,7 +198,7 @@ class CrossPRAnalyzer:
                 source_file=call.file_path,
                 source_symbol=call.caller,
                 target_file=target_file,
-                target_symbol=call.callee,
+                target_symbol=imported_symbol or call.callee,
                 relation_type="call",
             )
 
@@ -172,7 +206,13 @@ class CrossPRAnalyzer:
         await self._mark_symbol_risks(existing_findings, all_symbols, run_id, pr_number)
 
         # Step 4: Find suspicious cross-PR connections (zero tokens)
-        suspicious_chains = await self._find_suspicious_chains(all_imports, all_calls, state.files_changed)
+        suspicious_chains = await self._find_suspicious_chains(
+            all_imports,
+            all_calls,
+            state.files_changed,
+            run_id,
+            state,
+        )
 
         if not suspicious_chains:
             logger.info("Cross-PR: no suspicious chains found")
@@ -205,16 +245,20 @@ class CrossPRAnalyzer:
         in_target = False
 
         for line in lines:
-            if line.startswith("--- "):
-                # Check if this is the target file
-                header_file = line.split(" ")[1] if len(line.split(" ")) > 1 else ""
-                in_target = file_path.endswith(header_file) or header_file.endswith(file_path)
+            header = _SUMMARY_FILE_HEADER.match(line)
+            if header:
+                if in_target:
+                    break
+                header_file = header.group("file")
+                in_target = file_path == header_file
                 if in_target:
                     result.append(line)
-            elif in_target:
-                # Stop at next file header
-                if line.startswith("--- ") and not in_target:
-                    break
+                continue
+
+            if in_target:
+                # A real unified diff can contain `--- a/old` / `+++ b/new` file
+                # headers for renames. They are patch data, not ReviewForge's next
+                # `--- file (+N -M)` summary delimiter, so retain them for parsing.
                 result.append(line)
 
         return "\n".join(result)
@@ -232,6 +276,37 @@ class CrossPRAnalyzer:
                 return f
 
         return None
+
+    @staticmethod
+    def _imports_by_binding(imports: list[ImportInfo]) -> dict[str, dict[str, ImportInfo]]:
+        """Index imports by names visible to calls in each consumer file."""
+
+        by_file: dict[str, dict[str, ImportInfo]] = {}
+        for imp in imports:
+            bindings = {imp.local_name, imp.name}
+            for binding in bindings - {"", "*"}:
+                by_file.setdefault(imp.file_path, {})[binding] = imp
+        return by_file
+
+    @staticmethod
+    def _match_call_import(
+        call: CallInfo,
+        imports_by_binding: dict[str, ImportInfo],
+    ) -> tuple[ImportInfo | None, str]:
+        """Resolve a direct/member call to its import and exported target name."""
+
+        if call.receiver:
+            receiver_name = call.receiver.rsplit(".", 1)[-1]
+            for binding in (call.receiver_type, receiver_name, call.receiver.split(".", 1)[0]):
+                imported = imports_by_binding.get(binding)
+                if imported is not None:
+                    return imported, call.callee
+
+        imported = imports_by_binding.get(call.callee)
+        if imported is None:
+            return None, call.callee
+        exported = imported.name if imported.name not in {"", "*"} else call.callee
+        return imported, exported
 
     async def _mark_symbol_risks(
         self,
@@ -311,132 +386,416 @@ class CrossPRAnalyzer:
                 risk_categories=sorted(cats),
             )
 
+    async def _source_run_rank(
+        self,
+        source_run_id: str,
+        target_file: str,
+        current_run_id: str,
+        state: StateStore,
+    ) -> int:
+        """Return how strongly a graph row is proven to exist in the current base."""
+        source_run_id = str(source_run_id or "")
+        if source_run_id == current_run_id:
+            return 0
+
+        source_run = await self._db.get_run(source_run_id) if source_run_id else None
+        if source_run is None:
+            # Historical unit/eval harnesses predate review_runs provenance. Keep
+            # them deterministic offline, but never trust an untraceable row in
+            # production where GitHub is available for verification.
+            return _APPLICABLE_OFFLINE if self._github is None else 0
+
+        if source_run.get("repo") != state.repo or source_run.get("status") != "completed":
+            return 0
+
+        source_head = str(source_run.get("head_sha") or "")
+        base_sha = str(state.base_sha or "")
+        if source_head and base_sha and source_head == base_sha:
+            return _APPLICABLE_BASE_HEAD
+
+        if self._github is None:
+            return _APPLICABLE_OFFLINE
+        if not state.repo or not source_head or not base_sha or not target_file:
+            return 0
+
+        source_content = await self._get_cached_file_content(state.repo, source_head, target_file)
+        if source_content is None:
+            return 0
+        base_content = await self._get_cached_file_content(state.repo, base_sha, target_file)
+        if base_content is None:
+            return 0
+        if source_content == base_content:
+            return _APPLICABLE_SAME_CONTENT
+        return 0
+
+    async def _get_cached_file_content(self, repo: str, ref: str, file_path: str) -> str | None:
+        key = (repo, ref, file_path)
+        cache = getattr(self, "_content_cache", None)
+        if cache is None:
+            cache = self._content_cache = OrderedDict()
+            self._content_cache_lock = asyncio.Lock()
+            self._content_inflight = {}
+
+        async with self._content_cache_lock:
+            if key in cache:
+                content = cache.pop(key)
+                cache[key] = content
+                return content
+
+            pending = self._content_inflight.get(key)
+            owns_request = pending is None
+            if pending is None:
+                pending = asyncio.get_running_loop().create_future()
+                self._content_inflight[key] = pending
+
+        if not owns_request:
+            # A cancelled waiter must not cancel the shared request for everyone.
+            return await asyncio.shield(pending)
+
+        try:
+            try:
+                content = await self._github.get_file_content(repo, ref, file_path)
+            except Exception as exc:
+                logger.info(
+                    "Cross-PR: cannot verify %s at %s (%s); skipping graph evidence",
+                    file_path,
+                    ref,
+                    type(exc).__name__,
+                )
+                content = None
+
+            async with self._content_cache_lock:
+                cache[key] = content
+                cache.move_to_end(key)
+                while len(cache) > _CONTENT_CACHE_MAX_SIZE:
+                    cache.popitem(last=False)
+                self._content_inflight.pop(key, None)
+                if not pending.done():
+                    pending.set_result(content)
+            return content
+        except BaseException:
+            # Cancellation (including while waiting to publish the result) must
+            # never strand same-key waiters on an unresolved Future.
+            async with self._content_cache_lock:
+                if self._content_inflight.get(key) is pending:
+                    self._content_inflight.pop(key, None)
+                if not pending.done():
+                    pending.set_result(None)
+            raise
+
+    async def _load_risk_evidence(
+        self,
+        file_path: str,
+        current_run_id: str,
+        state: StateStore,
+    ) -> _RiskEvidence:
+        file_risk: dict[str, Any] | None = None
+        file_rank = 0
+        symbols: list[_ApplicableSymbol] = []
+
+        if not file_path:
+            return _RiskEvidence(file_path, file_risk, file_rank, symbols)
+
+        risk_row = await self._db.get_file_risk(file_path)
+        if risk_row and risk_row.get("max_risk", "safe") != "safe":
+            file_rank = await self._source_run_rank(
+                str(risk_row.get("last_run_id") or ""),
+                file_path,
+                current_run_id,
+                state,
+            )
+            if file_rank:
+                file_risk = risk_row
+
+        for symbol_row in await self._db.get_risky_symbols(file_path):
+            rank = await self._source_run_rank(
+                str(symbol_row.get("defined_in_run") or ""),
+                file_path,
+                current_run_id,
+                state,
+            )
+            if rank:
+                symbols.append(_ApplicableSymbol(symbol_row, rank))
+
+        return _RiskEvidence(file_path, file_risk, file_rank, symbols)
+
+    @staticmethod
+    def _evidence_rank(
+        evidence: _RiskEvidence,
+        symbol_name: str,
+        *,
+        allow_file_risk: bool,
+    ) -> int:
+        named_symbol = (symbol_name or "").strip()
+        is_specific = bool(named_symbol and named_symbol != "*")
+        if is_specific:
+            matched = [s.rank for s in evidence.symbols if s.row.get("symbol_name") == named_symbol]
+            if matched:
+                return max(matched)
+            if evidence.symbols:
+                return 0
+            return evidence.file_rank if allow_file_risk else 0
+
+        symbol_rank = max((s.rank for s in evidence.symbols), default=0)
+        file_rank = evidence.file_rank if allow_file_risk else 0
+        return max(symbol_rank, file_rank)
+
+    @staticmethod
+    def _row_categories(row: dict[str, Any]) -> list[str]:
+        raw = row.get("risk_categories", "[]")
+        if isinstance(raw, list):
+            categories = raw
+        else:
+            try:
+                categories = json.loads(raw or "[]")
+            except (json.JSONDecodeError, TypeError):
+                categories = []
+        if not isinstance(categories, list):
+            return []
+        return [normalize_category(str(cat)) for cat in categories if is_security_category(str(cat))]
+
+    def _risk_items(
+        self,
+        evidence: _RiskEvidence,
+        symbol_name: str,
+        *,
+        allow_file_risk: bool,
+    ) -> list[tuple[str, str, str]]:
+        """Return target symbol, category and level from applicable evidence only."""
+        named_symbol = (symbol_name or "").strip()
+        is_specific = bool(named_symbol and named_symbol != "*")
+        matched_symbols = evidence.symbols
+        if is_specific:
+            matched_symbols = [s for s in evidence.symbols if s.row.get("symbol_name") == named_symbol]
+
+        items: list[tuple[str, str, str]] = []
+        if matched_symbols:
+            for applicable in matched_symbols:
+                row = applicable.row
+                for category in self._row_categories(row):
+                    items.append(
+                        (
+                            str(row.get("symbol_name") or named_symbol or "<module>"),
+                            category,
+                            str(row.get("risk_level") or self._category_to_risk(category)),
+                        )
+                    )
+        elif not evidence.symbols and allow_file_risk and evidence.file_risk:
+            for category in self._row_categories(evidence.file_risk):
+                items.append(
+                    (
+                        named_symbol or "<module>",
+                        category,
+                        str(evidence.file_risk.get("max_risk") or self._category_to_risk(category)),
+                    )
+                )
+
+        unique: dict[tuple[str, str], tuple[str, str, str]] = {}
+        for item in items:
+            unique[(item[0], item[1])] = item
+        return list(unique.values())
+
+    async def _select_fuzzy_evidence(
+        self,
+        import_source: str,
+        symbol_name: str,
+        current_run_id: str,
+        state: StateStore,
+        *,
+        allow_file_risk: bool,
+    ) -> _RiskEvidence | None:
+        """Choose the best applicable fuzzy candidate, not merely the first DB row."""
+        best: _RiskEvidence | None = None
+        best_rank = 0
+        seen: set[str] = set()
+        for row in await self._db.find_risky_files_for_import(import_source):
+            file_path = str(row.get("file_path") or "")
+            if not file_path or file_path in seen:
+                continue
+            seen.add(file_path)
+            evidence = await self._load_risk_evidence(file_path, current_run_id, state)
+            rank = self._evidence_rank(evidence, symbol_name, allow_file_risk=allow_file_risk)
+            if rank > best_rank:
+                best = evidence
+                best_rank = rank
+
+        # Some ecosystems keep dots inside filenames (for example Angular's
+        # ``admin.component.ts``), while the database's legacy fuzzy query
+        # treats every dot as a package separator.  Fall back to exact risky
+        # symbol rows, but retain a strict source↔file suffix check so a same-
+        # named symbol in an unrelated module cannot contaminate this PR.
+        if symbol_name and symbol_name != "*":
+            for row in await self._db.find_risky_symbols_by_name(symbol_name):
+                file_path = str(row.get("file_path") or "")
+                if not file_path or file_path in seen or not _import_source_matches_file(import_source, file_path):
+                    continue
+                seen.add(file_path)
+                evidence = await self._load_risk_evidence(file_path, current_run_id, state)
+                rank = self._evidence_rank(evidence, symbol_name, allow_file_risk=allow_file_risk)
+                if rank > best_rank:
+                    best = evidence
+                    best_rank = rank
+        return best
+
+    async def _select_import_evidence(
+        self,
+        import_source: str,
+        symbol_name: str,
+        known_files: list[str],
+        current_run_id: str,
+        state: StateStore,
+        *,
+        allow_file_risk: bool,
+    ) -> _RiskEvidence | None:
+        resolved = self._resolve_import_to_file(import_source, known_files)
+        if resolved:
+            evidence = await self._load_risk_evidence(resolved, current_run_id, state)
+            rank = self._evidence_rank(evidence, symbol_name, allow_file_risk=allow_file_risk)
+            return evidence if rank else None
+        return await self._select_fuzzy_evidence(
+            import_source,
+            symbol_name,
+            current_run_id,
+            state,
+            allow_file_risk=allow_file_risk,
+        )
+
+    async def _select_relation_target_evidence(
+        self,
+        target_reference: str,
+        symbol_name: str,
+        current_run_id: str,
+        state: StateStore,
+    ) -> _RiskEvidence | None:
+        direct = await self._load_risk_evidence(target_reference, current_run_id, state)
+        direct_rank = self._evidence_rank(direct, symbol_name, allow_file_risk=True)
+        fuzzy = await self._select_fuzzy_evidence(
+            target_reference,
+            symbol_name,
+            current_run_id,
+            state,
+            allow_file_risk=True,
+        )
+        fuzzy_rank = self._evidence_rank(fuzzy, symbol_name, allow_file_risk=True) if fuzzy else 0
+        return fuzzy if fuzzy_rank > direct_rank else (direct if direct_rank else None)
+
     async def _find_suspicious_chains(
         self,
         imports: list[ImportInfo],
         calls: list[CallInfo],
         known_files: list[str],
+        current_run_id: str,
+        state: StateStore,
     ) -> list[CrossPRChain]:
-        """Find import chains that connect to historically risky code."""
-        chains = []
+        """Find import chains that connect to risks proven to exist in the PR base."""
+        chains: list[CrossPRChain] = []
 
         for imp in imports:
             if _is_ignored_import(imp.source):
                 continue
 
-            # Check if the import target has known risks
-            target_file = self._resolve_import_to_file(imp.source, known_files)
-            if not target_file:
-                # Try fuzzy match in DB
-                risky_files = await self._db.find_risky_files_for_import(imp.source)
-                if not risky_files:
-                    continue
-                target_file = risky_files[0]["file_path"]
-
-            file_risk = await self._db.get_file_risk(target_file)
-            if not file_risk or file_risk.get("max_risk", "safe") == "safe":
+            evidence = await self._select_import_evidence(
+                imp.source,
+                imp.name,
+                known_files,
+                current_run_id,
+                state,
+                allow_file_risk=True,
+            )
+            if evidence is None:
                 continue
 
-            # Found a risky target! Build the chain
-            risk_categories = json.loads(file_risk.get("risk_categories", "[]"))
-            risk_level = file_risk.get("max_risk", "medium")
-
-            # Get risky symbols in the target file
-            risky_symbols = await self._db.get_risky_symbols(target_file)
-
-            if risky_symbols:
-                # A specific named import (e.g. `from db import cache_load`) only carries the
-                # risk of *that* symbol; a module/wildcard import carries the whole file's risk.
-                imported = (imp.name or "").strip()
-                if imported and imported != "*":
-                    matched = [s for s in risky_symbols if s["symbol_name"] == imported]
-                    if not matched:
-                        # Imported a non-risky symbol from a risky file → no cross-PR risk here.
-                        continue
-                else:
-                    matched = risky_symbols
-
-                # Use symbol-level detail
-                for sym in matched:
-                    sym_categories = json.loads(sym.get("risk_categories", "[]"))
-                    for cat in sym_categories:
-                        if not is_security_category(cat):
-                            continue
-
-                        chain = CrossPRChain(
-                            source_file=imp.file_path,
-                            source_symbol=imp.name or "<import>",
-                            source_line=imp.line,
-                            target_file=target_file,
-                            target_symbol=sym["symbol_name"],
-                            risk_category=cat,
-                            risk_level=sym.get("risk_level", risk_level),
-                            depth=1,
-                            path=[
-                                {"file": imp.file_path, "symbol": imp.name or "<import>"},
-                                {"file": target_file, "symbol": sym["symbol_name"], "risk": cat},
-                            ],
-                        )
-                        chains.append(chain)
-            else:
-                # No symbol-level data — use file-level risk
-                for cat in risk_categories:
-                    if not is_security_category(cat):
-                        continue
-
-                    chain = CrossPRChain(
+            risk_items = self._risk_items(evidence, imp.name, allow_file_risk=True)
+            for target_symbol, category, risk_level in risk_items:
+                chains.append(
+                    CrossPRChain(
                         source_file=imp.file_path,
                         source_symbol=imp.name or "<import>",
                         source_line=imp.line,
-                        target_file=target_file,
-                        target_symbol=imp.name or "<module>",
-                        risk_category=cat,
+                        target_file=evidence.file_path,
+                        target_symbol=target_symbol,
+                        risk_category=category,
                         risk_level=risk_level,
                         depth=1,
                         path=[
                             {"file": imp.file_path, "symbol": imp.name or "<import>"},
-                            {"file": target_file, "symbol": f"<{cat}>", "risk": cat},
+                            {"file": evidence.file_path, "symbol": target_symbol, "risk": category},
                         ],
                     )
-                    chains.append(chain)
+                )
 
-            # Depth 2: check what the risky file imports
-            if risk_level in ("critical", "high"):
-                target_imports = await self._db.get_relations_from(target_file)
-                for ti in target_imports:
-                    sub_target = ti.get("target_file", "")
-                    sub_risk = await self._db.get_file_risk(sub_target)
-                    if sub_risk and sub_risk.get("max_risk", "safe") != "safe":
-                        sub_cats = json.loads(sub_risk.get("risk_categories", "[]"))
-                        for cat in sub_cats:
-                            if not is_security_category(cat):
-                                continue
-                            chain = CrossPRChain(
-                                source_file=imp.file_path,
-                                source_symbol=imp.name or "<import>",
-                                source_line=imp.line,
-                                target_file=sub_target,
-                                target_symbol=ti.get("target_symbol", ""),
-                                risk_category=cat,
-                                risk_level=sub_risk.get("max_risk", "medium"),
-                                depth=2,
-                                path=[
-                                    {"file": imp.file_path, "symbol": imp.name or "<import>"},
-                                    {"file": target_file, "symbol": ti.get("target_symbol", "")},
-                                    {"file": sub_target, "symbol": ti.get("target_symbol", ""), "risk": cat},
-                                ],
-                            )
-                            chains.append(chain)
+            # Depth 2 is meaningful only when the applicable parent risk warrants
+            # propagation. Every relation and downstream risk gets its own base check.
+            if not any(level in ("critical", "high") for _, _, level in risk_items):
+                continue
+            for relation in await self._db.get_relations_from(evidence.file_path):
+                relation_rank = await self._source_run_rank(
+                    str(relation.get("run_id") or ""),
+                    str(relation.get("source_file") or evidence.file_path),
+                    current_run_id,
+                    state,
+                )
+                if not relation_rank:
+                    continue
 
-        chains.extend(await self._find_suspicious_call_chains(calls, imports, known_files))
+                target_reference = str(relation.get("target_file") or "")
+                target_symbol = str(relation.get("target_symbol") or "")
+                if not target_reference:
+                    continue
+                sub_evidence = await self._select_relation_target_evidence(
+                    target_reference,
+                    target_symbol,
+                    current_run_id,
+                    state,
+                )
+                if sub_evidence is None:
+                    continue
+                for sub_symbol, category, risk_level in self._risk_items(
+                    sub_evidence,
+                    target_symbol,
+                    allow_file_risk=True,
+                ):
+                    chains.append(
+                        CrossPRChain(
+                            source_file=imp.file_path,
+                            source_symbol=imp.name or "<import>",
+                            source_line=imp.line,
+                            target_file=sub_evidence.file_path,
+                            target_symbol=sub_symbol,
+                            risk_category=category,
+                            risk_level=risk_level,
+                            depth=2,
+                            path=[
+                                {"file": imp.file_path, "symbol": imp.name or "<import>"},
+                                {"file": evidence.file_path, "symbol": target_symbol or "<module>"},
+                                {"file": sub_evidence.file_path, "symbol": sub_symbol, "risk": category},
+                            ],
+                        )
+                    )
+
+        chains.extend(
+            await self._find_suspicious_call_chains(
+                calls,
+                imports,
+                known_files,
+                current_run_id,
+                state,
+            )
+        )
 
         # Deduplicate, preferring call-chain evidence over a bare import.
-        unique_by_key: dict[tuple[str, str, str, int], CrossPRChain] = {}
-        for c in chains:
-            key = (c.source_file, c.target_file, c.risk_category, c.depth)
+        unique_by_key: dict[tuple[str, str, str, str, int], CrossPRChain] = {}
+        for chain in chains:
+            key = (
+                chain.source_file,
+                chain.target_file,
+                chain.target_symbol,
+                chain.risk_category,
+                chain.depth,
+            )
             current = unique_by_key.get(key)
-            if current is None or _chain_specificity(c) > _chain_specificity(current):
-                unique_by_key[key] = c
+            if current is None or _chain_specificity(chain) > _chain_specificity(current):
+                unique_by_key[key] = chain
 
         return list(unique_by_key.values())
 
@@ -445,57 +804,91 @@ class CrossPRAnalyzer:
         calls: list[CallInfo],
         imports: list[ImportInfo],
         known_files: list[str],
+        current_run_id: str,
+        state: StateStore,
     ) -> list[CrossPRChain]:
         """Find new calls that target a historically risky confirmed symbol."""
 
         chains: list[CrossPRChain] = []
-        imports_by_file: dict[str, dict[str, ImportInfo]] = {}
-        for imp in imports:
-            if imp.name:
-                imports_by_file.setdefault(imp.file_path, {})[imp.name] = imp
+        imports_by_file = self._imports_by_binding(imports)
 
         for call in calls:
             if not call.callee or call.callee.startswith("_"):
                 continue
 
-            imported = imports_by_file.get(call.file_path, {}).get(call.callee)
-            target_file = ""
-            risky_symbols: list[dict[str, Any]] = []
-
+            imported, imported_symbol = self._match_call_import(
+                call,
+                imports_by_file.get(call.file_path, {}),
+            )
             if imported and not _is_ignored_import(imported.source):
-                target_file = self._resolve_import_to_file(imported.source, known_files) or ""
-                if not target_file:
-                    risky_files = await self._db.find_risky_files_for_import(imported.source)
-                    target_file = risky_files[0]["file_path"] if risky_files else ""
-                if not target_file:
-                    continue
-                risky_symbols = [
-                    s for s in await self._db.get_risky_symbols(target_file) if s.get("symbol_name") == call.callee
-                ]
-
-            if not imported and not risky_symbols:
-                risky_symbols = await self._db.find_risky_symbols_by_name(call.callee)
-
-            for sym in risky_symbols:
-                sym_categories = json.loads(sym.get("risk_categories", "[]"))
-                for cat in sym_categories:
-                    if not is_security_category(cat):
-                        continue
-                    resolved_target = sym.get("file_path") or target_file
+                evidence = await self._select_import_evidence(
+                    imported.source,
+                    imported_symbol,
+                    known_files,
+                    current_run_id,
+                    state,
+                    allow_file_risk=False,
+                )
+                risk_items = (
+                    self._risk_items(evidence, imported_symbol, allow_file_risk=False) if evidence is not None else []
+                )
+                for target_symbol, category, risk_level in risk_items:
                     chains.append(
                         CrossPRChain(
                             source_file=call.file_path,
                             source_symbol=call.caller or "<module>",
                             source_line=call.line,
-                            target_file=resolved_target,
-                            target_symbol=call.callee,
-                            risk_category=cat,
-                            risk_level=sym.get("risk_level", self._category_to_risk(cat)),
+                            target_file=evidence.file_path,
+                            target_symbol=target_symbol,
+                            risk_category=category,
+                            risk_level=risk_level,
                             depth=1,
                             path=[
                                 {"file": call.file_path, "symbol": call.caller or "<module>"},
-                                {"file": resolved_target, "symbol": call.callee, "risk": cat},
+                                {"file": evidence.file_path, "symbol": target_symbol, "risk": category},
                             ],
+                            evidence_kind="call",
+                        )
+                    )
+                continue
+
+            if imported:
+                continue
+
+            applicable_symbols: list[_ApplicableSymbol] = []
+            for symbol_row in await self._db.find_risky_symbols_by_name(call.callee):
+                target_file = str(symbol_row.get("file_path") or "")
+                rank = await self._source_run_rank(
+                    str(symbol_row.get("defined_in_run") or ""),
+                    target_file,
+                    current_run_id,
+                    state,
+                )
+                if rank:
+                    applicable_symbols.append(_ApplicableSymbol(symbol_row, rank))
+
+            applicable_symbols.sort(
+                key=lambda item: (-item.rank, str(item.row.get("file_path") or "")),
+            )
+            for applicable in applicable_symbols:
+                symbol_row = applicable.row
+                target_file = str(symbol_row.get("file_path") or "")
+                for category in self._row_categories(symbol_row):
+                    chains.append(
+                        CrossPRChain(
+                            source_file=call.file_path,
+                            source_symbol=call.caller or "<module>",
+                            source_line=call.line,
+                            target_file=target_file,
+                            target_symbol=call.callee,
+                            risk_category=category,
+                            risk_level=str(symbol_row.get("risk_level") or self._category_to_risk(category)),
+                            depth=1,
+                            path=[
+                                {"file": call.file_path, "symbol": call.caller or "<module>"},
+                                {"file": target_file, "symbol": call.callee, "risk": category},
+                            ],
+                            evidence_kind="call",
                         )
                     )
 
@@ -523,7 +916,7 @@ class CrossPRAnalyzer:
     def _chains_to_findings(self, chains: list[CrossPRChain]) -> list[Finding]:
         """Convert suspicious chains directly to findings without LLM confirmation."""
         findings = []
-        for chain in chains[:10]:  # Max 10 findings
+        for chain in chains:
             chain_path = " → ".join(f"{p['file']}:{p['symbol']}" for p in chain.path)
             findings.append(
                 Finding(
@@ -551,9 +944,29 @@ class CrossPRAnalyzer:
         state: StateStore,
     ) -> list[Finding]:
         """Use LLM to confirm whether suspicious chains are actually exploitable."""
+        findings: list[Finding] = []
+        for start in range(0, len(chains), _LLM_CHAIN_BATCH_SIZE):
+            batch = chains[start : start + _LLM_CHAIN_BATCH_SIZE]
+            try:
+                findings.extend(await self._llm_confirm_chain_batch(batch, diff_summary, state))
+            except Exception:
+                logger.exception(
+                    "Cross-PR: LLM confirmation batch %d-%d failed; continuing with later batches",
+                    start + 1,
+                    start + len(batch),
+                )
+        return findings
+
+    async def _llm_confirm_chain_batch(
+        self,
+        chains: list[CrossPRChain],
+        diff_summary: str,
+        state: StateStore,
+    ) -> list[Finding]:
+        """Confirm one bounded batch; chain ids are local to this exact batch."""
         # Build context for LLM
         chain_descriptions = []
-        for i, chain in enumerate(chains[:5]):  # Max 5 chains per analysis
+        for i, chain in enumerate(chains):
             path_str = " → ".join(
                 f"{p['file']}:{p['symbol']}" + (f" [{p.get('risk', '')}]" if p.get("risk") else "") for p in chain.path
             )
@@ -563,8 +976,11 @@ class CrossPRAnalyzer:
 
         # Get relevant source code for context
         context_parts = []
-        for chain in chains[:3]:
-            for step in chain.path:
+        for chain in chains:
+            # One target-first context per chain gives every item in the bounded
+            # batch evidence while keeping the prompt size deterministic.
+            steps = sorted(chain.path, key=lambda step: 0 if step.get("risk") else 1)
+            for step in steps:
                 if self._github and state.repo:
                     try:
                         content = await self._github.get_file_content(
@@ -576,10 +992,13 @@ class CrossPRAnalyzer:
                         relevant = self._extract_function(content, step["symbol"])
                         if relevant:
                             context_parts.append(f"### {step['file']}:{step['symbol']}\n```\n{relevant}\n```")
+                            break
                     except Exception:
                         pass
+            if len(context_parts) >= _LLM_CONTEXT_PARTS_PER_BATCH:
+                break
 
-        context_text = "\n\n".join(context_parts[:5])  # Limit context size
+        context_text = "\n\n".join(context_parts[:_LLM_CONTEXT_PARTS_PER_BATCH])
 
         system = """你是 ReviewForge 的跨 PR 安全分析器。
 
@@ -692,32 +1111,38 @@ class CrossPRAnalyzer:
         return findings
 
     def _extract_function(self, content: str, func_name: str) -> str:
-        """Extract a specific function definition from file content."""
-        if not func_name or func_name == "<import>":
+        """Extract one bounded Python/JS/TS/Go/Java symbol code block."""
+        if not func_name or (func_name.startswith("<") and func_name.endswith(">")):
             return ""
 
-        lines = content.split("\n")
-        result = []
-        in_target = False
-        target_indent = None
+        lines = content.splitlines()
+        code_lines = _project_code_lines(lines)
+        escaped = re.escape(func_name)
+        python_start = re.compile(rf"^\s*(?:(?:async\s+)?def|class)\s+{escaped}\b")
+        braced_starts = (
+            re.compile(rf"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+{escaped}\s*\("),
+            re.compile(rf"^\s*func\s+(?:\([^)]*\)\s*)?{escaped}\s*\("),
+            re.compile(rf"^\s*(?:export\s+(?:default\s+)?)?(?:public\s+)?class\s+{escaped}\b"),
+            re.compile(rf"^\s*(?:export\s+)?(?:const|let|var)\s+{escaped}\b[^;]*=>"),
+            # TypeScript/JavaScript class or object-literal method.
+            re.compile(
+                rf"^\s*(?:(?:public|private|protected|static|readonly|override|abstract|async)\s+)*"
+                rf"{escaped}\s*\([^;{{}}]*\)\s*(?::[^={{}};]+)?\s*\{{"
+            ),
+            # Java method with return type and optional throws clause.
+            re.compile(
+                rf"^\s*(?:(?:public|private|protected|static|final|synchronized|native|abstract)\s+)*"
+                rf"(?:<[^>]+>\s+)?[\w<>\[\],.?]+\s+{escaped}\s*\([^;{{}}]*\)"
+                rf"\s*(?:throws\s+[^{{}};]+)?\s*\{{"
+            ),
+        )
 
-        for line in lines:
-            if re.search(rf"(?:async\s+)?def\s+{re.escape(func_name)}\s*\(", line):
-                in_target = True
-                target_indent = len(line) - len(line.lstrip())
-                result.append(line)
-                continue
-
-            if in_target:
-                if line.strip() == "":
-                    result.append(line)
-                    continue
-                current_indent = len(line) - len(line.lstrip())
-                if current_indent <= target_indent and line.strip():
-                    break
-                result.append(line)
-
-        return "\n".join(result[:30])  # Limit to 30 lines
+        for index, code_line in enumerate(code_lines):
+            if python_start.search(code_line):
+                return _extract_indented_symbol(lines, code_lines, index)
+            if any(pattern.search(code_line) for pattern in braced_starts):
+                return _extract_braced_symbol(lines, code_lines, index)
+        return ""
 
     @staticmethod
     def _category_to_risk(category: str) -> str:
@@ -739,6 +1164,116 @@ class CrossPRAnalyzer:
         return a if order.get(a, 0) >= order.get(b, 0) else b
 
 
+def _project_code_lines(lines: list[str]) -> list[str]:
+    """Mask strings/comments while preserving code columns and brace syntax."""
+
+    projected: list[str] = []
+    quote = ""
+    block_comment = False
+
+    for line in lines:
+        output: list[str] = []
+        index = 0
+        while index < len(line):
+            if block_comment:
+                if line.startswith("*/", index):
+                    output.extend("  ")
+                    index += 2
+                    block_comment = False
+                else:
+                    output.append(" ")
+                    index += 1
+                continue
+
+            if quote:
+                if len(quote) == 3 and line.startswith(quote, index):
+                    output.extend(" " * 3)
+                    index += 3
+                    quote = ""
+                elif len(quote) == 1 and line[index] == "\\" and index + 1 < len(line):
+                    output.extend("  ")
+                    index += 2
+                elif len(quote) == 1 and line[index] == quote:
+                    output.append(" ")
+                    index += 1
+                    quote = ""
+                else:
+                    output.append(" ")
+                    index += 1
+                continue
+
+            if line.startswith("//", index) or line[index] == "#":
+                output.extend(" " * (len(line) - index))
+                break
+            if line.startswith("/*", index):
+                output.extend("  ")
+                index += 2
+                block_comment = True
+                continue
+            if line.startswith(('"""', "'''"), index):
+                quote = line[index : index + 3]
+                output.extend(" " * 3)
+                index += 3
+                continue
+            if line[index] in {'"', "'", "`"}:
+                quote = line[index]
+                output.append(" ")
+                index += 1
+                continue
+
+            output.append(line[index])
+            index += 1
+
+        projected.append("".join(output))
+
+    return projected
+
+
+def _extract_indented_symbol(lines: list[str], code_lines: list[str], start: int) -> str:
+    """Extract a Python definition by indentation, capped to the context budget."""
+
+    target_indent = len(lines[start]) - len(lines[start].lstrip())
+    result: list[str] = []
+    end = min(len(lines), start + _MAX_SYMBOL_CONTEXT_LINES)
+    for index in range(start, end):
+        code = code_lines[index]
+        if index > start and code.strip():
+            current_indent = len(lines[index]) - len(lines[index].lstrip())
+            if current_indent <= target_indent:
+                break
+        result.append(lines[index])
+    return "\n".join(result).rstrip()
+
+
+def _extract_braced_symbol(lines: list[str], code_lines: list[str], start: int) -> str:
+    """Extract a brace-delimited symbol, including bounded multi-line signatures."""
+
+    result: list[str] = []
+    depth = 0
+    saw_opening_brace = False
+    end = min(len(lines), start + _MAX_SYMBOL_CONTEXT_LINES)
+
+    for index in range(start, end):
+        code = code_lines[index]
+        if not saw_opening_brace and index - start >= _MAX_SYMBOL_SIGNATURE_LINES:
+            return ""
+        if not saw_opening_brace and "=>" in code and "{" not in code:
+            return lines[index].rstrip()
+        if not saw_opening_brace and ";" in code and "{" not in code:
+            return ""
+
+        opening = code.count("{")
+        closing = code.count("}")
+        if opening:
+            saw_opening_brace = True
+        depth += opening - closing
+        result.append(lines[index])
+        if saw_opening_brace and depth <= 0:
+            return "\n".join(result).rstrip()
+
+    return "\n".join(result).rstrip() if saw_opening_brace else ""
+
+
 def _is_ignored_import(import_source: str) -> bool:
     source = (import_source or "").strip().strip("\"'")
     if not source:
@@ -749,17 +1284,27 @@ def _is_ignored_import(import_source: str) -> bool:
     return source in _IGNORED_IMPORTS or first in _IGNORED_IMPORTS
 
 
-def _chain_specificity(chain: CrossPRChain) -> int:
-    if chain.source_symbol and chain.source_symbol not in {"<import>", "<module>", chain.target_symbol, "*"}:
-        return 2
-    if chain.target_symbol and chain.target_symbol not in {"<module>", "*"}:
-        return 1
-    return 0
+def _import_source_matches_file(import_source: str, file_path: str) -> bool:
+    """Match package-style and path-style imports without broad substring hits."""
 
+    source = (import_source or "").strip().strip("\"'").removeprefix("./").rstrip("/")
+    path = (file_path or "").replace("\\", "/")
+    if not source or not path:
+        return False
 
-def _added_content(diff_content: str) -> str:
-    """Return added source lines from a unified diff-like snippet."""
-
-    return "\n".join(
-        line[1:] for line in (diff_content or "").splitlines() if line.startswith("+") and not line.startswith("+++")
+    path_without_extension = re.sub(r"\.(?:py|pyi|js|jsx|mjs|ts|tsx|vue|svelte|go|java)$", "", path)
+    source_path = source.replace("\\", "/")
+    candidates = {source_path, source_path.replace(".", "/")}
+    return any(
+        path_without_extension == candidate or path_without_extension.endswith(f"/{candidate}")
+        for candidate in candidates
     )
+
+
+def _chain_specificity(chain: CrossPRChain) -> int:
+    call_bonus = 10 if chain.evidence_kind == "call" else 0
+    if chain.source_symbol and chain.source_symbol not in {"<import>", "<module>", chain.target_symbol, "*"}:
+        return call_bonus + 2
+    if chain.target_symbol and chain.target_symbol not in {"<module>", "*"}:
+        return call_bonus + 1
+    return call_bonus

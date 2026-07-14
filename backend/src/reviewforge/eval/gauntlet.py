@@ -262,10 +262,10 @@ def _finding_dicts(findings: list[Any]) -> list[dict[str, Any]]:
 
 
 def _as_added_diff(content: str) -> str:
-    return "@@ golden @@\n" + "\n".join(f"+{line}" for line in content.splitlines())
+    lines = content.splitlines()
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{line}" for line in lines)
 
 
 def _case_diff(file_path: str, content: str) -> str:
-    return f"--- {file_path} (+{len(content.splitlines())} -0)\n" + "\n".join(
-        f"+{line}" for line in content.splitlines()
-    )
+    lines = content.splitlines()
+    return f"--- {file_path} (+{len(lines)} -0)\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{line}" for line in lines)

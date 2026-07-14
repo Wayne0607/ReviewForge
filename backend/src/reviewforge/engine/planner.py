@@ -16,11 +16,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.specs import SpecRegistry
-from reviewforge.core.state import ReviewTask, StateStore
+from reviewforge.core.state import TASK_RATIONALE_MAX_LENGTH, ReviewTask, StateStore
 from reviewforge.engine.prompt import build_planner_prompt
 from reviewforge.engine.symbol_extractor import detect_language
 
 logger = logging.getLogger(__name__)
+
+_MAX_LLM_TASKS = 6
+_MAX_REVIEWER_NAME_LENGTH = 100
+_MAX_FILE_PATH_LENGTH = 1024
+_MAX_RATIONALE_INPUT_LENGTH = TASK_RATIONALE_MAX_LENGTH * 10
 
 # ── 通用安全模式（不限语言）────────────────────────────────────────────
 _UNIVERSAL_SECURITY = [
@@ -205,7 +210,7 @@ class Planner:
 
         llm_tasks = [
             t
-            for t in self._parse_response(response.content)
+            for t in self._parse_response(response.content, allowed_files=state.files_changed)
             if t.reviewer not in done_reviewers
             and not _skip_reviewer_for_files(t.reviewer, t.files or state.files_changed)
             and not (cross_pr_wrapper and _is_low_signal_reviewer(t.reviewer))
@@ -340,8 +345,16 @@ class Planner:
             return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
         return merged
 
-    def _parse_response(self, content: str) -> list[ReviewTask]:
-        """Parse LLM JSON output into ReviewTask objects."""
+    def _parse_response(self, content: str, allowed_files: list[str] | None = None) -> list[ReviewTask]:
+        """Parse untrusted LLM JSON into bounded, schema-valid tasks.
+
+        Validation is deliberately per item: one malformed proposal must not
+        discard valid sibling tasks or fail the entire review round.
+        """
+        if not isinstance(content, str):
+            logger.warning("Planner returned non-text content, ignoring LLM tasks")
+            return []
+
         content = content.strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1] if "\n" in content else content[3:]
@@ -355,9 +368,33 @@ class Planner:
             logger.warning("Planner returned invalid JSON, falling back to style-only review")
             return []
 
-        tasks = []
-        for item in data.get("tasks", []):
-            reviewer = item.get("reviewer", "")
+        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
+            logger.warning("Planner returned an invalid task envelope, ignoring LLM tasks")
+            return []
+
+        allowed_by_normalized_path = (
+            {_normalize_file_path(path): path for path in allowed_files if _normalize_file_path(path)}
+            if allowed_files is not None
+            else None
+        )
+        tasks: list[ReviewTask] = []
+        for index, item in enumerate(data["tasks"]):
+            if len(tasks) >= _MAX_LLM_TASKS:
+                logger.warning("Planner returned more than %d valid tasks; extras were ignored", _MAX_LLM_TASKS)
+                break
+            if not isinstance(item, dict):
+                logger.warning("Planner task %d is not an object; skipping", index)
+                continue
+
+            raw_reviewer = item.get("reviewer")
+            if not isinstance(raw_reviewer, str) or not raw_reviewer.strip():
+                logger.warning("Planner task %d has an invalid reviewer; skipping", index)
+                continue
+            if len(raw_reviewer) > _MAX_REVIEWER_NAME_LENGTH:
+                logger.warning("Planner task %d has an overlong reviewer; skipping", index)
+                continue
+
+            reviewer = raw_reviewer.strip()
             reviewer = reviewer.lower().replace(" ", "_").replace("-", "_")
             reviewer_map = {
                 "security": "security_reviewer",
@@ -385,18 +422,67 @@ class Planner:
             reviewer = reviewer_map.get(reviewer, reviewer)
 
             if reviewer not in self._registry.agents:
-                logger.warning(f"Planner proposed unknown reviewer '{reviewer}', skipping")
+                logger.warning("Planner task %d proposed an unknown reviewer; skipping", index)
                 continue
 
-            tasks.append(
-                ReviewTask(
-                    reviewer=reviewer,
-                    files=item.get("files", []),
-                    rationale=item.get("rationale", ""),
+            raw_files = item.get("files")
+            if not isinstance(raw_files, list):
+                logger.warning("Planner task %d has an invalid files field; skipping", index)
+                continue
+
+            files: list[str] = []
+            seen_files: set[str] = set()
+            for raw_path in raw_files:
+                path = _normalize_file_path(raw_path)
+                if not path or path in seen_files:
+                    continue
+                if allowed_by_normalized_path is not None:
+                    canonical_path = allowed_by_normalized_path.get(path)
+                    if canonical_path is None:
+                        continue
+                    path = canonical_path
+                seen_files.add(path)
+                files.append(path)
+
+            if not files:
+                logger.warning("Planner task %d has no valid changed files; skipping", index)
+                continue
+
+            try:
+                tasks.append(
+                    ReviewTask(
+                        reviewer=reviewer,
+                        files=files,
+                        rationale=_normalize_rationale(item.get("rationale", "")),
+                    )
                 )
-            )
+            except (TypeError, ValueError):
+                logger.warning("Planner task %d failed schema validation; skipping", index)
 
         return tasks
+
+
+def _normalize_rationale(value: object) -> str:
+    """Normalize optional prose without coercing structured data into logs/state."""
+    if not isinstance(value, str):
+        return ""
+    bounded = value[:_MAX_RATIONALE_INPUT_LENGTH]
+    printable = "".join(char if char.isprintable() else " " for char in bounded)
+    return " ".join(printable.split())[:TASK_RATIONALE_MAX_LENGTH]
+
+
+def _normalize_file_path(value: object) -> str:
+    """Return a safe repository-relative path, or an empty string when invalid."""
+    if not isinstance(value, str):
+        return ""
+    path = value.strip().replace("\\", "/")
+    if not path or len(path) > _MAX_FILE_PATH_LENGTH or not path.isprintable():
+        return ""
+    if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
+        return ""
+    if any(part == ".." for part in path.split("/")):
+        return ""
+    return path
 
 
 def _is_test_file(file_path: str) -> bool:

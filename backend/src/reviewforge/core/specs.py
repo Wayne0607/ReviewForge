@@ -166,12 +166,13 @@ def build_registry() -> SpecRegistry:
                             "type": "object",
                             "properties": {
                                 "reviewer": {"type": "string"},
-                                "files": {"type": "array", "items": {"type": "string"}},
-                                "rationale": {"type": "string"},
+                                "files": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                                "rationale": {"type": "string", "maxLength": 500},
                             },
                             "required": ["reviewer", "files"],
                         },
-                    }
+                        "maxItems": 6,
+                    },
                 },
                 "required": ["tasks"],
             },

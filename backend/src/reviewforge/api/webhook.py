@@ -65,15 +65,28 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                 logger.info(f"PR #{pr_number} @ {head_sha[:8]} already reviewed/in-flight, skipping duplicate")
                 return {"status": "duplicate_skipped", "pr": str(pr_number)}
 
-            logger.info(f"PR #{pr_number} {action} on {repo}, triggering review")
-
             # S7: 持引用 + 并发上限，IO 移入后台
             sem = request.app.state.review_semaphore
             tasks = request.app.state.review_tasks
 
+            # Cover the gap before Orchestrator creates/claims the DB run. This
+            # also keeps a retry queued behind the semaphore from being scheduled
+            # repeatedly by webhook redeliveries.
+            review_key = (repo, int(pr_number), head_sha)
+            inflight_heads = getattr(request.app.state, "review_inflight_heads", None)
+            if inflight_heads is None:
+                inflight_heads = set()
+                request.app.state.review_inflight_heads = inflight_heads
+            if review_key in inflight_heads:
+                logger.info(f"PR #{pr_number} @ {head_sha[:8]} already queued, skipping duplicate")
+                return {"status": "duplicate_skipped", "pr": str(pr_number)}
+            inflight_heads.add(review_key)
+
+            logger.info(f"PR #{pr_number} {action} on {repo}, triggering review")
+
             async def _run_review():
-                async with sem:
-                    try:
+                try:
+                    async with sem:
                         orchestrator = request.app.state.orchestrator
                         github = request.app.state.github_client
 
@@ -94,15 +107,25 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                             base_sha=pr["base"]["sha"],
                             files_changed=file_paths,
                             diff_summary=diff_summary,
+                            file_diffs={f["filename"]: f.get("patch") or "" for f in files_data},
                         )
 
                         logger.info(f"Starting review for PR #{pr_number} on {repo}")
                         summary = await orchestrator.run(state)
-                        logger.info(f"Review completed for PR #{pr_number}: {summary}")
-                    except Exception as e:
-                        logger.error(f"Review failed for PR #{pr_number}: {e}", exc_info=True)
+                        if summary.get("status") == "partial":
+                            logger.warning(f"Review partial/retryable for PR #{pr_number}: {summary}")
+                        else:
+                            logger.info(f"Review completed for PR #{pr_number}: {summary}")
+                except Exception as e:
+                    logger.error(f"Review failed for PR #{pr_number}: {e}", exc_info=True)
+                finally:
+                    inflight_heads.discard(review_key)
 
-            t = asyncio.create_task(_run_review())
+            try:
+                t = asyncio.create_task(_run_review())
+            except Exception:
+                inflight_heads.discard(review_key)
+                raise
             tasks.add(t)
             t.add_done_callback(tasks.discard)
 

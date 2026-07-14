@@ -14,6 +14,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+TASK_RATIONALE_MAX_LENGTH = 500
+
 
 class FindingSchema(BaseModel):
     """Validation schema for findings."""
@@ -38,7 +40,7 @@ class TaskSchema(BaseModel):
     id: str = Field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
     reviewer: str = Field(..., min_length=1)
     files: list[str] = Field(default_factory=list)
-    rationale: str = Field(default="", max_length=500)
+    rationale: str = Field(default="", max_length=TASK_RATIONALE_MAX_LENGTH)
     status: str = Field(default="pending", pattern="^(pending|claimed|completed|failed)$")
     error: str = Field(default="", max_length=500)
 
@@ -170,6 +172,9 @@ class StateStore:
     base_sha: str = ""
     files_changed: list[str] = field(default_factory=list)
     diff_summary: str = ""
+    # Per-run patch cache. ``None`` means the PR file list has not been loaded;
+    # an empty dict is a valid loaded result (for example binary-only patches).
+    file_diffs: dict[str, str] | None = field(default=None, repr=False)
 
     # Runtime state
     findings: dict[str, Finding] = field(default_factory=dict)

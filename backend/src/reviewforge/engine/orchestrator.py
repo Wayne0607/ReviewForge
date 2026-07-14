@@ -25,6 +25,7 @@ from reviewforge.engine.calibrator import DynamicCalibrator
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.escalation import EscalationReviewer
 from reviewforge.engine.model_router import ModelRouter
+from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.security_categories import is_security_category
@@ -281,6 +282,18 @@ class Orchestrator:
         resumed = await self._db.get_resumable_run(state.repo, state.pr_number, state.head_sha) if self._db else None
         if resumed:
             run_id = resumed["run_id"]
+            if not await self._db.restart_run(run_id):
+                logger.info(
+                    "Review retry for %s/%s@%s was already claimed", state.repo, state.pr_number, state.head_sha
+                )
+                return {
+                    "status": "duplicate_skipped",
+                    "total_findings": 0,
+                    "confirmed": 0,
+                    "false_positives": 0,
+                    "tasks_completed": 0,
+                    "tasks_failed": 0,
+                }
             await self._rehydrate(state, run_id)
             self._events.set_run_id(run_id)
             self._events.emit(
@@ -294,6 +307,18 @@ class Orchestrator:
                 },
             )
         else:
+            if self._db and await self._db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha):
+                logger.info(
+                    "Review for %s/%s@%s is already active/completed", state.repo, state.pr_number, state.head_sha
+                )
+                return {
+                    "status": "duplicate_skipped",
+                    "total_findings": 0,
+                    "confirmed": 0,
+                    "false_positives": 0,
+                    "tasks_completed": 0,
+                    "tasks_failed": 0,
+                }
             run_id = uuid.uuid4().hex[:12]
             self._events.set_run_id(run_id)
             self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
@@ -310,7 +335,33 @@ class Orchestrator:
         if self._db:
             self._token_ctx.set(run_id, self._db)
 
+        planner_errors: list[str] = []
         try:
+            # Phase 0: deterministic coverage is independent of Planner routing
+            # and Reviewer health. Keep its keys so later reviewer overlap can be
+            # merged at ingestion instead of becoming duplicate findings.
+            self._events.emit("deterministic_scan.started", {"file_count": len(state.files_changed)})
+            scan_result = await scan_changed_files(self._gateway, state)
+            phase0_keys = {finding_identity(finding) for finding in scan_result.findings}
+            existing_keys = {finding_identity(finding) for finding in state.list_findings()}
+            added_count = 0
+            for finding in scan_result.findings:
+                key = finding_identity(finding)
+                if key in existing_keys:
+                    continue
+                state.add_finding(finding)
+                existing_keys.add(key)
+                added_count += 1
+            self._events.emit(
+                "deterministic_scan.completed",
+                {
+                    "files_scanned": scan_result.files_scanned,
+                    "files_failed": len(scan_result.file_errors),
+                    "scanners_failed": len(scan_result.scanner_errors),
+                    "findings_count": added_count,
+                },
+            )
+
             # Phase 1+2: iterative plan → schedule → execute (re-planning loop).
             # #4 Scheduler dispatches reviewers by priority with bounded concurrency.
             # #2/#3 bounded rounds; loop-detector rescue→stall guards repeats and writes
@@ -337,18 +388,22 @@ class Orchestrator:
                     reviewer._target_language = lang or ""
                     reviewer._target_framework = fw or ""
                     findings = await reviewer.execute(task, state)
+                    accepted_findings = 0
                     for f in findings:
+                        if finding_identity(f) in phase0_keys:
+                            continue
                         state.add_finding(f)
+                        accepted_findings += 1
                     state.update_task(task.id, status="completed")
                     self._events.emit(
                         "reviewer.completed",
-                        {"reviewer": task.reviewer, "findings_count": len(findings)},
+                        {"reviewer": task.reviewer, "findings_count": accepted_findings},
                     )
                     if self._db:
                         await self._db.insert_metric(
                             run_id,
                             task.reviewer,
-                            findings_count=len(findings),
+                            findings_count=accepted_findings,
                             duration_ms=int((time.monotonic() - t_start) * 1000),
                         )
                 except Exception as e:
@@ -366,10 +421,24 @@ class Orchestrator:
             for round_no in range(max_rounds):
                 self._events.emit("planner.started", {"round": round_no})
                 notes = state.consume_notes()  # #3: feed prior-round hints to the planner
-                proposed = await self._planner.plan(state, notes=notes)
+                planner_succeeded = True
+                try:
+                    proposed = await self._planner.plan(state, notes=notes)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Phase 0 findings remain actionable when the planner model or
+                    # provider is unavailable. Continue through verification and
+                    # commenting instead of failing the whole review.
+                    logger.error("Planner failed in round %d: %s", round_no, e, exc_info=True)
+                    self._events.emit("planner.failed", {"round": round_no, "error": str(e)})
+                    planner_errors.append(f"round {round_no}: {e}")
+                    planner_succeeded = False
+                    proposed = []
                 for task in proposed:
                     state.add_task(task)
-                self._events.emit("planner.completed", {"round": round_no, "task_count": len(proposed)})
+                if planner_succeeded:
+                    self._events.emit("planner.completed", {"round": round_no, "task_count": len(proposed)})
 
                 pending = state.list_tasks(status="pending")
                 if not pending:
@@ -485,7 +554,14 @@ class Orchestrator:
 
             # Phase 3.5: Cross-PR Analysis
             if self._cross_pr:
-                confirmed_findings = state.list_findings(status="confirmed")
+                # A retry rehydrates already-delivered Phase-0 findings as
+                # ``reported``. They still need to seed graph provenance under
+                # the run that is about to complete, but must not be commented
+                # a second time.
+                confirmed_findings = [
+                    *state.list_findings(status="confirmed"),
+                    *state.list_findings(status="reported"),
+                ]
                 self._events.emit("cross_pr.started")
                 try:
                     cross_findings = await self._cross_pr.analyze(
@@ -493,16 +569,23 @@ class Orchestrator:
                         state=state,
                         existing_findings=confirmed_findings,
                     )
+                    existing_cross_keys = {finding_identity(finding) for finding in state.list_findings()}
+                    accepted_cross_findings = []
                     for f in cross_findings:
+                        key = finding_identity(f)
+                        if key in existing_cross_keys:
+                            continue
                         state.add_finding(f)
-                    if cross_findings:
+                        existing_cross_keys.add(key)
+                        accepted_cross_findings.append(f)
+                    if accepted_cross_findings:
                         self._events.emit(
                             "cross_pr.completed",
                             {
-                                "cross_pr_findings": len(cross_findings),
+                                "cross_pr_findings": len(accepted_cross_findings),
                             },
                         )
-                        logger.info(f"Cross-PR: found {len(cross_findings)} cross-PR issues")
+                        logger.info(f"Cross-PR: found {len(accepted_cross_findings)} cross-PR issues")
                     else:
                         self._events.emit("cross_pr.completed", {"cross_pr_findings": 0})
                 except Exception as e:
@@ -528,11 +611,27 @@ class Orchestrator:
                 "tasks_completed": len(state.list_tasks(status="completed")),
                 "tasks_failed": len(state.list_tasks(status="failed")),
             }
+            if planner_errors:
+                summary.update({"status": "partial", "retryable": True})
+                self._events.emit(
+                    "review.partial",
+                    {**summary, "errors": planner_errors},
+                )
             self._events.emit("review.completed", summary)
 
-            # Persist run completion
+            # A Planner/provider outage must not permanently de-duplicate this
+            # head as reviewed. Phase-0 findings have already been persisted and
+            # delivered; keep the same run resumable so a later webhook can add
+            # the missing semantic review without reposting delivered comments.
             if self._db:
-                await self._db.complete_run(run_id, summary)
+                if planner_errors:
+                    await self._db.fail_run(
+                        run_id,
+                        "Planner unavailable; semantic review is retryable: " + "; ".join(planner_errors),
+                        summary=summary,
+                    )
+                else:
+                    await self._db.complete_run(run_id, summary)
 
             return summary
 
@@ -670,14 +769,23 @@ class Orchestrator:
                     state,
                     agent_name="orchestrator",
                 )
-                state.update_finding(finding.id, status="reported")
-                count += 1
             except Exception as e:
                 error_msg = str(e)
                 if "422" in error_msg:
                     logger.warning(f"Skipping comment for {finding.id}: line {finding.line} not in diff")
                 else:
                     logger.error(f"Failed to post comment for {finding.id}: {e}")
+                continue
+
+            state.update_finding(finding.id, status="reported")
+            count += 1
+            if self._db:
+                try:
+                    await self._db.update_finding_status(finding.id, "reported", finding.verified_by)
+                except Exception as e:
+                    # The external delivery succeeded, so do not misclassify it as
+                    # a comment failure (which could trigger a duplicate retry).
+                    logger.error(f"Comment delivered but DB status update failed for {finding.id}: {e}")
         return count
 
     @staticmethod

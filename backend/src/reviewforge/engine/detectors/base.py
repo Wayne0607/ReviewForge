@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from reviewforge.engine.detectors.unified_diff import iter_added_lines
 from reviewforge.engine.security_categories import normalize_category
 
 
@@ -28,20 +29,8 @@ def normalize_category_for_detector(category: str) -> str:
     return normalize_category(category)
 
 
-def iter_added_lines(diff: str) -> list[tuple[int, str]]:
-    """Return `(line_no, line)` for added lines in a unified diff chunk."""
-
-    lines: list[tuple[int, str]] = []
-    for idx, raw_line in enumerate((diff or "").splitlines(), start=1):
-        if raw_line.startswith("+++"):
-            continue
-        if raw_line.startswith("+"):
-            lines.append((idx, raw_line[1:]))
-    return lines
-
-
 def match_lines(diff: str, pattern: str) -> list[tuple[int, re.Match[str]]]:
-    """Return matches only for added lines."""
+    """Return matches on added lines using new-file RIGHT-side line numbers."""
 
     out: list[tuple[int, re.Match[str]]] = []
     for line_no, line in iter_added_lines(diff or ""):

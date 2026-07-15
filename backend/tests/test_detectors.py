@@ -90,6 +90,55 @@ def test_rust_unwrap_is_not_mislabeled_as_unsafe_security_usage():
     assert findings == []
 
 
+def test_rust_command_detector_requires_parameter_to_select_executable():
+    findings = detect_security_findings(
+        {
+            "dynamic.rs": _diff(
+                "use std::process::Command;\n"
+                "pub fn execute_hook(hook_name: &str) -> std::io::Result<()> {\n"
+                "    let program = hook_name.trim();\n"
+                '    Command::new(program).arg("--check").status()?;\n'
+                "    Ok(())\n"
+                "}"
+            ),
+            "fixed.rs": _diff(
+                "use std::process::Command;\n"
+                "pub fn inspect(user_arg: &str) -> std::io::Result<()> {\n"
+                '    Command::new("/usr/bin/git").arg(user_arg).status()?;\n'
+                "    Ok(())\n"
+                "}"
+            ),
+            "multiline.rs": _diff(
+                "use std::process::Command;\n"
+                "pub fn execute_hook(hook_name: &str) -> std::io::Result<()> {\n"
+                "    Command::new(\n"
+                "        hook_name.trim(),\n"
+                "    ).status()?;\n"
+                "    Ok(())\n"
+                "}"
+            ),
+            "private_fixed.rs": _diff(
+                "use std::process::Command;\n"
+                "fn fixed_helper(program: &str) -> std::io::Result<()> {\n"
+                "    Command::new(program).status()?;\n"
+                "    Ok(())\n"
+                "}\n"
+                "fn main() -> std::io::Result<()> {\n"
+                '    fixed_helper("/usr/bin/git")\n'
+                "}"
+            ),
+        }
+    )
+
+    commands = [finding for finding in findings if finding.category == "command-injection"]
+    assert [(finding.file, finding.line) for finding in commands] == [
+        ("dynamic.rs", 4),
+        ("multiline.rs", 3),
+    ]
+    assert all("hook_name" in finding.message or "program" in finding.message for finding in commands)
+    assert all(finding.confidence >= 0.96 for finding in commands)
+
+
 def test_rust_path_detector_requires_dynamic_construction_or_request_provenance():
     findings = detect_security_findings(
         {
@@ -127,6 +176,7 @@ def test_rust_path_detector_requires_dynamic_construction_or_request_provenance(
     paths = [finding for finding in findings if finding.category == "path-traversal"]
     assert {(finding.file, finding.line) for finding in paths} == {("dynamic.rs", 4), ("joined.rs", 4)}
     assert all(finding.confidence >= 0.96 for finding in paths)
+    assert all("parameter" in finding.message and "filesystem read" in finding.message for finding in paths)
 
 
 def test_high_signal_browser_storage_raw_html_and_ruby_backticks_are_detector_auto_quality():
@@ -548,6 +598,21 @@ def test_browser_redirect_detector_requires_a_dynamic_destination():
     redirects = [finding for finding in findings if finding.category == "open-redirect"]
     assert {(finding.file, finding.line) for finding in redirects} == {("view.jsx", 1), ("view.vue", 1)}
     assert all(finding.confidence >= 0.96 for finding in redirects)
+
+
+def test_browser_redirect_detector_keeps_jsx_event_handler_code():
+    findings = detect_security_findings(
+        {
+            "view.jsx": _diff(
+                "export function Continue({ next }) {\n"
+                "  return <button onClick={() => (window.location.href = next)}>continue</button>;\n"
+                "}"
+            )
+        }
+    )
+
+    redirects = [finding for finding in findings if finding.category == "open-redirect"]
+    assert [(finding.file, finding.line) for finding in redirects] == [("view.jsx", 2)]
 
 
 def test_rust_safety_comment_suppresses_generic_unsafe_audit_but_undocumented_unsafe_remains():

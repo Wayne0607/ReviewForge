@@ -887,11 +887,44 @@ def _starts_in_markup_text(line: str, start: int) -> bool:
     """Return true for JSX/Vue text nodes rather than executable expressions."""
 
     prefix = (line or "")[:start]
-    closing = prefix.rfind(">")
-    opening = prefix.rfind("<", 0, closing + 1)
-    if opening < 0 or closing < opening:
+    # Find a real tag terminator.  The ``>`` in an event-handler arrow (``=>``)
+    # or comparison lives inside a JSX expression and must not make subsequent
+    # executable code look like a text node.
+    opening = -1
+    closing = -1
+    quote = ""
+    escaped = False
+    expression_depth = 0
+    for index, char in enumerate(prefix):
+        if opening < 0:
+            if (
+                char == "<"
+                and index + 1 < len(prefix)
+                and prefix[index + 1] in "/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            ):
+                opening = index
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char == "{":
+            expression_depth += 1
+        elif char == "}" and expression_depth:
+            expression_depth -= 1
+        elif char == ">" and expression_depth == 0:
+            closing = index
+            opening = -1
+    if closing < 0:
         return False
-    if not re.match(r"</?[A-Za-z][^>]*>$", prefix[opening : closing + 1].strip()):
+    tag_opening = prefix.rfind("<", 0, closing + 1)
+    if tag_opening < 0 or not re.match(r"</?[A-Za-z][^>]*>$", prefix[tag_opening : closing + 1].strip()):
         return False
     after_tag = prefix[closing + 1 :]
     return after_tag.rfind("{") <= after_tag.rfind("}")
@@ -1517,6 +1550,12 @@ def _rust_function_parameters(block: list[tuple[int, str, bool]]) -> tuple[set[s
     return ordinary_parameters, request_parameters
 
 
+def _rust_function_is_public(block: list[tuple[int, str, bool]]) -> bool:
+    body = "\n".join(content for _line, content, _added in block)
+    signature = body.split("{", 1)[0]
+    return bool(re.search(r"\bpub(?:\s*\([^)]*\))?\s+(?:async\s+)?fn\b", signature))
+
+
 def _rust_constructs_path_from(expression: str, sources: set[str]) -> bool:
     """Require a source to occupy a path-fragment position, not merely share a line."""
 
@@ -1742,6 +1781,82 @@ def _rust_dynamic_path_sinks(diff: str) -> list[int]:
                     sink_lines.append(line_no)
                     break
     return sink_lines
+
+
+def _rust_command_program_expression(content: str) -> str:
+    """Return the first same-line ``Command::new`` program expression."""
+
+    match = re.search(r"\bCommand::new\s*\(", content)
+    if match is None:
+        return ""
+    start = match.end()
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(start, len(content)):
+        character = content[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}":
+            if character == ")" and depth == 0:
+                return content[start:index].strip()
+            depth = max(0, depth - 1)
+        elif character == "," and depth == 0:
+            return content[start:index].strip()
+    return ""
+
+
+def _rust_dynamic_command_sinks(diff: str) -> list[tuple[int, tuple[str, ...]]]:
+    """Find function parameters that directly choose a spawned executable."""
+
+    sinks: list[tuple[int, tuple[str, ...]]] = []
+    for block in _rust_function_blocks(diff):
+        ordinary_parameters, request_parameters = _rust_function_parameters(block)
+        # Ordinary parameters prove an external source only on a public API.
+        # Private helpers may be called exclusively with fixed programs. Axum
+        # Path bindings retain request provenance regardless of visibility.
+        tainted = set(request_parameters)
+        if _rust_function_is_public(block):
+            tainted.update(ordinary_parameters)
+        assignments: list[tuple[str, str]] = []
+        for _line_no, content, _added in block:
+            assignment = _RUST_ASSIGNMENT.search(content)
+            if assignment:
+                assignments.append((assignment.group("name"), assignment.group("expr")))
+        changed = True
+        while changed:
+            changed = False
+            for name, expression in assignments:
+                if name not in tainted and _rust_references(expression, tainted):
+                    tainted.add(name)
+                    changed = True
+
+        for index, (line_no, content, added) in enumerate(block):
+            if not added:
+                continue
+            if "Command::new" not in content:
+                continue
+            # Rust formatting commonly places the program expression on the
+            # following line. Join only a small contiguous statement window;
+            # the balanced extractor stops at Command::new's closing paren.
+            statement = "\n".join(row[1] for row in block[index : index + 12])
+            expression = _rust_command_program_expression(statement)
+            if not expression:
+                continue
+            sources = tuple(sorted(name for name in tainted if re.search(rf"\b{re.escape(name)}\b", expression)))
+            if sources:
+                sinks.append((line_no, sources))
+    return sinks
 
 
 def _rust_contextual_path_sinks(diff: str, *, excluded: set[int]) -> list[int]:
@@ -2212,6 +2327,12 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     and _java_runtime_exec_is_static(match.string)
                 ):
                     continue
+                # Rust's Command API does not invoke a shell.  A fixed program
+                # with dynamic argv is therefore not command injection.  The
+                # relational pass below reports only when a function parameter
+                # itself selects the executable.
+                if language == "rust" and rule.category == "command-injection":
+                    continue
                 if rule.category == "open-redirect" and _browser_redirect_is_guarded(diff, line_no, match.string):
                     continue
                 findings.append(
@@ -2254,6 +2375,24 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     )
                 )
         elif language == "rust":
+            for line_no, sources in _rust_dynamic_command_sinks(diff):
+                source_text = ", ".join(f"`{source}`" for source in sources)
+                findings.append(
+                    DetectorFinding(
+                        file=file_path,
+                        line=line_no,
+                        severity="error",
+                        category="command-injection",
+                        message=(
+                            f"Function parameter {source_text} directly selects the executable passed to Command::new."
+                        ),
+                        suggestion=(
+                            "Map an allow-listed operation name to fixed executable paths; do not let callers choose "
+                            "the spawned program."
+                        ),
+                        confidence=_detector_confidence(file_path, 0.97),
+                    )
+                )
             rust_path_lines = set(_rust_dynamic_path_sinks(diff))
             for line_no in sorted(rust_path_lines):
                 findings.append(
@@ -2262,7 +2401,10 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                         line=line_no,
                         severity="error",
                         category="path-traversal",
-                        message="A dynamically constructed path reaches a Rust filesystem read.",
+                        message=(
+                            "A function/request parameter is interpolated or joined into this path and reaches "
+                            "a Rust filesystem read without a canonical containment guard."
+                        ),
                         suggestion="Resolve the path under an intended root and reject candidates that escape it.",
                         confidence=_detector_confidence(file_path, 0.96),
                     )

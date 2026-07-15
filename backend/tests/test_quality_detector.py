@@ -168,6 +168,137 @@ def test_quality_detector_avoids_guarded_handled_and_server_only_controls():
     assert findings == []
 
 
+def test_quality_detector_finds_provable_resource_and_log_continue_failures():
+    findings = detect_quality_findings(
+        {
+            "src/Repository.java": _patch(
+                "import java.sql.Statement;\n"
+                "class Repository {\n"
+                "  void delete() throws Exception {\n"
+                "    Statement stmt = db.createStatement();\n"
+                '    stmt.executeUpdate("DELETE FROM jobs");\n'
+                "    stmt.close();\n"
+                "  }\n"
+                "}"
+            ),
+            "src/MixedRepository.java": _patch(
+                "class MixedRepository {\n"
+                "  void safe() throws Exception {\n"
+                "    Statement stmt = db.createStatement();\n"
+                '    try { stmt.executeUpdate("DELETE FROM jobs"); }\n'
+                "    finally { stmt.close(); }\n"
+                "  }\n"
+                "  void unsafe() throws Exception {\n"
+                "    Statement stmt = db.createStatement();\n"
+                '    stmt.executeUpdate("DELETE FROM jobs");\n'
+                "  }\n"
+                "}"
+            ),
+            "src/Poller.vue": _patch("<script setup>\nsetInterval(() => refresh(), 1000)\n</script>"),
+            "src/importer.py": _patch(
+                "import sqlite3\n"
+                "def load():\n"
+                "    conn = sqlite3.connect('data.db')\n"
+                "    rows = conn.execute('SELECT 1').fetchall()\n"
+                "    return rows"
+            ),
+            "src/direct_result.py": _patch(
+                "import sqlite3\n"
+                "def load():\n"
+                "    conn = sqlite3.connect('data.db')\n"
+                "    return conn.execute('SELECT 1').fetchall()"
+            ),
+            "src/conditional_close.py": _patch(
+                "import sqlite3\n"
+                "def load(close_now):\n"
+                "    conn = sqlite3.connect('data.db')\n"
+                "    if close_now:\n"
+                "        conn.close()\n"
+                "    return []"
+            ),
+            "src/service.go": _patch(
+                "package service\n"
+                "func run(db *sql.DB) error {\n"
+                '  _, err := db.Exec("DELETE FROM jobs")\n'
+                "  if err != nil {\n"
+                '    fmt.Println("delete failed", err)\n'
+                "  }\n"
+                "  return nil\n"
+                "}"
+            ),
+        }
+    )
+
+    keys = _keys(findings)
+    assert ("src/Repository.java", 4, "resource-leak") in keys
+    assert ("src/MixedRepository.java", 8, "resource-leak") in keys
+    assert ("src/Poller.vue", 2, "resource-leak") in keys
+    assert ("src/importer.py", 3, "resource-leak") in keys
+    assert ("src/direct_result.py", 3, "resource-leak") in keys
+    assert ("src/conditional_close.py", 3, "resource-leak") in keys
+    assert ("src/service.go", 4, "error-handling") in keys
+
+
+def test_quality_detector_accepts_explicit_resource_ownership_and_error_exit_paths():
+    findings = detect_quality_findings(
+        {
+            "src/SafeRepository.java": _patch(
+                "import java.sql.Statement;\n"
+                "class SafeRepository {\n"
+                "  void first() throws Exception {\n"
+                "    try (Statement stmt = db.createStatement()) {\n"
+                '      stmt.executeUpdate("DELETE FROM jobs");\n'
+                "    }\n"
+                "  }\n"
+                "  void second() throws Exception {\n"
+                "    Statement stmt = db.createStatement();\n"
+                '    try { stmt.executeUpdate("DELETE FROM jobs"); }\n'
+                "    finally { stmt.close(); }\n"
+                "  }\n"
+                "  Statement transfer() throws Exception {\n"
+                "    Statement stmt = db.createStatement();\n"
+                "    return stmt;\n"
+                "  }\n"
+                "  void javaNine() throws Exception {\n"
+                "    Statement stmt = db.createStatement();\n"
+                '    try (stmt) { stmt.executeUpdate("DELETE FROM jobs"); }\n'
+                "  }\n"
+                "}"
+            ),
+            "src/SafePoller.vue": _patch(
+                "<script setup>\n"
+                "const timer = setInterval(() => refresh(), 1000)\n"
+                "onUnmounted(() => clearInterval(timer))\n"
+                "</script>"
+            ),
+            "src/safe_importer.py": _patch(
+                "import sqlite3\n"
+                "def load():\n"
+                "    conn = sqlite3.connect('data.db')\n"
+                "    try:\n"
+                "        return conn.execute('SELECT 1').fetchall()\n"
+                "    finally:\n"
+                "        conn.close()\n"
+                "def connect():\n"
+                "    conn = sqlite3.connect('data.db')\n"
+                "    return conn"
+            ),
+            "src/safe_service.go": _patch(
+                "package service\n"
+                "func run(db *sql.DB) error {\n"
+                '  _, err := db.Exec("DELETE FROM jobs")\n'
+                "  if err != nil {\n"
+                '    return fmt.Errorf("delete: %w", err)\n'
+                "  }\n"
+                "  return nil\n"
+                "}"
+            ),
+        }
+    )
+
+    assert findings == []
+
+
 def test_quality_detector_skips_tests_fixtures_examples_and_unanchored_text():
     risky = _patch("def test():\n    try:\n        run()\n    except:\n        pass")
 

@@ -58,6 +58,14 @@ _CALIBRATION_MAX_DIFF_CHARS = 24_000
 _CALIBRATION_DIFF_CONTEXT_LINES = 30
 _CALIBRATION_MAX_MESSAGE_CHARS = 800
 _CALIBRATION_MAX_SUGGESTION_CHARS = 600
+# A malformed response is often transient. Retry the original bounded batch
+# once, then split it to isolate persistent schema failures. Split children do
+# not retry, which bounds the worst case for a 16-finding batch at 32 calls.
+_CALIBRATION_FORMAT_RETRIES = 1
+_CALIBRATION_FAIL_CLOSED_SOURCE = "calibration-fail-closed"
+_CALIBRATION_FAIL_CLOSED_REASON = (
+    "Semantic calibration returned an invalid response after bounded recovery; the finding was suppressed fail-closed."
+)
 _SUBPROCESS_CALLS = {
     "subprocess.run",
     "subprocess.Popen",
@@ -182,6 +190,7 @@ class ChallengeResult:
     verdict: str  # confirmed / false_positive
     adjusted_confidence: float
     challenge: str  # reason for the verdict
+    verified_by: str = "adversarial"
 
 
 @dataclass(frozen=True)
@@ -703,8 +712,10 @@ class DynamicCalibrator:
     async def calibrate(self, findings: list[Finding], code_diff: str) -> list[Finding]:
         """Run dynamic calibration loop. Returns calibrated findings.
 
-        Invalid, incomplete or malformed semantic verdicts raise instead of
-        allowing an unverified candidate to reach comment publication.
+        Invalid, incomplete or malformed semantic verdicts are retried and
+        isolated into smaller batches. A persistently invalid singleton is
+        suppressed instead of allowing an unverified candidate to reach
+        comment publication.
         """
         if not findings:
             return []
@@ -808,6 +819,10 @@ class DynamicCalibrator:
         # 找出与原始判断有分歧的
         disputed = []
         for f in updated:
+            # A synthetic fail-closed result has no semantic verdict for a
+            # judge to reconsider. It must remain filtered.
+            if f.verified_by == _CALIBRATION_FAIL_CLOSED_SOURCE:
+                continue
             oc, ostatus = original.get(f.id, (f.confidence, f.status))
             if abs(oc - f.confidence) > self._consensus_threshold or ostatus != f.status:
                 disputed.append(f)
@@ -824,7 +839,7 @@ class DynamicCalibrator:
         return evidence_rejected + auto_confirmed + updated
 
     async def _adversarial_round(self, findings: list[Finding], code_diff: str) -> list[ChallengeResult]:
-        """Verify bounded batches and return results only after every batch succeeds."""
+        """Verify bounded batches, isolating malformed semantic responses."""
 
         batches = _finding_batches(findings)
         results: list[ChallengeResult] = []
@@ -836,12 +851,74 @@ class DynamicCalibrator:
                 len(batch),
             )
             try:
-                results.extend(await self._adversarial_batch(batch, _relevant_diff(code_diff, batch)))
-            except CalibrationResponseError:
-                raise
+                results.extend(
+                    await self._adversarial_batch_resilient(
+                        batch,
+                        code_diff,
+                        retries=_CALIBRATION_FORMAT_RETRIES,
+                    )
+                )
             except Exception as exc:
                 raise CalibrationResponseError(f"Adversarial verifier batch {index + 1}/{len(batches)} failed") from exc
         return results
+
+    async def _adversarial_batch_resilient(
+        self,
+        findings: list[Finding],
+        code_diff: str,
+        *,
+        retries: int,
+    ) -> list[ChallengeResult]:
+        """Retry malformed output, then split and suppress only bad singletons."""
+
+        error: CalibrationResponseError | None = None
+        for attempt in range(retries + 1):
+            try:
+                return await self._adversarial_batch(findings, _relevant_diff(code_diff, findings))
+            except CalibrationResponseError as exc:
+                error = exc
+                if attempt < retries:
+                    logger.warning(
+                        "Calibration adversarial response invalid; retrying %d findings: %s",
+                        len(findings),
+                        exc,
+                    )
+
+        assert error is not None
+        if len(findings) > 1:
+            midpoint = len(findings) // 2
+            logger.warning(
+                "Calibration adversarial response remained invalid; splitting %d findings: %s",
+                len(findings),
+                error,
+            )
+            left = await self._adversarial_batch_resilient(
+                findings[:midpoint],
+                code_diff,
+                retries=0,
+            )
+            right = await self._adversarial_batch_resilient(
+                findings[midpoint:],
+                code_diff,
+                retries=0,
+            )
+            return left + right
+
+        finding = findings[0]
+        logger.error(
+            "Calibration adversarial response invalid for finding %s; suppressing fail-closed: %s",
+            finding.id,
+            error,
+        )
+        return [
+            ChallengeResult(
+                finding_id=finding.id,
+                verdict="false_positive",
+                adjusted_confidence=0.0,
+                challenge=_CALIBRATION_FAIL_CLOSED_REASON,
+                verified_by=_CALIBRATION_FAIL_CLOSED_SOURCE,
+            )
+        ]
 
     async def _adversarial_batch(self, findings: list[Finding], code_diff: str) -> list[ChallengeResult]:
         """Attempt to refute one complete finding batch."""
@@ -904,6 +981,33 @@ class DynamicCalibrator:
 Return exactly one JSON object for every listed finding_id, with no omissions or extras.
 Keep each challenge concise (at most 300 characters).
 
+Dependency and manifest evidence rules:
+- A dependency-version-range is a reproducibility and supply-chain finding whenever the changed
+  manifest constraint admits more than one version. This includes `*`, `>=`, `^`, `~`, Ruby
+  `~>`, Maven interval syntax, movable GitHub Action tags, and Cargo's implicit caret ranges.
+  Confirm a candidate anchored on that declaration even when the range is bounded or conventional
+  for the ecosystem. Exact pins use ecosystem-specific exact syntax such as npm `1.2.3`, Python
+  `==1.2.3`, Cargo `=1.2.3`, or a literal Maven version.
+- GitHub expressions such as `${{{{ secrets.NAME }}}}` and `${{{{ github.event.* }}}}` are references, not
+  hardcoded secret values. Suppress hardcoded-secret findings that have no literal credential.
+- If several candidates describe the same manifest entry or source expression, keep only the most
+  specific independently evidenced defect. Suppress generic duplicate labels such as
+  unmaintained-dependency or unsafe-script when a more specific finding already covers the same
+  changed value and there is no separate evidence.
+- The reported line must contain the risky value, call, or sink. A parent object key, XML groupId,
+  or nearby block header is not sufficient evidence when the actual declaration is elsewhere.
+- An ordinary native button with an async click handler does not require `aria-busy` or
+  `aria-disabled` merely because code has a loading variable. Confirm a missing-state finding only
+  when the diff exposes a visual busy/disabled state without equivalent native or programmatic
+  state, or a custom role requires that state. Native `disabled` does not need redundant
+  `aria-disabled`.
+- In Rust, `Command::new(dynamic_program)` is a command-execution injection risk when a public or
+  attacker-controlled parameter selects the executable, even though no shell is used. A fixed
+  executable with only a dynamic argv value is not shell injection. Likewise, a public path-like
+  parameter that is joined/formatted into a filesystem path and reaches `fs::read` without
+  canonical containment is path traversal evidence; do not dismiss that complete data flow as a
+  mere variable path.
+
 ## 输出格式
 
 对每个 finding 输出 JSON 数组：
@@ -928,7 +1032,7 @@ Keep each challenge concise (at most 300 characters).
         return self._parse_challenges(response.content, findings)
 
     async def _judge_round(self, disputed: list[Finding], code_diff: str) -> list[Finding]:
-        """Judge bounded batches atomically after every response validates."""
+        """Judge bounded batches, isolating malformed semantic responses."""
 
         batches = _finding_batches(disputed)
         judged: list[Finding] = []
@@ -939,16 +1043,74 @@ Keep each challenge concise (at most 300 characters).
                 len(batches),
                 len(batch),
             )
-            # Parsing a judgment mutates findings.  Parse against copies so an
-            # invalid later batch cannot leave a partially judged input set.
-            batch_copies = [replace(finding) for finding in batch]
             try:
-                judged.extend(await self._judge_batch(batch_copies, _relevant_diff(code_diff, batch)))
-            except CalibrationResponseError:
-                raise
+                judged.extend(
+                    await self._judge_batch_resilient(
+                        batch,
+                        code_diff,
+                        retries=_CALIBRATION_FORMAT_RETRIES,
+                    )
+                )
             except Exception as exc:
                 raise CalibrationResponseError(f"Judge batch {index + 1}/{len(batches)} failed") from exc
         return judged
+
+    async def _judge_batch_resilient(
+        self,
+        findings: list[Finding],
+        code_diff: str,
+        *,
+        retries: int,
+    ) -> list[Finding]:
+        """Retry malformed judgments, then split and suppress bad singletons."""
+
+        error: CalibrationResponseError | None = None
+        for attempt in range(retries + 1):
+            # Judgment parsing mutates findings after validating the complete
+            # response, so use fresh copies for every attempt.
+            batch_copies = [replace(finding) for finding in findings]
+            try:
+                return await self._judge_batch(batch_copies, _relevant_diff(code_diff, findings))
+            except CalibrationResponseError as exc:
+                error = exc
+                if attempt < retries:
+                    logger.warning(
+                        "Calibration judge response invalid; retrying %d findings: %s",
+                        len(findings),
+                        exc,
+                    )
+
+        assert error is not None
+        if len(findings) > 1:
+            midpoint = len(findings) // 2
+            logger.warning(
+                "Calibration judge response remained invalid; splitting %d findings: %s",
+                len(findings),
+                error,
+            )
+            left = await self._judge_batch_resilient(
+                findings[:midpoint],
+                code_diff,
+                retries=0,
+            )
+            right = await self._judge_batch_resilient(
+                findings[midpoint:],
+                code_diff,
+                retries=0,
+            )
+            return left + right
+
+        finding = replace(findings[0])
+        logger.error(
+            "Calibration judge response invalid for finding %s; suppressing fail-closed: %s",
+            finding.id,
+            error,
+        )
+        finding.status = "false_positive"
+        finding.confidence = 0.0
+        finding.verify_reason = _CALIBRATION_FAIL_CLOSED_REASON
+        finding.verified_by = _CALIBRATION_FAIL_CLOSED_SOURCE
+        return [finding]
 
     async def _judge_batch(self, disputed: list[Finding], code_diff: str) -> list[Finding]:
         """Final judgment on one complete disputed batch."""
@@ -1004,6 +1166,27 @@ Keep each challenge concise (at most 300 characters).
 Return exactly one JSON object for every listed finding_id, with no omissions or extras.
 Keep each reason concise (at most 300 characters).
 
+Dependency and duplicate-finding rules:
+- Treat every changed dependency constraint that admits multiple versions as a real
+  dependency-version-range, including bounded `>=`/`~>` constraints, npm caret/tilde ranges,
+  Maven intervals, movable Action tags, and Cargo implicit caret ranges. Do not dismiss it merely
+  because the ecosystem commonly permits such ranges.
+- `${{{{ secrets.NAME }}}}` and `${{{{ github.event.* }}}}` are GitHub expression references, not literal
+  hardcoded secrets.
+- Publish one finding per concrete defect. When multiple candidates cover the same manifest entry,
+  call, source-to-sink path, or expression, retain the best anchored and most specific category and
+  mark redundant aliases or broader labels false_positive.
+- Require the finding line to identify the changed risky value/call/sink rather than a nearby block
+  header or metadata line.
+- Do not require `aria-busy`/`aria-disabled` on an ordinary native button solely because its click
+  handler is async or a loading variable exists. There must be an exposed visual state or a custom
+  role contract, and native `disabled` is already programmatic state.
+- For Rust, confirm dynamic executable selection when a public/attacker-controlled parameter flows
+  into `Command::new`; absence of a shell does not make arbitrary program selection safe. Do not
+  confuse this with a fixed executable receiving dynamic argv. Also confirm path traversal when a
+  public path-like parameter is joined/formatted into an `fs::read` path without canonical
+  containment.
+
 ## 输出格式
 
 ```json
@@ -1028,6 +1211,8 @@ Keep each reason concise (at most 300 characters).
 
     def _parse_challenges(self, content: str, findings: list[Finding]) -> list[ChallengeResult]:
         """Parse a complete adversarial verdict set or fail closed."""
+        if not isinstance(content, str):
+            raise CalibrationResponseError("Adversarial verifier returned non-text content")
         data = self._extract_json(content)
         if not isinstance(data, list):
             raise CalibrationResponseError("Adversarial verifier returned invalid JSON or a non-array response")
@@ -1078,6 +1263,8 @@ Keep each reason concise (at most 300 characters).
 
     def _parse_judgment(self, content: str, findings: list[Finding]) -> list[Finding]:
         """Parse a complete final verdict set or fail closed."""
+        if not isinstance(content, str):
+            raise CalibrationResponseError("Judge returned non-text content")
         data = self._extract_json(content)
         if not isinstance(data, list):
             raise CalibrationResponseError("Judge returned invalid JSON or a non-array response")
@@ -1131,7 +1318,7 @@ Keep each reason concise (at most 300 characters).
                 f.confidence = challenge.adjusted_confidence
                 f.status = challenge.verdict
                 f.verify_reason = challenge.challenge
-                f.verified_by = "adversarial"
+                f.verified_by = challenge.verified_by
                 logger.debug(f"Finding {f.id}: {old_confidence:.2f} -> {f.confidence:.2f} ({challenge.verdict})")
             updated.append(f)
         return updated

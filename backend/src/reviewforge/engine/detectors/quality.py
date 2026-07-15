@@ -270,7 +270,88 @@ def _finding(
     )
 
 
-def _java_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) -> list[DetectorFinding]:
+def _java_try_resource_names(rows: list[tuple[int, str]]) -> set[str]:
+    """Return variables declared in complete Java try-with-resources headers."""
+
+    names: set[str] = set()
+    for index, (_line_no, content) in enumerate(rows):
+        if not re.search(r"\btry\s*\(", content):
+            continue
+        header: list[str] = []
+        depth = 0
+        saw_open = False
+        previous_line = 0
+        for line_no, fragment in rows[index : index + 24]:
+            if previous_line and line_no != previous_line + 1:
+                break
+            previous_line = line_no
+            structural = _structural_text(fragment)
+            header.append(structural)
+            for character in structural:
+                if character == "(":
+                    depth += 1
+                    saw_open = True
+                elif character == ")" and saw_open:
+                    depth -= 1
+            if saw_open and depth <= 0:
+                break
+        if not saw_open or depth > 0:
+            continue
+        joined = "\n".join(header)
+        names.update(
+            re.findall(
+                r"\b(?:Statement|PreparedStatement|CallableStatement|ResultSet)\s+([A-Za-z_]\w*)\s*=",
+                joined,
+            )
+        )
+        names.update(re.findall(r"(?:\(|;)\s*([A-Za-z_]\w*)\s*(?=;|\))", joined))
+    return names
+
+
+def _java_method_blocks(rows: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
+    """Return complete Java method/constructor blocks, excluding controls and types."""
+
+    blocks: list[list[tuple[int, str]]] = []
+    method_header = re.compile(
+        r"^\s*(?:(?:public|protected|private|static|final|synchronized|native|abstract|default)\s+)*"
+        r"(?:<[^>{}]+>\s*)?(?:[A-Za-z_$][\w$<>.?\[\],]*\s+)?[A-Za-z_$][\w$]*\s*\([^;{}]*\)"
+        r"(?:\s+throws\s+[^{}]+)?\s*\{"
+    )
+    for index, (_line_no, content) in enumerate(rows):
+        structural = _structural_text(content)
+        if not method_header.search(structural) or re.match(r"^\s*(?:if|for|while|switch|catch|try)\b", structural):
+            continue
+        block = _brace_block(rows, index)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _java_finally_closes(rows: list[tuple[int, str]], variable: str) -> bool:
+    """Whether a visible finally block closes the specified local resource."""
+
+    close = re.compile(rf"\b{re.escape(variable)}\s*\.\s*close\s*\(")
+    for index, (_line_no, content) in enumerate(rows):
+        if not re.search(r"\bfinally\b", content) or "{" not in content:
+            continue
+        block = _brace_block(rows, index)
+        if block and any(close.search(fragment) for _line, fragment in block):
+            return True
+    return False
+
+
+def _java_name_is_returned(rows: list[tuple[int, str]], variable: str) -> bool:
+    return any(
+        re.search(rf"\breturn\s+{re.escape(variable)}\s*;", _structural_text(content)) for _line_no, content in rows
+    )
+
+
+def _java_findings(
+    file_path: str,
+    patch: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
     findings = [
         _finding(
             file_path,
@@ -301,10 +382,53 @@ def _java_findings(file_path: str, rows: list[tuple[int, str]], added: set[int])
                         confidence=0.9,
                     )
                 )
+
+    # Resource lifetime is only provable from a complete new source file.  A
+    # local JDBC handle that is neither owned by try-with-resources nor closed
+    # from a finally block can leak whenever execution throws before a trailing
+    # close call.  Merely seeing ``stmt.close()`` on the success path is not a
+    # sufficient lifetime guarantee.
+    if _is_complete_new_file_patch(patch):
+        declaration = re.compile(
+            r"\b(?P<kind>Statement|PreparedStatement|CallableStatement|ResultSet)\s+"
+            r"(?P<name>[A-Za-z_]\w*)\s*=\s*[^;]*(?:createStatement|prepareStatement|prepareCall|executeQuery)\s*\("
+        )
+        for method in _java_method_blocks(rows):
+            try_resource_names = _java_try_resource_names(method)
+            for line_no, content in method:
+                if line_no not in added:
+                    continue
+                match = declaration.search(content)
+                if match is None:
+                    continue
+                name = match.group("name")
+                kind = match.group("kind")
+                if (
+                    name in try_resource_names
+                    or _java_finally_closes(method, name)
+                    or _java_name_is_returned(method, name)
+                ):
+                    continue
+                findings.append(
+                    _finding(
+                        file_path,
+                        line_no,
+                        "resource-leak",
+                        f"Local JDBC {kind} resource `{name}` is not protected by "
+                        "try-with-resources or a finally close.",
+                        "Acquire the JDBC resource in try-with-resources so every exceptional path closes it.",
+                        confidence=0.98,
+                    )
+                )
     return findings
 
 
-def _vue_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) -> list[DetectorFinding]:
+def _vue_findings(
+    file_path: str,
+    patch: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
     findings = [
         _finding(
             file_path,
@@ -367,17 +491,106 @@ def _vue_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) 
                     "Filter in a computed value or wrap the loop/condition in separate elements.",
                 )
             )
+
+    if _is_complete_new_file_patch(patch):
+        source = "\n".join(content for _line, content in rows)
+        cleared = set(re.findall(r"\bclearInterval\s*\(\s*([A-Za-z_$][\w$]*)\s*\)", source))
+        interval = re.compile(r"(?:(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*)?\bsetInterval\s*\(")
+        for line_no, content in rows:
+            if line_no not in added:
+                continue
+            match = interval.search(content)
+            if match is None:
+                continue
+            handle = match.group("name")
+            if handle and handle in cleared:
+                continue
+            findings.append(
+                _finding(
+                    file_path,
+                    line_no,
+                    "resource-leak",
+                    "The component starts an interval without a visible clearInterval cleanup path.",
+                    "Keep the timer handle and clear it from onUnmounted/onBeforeUnmount "
+                    "or the watch cleanup callback.",
+                    confidence=0.98,
+                )
+            )
     return findings
 
 
-def _python_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) -> list[DetectorFinding]:
-    if not rows or rows[0][0] != 1 or any(right != left + 1 for (left, _), (right, _) in zip(rows, rows[1:])):
+def _python_scope_nodes(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+    """Walk one Python function without borrowing evidence from nested scopes."""
+
+    nodes: list[ast.AST] = []
+    stack = list(function.body)
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
+def _python_is_sqlite_connect(node: ast.AST) -> bool:
+    return bool(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "connect"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "sqlite3"
+    )
+
+
+def _python_name_is_returned(nodes: list[ast.AST], name: str) -> bool:
+    for node in nodes:
+        # Ownership transfers only when the connection object itself is
+        # returned. `return conn.execute(...).fetchall()` returns rows while
+        # leaving the underlying connection owned (and leaked) locally.
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Name) and node.value.id == name:
+            return True
+    return False
+
+
+def _python_name_has_cleanup(function: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+    nodes = _python_scope_nodes(function)
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            continue
+        if node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == name:
+            if isinstance(node.func, ast.Name) and node.func.id == "closing":
+                return True
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"enter_context", "push"}:
+                return True
+    close_call = lambda node: bool(  # noqa: E731
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "close"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == name
+    )
+    for node in nodes:
+        if not isinstance(node, ast.Try):
+            continue
+        if any(close_call(child) for statement in node.finalbody for child in ast.walk(statement)):
+            return True
+    return False
+
+
+def _python_findings(
+    file_path: str,
+    patch: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    if not _is_complete_new_file_patch(patch):
         return []
     try:
         tree = ast.parse("\n".join(content for _line_no, content in rows) + "\n")
     except SyntaxError:
         return []
-    return [
+    findings = [
         _finding(
             file_path,
             node.lineno,
@@ -388,6 +601,30 @@ def _python_findings(file_path: str, rows: list[tuple[int, str]], added: set[int
         for node in ast.walk(tree)
         if isinstance(node, ast.ExceptHandler) and node.type is None and node.lineno in added
     ]
+
+    for function in [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        nodes = _python_scope_nodes(function)
+        for node in nodes:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or not _python_is_sqlite_connect(node.value):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name) or node.lineno not in added:
+                continue
+            name = targets[0].id
+            if _python_name_has_cleanup(function, name) or _python_name_is_returned(nodes, name):
+                continue
+            findings.append(
+                _finding(
+                    file_path,
+                    node.lineno,
+                    "resource-leak",
+                    f"SQLite connection `{name}` is acquired locally but never closed or transferred to the caller.",
+                    "Close the connection in finally/contextlib.closing, or return it with "
+                    "an explicit ownership contract.",
+                    confidence=0.98,
+                )
+            )
+    return findings
 
 
 def _ruby_findings(
@@ -453,6 +690,81 @@ def _go_loop_blocks(rows: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
             if block:
                 blocks.append(block)
     return blocks
+
+
+def _go_function_blocks(rows: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
+    blocks: list[list[tuple[int, str]]] = []
+    for index, (_line_no, content) in enumerate(rows):
+        if not re.match(r"^\s*func\b", content) or "{" not in content:
+            continue
+        block = _brace_block(rows, index)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _go_error_block_only_logs(block: list[tuple[int, str]]) -> bool:
+    """Whether an ``if err != nil`` block merely emits non-terminating logs."""
+
+    if len(block) < 2:
+        return False
+    statements: list[str] = []
+    for index, (_line_no, content) in enumerate(block):
+        structural = _structural_text(content).strip()
+        if index == 0:
+            structural = structural.split("{", 1)[1].strip()
+        if index == len(block) - 1:
+            structural = structural.rsplit("}", 1)[0].strip()
+        if structural:
+            statements.extend(part.strip() for part in structural.split(";") if part.strip())
+    if not statements:
+        return False
+    logger = re.compile(
+        r"^(?:fmt\.(?:Print|Printf|Println)|(?:log|slog|logger|zap\.L\(\))\."
+        r"(?:Print|Printf|Println|Debug|Debugf|Info|Infof|Warn|Warnf|Error|Errorf))\s*\("
+    )
+    return all(logger.search(statement) for statement in statements)
+
+
+def _go_log_and_continue_findings(
+    file_path: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    findings: list[DetectorFinding] = []
+    functions = _go_function_blocks(rows)
+    for function in functions:
+        signature = function[0][1]
+        if not re.search(r"\berror\b[^{}]*\{\s*$", signature):
+            continue
+        for index, (line_no, content) in enumerate(function):
+            if line_no not in added:
+                continue
+            match = re.search(r"\bif\s+(?P<name>[A-Za-z_]\w*)\s*!=\s*nil\s*\{", content)
+            if match is None:
+                continue
+            error_name = match.group("name")
+            block = _brace_block(function, index)
+            if not block or not _go_error_block_only_logs(block):
+                continue
+
+            preceding = "\n".join(fragment for _line, fragment in function[max(0, index - 3) : index])
+            if not re.search(rf"\b{re.escape(error_name)}\s*:?=\s*[^\n]+\([^\n]*\)\s*$", preceding):
+                continue
+            after = "\n".join(fragment for _line, fragment in function[index + len(block) :])
+            if not re.search(r"\breturn\b[^\n]*\bnil\b", after):
+                continue
+            findings.append(
+                _finding(
+                    file_path,
+                    line_no,
+                    "error-handling",
+                    f"Error `{error_name}` is only logged; execution continues and the function can return nil.",
+                    "Return or wrap the error, or perform an explicit retry/recovery before continuing.",
+                    confidence=0.98,
+                )
+            )
+    return findings
 
 
 def _go_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) -> list[DetectorFinding]:
@@ -560,6 +872,7 @@ def _go_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) -
                     confidence=0.98,
                 )
             )
+    findings.extend(_go_log_and_continue_findings(file_path, rows, added))
     return findings
 
 
@@ -678,11 +991,11 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
         code_rows = _masked_rows(rows, language)
 
         if suffix == ".java":
-            findings.extend(_java_findings(file_path, code_rows, added))
+            findings.extend(_java_findings(file_path, patch, code_rows, added))
         elif suffix == ".vue":
-            findings.extend(_vue_findings(file_path, code_rows, added))
+            findings.extend(_vue_findings(file_path, patch, code_rows, added))
         elif suffix == ".py":
-            findings.extend(_python_findings(file_path, rows, added))
+            findings.extend(_python_findings(file_path, patch, rows, added))
         elif suffix == ".rb":
             findings.extend(_ruby_findings(file_path, patch, code_rows, added))
         elif suffix == ".go":

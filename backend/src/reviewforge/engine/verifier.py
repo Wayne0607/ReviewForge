@@ -68,6 +68,16 @@ _MANIFEST_GUESS_CATEGORIES = {
     "security",
     "supply-chain-risk",
 }
+_MANIFEST_CATEGORY_ALIASES = {
+    # Reviewer vocabularies are intentionally broader than the stable public
+    # taxonomy.  Keep these aliases manifest-scoped so a generic
+    # ``vulnerability`` label in application code is not reclassified as a
+    # dependency advisory.
+    "unmaintained": "dependency-deprecated",
+    "unmaintained-dependency": "dependency-deprecated",
+    "unsafe-script": "supply-chain-risk",
+    "vulnerability": "dependency-vulnerability",
+}
 _ADVISORY_ID = re.compile(
     r"\b(?:CVE-(?:\d{4}-)?\d+|GHSA-[a-z0-9-]+|"
     r"(?:GO|PYSEC|RUSTSEC|MAL)-\d{4}-\d+|OSV-[A-Z0-9-]+|SNYK-[A-Z0-9-]+)\b",
@@ -202,6 +212,21 @@ _SINK_FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_VULNERABILITY_MECHANISM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("prototype-pollution", re.compile(r"prototype\s+pollution|原型污染", re.IGNORECASE)),
+    (
+        "remote-code-execution",
+        re.compile(r"remote\s+code\s+execution|arbitrary\s+code\s+execution|\bRCE\b|远程代码执行|任意代码执行", re.I),
+    ),
+    ("deserialization", re.compile(r"deserializ|反序列化", re.IGNORECASE)),
+    ("cross-site-scripting", re.compile(r"cross[- ]site\s+scripting|\bXSS\b|跨站脚本", re.IGNORECASE)),
+    ("denial-of-service", re.compile(r"denial\s+of\s+service|\bDoS\b|拒绝服务", re.IGNORECASE)),
+    ("authentication-bypass", re.compile(r"auth(?:entication)?\s+bypass|认证绕过|身份验证绕过", re.IGNORECASE)),
+    ("path-traversal", re.compile(r"path\s+traversal|directory\s+traversal|路径穿越|目录遍历", re.IGNORECASE)),
+    ("command-injection", re.compile(r"command\s+injection|命令注入", re.IGNORECASE)),
+    ("sql-injection", re.compile(r"sql\s+injection|SQL\s*注入", re.IGNORECASE)),
+)
+
 
 class Verifier:
     """Deterministic de-duplication + confidence-floor filtering of candidate findings."""
@@ -230,6 +255,10 @@ class Verifier:
                 dropped.append(f.id)
                 continue
             f.category = normalize_category(f.category)
+            if self._is_dependency_manifest(f.file):
+                semantic = self._manifest_semantic_category(f)
+                if semantic is not None:
+                    f.category = semantic
             duplicate_index = next(
                 (
                     index
@@ -283,7 +312,10 @@ class Verifier:
         matched_detectors = set(exact_matched_detectors)
         matched_findings: set[str] = set()
         for _quality, _distance, _confidence, _detector_id, _finding_id, detector, finding in sorted(pair_candidates):
-            if detector.id in matched_detectors or finding.id in matched_findings:
+            reusable_manifest_duplicate = detector.id in matched_detectors and self._is_reusable_manifest_duplicate(
+                detector, finding
+            )
+            if (detector.id in matched_detectors and not reusable_manifest_duplicate) or finding.id in matched_findings:
                 continue
             detector.reviewer = self._union_reviewers(detector.reviewer, finding.reviewer)
             matched_detectors.add(detector.id)
@@ -527,8 +559,10 @@ class Verifier:
     def _manifest_semantic_category(finding: Finding) -> str | None:
         """Resolve generic manifest security reports to a concrete claim type."""
 
-        if finding.category != "security":
-            return finding.category
+        category = normalize_category(finding.category)
+        category = _MANIFEST_CATEGORY_ALIASES.get(category, category)
+        if category != "security":
+            return category
         text = f"{finding.message}\n{finding.suggestion}".lower()
         if re.search(r"supply[- ]?chain|package[- ]?compromise|malicious\s+package", text):
             return "supply-chain-risk"
@@ -541,6 +575,45 @@ class Verifier:
         if re.search(r"vulnerab|\badvisory\b|\binsecure\b|unsafe\s+version", text) or _ADVISORY_ID.search(text):
             return "dependency-vulnerability"
         return None
+
+    @classmethod
+    def _is_reusable_manifest_duplicate(cls, detector: Finding, finding: Finding) -> bool:
+        """Allow one advisory detector to absorb repeated generic restatements.
+
+        A detector remains one-to-one for distinct CVE/GHSA claims.  Reuse is
+        safe only for an advisory-free reviewer restatement that names the same
+        package *and exact version* and has the same semantic category.  This
+        handles several reviewers independently reporting one manifest entry
+        without collapsing separate advisories for that entry.
+        """
+
+        if not cls._is_dependency_manifest(detector.file) or cls._advisory_ids(finding):
+            return False
+        if cls._manifest_semantic_category(detector) != cls._manifest_semantic_category(finding):
+            return False
+        detector_packages = cls._dependency_coordinates(detector)
+        finding_packages = cls._dependency_coordinates(finding)
+        if not detector_packages or not detector_packages & finding_packages:
+            return False
+        detector_versions = cls._dependency_version_coordinates(detector)
+        finding_versions = cls._dependency_version_coordinates(finding)
+        finding_mechanisms = cls._vulnerability_mechanisms(finding)
+        if finding_mechanisms:
+            detector_mechanisms = cls._vulnerability_mechanisms(detector)
+            if not detector_mechanisms.intersection(finding_mechanisms):
+                return False
+        return bool(detector_versions & finding_versions) and cls._manifest_evidence_compatible(
+            detector,
+            finding,
+            same_source_line=detector.line == finding.line,
+        )
+
+    @staticmethod
+    def _vulnerability_mechanisms(finding: Finding) -> set[str]:
+        """Return concrete vulnerability mechanisms named by a manifest claim."""
+
+        text = f"{finding.message}\n{finding.suggestion}"
+        return {name for name, pattern in _VULNERABILITY_MECHANISM_PATTERNS if pattern.search(text)}
 
     @staticmethod
     def _advisory_ids(finding: Finding) -> set[str]:

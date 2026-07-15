@@ -620,6 +620,81 @@ def test_exact_manifest_match_consumes_detector_before_advisory_fuzzy_matching()
     assert dropped == ["exact-duplicate"]
 
 
+def test_manifest_detector_absorbs_repeated_generic_same_version_restatement():
+    detector = _finding(
+        "detector",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="serialize-javascript 1.7.0 matches GHSA-h9rv-jmmf-4pgx.",
+        verified_by="detector-auto",
+    )
+    exact_duplicate = _finding(
+        "exact-duplicate",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="serialize-javascript 1.7.0 matches GHSA-h9rv-jmmf-4pgx.",
+    )
+    offset_restatement = _finding(
+        "offset-restatement",
+        file="package.json",
+        line=8,
+        category="vulnerability",
+        message="serialize-javascript 1.7.0 has a known vulnerability.",
+    )
+
+    survivors, dropped = Verifier().verify([detector, exact_duplicate, offset_restatement])
+
+    assert [finding.id for finding in survivors] == ["detector"]
+    assert dropped == ["exact-duplicate", "offset-restatement"]
+
+
+def test_manifest_detector_does_not_absorb_distinct_same_version_mechanism():
+    detector = _finding(
+        "detector",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="widget 1.2.3 matches GHSA-aaaa-bbbb-cccc for prototype pollution.",
+        verified_by="detector-auto",
+    )
+    exact_duplicate = _finding(
+        "exact-duplicate",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="widget 1.2.3 matches GHSA-aaaa-bbbb-cccc for prototype pollution.",
+    )
+    independent = _finding(
+        "independent",
+        file="package.json",
+        line=8,
+        category="dependency-vulnerability",
+        message="widget 1.2.3 allows remote code execution through unsafe deserialization.",
+    )
+
+    survivors, dropped = Verifier().verify([detector, exact_duplicate, independent])
+
+    assert [finding.id for finding in survivors] == ["detector", "independent"]
+    assert dropped == ["exact-duplicate"]
+
+
+def test_manifest_unmaintained_alias_requires_lifecycle_evidence():
+    unsupported = _finding(
+        "unsupported",
+        file="go.mod",
+        line=7,
+        category="unmaintained-dependency",
+        message="jwt-go v3.2.0 is unmaintained.",
+    )
+
+    survivors, dropped = Verifier().verify([unsupported])
+
+    assert survivors == []
+    assert dropped == ["unsupported"]
+
+
 def test_unsupported_manifest_dependency_guess_is_filtered_but_advisory_evidence_survives():
     guess = _finding(
         "guess",

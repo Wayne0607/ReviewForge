@@ -584,6 +584,33 @@ def _semantic_dependency_range_line(
     return kind == "workflow"
 
 
+def _dependency_range_evidence(kind: str, content: str) -> str:
+    """Return a compact package/spec coordinate for a proven range rule."""
+
+    patterns: dict[str, str] = {
+        "package.json": r'^[\s]*["\'](?P<name>[^"\']+)["\']\s*:\s*["\'](?P<spec>[^"\']+)["\']',
+        "requirements.txt": (
+            r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[[^]]+])?)\s*"
+            r"(?P<spec>(?:(?:>=|<=|>|<|~=|!=|==)\s*[^;#\s]+|\*))"
+        ),
+        "Gemfile": r"^\s*gem\s+['\"](?P<name>[^'\"]+)['\"]\s*,\s*['\"](?P<spec>[^'\"]+)['\"]",
+        "Cargo.toml": (
+            r"^\s*(?P<name>[A-Za-z0-9_.-]+)\s*=\s*(?:['\"](?P<simple>[^'\"]+)['\"]|"
+            r"\{[^}]*\bversion\s*=\s*['\"](?P<inline>[^'\"]+)['\"])"
+        ),
+    }
+    pattern = patterns.get(kind)
+    if pattern is None:
+        return ""
+    match = re.match(pattern, content, re.IGNORECASE)
+    if match is None:
+        return ""
+    groups = match.groupdict()
+    spec = groups.get("spec") or groups.get("simple") or groups.get("inline") or ""
+    name = groups.get("name") or ""
+    return f" Declaration: {name} {spec.strip()}." if name and spec else ""
+
+
 def _collect_dependency_findings(
     file_path: str,
     added_lines: list[tuple[int, str]],
@@ -607,7 +634,11 @@ def _collect_dependency_findings(
                     line=line_no,
                     severity=rule.severity,
                     category=normalize_category_for_detector(rule.category),
-                    message=rule.message,
+                    message=(
+                        rule.message + _dependency_range_evidence(kind, line)
+                        if rule.category == "dependency-version-range"
+                        else rule.message
+                    ),
                     suggestion=rule.suggestion,
                     confidence=rule.confidence,
                 )

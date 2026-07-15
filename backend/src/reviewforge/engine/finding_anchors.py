@@ -230,8 +230,175 @@ def reanchor_accessibility_findings(findings: list[Finding], diff_summary: str) 
     return changed
 
 
+def _quality_issue_family(finding: Finding) -> str:
+    """Return a narrow semantic family for deterministic quality duplicates."""
+
+    category = normalize_category(finding.category)
+    text = f"{category}\n{finding.message}\n{finding.suggestion}".lower()
+    file_path = finding.file.lower()
+
+    if file_path.endswith(".java"):
+        if category in {"exception-handling", "error-handling"} and re.search(
+            r"\bcatch\b.*(?:empty|silent|swallow)|(?:empty|silent|swallow).*\bcatch\b|空\s*catch|吞.{0,12}异常",
+            text,
+        ):
+            return "java-empty-catch"
+        if category in {"null-safety", "optional-misuse", "correctness"} and (
+            category == "optional-misuse" or "optional" in text
+        ):
+            return "java-optional-get"
+        if category in {"resource-leak", "resource-management"}:
+            # JDBC resources in one method are independent lifetimes.  Keep
+            # their concrete type in the family so a Statement detector cannot
+            # absorb a separate Connection or ResultSet review finding.
+            for resource_type in ("preparedstatement", "callablestatement", "resultset", "statement", "connection"):
+                if re.search(rf"\b{resource_type}\b", text):
+                    return f"java-jdbc-resource:{resource_type}"
+
+    if file_path.endswith(".vue"):
+        if category in {"exception-handling", "error-handling"} and re.search(
+            r"\bcatch\b.*(?:empty|silent|swallow)|(?:empty|silent|swallow).*\bcatch\b|空\s*catch|吞.{0,12}异常",
+            text,
+        ):
+            return "vue-empty-catch"
+        if category in {"computed-side-effect", "side-effect-in-computed"} or (
+            "computed" in text and re.search(r"side.?effect|副作用", text)
+        ):
+            return "vue-computed-side-effect"
+        if category == "v-for-v-if-misuse" or ("v-for" in text and "v-if" in text):
+            return "vue-v-if-for"
+        if category in {"timer-leak", "memory-leak", "resource-leak"} and re.search(
+            r"setinterval|clearinterval|\binterval\b|定时器",
+            text,
+        ):
+            return "vue-interval-lifecycle"
+
+    if file_path.endswith(".go"):
+        if category in {"goroutine-leak", "lifecycle", "performance", "resource-leak"} and re.search(
+            r"goroutine.{0,80}(?:unbounded|infinite|loop|no\s+(?:stop|exit|cancel)|without\s+cancellation)|"
+            r"(?:unbounded|infinite|loop|no\s+(?:stop|exit|cancel)|without\s+cancellation).{0,80}goroutine|"
+            r"goroutine.{0,40}(?:无限|退出|取消)",
+            text,
+        ):
+            return "go-goroutine-lifecycle"
+        if category in {"error-handling", "ignored-error"} and re.search(
+            r"only logged|log.{0,24}continue|return nil|仅.{0,8}(?:日志|打印).{0,16}继续",
+            text,
+        ):
+            return "go-log-and-continue"
+
+    if (
+        file_path.endswith(".py")
+        and category in {"resource-leak", "resource-management"}
+        and re.search(
+            r"sqlite|connection|\bconn\b",
+            text,
+        )
+    ):
+        return "python-sqlite-resource"
+    return ""
+
+
+def _quality_family_sink_lines(file_path: str, family: str, diff_summary: str) -> set[int]:
+    """Return conservative concrete sink lines for one quality family."""
+
+    patch_lines = iter_right_lines(_extract_file_patch(diff_summary, file_path))
+    if not patch_lines:
+        return set()
+
+    if family == "java-empty-catch":
+        return {line for line, content in patch_lines if re.search(r"\bcatch\s*\([^)]*\)\s*\{", content)}
+    if family == "java-optional-get":
+        return {line for line, content in patch_lines if re.search(r"\.\s*get\s*\(", content)}
+    if family.startswith("java-jdbc-resource:"):
+        resource_type = family.rsplit(":", 1)[1]
+        declaration = re.compile(rf"\b{re.escape(resource_type)}\s+[A-Za-z_]\w*\s*=", re.IGNORECASE)
+        return {line for line, content in patch_lines if declaration.search(content)}
+    if family == "vue-empty-catch":
+        return {line for line, content in patch_lines if re.search(r"\bcatch\s*(?:\([^)]*\))?\s*\{", content)}
+    if family == "vue-computed-side-effect":
+        # Counting every fetch-like call is intentionally conservative: when a
+        # component has another independent fetch, do not guess which one an
+        # offset Reviewer anchor describes.
+        return {
+            line for line, content in patch_lines if re.search(r"\b[A-Za-z_$]*fetch\w*\s*\(", content, re.IGNORECASE)
+        }
+    if family == "vue-v-if-for":
+        return {
+            line
+            for line, content in patch_lines
+            if re.search(r"\bv-if\s*=", content) and re.search(r"\bv-for\s*=", content)
+        }
+    if family == "vue-interval-lifecycle":
+        return {line for line, content in patch_lines if re.search(r"\bsetInterval\s*\(", content)}
+    if family == "go-goroutine-lifecycle":
+        return {line for line, content in patch_lines if re.search(r"\bgo\s+(?:func\b|[A-Za-z_]\w*\s*\()", content)}
+    if family == "go-log-and-continue":
+        return {line for line, content in patch_lines if re.search(r"\bif\s+[A-Za-z_]\w*\s*!=\s*nil\s*\{", content)}
+    if family == "python-sqlite-resource":
+        return {line for line, content in patch_lines if re.search(r"\bsqlite3\s*\.\s*connect\s*\(", content)}
+    return set()
+
+
+def reanchor_quality_detector_duplicates(findings: list[Finding], diff_summary: str) -> list[Finding]:
+    """Move one semantic Reviewer duplicate onto one deterministic quality sink.
+
+    Families are deliberately syntax-specific.  A repair is made only when the
+    file contains exactly one deterministic candidate for that family; adjacent
+    independent sinks remain ambiguous and untouched. JDBC resources additionally
+    require a unique concrete declaration in the changed source.
+    """
+
+    grouped: dict[tuple[str, str], dict[str, list[Finding]]] = defaultdict(lambda: {"detectors": [], "reviewers": []})
+    for finding in findings:
+        family = _quality_issue_family(finding)
+        if not family:
+            continue
+        bucket = "detectors" if finding.verified_by.strip().lower() in _DETECTOR_PROVENANCE else "reviewers"
+        grouped[(finding.file, family)][bucket].append(finding)
+
+    proposals: list[tuple[int, str, Finding, Finding]] = []
+    for (file_path, family), group in grouped.items():
+        detectors = group["detectors"]
+        if len(detectors) != 1:
+            continue
+        detector = detectors[0]
+        sink_lines = _quality_family_sink_lines(file_path, family, diff_summary)
+        # A unique detector is not proof that the file has only one defect: a
+        # second sink may simply be outside the deterministic rule's coverage.
+        # Repair only when the changed source itself has one concrete sink for
+        # this narrow family and the detector is anchored on it.
+        if sink_lines != {detector.line}:
+            continue
+        for finding in group["reviewers"]:
+            if family.startswith("java-jdbc-resource:"):
+                detector_symbols = {value.lower() for value in re.findall(r"`([A-Za-z_]\w*)`", detector.message)}
+                finding_symbols = {value.lower() for value in re.findall(r"`([A-Za-z_]\w*)`", finding.message)}
+                if detector_symbols and finding_symbols and not detector_symbols.intersection(finding_symbols):
+                    continue
+            proposals.append((abs(finding.line - detector.line), finding.id, finding, detector))
+
+    changed: list[Finding] = []
+    claimed_detectors: set[str] = set()
+    for _distance, _finding_id, finding, detector in sorted(proposals):
+        if detector.id in claimed_detectors:
+            continue
+        finding.line = detector.line
+        finding.category = normalize_category(detector.category)
+        claimed_detectors.add(detector.id)
+        changed.append(finding)
+    return changed
+
+
 def _message_code_identifiers(message: str, patch_lines: list[tuple[int, str]]) -> set[str]:
-    """Return code-like message terms that identify exactly one line in the patch."""
+    """Return code-like message terms that are actually present in the patch.
+
+    A useful identifier often appears once in a declaration and again at its
+    sink (for example ``backupPath`` or ``query``).  Requiring one textual
+    occurrence discarded that evidence.  Ambiguity is instead resolved against
+    eligible detector windows below: an identifier may repeat inside one owning
+    symbol, but must not select two independent sinks.
+    """
 
     code = "\n".join(content for _line, content in patch_lines)
     identifiers: set[str] = set()
@@ -241,7 +408,7 @@ def _message_code_identifiers(message: str, patch_lines: list[tuple[int, str]]) 
         if len(raw) < 4 or lowered in _IDENTIFIER_STOPWORDS:
             continue
         occurrence = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(raw)}(?![A-Za-z0-9_$])", re.IGNORECASE)
-        if len(occurrence.findall(code)) == 1:
+        if occurrence.search(code):
             identifiers.add(lowered)
     return identifiers
 
@@ -265,6 +432,9 @@ def _security_anchor_categories_compatible(
     if frozenset({detector_category, reviewer_category}) in _SECURITY_ANCHOR_CATEGORY_PAIRS:
         return True
     categories = {detector_category, reviewer_category}
+    if "unsafe-script" in categories and categories.intersection(_REMOTE_DOWNLOAD_CATEGORIES):
+        window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3)
+        return bool(re.search(r"\b(?:curl|wget)\b[^\n]*\|\s*(?:sh|bash)\b", window, re.IGNORECASE))
     if "code-injection" not in categories or not categories.intersection(_REMOTE_DOWNLOAD_CATEGORIES):
         return False
     window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3)
@@ -298,8 +468,6 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
             continue
         for finding in reviewers:
             identifiers = _message_code_identifiers(finding.message, patch_lines)
-            if not identifiers:
-                continue
             matching = [
                 detector
                 for detector in detectors
@@ -309,8 +477,40 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
                     patch_lines,
                     detector.line,
                 )
+                and identifiers
                 and _window_contains_identifier(patch_lines, detector.line, identifiers)
             ]
+            # Secret-output reviews often say only "GitHub token" and anchor on
+            # a nearby expression.  When the diff has exactly one concrete
+            # secret-print sink, that sink is stronger evidence than a generic
+            # identifier (``github`` occurs throughout workflow expressions).
+            if not matching and re.search(r"\.ya?ml$", file_path, re.IGNORECASE):
+                message_is_secret_output = bool(
+                    re.search(r"(?:print|echo|log|output|write|打印|日志)", finding.message, re.IGNORECASE)
+                    and re.search(r"(?:secret|token|password|key|密钥|令牌)", finding.message, re.IGNORECASE)
+                )
+                if message_is_secret_output:
+                    matching = [
+                        detector
+                        for detector in detectors
+                        if frozenset(
+                            {
+                                normalize_category(detector.category),
+                                normalize_category(finding.category),
+                            }
+                        )
+                        == frozenset({"hardcoded-secrets", "data-leak"})
+                        and abs(detector.line - finding.line) <= 6
+                        and any(
+                            line == detector.line
+                            and re.search(
+                                r"\b(?:echo|printf|printenv|write-output)\b.*(?:\$\{\{\s*secrets\.|\$[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|KEY)\b)",
+                                content,
+                                re.IGNORECASE,
+                            )
+                            for line, content in patch_lines
+                        )
+                    ]
             if len(matching) != 1:
                 continue
             detector = matching[0]

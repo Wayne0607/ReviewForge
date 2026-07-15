@@ -28,6 +28,7 @@ from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
 from reviewforge.engine.finding_anchors import (
     reanchor_accessibility_findings,
+    reanchor_quality_detector_duplicates,
     reanchor_security_detector_duplicates,
     unsupported_python_open_redirect_findings,
 )
@@ -524,6 +525,7 @@ class Orchestrator:
             reanchored = [
                 *reanchor_accessibility_findings(raw_candidates, state.diff_summary),
                 *reanchor_security_detector_duplicates(raw_candidates, state.diff_summary),
+                *reanchor_quality_detector_duplicates(raw_candidates, state.diff_summary),
             ]
             for finding in reanchored:
                 state.update_finding(finding.id, line=finding.line, category=finding.category)

@@ -49,9 +49,11 @@ class PromptCaptureLLM:
     def __init__(self, finding_id: str):
         self.finding_id = finding_id
         self.system_prompts: list[str] = []
+        self.human_prompts: list[str] = []
 
     async def ainvoke(self, messages):
         self.system_prompts.append(str(messages[0].content))
+        self.human_prompts.append(str(messages[1].content))
         if len(self.system_prompts) == 1:
             payload = [
                 {
@@ -143,7 +145,7 @@ def _summary(file_path: str, content: str) -> str:
     return f"--- {file_path} (+{len(lines)} -0)\n{patch}"
 
 
-async def test_malformed_semantic_verdict_fails_closed_instead_of_confirming_detector_candidate():
+async def test_malformed_semantic_verdict_is_retried_then_suppressed_fail_closed():
     finding = Finding(
         id="manifest_candidate",
         file="Gemfile",
@@ -156,18 +158,20 @@ async def test_malformed_semantic_verdict_fails_closed_instead_of_confirming_det
     )
     llm = MalformedCalibrationLLM()
 
-    with pytest.raises(CalibrationResponseError, match="Adversarial verifier"):
-        await DynamicCalibrator(llm, build_registry()).calibrate(
-            [finding],
-            _summary("Gemfile", 'gem "unsafe", "*"'),
-        )
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(
+        [finding],
+        _summary("Gemfile", 'gem "unsafe", "*"'),
+    )
 
-    assert llm.calls == 1
-    assert finding.status == "candidate"
-    assert finding.verified_by == "detector"
+    assert llm.calls == 2
+    assert result == [finding]
+    assert finding.status == "false_positive"
+    assert finding.confidence == 0.0
+    assert finding.verified_by == "calibration-fail-closed"
+    assert "suppressed fail-closed" in finding.verify_reason
 
 
-async def test_malformed_final_judge_never_preserves_an_unverified_confirmation():
+async def test_malformed_final_judge_is_retried_then_suppresses_finding():
     finding = Finding(
         id="judge_candidate",
         file="app.py",
@@ -180,15 +184,17 @@ async def test_malformed_final_judge_never_preserves_an_unverified_confirmation(
     )
     llm = RejectThenMalformedJudgeLLM(finding.id)
 
-    with pytest.raises(CalibrationResponseError, match="Judge returned invalid JSON"):
-        await DynamicCalibrator(llm, build_registry()).calibrate(
-            [finding],
-            _summary("app.py", "os.system(user_command)"),
-        )
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(
+        [finding],
+        _summary("app.py", "os.system(user_command)"),
+    )
 
-    assert llm.calls == 2
+    assert llm.calls == 3
     assert finding.status == "false_positive"
     assert finding.verified_by == "adversarial"
+    assert result[0].status == "false_positive"
+    assert result[0].confidence == 0.0
+    assert result[0].verified_by == "calibration-fail-closed"
 
 
 def test_semantic_verdict_parser_rejects_truthy_types_and_incomplete_batches():
@@ -526,6 +532,36 @@ async def test_quality_evidence_contract_is_present_in_both_calibration_rounds()
         assert "命名" in prompt and "风格" in prompt
         assert "普通静态文本" in prompt and "textContent" in prompt
         assert "alt" in prompt and "label" in prompt
+
+
+async def test_dependency_and_duplicate_evidence_contract_is_present_in_both_rounds():
+    finding = Finding(
+        id="finding_dependency_contract",
+        file="Gemfile",
+        line=4,
+        severity="warning",
+        category="dependency-version-range",
+        message="Dependency constraint admits multiple versions.",
+        confidence=0.9,
+        reviewer="dependency_reviewer",
+    )
+    llm = PromptCaptureLLM(finding.id)
+
+    await DynamicCalibrator(llm, build_registry()).calibrate(
+        [finding],
+        _summary("Gemfile", 'gem "rack", "~> 1.6"'),
+    )
+
+    assert len(llm.human_prompts) == 2
+    for prompt in llm.human_prompts:
+        assert "dependency-version-range" in prompt
+        assert "admits multiple versions" in prompt
+        assert "${{ secrets.NAME }}" in prompt
+        assert "most" in prompt and "specific" in prompt
+        assert "risky value" in prompt
+        assert "ordinary native button" in prompt
+        assert "Command::new" in prompt
+        assert "public path-like" in prompt
 
 
 async def test_python_code_evidence_rejects_safe_process_and_path_claims_without_llm():
@@ -1305,6 +1341,46 @@ class BoundedCalibrationLLM:
         return SimpleNamespace(content=json.dumps(payload))
 
 
+class PoisonedCalibrationLLM:
+    """Return malformed output when one designated finding is present."""
+
+    def __init__(self, poisoned_id: str, poisoned_round: str = "adversarial") -> None:
+        self.poisoned_id = poisoned_id
+        self.poisoned_round = poisoned_round
+        self.round_counts = {"adversarial": 0, "judge": 0}
+        self.records: list[tuple[str, list[str]]] = []
+
+    async def ainvoke(self, messages):
+        human = str(messages[1].content)
+        round_name = "adversarial" if '"adjusted_confidence"' in human else "judge"
+        finding_ids = re.findall(r"^- \[([^\]]+)\]", human, re.MULTILINE)
+        self.round_counts[round_name] += 1
+        self.records.append((round_name, finding_ids))
+        if round_name == self.poisoned_round and self.poisoned_id in finding_ids:
+            return SimpleNamespace(content="not-json")
+        if round_name == "adversarial":
+            payload = [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "confirmed",
+                    "adjusted_confidence": 0.9,
+                    "challenge": "concrete evidence",
+                }
+                for finding_id in finding_ids
+            ]
+        else:
+            payload = [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "confirmed",
+                    "confidence": 0.9,
+                    "reason": "concrete evidence",
+                }
+                for finding_id in finding_ids
+            ]
+        return SimpleNamespace(content=json.dumps(payload))
+
+
 def _large_calibration_fixture(count: int = 48, padding_lines: int = 90):
     findings: list[Finding] = []
     summaries: list[str] = []
@@ -1357,28 +1433,66 @@ async def test_large_calibration_is_bounded_file_local_complete_and_reason_limit
         assert len(human) <= 60_000
 
 
-async def test_large_adversarial_missing_id_fails_before_any_batch_is_applied():
+async def test_large_adversarial_missing_id_recovers_on_bounded_retry():
     findings, diff, _markers = _large_calibration_fixture(padding_lines=4)
     llm = BoundedCalibrationLLM(invalid_round="adversarial", invalid_batch=2)
 
-    with pytest.raises(CalibrationResponseError, match="Adversarial verifier omitted findings"):
-        await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
 
-    assert llm.round_counts == {"adversarial": 2, "judge": 0}
-    assert all(finding.status == "candidate" for finding in findings)
-    assert all(finding.verified_by == "" for finding in findings)
+    assert llm.round_counts == {"adversarial": 4, "judge": 3}
+    assert all(finding.status == "confirmed" for finding in result)
+    assert all(finding.verified_by == "judge" for finding in result)
 
 
-async def test_large_judge_missing_id_never_leaves_partially_judged_findings():
+async def test_large_judge_missing_id_recovers_on_bounded_retry():
     findings, diff, _markers = _large_calibration_fixture(padding_lines=4)
     llm = BoundedCalibrationLLM(invalid_round="judge", invalid_batch=2)
 
-    with pytest.raises(CalibrationResponseError, match="Judge omitted findings"):
-        await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
 
-    assert llm.round_counts == {"adversarial": 3, "judge": 2}
-    assert all(finding.status == "confirmed" for finding in findings)
-    assert all(finding.verified_by == "adversarial" for finding in findings)
+    assert llm.round_counts == {"adversarial": 3, "judge": 4}
+    assert all(finding.status == "confirmed" for finding in result)
+    assert all(finding.verified_by == "judge" for finding in result)
+
+
+async def test_persistent_poisoned_finding_is_split_and_suppressed_without_failing_peers():
+    findings, diff, _markers = _large_calibration_fixture(count=4, padding_lines=4)
+    poisoned = findings[0]
+    llm = PoisonedCalibrationLLM(poisoned.id)
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
+
+    result_by_id = {finding.id: finding for finding in result}
+    assert result_by_id[poisoned.id].status == "false_positive"
+    assert result_by_id[poisoned.id].confidence == 0.0
+    assert result_by_id[poisoned.id].verified_by == "calibration-fail-closed"
+    assert all(
+        result_by_id[finding.id].status == "confirmed" and result_by_id[finding.id].verified_by == "judge"
+        for finding in findings[1:]
+    )
+    assert llm.round_counts == {"adversarial": 6, "judge": 1}
+    judge_ids = {
+        finding_id for round_name, finding_ids in llm.records if round_name == "judge" for finding_id in finding_ids
+    }
+    assert poisoned.id not in judge_ids
+
+
+async def test_persistent_poisoned_judgment_is_split_and_suppressed_without_failing_peers():
+    findings, diff, _markers = _large_calibration_fixture(count=4, padding_lines=4)
+    poisoned = findings[0]
+    llm = PoisonedCalibrationLLM(poisoned.id, poisoned_round="judge")
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, diff)
+
+    result_by_id = {finding.id: finding for finding in result}
+    assert result_by_id[poisoned.id].status == "false_positive"
+    assert result_by_id[poisoned.id].confidence == 0.0
+    assert result_by_id[poisoned.id].verified_by == "calibration-fail-closed"
+    assert all(
+        result_by_id[finding.id].status == "confirmed" and result_by_id[finding.id].verified_by == "judge"
+        for finding in findings[1:]
+    )
+    assert llm.round_counts == {"adversarial": 1, "judge": 6}
 
 
 def test_reviewer_prompts_require_concrete_test_and_documentation_evidence():

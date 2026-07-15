@@ -7,7 +7,7 @@ import pytest
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import Finding
 from reviewforge.engine.calibrator import CalibrationResponseError, DynamicCalibrator, apply_actionability_gate
-from reviewforge.engine.detectors import detect_dependency_findings
+from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
 from reviewforge.engine.detectors.quality import detect_quality_findings
 from reviewforge.engine.prompt import build_reviewer_prompt
 
@@ -59,7 +59,7 @@ class PromptCaptureLLM:
                 {
                     "finding_id": self.finding_id,
                     "verdict": "confirmed",
-                    "adjusted_confidence": 0.8,
+                    "adjusted_confidence": 0.4,
                     "challenge": "存在明确证据。",
                 }
             ]
@@ -87,7 +87,7 @@ class ConfirmingBatchLLM:
                 {
                     "finding_id": finding_id,
                     "verdict": "confirmed",
-                    "adjusted_confidence": 0.9,
+                    "adjusted_confidence": 0.4,
                     "challenge": "存在动态 source 到 shell/path sink。",
                 }
                 for finding_id in self.finding_ids
@@ -103,6 +103,36 @@ class ConfirmingBatchLLM:
                 for finding_id in self.finding_ids
             ]
         return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False))
+
+
+class ConsensusProbeLLM:
+    def __init__(self, finding_id: str, verdict: str, adjusted_confidence: float) -> None:
+        self.finding_id = finding_id
+        self.verdict = verdict
+        self.adjusted_confidence = adjusted_confidence
+        self.calls = 0
+
+    async def ainvoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            payload = [
+                {
+                    "finding_id": self.finding_id,
+                    "verdict": self.verdict,
+                    "adjusted_confidence": self.adjusted_confidence,
+                    "challenge": "bounded semantic verdict",
+                }
+            ]
+        else:
+            payload = [
+                {
+                    "finding_id": self.finding_id,
+                    "verdict": self.verdict,
+                    "confidence": self.adjusted_confidence,
+                    "reason": "final bounded semantic verdict",
+                }
+            ]
+        return SimpleNamespace(content=json.dumps(payload))
 
 
 class MalformedCalibrationLLM:
@@ -236,30 +266,72 @@ def test_semantic_verdict_parser_rejects_truthy_types_and_incomplete_batches():
         calibrator._parse_challenges(incomplete_payload, findings)
 
 
-async def test_high_confidence_detector_security_requires_independent_calibration():
+@pytest.mark.parametrize(
+    ("verdict", "adjusted_confidence", "expected_calls"),
+    [
+        ("confirmed", 0.82, 1),
+        ("false_positive", 0.10, 2),
+        ("confirmed", 0.40, 2),
+    ],
+)
+async def test_candidate_confirmation_is_consensus_but_opposition_or_large_confidence_change_uses_judge(
+    verdict: str,
+    adjusted_confidence: float,
+    expected_calls: int,
+):
     finding = Finding(
-        id="finding_detector",
-        file="app.py",
+        id="candidate_consensus",
+        file="service.py",
         line=1,
-        severity="error",
-        category="code-injection",
-        message="Dynamic eval input is executed.",
-        confidence=0.97,
-        verified_by="detector",
+        category="correctness",
+        message="A concrete behavioral defect is present.",
+        confidence=0.8,
+        reviewer="architecture_reviewer",
     )
+    llm = ConsensusProbeLLM(finding.id, verdict, adjusted_confidence)
 
-    llm = ConfirmingBatchLLM([finding.id])
     result = await DynamicCalibrator(llm, build_registry()).calibrate(
         [finding],
-        _summary("app.py", "eval(user_code)"),
+        _summary("service.py", "result = broken_call()"),
     )
 
-    assert result[0].status == "confirmed"
-    assert result[0].verified_by == "judge"
+    assert llm.calls == expected_calls
+    assert result[0].status == verdict
+    assert result[0].verified_by == ("adversarial" if expected_calls == 1 else "judge")
+
+
+async def test_api_only_pickle_detector_requires_adversarial_calibration():
+    diff = _summary(
+        "app.py",
+        'import pickle\n\ndef clone_constant():\n    return pickle.loads(pickle.dumps({"safe": 1}))',
+    )
+    detector = next(
+        finding
+        for finding in detect_security_findings({"app.py": diff})
+        if finding.category == "insecure-deserialization"
+    )
+    finding = Finding(
+        id="finding_detector",
+        file=detector.file,
+        line=detector.line,
+        severity=detector.severity,
+        category=detector.category,
+        message=detector.message,
+        suggestion=detector.suggestion,
+        confidence=detector.confidence,
+        reviewer="security_reviewer",
+        verified_by="detector",
+    )
+    llm = RejectingLLM(finding.id)
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate([finding], diff)
+
     assert llm.calls == 2
+    assert result[0].status == "false_positive"
+    assert result[0].verified_by == "judge"
 
 
-async def test_security_alias_normalizes_but_still_requires_calibration():
+async def test_security_alias_normalizes_before_semantic_calibration():
     finding = Finding(
         file="settings.py",
         line=1,
@@ -267,22 +339,103 @@ async def test_security_alias_normalizes_but_still_requires_calibration():
         category="hardcoded-secret",
         message="secret literal",
         confidence=0.97,
+        reviewer="security_reviewer",
         verified_by="detector",
     )
 
-    llm = ConfirmingBatchLLM([finding.id])
+    llm = ConsensusProbeLLM(finding.id, "confirmed", 0.97)
     result = await DynamicCalibrator(llm, build_registry()).calibrate(
         [finding],
         _summary("settings.py", 'api_token = "ghp_A1b2C3d4E5f6G7h8"'),
     )
 
+    assert llm.calls == 1
     assert result[0].category == "hardcoded-secrets"
     assert result[0].status == "confirmed"
-    assert result[0].verified_by == "judge"
+    assert result[0].verified_by == "adversarial"
+
+
+async def test_public_unsafe_contract_detector_requires_semantic_calibration():
+    diff = _summary(
+        "src/raw.rs",
+        "pub unsafe fn raw_read(ptr: *const u8, len: usize) -> Vec<u8> {\n"
+        "    std::slice::from_raw_parts(ptr, len).to_vec()\n"
+        "}",
+    )
+    detector = next(
+        finding for finding in detect_security_findings({"src/raw.rs": diff}) if finding.category == "unsafe-block"
+    )
+    finding = Finding(
+        id="raw_read_contract",
+        file=detector.file,
+        line=detector.line,
+        severity=detector.severity,
+        category=detector.category,
+        message=detector.message,
+        suggestion=detector.suggestion,
+        confidence=detector.confidence,
+        reviewer="security_reviewer",
+        verified_by="detector",
+    )
+
+    llm = ConsensusProbeLLM(finding.id, "confirmed", detector.confidence)
+    result = await DynamicCalibrator(llm, build_registry()).calibrate([finding], diff)
+
+    assert llm.calls == 1
+    assert result[0].status == "confirmed"
+    assert result[0].verified_by == "adversarial"
+    assert "public unsafe function" in result[0].message.lower()
+    assert "# Safety" in result[0].message
+
+
+@pytest.mark.parametrize(
+    ("file_path", "source", "line", "category"),
+    [
+        (
+            "view.tsx",
+            "const html = DOMPurify.sanitize(userHtml);\n"
+            "return <article dangerouslySetInnerHTML={{ __html: html }} />;",
+            2,
+            "xss",
+        ),
+        (
+            "repository.py",
+            'cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))',
+            1,
+            "sql-injection",
+        ),
+    ],
+)
+async def test_safe_security_controls_do_not_auto_confirm(
+    file_path: str,
+    source: str,
+    line: int,
+    category: str,
+):
+    finding = Finding(
+        id=f"safe_{category}",
+        file=file_path,
+        line=line,
+        severity="error",
+        category=category,
+        message="Forged high-confidence detector candidate.",
+        confidence=0.99,
+        reviewer="security_reviewer",
+        verified_by="detector",
+    )
+    llm = RejectingLLM(finding.id)
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate(
+        [finding],
+        _summary(file_path, source),
+    )
+
     assert llm.calls == 2
+    assert result[0].status == "false_positive"
+    assert result[0].verified_by == "judge"
 
 
-async def test_security_auto_confirm_requires_exact_detector_replay():
+async def test_forged_security_detector_requires_semantic_calibration():
     finding = Finding(
         id="spoofed_detector",
         file="safe.py",
@@ -304,7 +457,7 @@ async def test_security_auto_confirm_requires_exact_detector_replay():
     assert result[0].verified_by == "judge"
 
 
-async def test_detector_manifest_ranges_require_independent_calibration_across_ecosystems():
+async def test_detector_manifest_ranges_auto_confirm_across_ecosystems():
     sources = {
         "requirements.txt": "flask>=2.0\nunsafe-lib==*\nunversioned-package\nrequests==2.31.0",
         "package.json": (
@@ -341,14 +494,12 @@ async def test_detector_manifest_ranges_require_independent_calibration_across_e
         for item in ranges
     ]
 
-    llm = ConfirmingBatchLLM([finding.id for finding in findings])
-    result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, summary)
+    result = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(findings, summary)
 
     assert {finding.file for finding in result} == set(sources)
     assert len(result) == 14
     assert {finding.status for finding in result} == {"confirmed"}
-    assert {finding.verified_by for finding in result} == {"judge"}
-    assert llm.calls == 2
+    assert {finding.verified_by for finding in result} == {"detector-auto"}
 
 
 async def test_manifest_range_auto_confirm_requires_detector_provenance():
@@ -422,13 +573,49 @@ async def test_high_confidence_quality_findings_require_independent_calibration(
         for item in detected
     ]
 
-    llm = ConfirmingBatchLLM([finding.id for finding in findings])
+    calibration_ids = [finding.id for finding in findings if finding.confidence < 0.98]
+    llm = ConfirmingBatchLLM(calibration_ids)
     result = await DynamicCalibrator(llm, build_registry()).calibrate(findings, summary)
 
     assert len(result) == 3
     assert {finding.status for finding in result} == {"confirmed"}
-    assert {finding.verified_by for finding in result} == {"judge"}
+    assert {finding.verified_by for finding in result} == {"detector-auto", "judge"}
     assert llm.calls == 2
+
+
+async def test_effect_verb_render_detector_requires_adversarial_calibration():
+    diff = _summary(
+        "src/Panel.tsx",
+        'import { runValidation } from "./pure";\n\n'
+        "export function Panel({ value }: { value: string }) {\n"
+        "  runValidation(value);\n"
+        "  return <section>{value}</section>;\n"
+        "}",
+    )
+    detector = next(
+        finding
+        for finding in detect_quality_findings({"src/Panel.tsx": diff})
+        if finding.category == "side-effect-in-render"
+    )
+    finding = Finding(
+        id="render_effect_name_only",
+        file=detector.file,
+        line=detector.line,
+        severity=detector.severity,
+        category=detector.category,
+        message=detector.message,
+        suggestion=detector.suggestion,
+        confidence=detector.confidence,
+        reviewer="quality_reviewer",
+        verified_by="detector",
+    )
+    llm = RejectingLLM(finding.id)
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate([finding], diff)
+
+    assert llm.calls == 2
+    assert result[0].status == "false_positive"
+    assert result[0].verified_by == "judge"
 
 
 async def test_quality_auto_confirm_requires_detector_provenance_and_reproduced_rule():
@@ -986,13 +1173,16 @@ pub fn load_config(base_path: &str, filename: &str) -> Result<String, std::io::E
     assert preserved[0].status == "confirmed"
 
 
-def test_contextual_live_region_style_and_performance_findings_are_not_irreversibly_filtered():
+def test_actionability_gate_rejects_static_live_noise_pure_naming_and_manual_count_micro_optimization():
     source = """function showStatus(message: string) {
   document.getElementById('status')!.textContent = message;
 }
 
 def count_lines(path: str) -> str:
     return run_wc(path)
+
+def ping_localhost(constant_host: str) -> bool:
+    return ping(constant_host)
 
 pub fn count_items(items: &[String]) -> usize {
     let mut count = 0;
@@ -1020,9 +1210,21 @@ pub fn count_items(items: &[String]) -> usize {
             reviewer="style_reviewer",
         ),
         Finding(
-            id="micro_optimization",
+            id="ping_name_preference",
             file="mixed.txt",
             line=8,
+            category="naming",
+            message=(
+                "ping_localhost is misleading because constant_host can select any host; "
+                "the naming is inconsistent with the implementation."
+            ),
+            confidence=0.85,
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="micro_optimization",
+            file="mixed.txt",
+            line=11,
             category="performance",
             message="The manual count loop can be replaced by len() for O(1) access.",
             confidence=1.0,
@@ -1032,8 +1234,41 @@ pub fn count_items(items: &[String]) -> usize {
 
     actionable, rejected = apply_actionability_gate(findings, _summary("mixed.txt", source))
 
-    assert actionable == findings
-    assert rejected == []
+    assert actionable == []
+    assert rejected == findings
+    assert {finding.verified_by for finding in rejected} == {"actionability-gate"}
+
+
+def test_actionability_gate_rejects_static_vue_and_svelte_raw_html_live_region_guesses():
+    diff = "\n".join(
+        [
+            _summary("StaticBio.vue", '<div class="bio" v-html="bio" />'),
+            _summary("StaticBio.svelte", "<article>{@html bio}</article>"),
+        ]
+    )
+    findings = [
+        Finding(
+            id="vue_static_live",
+            file="StaticBio.vue",
+            line=1,
+            category="missing-aria-live",
+            message="v-html content has no aria-live announcement.",
+            reviewer="accessibility_reviewer",
+        ),
+        Finding(
+            id="svelte_static_live",
+            file="StaticBio.svelte",
+            line=1,
+            category="missing-live-region",
+            message="The {@html} carrier has no live-region role.",
+            reviewer="accessibility_reviewer",
+        ),
+    ]
+
+    actionable, rejected = apply_actionability_gate(findings, diff)
+
+    assert actionable == []
+    assert rejected == findings
 
 
 async def test_actionability_gate_preserves_concrete_style_performance_and_removed_aria_failures():
@@ -1091,7 +1326,9 @@ def test_actionability_gate_preserves_new_live_carrier_blocking_io_listener_impo
             _summary(
                 "view.tsx",
                 "const status = document.getElementById('status');\n"
-                "status.textContent = message;\n"
+                "window.addEventListener('message', event => {\n"
+                "  status.textContent = event.data;\n"
+                "});\n"
                 'return <div id="status" />;',
             ),
             _summary(
@@ -1106,7 +1343,7 @@ def test_actionability_gate_preserves_new_live_carrier_blocking_io_listener_impo
         Finding(
             id="new_live_region",
             file="view.tsx",
-            line=2,
+            line=3,
             category="missing-live-region",
             message="The newly added status carrier is updated dynamically but has no live-region semantics.",
             confidence=0.9,
@@ -1250,7 +1487,7 @@ def test_rust_actionability_guard_requires_same_candidate_before_sink():
     assert {finding.id for finding in rejected} == {"guarded"}
 
 
-async def test_high_confidence_detector_missing_alt_requires_render_context():
+async def test_high_confidence_detector_missing_alt_auto_confirms_complete_file():
     finding = Finding(
         id="detector_alt",
         file="view.tsx",
@@ -1262,18 +1499,16 @@ async def test_high_confidence_detector_missing_alt_requires_render_context():
         verified_by="detector",
     )
 
-    llm = ConfirmingBatchLLM([finding.id])
-    result = await DynamicCalibrator(llm, build_registry()).calibrate(
+    result = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(
         [finding],
         _summary("view.tsx", '<img src="/avatar.png" />'),
     )
 
     assert {finding.status for finding in result} == {"confirmed"}
-    assert {finding.verified_by for finding in result} == {"judge"}
-    assert llm.calls == 2
+    assert {finding.verified_by for finding in result} == {"detector-auto"}
 
 
-async def test_detector_missing_label_still_requires_contextual_calibration():
+async def test_detector_missing_label_auto_confirms_complete_file_replay():
     finding = Finding(
         id="detector_label",
         file="view.tsx",
@@ -1284,15 +1519,12 @@ async def test_detector_missing_label_still_requires_contextual_calibration():
         reviewer="accessibility_reviewer",
         verified_by="detector",
     )
-    llm = ConfirmingBatchLLM([finding.id])
-
-    result = await DynamicCalibrator(llm, build_registry()).calibrate(
+    result = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(
         [finding],
         _summary("view.tsx", '<input name="email" />'),
     )
 
-    assert llm.calls == 2
-    assert result[0].verified_by == "judge"
+    assert result[0].verified_by == "detector-auto"
 
 
 class BoundedCalibrationLLM:
@@ -1363,7 +1595,7 @@ class PoisonedCalibrationLLM:
                 {
                     "finding_id": finding_id,
                     "verdict": "confirmed",
-                    "adjusted_confidence": 0.9,
+                    "adjusted_confidence": 0.4,
                     "challenge": "concrete evidence",
                 }
                 for finding_id in finding_ids

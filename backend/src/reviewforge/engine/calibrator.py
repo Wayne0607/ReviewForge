@@ -24,7 +24,7 @@ from reviewforge.core.state import Finding
 from reviewforge.engine.detectors.accessibility import is_deterministic_accessibility_finding
 from reviewforge.engine.detectors.dependency import is_deterministic_dependency_version_range
 from reviewforge.engine.detectors.quality import is_deterministic_quality_finding
-from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks, is_deterministic_security_finding
+from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 
@@ -35,20 +35,15 @@ class CalibrationResponseError(RuntimeError):
     """Raised when semantic calibration has no complete, trustworthy verdict."""
 
 
-# Only findings backed by a deterministic detector and a near-certain rule may
-# bypass contextual calibration.  A security category by itself is not proof:
-# reviewers can misread sanitizers, allow-lists, test fixtures, or safe process
-# argument APIs just like any other reviewer.
-_DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE = 0.96
-# Quality heuristics are valuable candidates, but replaying the same lexical
-# rule is not independent proof of semantics (constants, re-raises and control
-# flow can make an apparent defect safe). Route every quality finding through
-# adversarial calibration until parser-backed proofs are introduced.
-_QUALITY_AUTO_CONFIRM_MIN_CONFIDENCE = 1.01
-# Detector replay is useful provenance, not independent verification. Keep the
-# plumbing available for future parser/type-backed proofs, but require the
-# adversarial verifier and judge for every current detector family.
-_DETECTOR_AUTO_CONFIRM_ENABLED = False
+# Security detector matches always require semantic calibration. Replaying the
+# same lexical/API rule is provenance, not independent proof of an attacker-
+# controlled source reaching the sink. The remaining local auto-confirm lanes
+# are deliberately limited to manifest, quality, and accessibility rules whose
+# helpers require a complete new-file patch and an exact file/line/category
+# match.
+_QUALITY_AUTO_CONFIRM_MIN_CONFIDENCE = 0.98
+_ACCESSIBILITY_AUTO_CONFIRM_MIN_CONFIDENCE = 0.90
+_DETECTOR_AUTO_CONFIRM_ENABLED = True
 _SUMMARY_FILE_HEADER = re.compile(r"^--- (?P<file>.+?) \(\+\d+ -\d+\)$")
 # Keep calibration requests comfortably below common model output limits.  The
 # model must return one JSON object per finding, so candidate count is the
@@ -129,9 +124,59 @@ _GENERIC_PERFORMANCE_CATEGORIES = {
     "performance",
     "unnecessary-computation",
 }
+_NAMING_LANGUAGE = re.compile(
+    r"\b(?:name|naming|named|mislead(?:ing)?|imprecise|inconsistent|confusing|suggests?|implies?)\b|"
+    r"命名|名称|误导|不一致|不准确|含糊",
+    re.IGNORECASE,
+)
+_OBSERVABLE_NAMING_FAILURE = re.compile(
+    r"(?:\b(?:name|naming|named|mislead(?:ing)?)\b|\bapi\b)[^.\n]{0,100}"
+    r"\b(?:causes?|caused|results?\s+in|leads?\s+to|makes?)\b[^.\n]{0,100}"
+    r"\b(?:fail(?:s|ed|ure)?|reject(?:s|ed|ion)?|crash(?:es|ed)?|throw(?:s|n)?|"
+    r"exception|compile(?:s|d)?\s+(?:error|failure)|framework\s+(?:error|failure))\b|"
+    r"(?:命名|名称|误导)[^\n。]{0,80}(?:导致|使得|造成)[^\n。]{0,80}"
+    r"(?:API\s*)?(?:调用者)?(?:失败|拒绝|崩溃|异常|编译错误|运行时错误)",
+    re.IGNORECASE,
+)
+_MANUAL_COUNT_LANGUAGE = re.compile(
+    r"\b(?:manual(?:ly)?|hand[- ]written|loop|iterat(?:e|ion)|linear|o\s*\(\s*n\s*\)|count(?:ing)?)\b"
+    r"[^\n]{0,160}\b(?:len(?:gth)?|size|count)\s*\(?|"
+    r"(?:len(?:gth)?|size|count)\s*\([^\n]{0,160}\b(?:loop|iterat(?:e|ion)|manual(?:ly)?)\b|"
+    r"手写|手动|循环计数|遍历计数",
+    re.IGNORECASE,
+)
+_MANUAL_COUNT_CODE = re.compile(
+    r"\b[A-Za-z_]\w*\s*(?:\+=\s*1|=\s*[A-Za-z_]\w*\s*\+\s*1)\b|"
+    r"\bfor\b[^\n{]*\{?[^\n]*(?:count|total|length|size)\s*\+\+",
+    re.IGNORECASE,
+)
+_MEANINGFUL_PERFORMANCE_IMPACT = re.compile(
+    r"(?:\b(?:n\s*\+\s*1|unbounded|hot\s*path|every\s+(?:request|frame|event)|blocking|"
+    r"event\s*loop|database|query|network|disk|i/?o|resource|memory|leak|allocation|"
+    r"exhaust|latency|timeout|quadratic|cubic)\b|o\s*\(\s*n\s*(?:\^\s*2|²)\s*\)|"
+    r"o\s*\(\s*2\s*\^\s*n\s*\)|"
+    r"无界|热路径|每个请求|每帧|阻塞|数据库|网络|磁盘|资源|"
+    r"内存|泄漏|耗尽|延迟|超时|二次复杂度)",
+    re.IGNORECASE,
+)
+_A11Y_DYNAMIC_TRIGGER = re.compile(
+    r"\b(?:async|await|fetch|promise|then|addEventListener|onClick|onSubmit|onChange|"
+    r"subscribe|subscription|watch|websocket|eventsource|setTimeout|setInterval|useEffect)\b|"
+    r"异步|事件|订阅",
+    re.IGNORECASE,
+)
+_A11Y_DYNAMIC_UPDATE = re.compile(
+    r"\b(?:textContent|innerHTML|outerHTML|setStatus|setMessage|status\s*=|message\s*=|"
+    r"v-html)\b|\{@html\}|\b(?:status|message)\.(?:value|set)\b",
+    re.IGNORECASE,
+)
+_A11Y_NOTIFICATION_SEMANTICS = re.compile(
+    r"\baria-live\s*=|\brole\s*=\s*[\"'](?:status|alert)[\"']",
+    re.IGNORECASE,
+)
 # Markup absence still depends on renderability (hidden/dead JSX, stories,
 # framework conditions), so accessibility findings remain contextual.
-_DETERMINISTIC_A11Y_CATEGORIES: set[str] = set()
+_DETERMINISTIC_A11Y_CATEGORIES = {"missing-alt", "missing-label"}
 _DETERMINISTIC_QUALITY_CATEGORIES = {
     "api-contract",
     "computed-side-effect",
@@ -616,12 +661,30 @@ def _has_removed_test_code(diff_summary: str, file_path: str) -> bool:
     return False
 
 
-def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
-    """Reject only narrow test-absence noise at the zero-token stage.
+def _has_removed_notification_semantics(diff_summary: str, file_path: str) -> bool:
+    """Recognize an explicitly removed live-region contract in a valid hunk."""
 
-    Style, imports, performance, accessibility, and documentation require broader
-    repository context. A finite keyword allow-list cannot prove those findings
-    false, so they always continue to adversarial calibration.
+    patch = _extract_file_patch(diff_summary, file_path)
+    in_hunk = False
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("@@ "):
+            in_hunk = True
+            continue
+        if raw_line.startswith("@@") or raw_line.startswith("diff --git "):
+            in_hunk = False
+            continue
+        if in_hunk and raw_line.startswith("-") and not raw_line.startswith("---"):
+            if _A11Y_NOTIFICATION_SEMANTICS.search(raw_line[1:]):
+                return True
+    return False
+
+
+def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
+    """Reject narrow, locally disproven quality noise at the zero-token stage.
+
+    The gate recognizes only absence/no-impact shapes with a complete local
+    counterexample. Other style, performance, accessibility, and documentation
+    findings continue to semantic calibration.
     """
 
     kind = _generic_quality_kind(finding)
@@ -654,6 +717,33 @@ def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
         if changed_test_defect or removed_test or security_regression_contract:
             return ""
         return "仅指出缺少测试/覆盖率，没有在可评论的变更行上证明具体错误断言、测试删除或安全回归契约"
+
+    if kind == "style" and finding.category == "naming":
+        if _NAMING_LANGUAGE.search(text) and not _OBSERVABLE_NAMING_FAILURE.search(text):
+            return "该发现只描述名称可能误导或不一致，未给出可验证的运行时、框架或 API 调用失败"
+
+    if kind == "performance":
+        count_scope = _nearby_added_code(code_diff, finding.file, finding.line, radius=6)
+        manual_count = bool(_MANUAL_COUNT_LANGUAGE.search(text)) and bool(_MANUAL_COUNT_CODE.search(count_scope))
+        if manual_count and not _MEANINGFUL_PERFORMANCE_IMPACT.search(text):
+            return "该发现只建议用 len/size 替代手写计数，未证明热路径、无界工作或资源影响"
+
+    if kind == "a11y-absence":
+        if _has_removed_notification_semantics(code_diff, finding.file):
+            return ""
+        patch = _extract_file_patch(code_diff, finding.file)
+        dynamic_contract = (
+            has_anchor
+            and bool(_A11Y_DYNAMIC_TRIGGER.search(patch))
+            and bool(_A11Y_DYNAMIC_UPDATE.search(patch))
+            and not bool(_A11Y_NOTIFICATION_SEMANTICS.search(patch))
+        )
+        if dynamic_contract:
+            return ""
+        return (
+            "仅出现 innerHTML/v-html/{@html} 或普通属性渲染，"
+            "未显示异步/事件/订阅驱动的状态更新或被删除的 live-region 契约"
+        )
 
     return ""
 
@@ -692,9 +782,10 @@ class DynamicCalibrator:
     2. Adversarial Verifier tries to refute each finding
     3. Judge rules on disputed findings (only if Round 2 disagrees with Round 1)
 
-    Every current detector and reviewer finding requires independent semantic
-    calibration. Detector replay remains provenance only until a parser/type-
-    backed proof is introduced and explicitly enabled.
+    Reviewer and security-detector findings require semantic calibration.
+    Manifest, quality, and accessibility detectors bypass it only when a
+    complete new-file patch reproduces the exact anchor under one of the
+    explicitly enabled high-confidence local proofs.
     """
 
     def __init__(
@@ -737,7 +828,16 @@ class DynamicCalibrator:
                 f.verify_reason = rejection_reason
                 evidence_rejected.append(f)
                 continue
-            detector_backed = f.verified_by == "detector"
+            expected_detector_reviewer = {
+                "dependency-version-range": "dependency_reviewer",
+                "missing-alt": "accessibility_reviewer",
+                "missing-label": "accessibility_reviewer",
+            }.get(f.category)
+            if expected_detector_reviewer is None:
+                expected_detector_reviewer = (
+                    "security_reviewer" if is_security_category(f.category) else "quality_reviewer"
+                )
+            detector_backed = f.verified_by == "detector" and f.reviewer == expected_detector_reviewer
             deterministic_manifest_range = (
                 _DETECTOR_AUTO_CONFIRM_ENABLED
                 and detector_backed
@@ -760,23 +860,10 @@ class DynamicCalibrator:
                     _extract_file_patch(code_diff, f.file),
                 )
             )
-            deterministic_security = (
-                _DETECTOR_AUTO_CONFIRM_ENABLED
-                and detector_backed
-                and f.confidence >= _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE
-                and is_security_category(f.category)
-                and f.category != "dependency-version-range"
-                and is_deterministic_security_finding(
-                    f.file,
-                    f.line,
-                    f.category,
-                    _extract_file_patch(code_diff, f.file),
-                )
-            )
             deterministic_accessibility = (
                 _DETECTOR_AUTO_CONFIRM_ENABLED
                 and detector_backed
-                and f.confidence >= _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE
+                and f.confidence >= _ACCESSIBILITY_AUTO_CONFIRM_MIN_CONFIDENCE
                 and f.category in _DETERMINISTIC_A11Y_CATEGORIES
                 and is_deterministic_accessibility_finding(
                     f.file,
@@ -785,12 +872,7 @@ class DynamicCalibrator:
                     _extract_file_patch(code_diff, f.file),
                 )
             )
-            if (
-                deterministic_manifest_range
-                or deterministic_quality
-                or deterministic_security
-                or deterministic_accessibility
-            ):
+            if deterministic_manifest_range or deterministic_quality or deterministic_accessibility:
                 f.status = "confirmed"
                 f.verified_by = "detector-auto"
                 f.verify_reason = "Deterministic detector rule matched the changed source line."
@@ -809,7 +891,11 @@ class DynamicCalibrator:
 
         current = need_calibration
         # 快照原始 confidence/status（在被 _apply_challenges 原地修改之前）
-        original = {f.id: (f.confidence, f.status) for f in current}
+        # A Reviewer candidate is its affirmative first-round hypothesis. A
+        # confirming adversarial verdict therefore reaches consensus unless it
+        # materially changes confidence; the candidate -> confirmed lifecycle
+        # transition is not itself a disagreement requiring a second LLM call.
+        original = {f.id: (f.confidence, "confirmed" if f.status == "candidate" else f.status) for f in current}
 
         # Round 2：对抗式验证
         logger.info(f"Calibration: adversarial verify ({len(current)} findings)")

@@ -39,6 +39,9 @@ _NON_TEXT_INPUT = re.compile(
 _STATIC_ID = re.compile(r"\bid\s*=\s*['\"](?P<id>[A-Za-z][\w:.-]*)['\"]", re.IGNORECASE)
 _DETECTOR_PROVENANCE = {"detector", "detector-auto"}
 _CODE_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_$])(?:[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*")
+_EXPLICIT_CALL_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9_$])(?P<name>[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*)(?=\s*\()"
+)
 _IDENTIFIER_STOPWORDS = {
     "allow",
     "application",
@@ -274,6 +277,12 @@ def _quality_issue_family(finding: Finding) -> str:
             return "vue-interval-lifecycle"
 
     if file_path.endswith(".go"):
+        if (
+            category in {"performance", "resource-exhaustion", "resource-leak"}
+            and re.search(r"\bdefer\b", text)
+            and re.search(r"\b(?:for|loop|iteration)\b|循环|迭代", text)
+        ):
+            return "go-defer-rows-close-loop"
         if category in {"goroutine-leak", "lifecycle", "performance", "resource-leak"} and re.search(
             r"goroutine.{0,80}(?:unbounded|infinite|loop|no\s+(?:stop|exit|cancel)|without\s+cancellation)|"
             r"(?:unbounded|infinite|loop|no\s+(?:stop|exit|cancel)|without\s+cancellation).{0,80}goroutine|"
@@ -335,6 +344,8 @@ def _quality_family_sink_lines(file_path: str, family: str, diff_summary: str) -
         return {line for line, content in patch_lines if re.search(r"\bgo\s+(?:func\b|[A-Za-z_]\w*\s*\()", content)}
     if family == "go-log-and-continue":
         return {line for line, content in patch_lines if re.search(r"\bif\s+[A-Za-z_]\w*\s*!=\s*nil\s*\{", content)}
+    if family == "go-defer-rows-close-loop":
+        return {line for line, content in patch_lines if re.search(r"\bdefer\s+rows\s*\.\s*Close\s*\(\s*\)", content)}
     if family == "python-sqlite-resource":
         return {line for line, content in patch_lines if re.search(r"\bsqlite3\s*\.\s*connect\s*\(", content)}
     return set()
@@ -413,6 +424,24 @@ def _message_code_identifiers(message: str, patch_lines: list[tuple[int, str]]) 
     return identifiers
 
 
+def _message_explicit_call_identifiers(message: str, patch_lines: list[tuple[int, str]]) -> set[str]:
+    """Return APIs explicitly written as calls in a reviewer message.
+
+    Ruby reviews commonly name both a tainted variable and the concrete sink,
+    such as ``system()``.  The sink API is stronger ownership evidence than a
+    variable reused by an earlier, independent command execution.
+    """
+
+    code = "\n".join(content for _line, content in patch_lines)
+    identifiers: set[str] = set()
+    for match in _EXPLICIT_CALL_IDENTIFIER.finditer(message or ""):
+        raw = re.sub(r"\s+", "", match.group("name"))
+        occurrence = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(raw)}\s*\(", re.IGNORECASE)
+        if occurrence.search(code):
+            identifiers.add(raw.lower())
+    return identifiers
+
+
 def _window_contains_identifier(patch_lines: list[tuple[int, str]], detector_line: int, identifiers: set[str]) -> bool:
     window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3).lower()
     return any(
@@ -480,6 +509,15 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
                 and identifiers
                 and _window_contains_identifier(patch_lines, detector.line, identifiers)
             ]
+            if file_path.lower().endswith(".rb"):
+                explicit_calls = _message_explicit_call_identifiers(finding.message, patch_lines)
+                preferred = [
+                    detector
+                    for detector in matching
+                    if _window_contains_identifier(patch_lines, detector.line, explicit_calls)
+                ]
+                if preferred:
+                    matching = preferred
             # Secret-output reviews often say only "GitHub token" and anchor on
             # a nearby expression.  When the diff has exactly one concrete
             # secret-print sink, that sink is stronger evidence than a generic
@@ -573,6 +611,23 @@ def _python_function_has_redirect_call(function: ast.FunctionDef | ast.AsyncFunc
     return False
 
 
+def _python_tree_has_redirect_call(tree: ast.Module) -> bool:
+    """Whether a complete Python post-image invokes a known redirect API."""
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            call_name = node.func.id.lower()
+        elif isinstance(node.func, ast.Attribute):
+            call_name = node.func.attr.lower()
+        else:
+            call_name = ""
+        if call_name in _PYTHON_REDIRECT_CALLS:
+            return True
+    return False
+
+
 def unsupported_python_open_redirect_findings(findings: list[Finding], diff_summary: str) -> list[Finding]:
     """Reject LLM open-redirect claims whose Python function has no redirect sink.
 
@@ -597,6 +652,12 @@ def unsupported_python_open_redirect_findings(findings: list[Finding], diff_summ
             continue
         tree, patch_lines = parsed
         functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        # A complete new file with no redirect API cannot support an
+        # open-redirect finding, even when the model anchored it on whitespace
+        # or otherwise outside the URL-builder function it describes.
+        if not _python_tree_has_redirect_call(tree):
+            rejected.append(finding)
+            continue
         scopes = [
             function
             for function in functions

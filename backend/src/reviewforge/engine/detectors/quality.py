@@ -13,7 +13,7 @@ from pathlib import PurePosixPath
 
 from reviewforge.engine.detectors.base import DetectorFinding, dedupe_findings
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
-from reviewforge.engine.symbol_extractor import mask_comments, mask_non_code
+from reviewforge.engine.symbol_extractor import extract_imports, mask_comments, mask_non_code
 
 _LOW_SIGNAL_PATH_PARTS = {
     "__tests__",
@@ -963,6 +963,156 @@ def _browser_import_findings(file_path: str, rows: list[tuple[int, str]], added:
     ]
 
 
+_REACT_RENDER_EFFECT_NAME = re.compile(
+    r"^(?:set|store|save|write|run|exec|spawn|send|post|put|patch|delete|remove|"
+    r"track|log|navigate|redirect|fetch|load|mutate|dispatch)[A-Za-z0-9_$]*$",
+    re.IGNORECASE,
+)
+
+
+def _matching_delimiter(masked: str, opening: int, left: str, right: str) -> int:
+    """Return the matching delimiter offset in already masked source."""
+
+    depth = 0
+    for index in range(opening, len(masked)):
+        char = masked[index]
+        if char == left:
+            depth += 1
+        elif char == right:
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _react_component_shadowed_bindings(parameters: str, masked_body: str, imported_names: set[str]) -> set[str]:
+    """Return imported names shadowed by component parameters or local bindings.
+
+    This is deliberately conservative: a name mentioned in the parameter
+    binding list, or declared in the component's top-level function scope,
+    cannot be proven to still refer to the module import. Nested callback
+    declarations do not shadow calls in the component scope.
+    """
+
+    shadowed = {
+        name
+        for name in imported_names
+        if re.search(rf"(?<![A-Za-z0-9_$]){re.escape(name)}(?![A-Za-z0-9_$])", parameters)
+    }
+    depth = 1
+    for masked_line in masked_body.splitlines():
+        if depth == 1:
+            for name in imported_names - shadowed:
+                escaped = re.escape(name)
+                declaration = re.search(
+                    rf"\b(?:const|let|var|function|class)\s+{escaped}(?![A-Za-z0-9_$])|"
+                    rf"\b(?:const|let|var)\s*(?:\{{|\[)[^;\n]*\b{escaped}\b",
+                    masked_line,
+                )
+                if declaration:
+                    shadowed.add(name)
+        structural = _structural_text(masked_line)
+        depth += structural.count("{") - structural.count("}")
+    return shadowed
+
+
+def _react_render_side_effect_findings(
+    file_path: str,
+    patch: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    """Detect direct effectful imported calls in a React function render body.
+
+    The rule is intentionally limited to complete new TSX/JSX files.  It only
+    considers PascalCase function components, imported calls with an explicit
+    effect verb, and top-level statements before the component's JSX return.
+    Calls inside hooks, callbacks, event handlers, or nested functions are not
+    treated as render-time effects.
+    """
+
+    if not _is_complete_new_file_patch(patch):
+        return []
+
+    source = "\n".join(content for _line, content in rows)
+    language = "typescript" if file_path.lower().endswith(".tsx") else "javascript"
+    masked = mask_non_code(source, language)
+
+    # The shared import extractor rejects matches inside comments and string
+    # literals and preserves aliases through ``local_name``.
+    imported_names = {
+        item.local_name or item.name
+        for item in extract_imports(source, file_path)
+        if item.import_type == "destructured" and re.fullmatch(r"[A-Za-z_$][\w$]*", item.local_name or item.name)
+    }
+
+    effectful_imports = {name for name in imported_names if _REACT_RENDER_EFFECT_NAME.fullmatch(name)}
+    if not effectful_imports:
+        return []
+
+    findings: list[DetectorFinding] = []
+    component = re.compile(r"\b(?:export\s+)?(?:async\s+)?function\s+(?P<name>[A-Z][A-Za-z0-9_$]*)\s*\(")
+    for match in component.finditer(masked):
+        parameter_open = masked.find("(", match.start())
+        parameter_close = _matching_delimiter(masked, parameter_open, "(", ")")
+        if parameter_close < 0:
+            continue
+        body_open = masked.find("{", parameter_close + 1)
+        if body_open < 0:
+            continue
+        # A return annotation may occur between ')' and '{', but another
+        # declaration or semicolon proves that this is not the function body.
+        between = masked[parameter_close + 1 : body_open]
+        if ";" in between or re.search(r"\bfunction\b", between):
+            continue
+        body_close = _matching_delimiter(masked, body_open, "{", "}")
+        if body_close < 0:
+            continue
+
+        raw_body = source[body_open + 1 : body_close]
+        masked_body = masked[body_open + 1 : body_close]
+        if not re.search(r"\breturn\s*(?:\(\s*)?<", masked_body):
+            continue
+
+        parameters = masked[parameter_open + 1 : parameter_close]
+        shadowed = _react_component_shadowed_bindings(parameters, masked_body, effectful_imports)
+        component_effectful_imports = effectful_imports - shadowed
+        if not component_effectful_imports:
+            continue
+
+        first_line = source.count("\n", 0, body_open) + 1
+        depth = 1
+        for offset, (raw_line, masked_line) in enumerate(
+            zip(raw_body.splitlines(), masked_body.splitlines(), strict=False),
+            start=0,
+        ):
+            line_no = first_line + offset
+            if depth == 1 and re.match(r"^\s*return\b", masked_line):
+                break
+            if depth == 1:
+                call = re.match(r"^\s*(?:await\s+)?(?P<callee>[A-Za-z_$][\w$]*)\s*\(", masked_line)
+                if call and call.group("callee") in component_effectful_imports and line_no in added:
+                    callee = call.group("callee")
+                    findings.append(
+                        _finding(
+                            file_path,
+                            line_no,
+                            "side-effect-in-render",
+                            f"React component render calls effectful imported API `{callee}` directly.",
+                            "Move the operation into an event handler or a dependency-scoped effect hook.",
+                            # An effect-shaped verb is strong triage evidence,
+                            # but the imported implementation may still be
+                            # pure. Keep semantic calibration in the loop.
+                            confidence=0.85,
+                        )
+                    )
+                    break
+            structural = _structural_text(masked_line)
+            depth += structural.count("{") - structural.count("}")
+
+    return findings
+
+
 def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
     """Detect high-signal quality defects on trustworthy RIGHT-side lines."""
 
@@ -1010,6 +1160,7 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     added,
                 )
             )
+            findings.extend(_react_render_side_effect_findings(file_path, patch, rows, added))
     return dedupe_findings(findings)
 
 

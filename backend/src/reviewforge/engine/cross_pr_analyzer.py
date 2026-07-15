@@ -7,6 +7,7 @@ Two-stage approach:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -22,16 +23,18 @@ from langchain_openai import ChatOpenAI
 
 from reviewforge.core.database import Database
 from reviewforge.core.state import Finding, StateStore
-from reviewforge.engine.detectors.unified_diff import iter_right_lines
+from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.engine.symbol_extractor import (
     CallInfo,
     ImportInfo,
     SymbolInfo,
     detect_language,
+    extract_calls,
     extract_definitions,
     extract_diff_calls,
     extract_diff_symbols,
+    extract_imports,
     mask_non_code,
 )
 
@@ -110,6 +113,12 @@ class CrossPRChain:
     evidence_kind: str = "import"
     source_column: int = 0
     call_callee: str = ""
+    # Deterministic publication is permitted only when both facts are proven:
+    # the import resolves to one historical file, and that historical finding
+    # was produced by the exact commit used as this PR's base.
+    target_resolution_proven: bool = False
+    history_base_proven: bool = False
+    call_binding_proven: bool = False
 
 
 @dataclass
@@ -955,6 +964,16 @@ class CrossPRAnalyzer:
                             ),
                             source_column=call.column,
                             call_callee=call.callee,
+                            target_resolution_proven=bool(resolved_import and evidence.file_path == resolved_import),
+                            history_base_proven=(
+                                self._evidence_rank(
+                                    evidence,
+                                    target_symbol,
+                                    allow_file_risk=False,
+                                )
+                                == _APPLICABLE_BASE_HEAD
+                            ),
+                            call_binding_proven=call.binding_proven,
                         )
                     )
                 continue
@@ -1078,11 +1097,665 @@ class CrossPRAnalyzer:
         diff_summary: str,
         state: StateStore,
     ) -> list[Finding]:
-        """Require independent semantic confirmation for every structural graph edge."""
+        """Confirm proven boundary-to-sink calls, then semantically judge the rest.
 
-        if not chains or self._llm is None:
+        A narrow deterministic lane is useful for stacked PRs: when the whole
+        consumer file is new, the imported target resolves uniquely to a risky
+        symbol from the exact base commit, and a language-aware check proves a
+        direct boundary value reaches the call, there is no remaining semantic
+        question for an LLM to answer.  Every weaker edge stays fail-closed and
+        follows the existing semantic-confirmation path.
+        """
+
+        if not chains:
             return []
-        return await self._llm_confirm_chains(chains, diff_summary, state)
+
+        structural: list[Finding] = []
+        contextual: list[CrossPRChain] = []
+        complete_files: dict[str, str | None] = {}
+        for chain in chains:
+            if chain.source_file not in complete_files:
+                file_diff = self._extract_file_diff(diff_summary, chain.source_file)
+                complete_files[chain.source_file] = self._complete_new_file_content(file_diff)
+            content = complete_files[chain.source_file]
+            if content is not None and self._structural_boundary_call_is_proven(chain, content):
+                structural.append(
+                    self._finding_from_chain(
+                        chain,
+                        confidence=0.99,
+                        reason=(
+                            "Complete new-file analysis proved an exact imported call from a "
+                            "consumer boundary into the historical high-risk symbol."
+                        ),
+                        verified_by="cross-pr-structural",
+                    )
+                )
+            else:
+                contextual.append(chain)
+
+        semantic = (
+            await self._llm_confirm_chains(contextual, diff_summary, state)
+            if contextual and self._llm is not None
+            else []
+        )
+        # Structural chains are removed before LLM batching.  The final key is
+        # still defensive against duplicate graph rows from older databases.
+        unique: dict[tuple[str, int, str], Finding] = {}
+        for finding in [*structural, *semantic]:
+            unique.setdefault((finding.file, finding.line, finding.category), finding)
+        return list(unique.values())
+
+    @staticmethod
+    def _complete_new_file_content(file_diff: str) -> str | None:
+        """Return post-image text only for one complete ``-0,0 +1,N`` hunk."""
+
+        headers = list(re.finditer(r"^@@ .* @@(?:.*)$", file_diff or "", re.MULTILINE))
+        new_file = re.search(
+            r"^@@ -0,0 \+1(?:,(?P<count>\d+))? @@(?:.*)$",
+            file_diff or "",
+            re.MULTILINE,
+        )
+        if new_file is None or len(headers) != 1 or headers[0].start() != new_file.start():
+            return None
+        expected = int(new_file.group("count") or 1)
+        added = iter_added_lines(file_diff)
+        if len(added) != expected or [line for line, _text in added] != list(range(1, expected + 1)):
+            return None
+        return "\n".join(text for _line, text in added)
+
+    def _structural_boundary_call_is_proven(self, chain: CrossPRChain, content: str) -> bool:
+        """Prove the deliberately small, high-precision structural subset."""
+
+        if (
+            chain.depth != 1
+            or chain.evidence_kind not in {"call", "exact-import-call"}
+            or not chain.call_callee
+            or not chain.target_resolution_proven
+            or not chain.history_base_proven
+            or (chain.risk_level not in {"critical", "high"} and chain.risk_category != "data-leak")
+            or chain.target_symbol in {"", "*", "<module>"}
+            or _is_nonproduction_path(chain.source_file)
+        ):
+            return False
+
+        calls = [
+            call
+            for call in extract_calls(content, chain.source_file)
+            if call.line == chain.source_line and call.callee == chain.call_callee
+        ]
+        if chain.source_column:
+            exact_column = [call for call in calls if call.column == chain.source_column]
+            if exact_column:
+                calls = exact_column
+        if len(calls) != 1:
+            return False
+        call = calls[0]
+        if chain.source_symbol not in {"", "<module>"} and call.caller != chain.source_symbol:
+            return False
+        if not self._call_import_matches_target(content, chain, call):
+            return False
+        if self._call_is_nested(content, call):
+            return False
+
+        language = detect_language(chain.source_file)
+        if language == "python":
+            return chain.call_binding_proven and self._python_boundary_call_is_proven(content, chain)
+        if language in {"javascript", "typescript"}:
+            return self._javascript_boundary_call_is_proven(content, chain, call)
+        if language == "go":
+            return self._go_boundary_call_is_proven(content, chain, call)
+        if language == "java":
+            return self._java_boundary_call_is_proven(content, chain, call)
+        return False
+
+    def _call_import_matches_target(self, content: str, chain: CrossPRChain, call: CallInfo) -> bool:
+        imports = extract_imports(content, chain.source_file)
+        imported, imported_symbol = self._match_call_import(
+            call,
+            self._imports_by_binding(imports).get(chain.source_file, {}),
+        )
+        if imported is None or imported_symbol != chain.target_symbol:
+            return False
+        return _import_source_matches_file(imported.source, chain.target_file) or _relative_import_matches_file(
+            imported.source,
+            chain.source_file,
+            chain.target_file,
+        )
+
+    @staticmethod
+    def _call_is_nested(content: str, call: CallInfo) -> bool:
+        """Reject calls lexically contained in another call expression."""
+
+        masked = mask_non_code(content, detect_language(call.file_path))
+        lines = masked.splitlines(keepends=True)
+        if call.line <= 0 or call.line > len(lines):
+            return True
+        offset = sum(len(line) for line in lines[: call.line - 1]) + max(call.column - 1, 0)
+        stack: list[int] = []
+        for index, character in enumerate(masked[:offset]):
+            if character == "(":
+                stack.append(index)
+            elif character == ")" and stack:
+                stack.pop()
+        for opening in stack:
+            prefix = masked[:opening].rstrip()
+            match = re.search(r"([A-Za-z_$][\w$]*)$", prefix)
+            if match and match.group(1) not in {
+                "if",
+                "for",
+                "while",
+                "switch",
+                "catch",
+                "with",
+                "return",
+            }:
+                return True
+            if prefix.endswith((")", "]")):
+                return True
+        return False
+
+    @staticmethod
+    def _unsafe_flow_name(name: str) -> bool:
+        lowered = name.lower()
+        return any(
+            marker in lowered
+            for marker in ("safe", "sanit", "clean", "normal", "valid", "escape", "encode", "allowlist")
+        )
+
+    @classmethod
+    def _boundary_identifier_is_risky(cls, name: str, boundary_names: set[str]) -> bool:
+        if name not in boundary_names or cls._unsafe_flow_name(name):
+            return False
+        return name.lower() not in {
+            "conn",
+            "connection",
+            "db",
+            "database",
+            "client",
+            "ctx",
+            "context",
+            "response",
+            "res",
+        }
+
+    @classmethod
+    def _python_boundary_call_is_proven(cls, content: str, chain: CrossPRChain) -> bool:
+        try:
+            tree = ast.parse(content + "\n")
+        except SyntaxError:
+            return False
+
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        candidates = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and node.lineno == chain.source_line
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == chain.call_callee)
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == chain.call_callee)
+            )
+        ]
+        if len(candidates) != 1:
+            return False
+        call = candidates[0]
+        current: ast.AST | None = call
+        owner: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, ast.Call):
+                return False
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = current
+                break
+        if owner is None or (chain.source_symbol not in {"", "<module>"} and owner.name != chain.source_symbol):
+            return False
+
+        boundary_names = {
+            argument.arg for argument in [*owner.args.posonlyargs, *owner.args.args, *owner.args.kwonlyargs]
+        }
+        if owner.args.vararg:
+            boundary_names.add(owner.args.vararg.arg)
+        if owner.args.kwarg:
+            boundary_names.add(owner.args.kwarg.arg)
+
+        # A parameter is a data boundary only after the function itself is
+        # proven externally reachable.  Keep ordinary internal wrappers in the
+        # semantic lane: a caller may pass only trusted constants to them.
+        request_entry = bool({"request", "req"} & boundary_names)
+        route_entry = any(
+            any(
+                marker in ast.unparse(decorator).lower()
+                for marker in ("route", "endpoint", ".get", ".post", ".put", ".patch", ".delete")
+            )
+            for decorator in owner.decorator_list
+        )
+        if not request_entry and not route_entry:
+            return False
+
+        assignments: dict[str, list[ast.expr]] = {}
+        for node in ast.walk(owner):
+            if isinstance(node, ast.Assign) and node.lineno < call.lineno:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        assignments.setdefault(target.id, []).append(node.value)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.value is not None
+                and node.lineno < call.lineno
+            ):
+                assignments.setdefault(node.target.id, []).append(node.value)
+
+        def boundary_flow(expression: ast.expr, seen: frozenset[str] = frozenset()) -> bool:
+            if any(isinstance(node, ast.Call) for node in ast.walk(expression)):
+                return False
+            names = {node.id for node in ast.walk(expression) if isinstance(node, ast.Name)}
+            if any(cls._unsafe_flow_name(name) for name in names):
+                return False
+            if isinstance(expression, ast.Name):
+                if cls._boundary_identifier_is_risky(expression.id, boundary_names):
+                    return True
+                values = assignments.get(expression.id, [])
+                if expression.id not in seen and len(values) == 1:
+                    return boundary_flow(values[0], seen | {expression.id})
+                return False
+            if isinstance(expression, (ast.Attribute, ast.Subscript)):
+                root: ast.expr = expression
+                while isinstance(root, (ast.Attribute, ast.Subscript)):
+                    root = root.value
+                return isinstance(root, ast.Name) and (
+                    cls._boundary_identifier_is_risky(root.id, boundary_names)
+                    or root.id.lower() in {"request", "req"}
+                    and root.id in boundary_names
+                )
+            return False
+
+        return any(boundary_flow(argument) for argument in [*call.args, *(item.value for item in call.keywords)])
+
+    @staticmethod
+    def _balanced_group(text: str, opening: int, left: str = "(", right: str = ")") -> str:
+        if opening < 0 or opening >= len(text) or text[opening] != left:
+            return ""
+        depth = 0
+        for index in range(opening, len(text)):
+            if text[index] == left:
+                depth += 1
+            elif text[index] == right:
+                depth -= 1
+                if depth == 0:
+                    return text[opening + 1 : index]
+        return ""
+
+    @classmethod
+    def _split_arguments(cls, expression: str) -> list[str]:
+        opening = expression.find("(")
+        body = cls._balanced_group(expression, opening)
+        if not body and opening >= 0:
+            return []
+        parts: list[str] = []
+        start = 0
+        stack: list[str] = []
+        pairs = {")": "(", "]": "[", "}": "{"}
+        for index, character in enumerate(body):
+            if character in "([{":
+                stack.append(character)
+            elif character in pairs and stack and stack[-1] == pairs[character]:
+                stack.pop()
+            elif character == "," and not stack:
+                parts.append(body[start:index].strip())
+                start = index + 1
+        tail = body[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    @classmethod
+    def _direct_text_flow(cls, expression: str, boundary_names: set[str]) -> bool:
+        expression = expression.strip()
+        if not expression or cls._unsafe_flow_name(expression):
+            return False
+        if re.fullmatch(r"[A-Za-z_$][\w$]*", expression):
+            return cls._boundary_identifier_is_risky(expression, boundary_names)
+        member = re.fullmatch(
+            r"(?P<root>[A-Za-z_$][\w$]*)(?:\s*\.\s*[A-Za-z_$][\w$]*|\s*\[[^()\]]+\])+",
+            expression,
+        )
+        if member:
+            root = member.group("root")
+            return cls._boundary_identifier_is_risky(root, boundary_names) or (
+                root.lower() in {"request", "req"} and root in boundary_names
+            )
+        return False
+
+    def _symbol_context(self, content: str, chain: CrossPRChain, call: CallInfo) -> str:
+        """Return the unique definition that owns this exact call site.
+
+        Name-only lookup is unsafe for Java overloads and same-named methods in
+        nested scopes: it can borrow parameters from one body to justify a call
+        in another.  A structural proof therefore requires a reliable source
+        range containing the call's RIGHT-side line.
+        """
+
+        lines = content.splitlines()
+        matches = [
+            symbol
+            for symbol in extract_definitions(content, chain.source_file)
+            if symbol.name == chain.source_symbol
+            and (symbol.start_line or symbol.line) <= call.line <= symbol.end_line
+            and symbol.end_line >= (symbol.start_line or symbol.line) > 0
+        ]
+        if len(matches) != 1:
+            return ""
+        symbol = matches[0]
+        start = (symbol.start_line or symbol.line) - 1
+        context = "\n".join(lines[start : symbol.end_line]).rstrip()
+        # Unlike prompt context, binding proof must inspect the complete body;
+        # truncating at 30 lines can hide a shadow/reassignment just before the
+        # call. Oversized bodies simply stay in the semantic lane.
+        return context if len(context) <= _MAX_CALL_SCAN_CHARS else ""
+
+    @classmethod
+    def _typescript_boundary_names(cls, context: str, content: str, symbol: str) -> set[str]:
+        match = re.search(rf"\b{re.escape(symbol)}\s*\(", context)
+        if match is None:
+            return set()
+        opening = context.find("(", match.start())
+        parameters = cls._balanced_group(context, opening)
+        names: set[str] = set()
+        stripped = parameters.lstrip()
+        if stripped.startswith("{"):
+            brace = parameters.find("{")
+            destructured = cls._balanced_group(parameters, brace, "{", "}")
+            for piece in destructured.split(","):
+                candidate = piece.split(":", 1)[0].split("=", 1)[0].strip()
+                if re.fullmatch(r"[A-Za-z_$][\w$]*", candidate):
+                    names.add(candidate)
+        else:
+            for piece in cls._split_top_level_commas(parameters):
+                candidate = re.sub(
+                    r"^(?:(?:public|private|protected|readonly)\s+)+",
+                    "",
+                    piece.strip(),
+                )
+                candidate = re.split(r"[?:=]", candidate, maxsplit=1)[0].strip()
+                if re.fullmatch(r"[A-Za-z_$][\w$]*", candidate):
+                    names.add(candidate)
+        names.update(re.findall(r"\bexport\s+let\s+([A-Za-z_$][\w$]*)", content))
+        return names
+
+    @staticmethod
+    def _split_top_level_commas(text: str) -> list[str]:
+        parts: list[str] = []
+        stack: list[str] = []
+        pairs = {")": "(", "]": "[", "}": "{", ">": "<"}
+        start = 0
+        for index, character in enumerate(text):
+            if character in "([{<":
+                stack.append(character)
+            elif character in pairs and stack and stack[-1] == pairs[character]:
+                stack.pop()
+            elif character == "," and not stack:
+                parts.append(text[start:index])
+                start = index + 1
+        parts.append(text[start:])
+        return parts
+
+    def _javascript_boundary_call_is_proven(
+        self,
+        content: str,
+        chain: CrossPRChain,
+        call: CallInfo,
+    ) -> bool:
+        context = self._symbol_context(content, chain, call)
+        if not context:
+            return False
+        if not self._javascript_import_binding_is_proven(content, chain, call, context):
+            return False
+        boundary_names = self._typescript_boundary_names(context, content, chain.source_symbol)
+        if not boundary_names:
+            return False
+
+        # XSS-returning helpers are latent unless the consumer actually mounts
+        # the imported component as JSX. Returning SafeHtml/React elements from
+        # an otherwise unused bridge is not itself a browser sink.
+        if chain.risk_category in {"xss", "xss-bypass"}:
+            line = content.splitlines()[chain.source_line - 1] if chain.source_line <= len(content.splitlines()) else ""
+            tag = re.search(
+                rf"<\s*{re.escape(chain.call_callee)}\b(?P<attrs>[^<>]*)/\s*>",
+                mask_non_code(line, detect_language(chain.source_file)),
+            )
+            if tag is None or not re.search(r"\breturn\s*\(", context):
+                return False
+            values = re.findall(r"=\s*\{\s*([^{}]+?)\s*\}", tag.group("attrs"))
+            return any(self._direct_text_flow(value, boundary_names) for value in values)
+
+        if chain.risk_category not in {
+            "data-leak",
+            "code-injection",
+            "command-injection",
+            "sql-injection",
+            "path-traversal",
+            "ssrf",
+            "insecure-deserialization",
+        }:
+            return False
+        reachable = bool(re.search(rf"\bexport\s+function\s+{re.escape(chain.source_symbol)}\b", content))
+        reachable = reachable or bool(
+            re.search(
+                rf"(?:on:[\w-]+\s*=\s*\{{\s*{re.escape(chain.source_symbol)}\s*\}}|"
+                rf"@[\w-]+\s*=\s*[\"'][^\"']*\b{re.escape(chain.source_symbol)}\b)",
+                content,
+            )
+        )
+        if not reachable:
+            return False
+        file_diff_expression = self._content_call_expression(content, chain, call)
+        return bool(file_diff_expression) and any(
+            self._direct_text_flow(argument, boundary_names) for argument in self._split_arguments(file_diff_expression)
+        )
+
+    def _javascript_import_binding_is_proven(
+        self,
+        content: str,
+        chain: CrossPRChain,
+        call: CallInfo,
+        context: str,
+    ) -> bool:
+        """Prove a direct ESM binding is not shadowed in the call's function."""
+
+        imported, imported_symbol = self._match_call_import(
+            call,
+            self._imports_by_binding(extract_imports(content, chain.source_file)).get(chain.source_file, {}),
+        )
+        if imported is None or imported_symbol != chain.target_symbol or call.receiver:
+            # Typed/member receivers need assignment-aware proof comparable to
+            # Java's lane below.  Until then they remain semantic-gated.
+            return False
+        binding = imported.local_name or imported.name
+        if not binding or binding != call.callee:
+            return False
+
+        masked = mask_non_code(context, detect_language(chain.source_file))
+        if binding in self._typescript_boundary_names(masked, "", chain.source_symbol):
+            return False
+        escaped = re.escape(binding)
+        shadow_patterns = (
+            rf"\b(?:const|let|var|function|class)\s+{escaped}\b",
+            rf"\b(?:const|let|var)\s+\{{[^{{}}]*\b{escaped}\b",
+            rf"\bcatch\s*\(\s*{escaped}\b",
+            rf"(?:\(|,)\s*{escaped}\s*(?:[,)=:]|=>)",
+            rf"\b{escaped}\s*=>",
+        )
+        return not any(re.search(pattern, masked, re.MULTILINE) for pattern in shadow_patterns)
+
+    @classmethod
+    def _content_call_expression(cls, content: str, chain: CrossPRChain, call: CallInfo) -> str:
+        lines = content.splitlines()
+        if call.line <= 0 or call.line > len(lines):
+            return ""
+        start = sum(len(line) + 1 for line in lines[: call.line - 1]) + max(call.column - 1, 0)
+        candidate = content[start:]
+        masked = mask_non_code(candidate, detect_language(chain.source_file))
+        opening = masked.find("(")
+        if opening < 0:
+            return ""
+        depth = 0
+        for index in range(opening, min(len(masked), _MAX_CALL_SCAN_CHARS)):
+            if masked[index] == "(":
+                depth += 1
+            elif masked[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    return candidate[: index + 1]
+        return ""
+
+    def _go_boundary_call_is_proven(self, content: str, chain: CrossPRChain, call: CallInfo) -> bool:
+        context = self._symbol_context(content, chain, call)
+        signature = re.search(rf"\bfunc\s+(?:\([^)]*\)\s*)?{re.escape(chain.source_symbol)}\s*\(", context)
+        if signature is None:
+            return False
+        if not (chain.source_symbol[:1].isupper() or self._go_handler_is_proven(content, context, chain)):
+            return False
+        if not self._go_import_binding_is_proven(content, chain, call, context):
+            return False
+        parameters = self._balanced_group(context, context.find("(", signature.start()))
+        boundary_names: set[str] = set()
+        pending: list[str] = []
+        for piece in self._split_top_level_commas(parameters):
+            stripped = piece.strip()
+            words = re.findall(r"[A-Za-z_]\w*", stripped)
+            if len(words) == 1 and re.fullmatch(r"[A-Za-z_]\w*", stripped):
+                pending.append(words[0])
+            elif len(words) >= 2:
+                boundary_names.update(pending)
+                pending.clear()
+                boundary_names.add(words[0])
+        expression = self._content_call_expression(content, chain, call)
+        return bool(expression) and any(
+            self._direct_text_flow(argument, boundary_names) for argument in self._split_arguments(expression)
+        )
+
+    @staticmethod
+    def _go_handler_is_proven(content: str, context: str, chain: CrossPRChain) -> bool:
+        escaped = re.escape(chain.source_symbol)
+        if re.search(r"\b(?:Handle|HandleFunc)\s*\([^,]+,\s*" + escaped + r"\s*\)", content):
+            return True
+        return bool(re.search(r"\bhttp\s*\.\s*ResponseWriter\b|\*\s*http\s*\.\s*Request\b", context))
+
+    def _go_import_binding_is_proven(
+        self,
+        content: str,
+        chain: CrossPRChain,
+        call: CallInfo,
+        context: str,
+    ) -> bool:
+        """Prove the package receiver is the import alias, not a local shadow."""
+
+        imported, imported_symbol = self._match_call_import(
+            call,
+            self._imports_by_binding(extract_imports(content, chain.source_file)).get(chain.source_file, {}),
+        )
+        alias = imported.local_name if imported is not None else ""
+        if (
+            imported is None
+            or imported_symbol != chain.target_symbol
+            or not alias
+            or re.sub(r"\s+", "", call.receiver) != alias
+        ):
+            return False
+
+        masked = mask_non_code(context, "go")
+        escaped = re.escape(alias)
+        # Parameters/receivers and nested function parameters can shadow a
+        # package binding. A qualifier in a type (``client seed.Client``) does
+        # not match because the alias is followed by a dot, not type spacing.
+        if re.search(rf"(?:\(|,)\s*{escaped}\s*(?:,|\.\.\.|\*|[A-Za-z_\[])", masked):
+            return False
+        if re.search(rf"\b(?:var|const)\s+{escaped}\b", masked):
+            return False
+        if re.search(rf"\b(?:var|const)\s*\([^)]*(?:^|\n)\s*{escaped}\b", masked, re.MULTILINE):
+            return False
+        for line in masked.splitlines():
+            left, separator, _right = line.partition(":=")
+            if separator and re.search(rf"\b{escaped}\b", left):
+                return False
+            if re.search(rf"\b{escaped}\s*(?:[+\-*/%&|^]?=(?!=)|\+\+|--)", line):
+                return False
+        return True
+
+    def _java_boundary_call_is_proven(self, content: str, chain: CrossPRChain, call: CallInfo) -> bool:
+        context = self._symbol_context(content, chain, call)
+        signature = re.search(rf"\b{re.escape(chain.source_symbol)}\s*\(", context)
+        if (
+            signature is None
+            or not re.search(r"\bpublic\b", context[: signature.start()])
+            or not call.receiver
+            or not call.receiver_type
+            or not self._java_receiver_binding_is_proven(content, chain, call, context)
+        ):
+            return False
+        parameters = self._balanced_group(context, context.find("(", signature.start()))
+        boundary_names: set[str] = set()
+        for piece in self._split_top_level_commas(parameters):
+            words = re.findall(r"[A-Za-z_$][\w$]*", re.sub(r"<[^<>]*>", "", piece))
+            if words:
+                boundary_names.add(words[-1])
+        expression = self._content_call_expression(content, chain, call)
+        return bool(expression) and any(
+            self._direct_text_flow(argument, boundary_names) for argument in self._split_arguments(expression)
+        )
+
+    def _java_receiver_binding_is_proven(
+        self,
+        content: str,
+        chain: CrossPRChain,
+        call: CallInfo,
+        context: str,
+    ) -> bool:
+        """Prove an imported concrete receiver is constructed once and stable."""
+
+        imported, imported_symbol = self._match_call_import(
+            call,
+            self._imports_by_binding(extract_imports(content, chain.source_file)).get(chain.source_file, {}),
+        )
+        receiver = call.receiver.rsplit(".", 1)[-1]
+        imported_type = imported.local_name if imported is not None else ""
+        if (
+            imported is None
+            or imported_symbol != chain.target_symbol
+            or not receiver
+            or call.receiver not in {receiver, f"this.{receiver}"}
+            or not imported_type
+            or call.receiver_type != imported_type
+        ):
+            return False
+        if re.search(rf"\bclass\s+{re.escape(imported_type)}\b", mask_non_code(content, "java")):
+            return False
+
+        type_name = re.escape(imported_type)
+        receiver_name = re.escape(receiver)
+        declaration_tail = rf"\b{type_name}\s+{receiver_name}\s*=\s*new\s+{type_name}\s*\([^;]*\)\s*;"
+        masked_context = mask_non_code(context, "java")
+        local = re.search(rf"(?:\bfinal\s+)?{declaration_tail}", masked_context)
+        stable = False
+        remainder = ""
+        if local is not None:
+            stable = True
+            remainder = masked_context[local.end() :]
+        else:
+            field = re.search(
+                rf"\b(?:public|protected|private)\s+(?:static\s+)?final\s+{declaration_tail}",
+                mask_non_code(content, "java"),
+            )
+            stable = field is not None
+        if not stable:
+            return False
+        reassignment = rf"\b(?:this\s*\.\s*)?{receiver_name}\s*(?:[+\-*/%&|^]?=(?!=)|\+\+|--)"
+        return not remainder or re.search(reassignment, remainder) is None
 
     async def _llm_confirm_chains(
         self,
@@ -1450,22 +2123,56 @@ reason 不得复述源码、凭据或密钥，且不超过 200 个中文字符�
             )
 
             findings.append(
-                Finding(
-                    file=chain.source_file,
-                    line=chain.source_line or 1,
-                    severity="error",
-                    category=_bounded_text(f"cross-pr-{chain.risk_category}", 50),
+                self._finding_from_chain(
+                    chain,
+                    confidence=confidence,
+                    reason=reason.strip(),
+                    verified_by="cross-pr-analysis",
                     message=message,
                     suggestion=suggestion,
-                    confidence=confidence,
-                    reviewer="cross_pr_analyzer",
-                    status="confirmed",
-                    verified_by="cross-pr-analysis",
-                    verify_reason=_bounded_text(reason.strip(), 500),
                 )
             )
 
         return findings
+
+    @staticmethod
+    def _finding_from_chain(
+        chain: CrossPRChain,
+        *,
+        confidence: float,
+        reason: str,
+        verified_by: str,
+        message: str = "",
+        suggestion: str = "",
+    ) -> Finding:
+        """Build one canonical finding for structural and semantic confirmation."""
+
+        chain_path = " -> ".join(
+            f"{_prompt_label(item.get('file'))}:{_prompt_label(item.get('symbol'), 120)}" for item in chain.path
+        )
+        if not message:
+            message = (
+                f"[Cross-PR] {_prompt_label(chain.source_symbol, 120)} calls "
+                f"{_prompt_label(chain.target_symbol, 120)}, which carries a historical "
+                f"{_prompt_label(chain.risk_category, 80)} risk.\nCall chain: {chain_path}"
+            )
+        if not suggestion:
+            suggestion = (
+                f"Validate or sanitize the untrusted input before calling {_prompt_label(chain.target_symbol, 120)}."
+            )
+        return Finding(
+            file=chain.source_file,
+            line=chain.source_line or 1,
+            severity="error",
+            category=_bounded_text(f"cross-pr-{chain.risk_category}", 50),
+            message=_bounded_text(message, 1000),
+            suggestion=_bounded_text(suggestion, 2000),
+            confidence=confidence,
+            reviewer="cross_pr_analyzer",
+            status="confirmed",
+            verified_by=verified_by,
+            verify_reason=_bounded_text(reason, 500),
+        )
 
     def _extract_function(self, content: str, func_name: str, file_path: str = "") -> str:
         """Extract one bounded language-aware symbol code block."""

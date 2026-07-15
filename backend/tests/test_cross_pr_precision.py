@@ -1771,7 +1771,7 @@ def test_cross_pr_confirmation_parser_bounds_long_reason_without_dropping_siblin
     assert findings[1].verify_reason == "正常理由"
 
 
-async def test_same_file_safe_then_unsafe_calls_are_both_semantic_gated(tmp_path):
+async def test_direct_request_flow_is_structural_but_same_file_literal_stays_semantic_gated(tmp_path):
     db = Database(tmp_path / "distinct_calls.db")
     await db.connect()
     repo = "owner/repo"
@@ -1806,13 +1806,315 @@ async def test_same_file_safe_then_unsafe_calls_are_both_semantic_gated(tmp_path
     findings = await analyzer.analyze("consumer", state, [])
     await db.close()
 
+    assert {(finding.line, finding.verified_by) for finding in findings} == {(7, "cross-pr-structural")}
+    prompt = llm.prompts[-1]
+    assert len(re.findall(r"^Chain \d+:", prompt, re.MULTILINE)) == 1
+    assert 'danger("fixed-safe-value")' in prompt
+    assert "Source: consumer.py:L4" in prompt
+
+
+async def test_structural_gate_rejects_sanitized_and_nested_python_calls(tmp_path):
+    db = Database(tmp_path / "structural_negative_flows.db")
+    await db.connect()
+    repo = "owner/repo"
+    llm = _CaptureRejectLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="seed",
+        repo=repo,
+        pr_number=1,
+        head_sha="seed-head",
+        file_path="pkg/sink.py",
+    )
+    body = (
+        "from pkg.sink import danger\n\n"
+        "def sanitized(request):\n"
+        '    cleaned = allowlist(request.args["q"])\n'
+        "    return danger(cleaned)\n\n"
+        "def nested_result(request):\n"
+        '    return wrapper(danger(request.args["q"]))\n\n'
+        "def nested_argument(request):\n"
+        '    return danger(wrapper(request.args["q"]))\n'
+    )
+    await db.create_run("consumer", repo, 2, "consumer-head", "seed-head")
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+
+    findings = await analyzer.analyze("consumer", state, [])
+    await db.close()
+
     assert findings == []
     prompt = llm.prompts[-1]
-    assert len(re.findall(r"^Chain \d+:", prompt, re.MULTILINE)) == 2
-    assert 'danger("fixed-safe-value")' in prompt
+    assert "danger(cleaned)" in prompt
     assert 'danger(request.args["q"])' in prompt
-    assert "Source: consumer.py:L4" in prompt
-    assert "Source: consumer.py:L7" in prompt
+    assert 'danger(wrapper(request.args["q"]))' in prompt
+
+
+def test_structural_gate_rejects_shadowed_non_python_import_bindings(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "non_python_binding_proof.db"), llm=None)
+
+    cases = [
+        (
+            "consumer.ts",
+            "route",
+            3,
+            "pkg/sink.ts",
+            "danger",
+            "danger",
+            'import { danger } from "pkg/sink";\n'
+            "export function route(danger: (value: string) => string, raw: string) {\n"
+            "  return danger(raw);\n"
+            "}\n",
+        ),
+        (
+            "local.ts",
+            "route",
+            4,
+            "pkg/sink.ts",
+            "danger",
+            "danger",
+            'import { danger } from "pkg/sink";\n'
+            "export function route(raw: string) {\n"
+            "  const danger = (value: string) => value;\n"
+            "  return danger(raw);\n"
+            "}\n",
+        ),
+        (
+            "consumer.go",
+            "Route",
+            4,
+            "pkg/sink.go",
+            "Danger",
+            "Danger",
+            'package app\nimport seed "pkg/sink"\n'
+            "func Route(seed interface{ Danger(string) string }, raw string) string {\n"
+            " return seed.Danger(raw)\n"
+            "}\n",
+        ),
+        (
+            "local.go",
+            "Route",
+            5,
+            "pkg/sink.go",
+            "Danger",
+            "Danger",
+            'package app\nimport seed "pkg/sink"\n'
+            "func Route(raw string) string {\n"
+            " seed := safeSeed()\n"
+            " return seed.Danger(raw)\n"
+            "}\n",
+        ),
+        (
+            "Consumer.java",
+            "route",
+            6,
+            "pkg/SeedJava.java",
+            "danger",
+            "danger",
+            "import pkg.SeedJava;\n"
+            "class Consumer {\n"
+            " public String route(String raw) {\n"
+            "  SeedJava seed = new SeedJava();\n"
+            "  seed = makeSafeSeed();\n"
+            "  return seed.danger(raw);\n"
+            " }\n"
+            "}\n",
+        ),
+    ]
+
+    for source_file, source_symbol, source_line, target_file, target_symbol, callee, content in cases:
+        chain = CrossPRChain(
+            source_file=source_file,
+            source_symbol=source_symbol,
+            source_line=source_line,
+            target_file=target_file,
+            target_symbol=target_symbol,
+            risk_category="command-injection",
+            risk_level="critical",
+            depth=1,
+            path=[],
+            evidence_kind="call",
+            call_callee=callee,
+            target_resolution_proven=True,
+            history_base_proven=True,
+        )
+        assert not analyzer._structural_boundary_call_is_proven(chain, content), source_file
+
+
+def test_structural_gate_requires_go_and_java_entry_reachability(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "entry_reachability.db"), llm=None)
+    cases = [
+        (
+            CrossPRChain(
+                source_file="internal.go",
+                source_symbol="internalWrapper",
+                source_line=4,
+                target_file="pkg/sink.go",
+                target_symbol="Danger",
+                risk_category="command-injection",
+                risk_level="critical",
+                depth=1,
+                path=[],
+                evidence_kind="call",
+                call_callee="Danger",
+                target_resolution_proven=True,
+                history_base_proven=True,
+            ),
+            'package app\nimport seed "pkg/sink"\n'
+            "func internalWrapper(raw string) string {\n"
+            " return seed.Danger(raw)\n"
+            "}\n",
+        ),
+        (
+            CrossPRChain(
+                source_file="Internal.java",
+                source_symbol="internalWrapper",
+                source_line=5,
+                target_file="pkg/SeedJava.java",
+                target_symbol="danger",
+                risk_category="command-injection",
+                risk_level="critical",
+                depth=1,
+                path=[],
+                evidence_kind="call",
+                call_callee="danger",
+                target_resolution_proven=True,
+                history_base_proven=True,
+            ),
+            "import pkg.SeedJava;\n"
+            "class Internal {\n"
+            " private final SeedJava seed = new SeedJava();\n"
+            " private String internalWrapper(String raw) {\n"
+            "  return seed.danger(raw);\n"
+            " }\n"
+            "}\n",
+        ),
+    ]
+
+    for chain, content in cases:
+        assert not analyzer._structural_boundary_call_is_proven(chain, content), chain.source_file
+
+
+async def test_internal_wrapper_with_only_trusted_caller_stays_semantic_gated(tmp_path):
+    db = Database(tmp_path / "internal_wrapper_reachability.db")
+    await db.connect()
+    repo = "owner/repo"
+    llm = _CaptureRejectLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="seed",
+        repo=repo,
+        pr_number=1,
+        head_sha="seed-head",
+        file_path="pkg/sink.py",
+    )
+    body = (
+        "from pkg.sink import danger\n\n"
+        "def internal_wrapper(value):\n"
+        "    return danger(value)\n\n"
+        "def run_internal_job():\n"
+        '    return internal_wrapper("fixed-safe-value")\n'
+    )
+    await db.create_run("consumer", repo, 2, "consumer-head", "seed-head")
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+
+    assert await analyzer.analyze("consumer", state, []) == []
+    assert llm.invocations == 1
+    assert "danger(value)" in llm.prompts[-1]
+    await db.close()
+
+
+async def test_partial_hunk_direct_request_flow_never_structurally_confirms(tmp_path):
+    db = Database(tmp_path / "structural_partial_hunk.db")
+    await db.connect()
+    repo = "owner/repo"
+    llm = _RejectEveryChainLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="seed",
+        repo=repo,
+        pr_number=1,
+        head_sha="seed-head",
+        file_path="pkg/sink.py",
+    )
+    patch = (
+        "--- consumer.py (+3 -0)\n"
+        "@@ -20,0 +21,3 @@\n"
+        "+from pkg.sink import danger\n"
+        "+def route(request):\n"
+        '+    return danger(request.args["q"])\n'
+    )
+    await db.create_run("consumer", repo, 2, "consumer-head", "seed-head")
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=["consumer.py"],
+        diff_summary=patch,
+    )
+
+    assert await analyzer.analyze("consumer", state, []) == []
+    assert llm.invocations == 1
+    await db.close()
+
+
+async def test_react_helper_return_without_jsx_mount_stays_semantic_gated(tmp_path):
+    db = Database(tmp_path / "structural_react_latent.db")
+    await db.connect()
+    repo = "owner/repo"
+    await db.create_run("seed", repo, 1, "seed-head", "parent")
+    await db.upsert_symbol(
+        file_path="pkg/cards.tsx",
+        symbol_name="RawProfileCard",
+        symbol_type="function",
+        run_id="seed",
+        pr_number=1,
+        language="typescript",
+        risk_level="high",
+        risk_categories=["xss"],
+    )
+    await db.upsert_file_risk("pkg/cards.tsx", "high", ["xss"], 1, "seed")
+    await db.complete_run("seed", {})
+    llm = _RejectEveryChainLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    body = (
+        'import { RawProfileCard } from "pkg/cards";\n\n'
+        "export function bridge(html: string) {\n"
+        "  return RawProfileCard({ html });\n"
+        "}\n"
+    )
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=["bridge.tsx"],
+        diff_summary=_diff("bridge.tsx", body),
+    )
+
+    assert await analyzer.analyze("consumer", state, []) == []
+    assert llm.invocations == 1
+    await db.close()
 
 
 async def test_depth_two_filters_relation_by_source_symbol_and_keeps_intermediate_context(tmp_path):
@@ -2334,14 +2636,18 @@ _REAL_PR74_EXPECTED = {
     ("gauntlet_services/go_consumer.go", 26, "cross-pr-ssrf"),
 }
 
+_REAL_PR74_LATENT_FRONTEND_CHAINS = {
+    ("gauntlet_consumers/admin_view.vue", 21, "cross-pr-xss"),
+    ("gauntlet_consumers/angular_bridge.ts", 7, "cross-pr-xss-bypass"),
+    ("gauntlet_consumers/live_summary.svelte", 12, "cross-pr-xss"),
+}
+_REAL_PR74_STRUCTURAL_EXPECTED = _REAL_PR74_EXPECTED - _REAL_PR74_LATENT_FRONTEND_CHAINS
 
-async def test_real_pr73_to_pr74_stacked_fixture_hits_all_manifest_cross_pr_truth(tmp_path):
+
+async def test_real_stacked_pr_structurally_confirms_only_direct_boundary_to_sink_calls(tmp_path):
     db = Database(tmp_path / "real_stacked.db")
     await db.connect()
-    # Python's complete-file AST binding proof is deterministic. Other
-    # languages remain semantic-confirmation gated until their package and
-    # lexical scopes can be resolved with equal rigor.
-    llm = _ConfirmEveryChainLLM()
+    llm = _RejectEveryChainLLM()
     analyzer = CrossPRAnalyzer(db, llm=llm)
     repo = "Wayne0607/ReviewForge"
     seed_sha = "c8a3d8ad11529c348a8565a771345e201529c680"
@@ -2392,12 +2698,12 @@ async def test_real_pr73_to_pr74_stacked_fixture_hits_all_manifest_cross_pr_trut
     actual = {(finding.file, finding.line, finding.category) for finding in findings}
     await db.close()
 
-    assert actual == _REAL_PR74_EXPECTED, {
-        "missing": sorted(_REAL_PR74_EXPECTED - actual),
-        "extra": sorted(actual - _REAL_PR74_EXPECTED),
+    assert actual == _REAL_PR74_STRUCTURAL_EXPECTED, {
+        "missing": sorted(_REAL_PR74_STRUCTURAL_EXPECTED - actual),
+        "extra": sorted(actual - _REAL_PR74_STRUCTURAL_EXPECTED),
     }
-    assert sum(llm.batch_sizes) > 0
-    assert {finding.verified_by for finding in findings} == {"cross-pr-analysis"}
+    assert llm.invocations == 1
+    assert {finding.verified_by for finding in findings} == {"cross-pr-structural"}
 
 
 _REAL_PR73_SEED.update(

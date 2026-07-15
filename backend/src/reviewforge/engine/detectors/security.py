@@ -1432,8 +1432,15 @@ def _rust_unsafe_has_safety_evidence(diff: str, line_no: int) -> bool:
     if location is None:
         return False
     hunk, index = location
-    context = "\n".join(content for _line, content, _added in hunk[max(0, index - 4) : index])
-    return bool(re.search(r"\bSAFETY\s*:", context, re.IGNORECASE))
+    preceding: list[str] = []
+    for _right_line, content, _added in reversed(hunk[max(0, index - 12) : index]):
+        stripped = content.strip()
+        if not stripped or stripped.startswith(("//", "/*", "*", "#[")):
+            preceding.append(content)
+            continue
+        break
+    context = "\n".join(reversed(preceding))
+    return bool(re.search(r"(?:#\s*Safety\b|\bSAFETY\s*:)", context, re.IGNORECASE))
 
 
 def _rust_line_for_braces(line: str) -> str:
@@ -2335,14 +2342,33 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     continue
                 if rule.category == "open-redirect" and _browser_redirect_is_guarded(diff, line_no, match.string):
                     continue
+                message = rule.message
+                suggestion = rule.suggestion
+                if language == "rust" and rule.category == "unsafe-block":
+                    if re.search(r"\bunsafe\s+fn\b", match.string):
+                        if re.search(r"\bpub(?:\s*\([^)]*\))?\s+unsafe\s+fn\b", match.string):
+                            message = (
+                                "A public unsafe function exposes caller-enforced safety preconditions "
+                                "without a documented `# Safety` contract."
+                            )
+                            suggestion = (
+                                "Add a `# Safety` section that states pointer validity, alignment, lifetime, "
+                                "aliasing, and length requirements."
+                            )
+                        else:
+                            message = "An unsafe function expands the trusted contract without visible safety evidence."
+                            suggestion = "Document its invariants and keep the unsafe operations narrowly scoped."
+                    else:
+                        message = "An unsafe block expands the trusted scope without a nearby `SAFETY:` invariant."
+                        suggestion = "State the invariant immediately above the block and minimize its scope."
                 findings.append(
                     DetectorFinding(
                         file=file_path,
                         line=line_no,
                         severity=rule.severity,
                         category=normalize_category_for_detector(rule.category),
-                        message=rule.message,
-                        suggestion=rule.suggestion,
+                        message=message,
+                        suggestion=suggestion,
                         confidence=_detector_confidence(file_path, safe_confidence(rule.confidence, 1)),
                     )
                 )
@@ -2441,10 +2467,16 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
 
 
 def is_deterministic_security_finding(file_path: str, line: int, category: str, diff: str) -> bool:
-    """Security regex/data-flow candidates always require independent calibration."""
+    """Replay a high-signal security detector at one exact new-file anchor."""
 
-    del file_path, line, category, diff
-    return False
+    if not _is_complete_new_file_patch(diff):
+        return False
+    return any(
+        finding.line == line
+        and finding.category == normalize_category_for_detector(category)
+        and finding.confidence >= 0.96
+        for finding in detect_security_findings({file_path: diff})
+    )
 
 
 def normalize_language(file_path: str) -> str:

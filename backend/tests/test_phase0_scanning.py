@@ -203,8 +203,10 @@ async def test_phase0_survives_planner_omission_without_reviewer_llm_tokens():
     command_findings = [finding for finding in state.list_findings() if finding.category == "command-injection"]
     assert len(command_findings) == 1
     assert command_findings[0].status == "reported"
-    assert command_findings[0].verified_by == "judge"
-    assert calibrator_llm.calls == 2
+    # A stable affirmative adversarial verdict is consensus; the candidate ->
+    # confirmed lifecycle transition no longer spends a redundant Judge call.
+    assert command_findings[0].verified_by == "adversarial"
+    assert calibrator_llm.calls == 1
     assert summary["confirmed"] == 1
     assert not state.list_tasks()
 

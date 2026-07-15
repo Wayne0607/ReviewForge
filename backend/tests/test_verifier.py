@@ -53,6 +53,55 @@ def test_exact_alias_duplicate_is_canonicalized_and_detector_wins():
     assert dropped == ["llm"]
 
 
+def test_vocabulary_aliases_are_canonicalized_before_detector_precedence():
+    cases = [
+        (
+            "eval-injection",
+            "code-injection",
+            "app.rb",
+            "eval(user_input) executes attacker-controlled Ruby code.",
+        ),
+        (
+            "version-not-pinned",
+            "dependency-version-range",
+            "package.json",
+            "react@^18.0.0 uses a mutable dependency version.",
+        ),
+        (
+            "deprecated-dependency",
+            "dependency-deprecated",
+            "requirements.txt",
+            "Dependency legacy-lib==1.0.0 is deprecated.",
+        ),
+    ]
+
+    for index, (alias, canonical, file_path, message) in enumerate(cases):
+        llm = _finding(
+            f"llm-{index}",
+            file=file_path,
+            line=7,
+            category=alias,
+            message=message,
+            confidence=0.99,
+        )
+        detector = _finding(
+            f"detector-{index}",
+            file=file_path,
+            line=7,
+            category=canonical,
+            message=message,
+            confidence=0.9,
+            verified_by="detector",
+        )
+
+        survivors, dropped = Verifier().verify([llm, detector])
+
+        assert [finding.id for finding in survivors] == [detector.id]
+        assert survivors[0].category == canonical
+        assert survivors[0].verified_by == "detector"
+        assert dropped == [llm.id]
+
+
 def test_nearby_detector_and_llm_same_sink_are_merged():
     detector = _finding(
         "detector",
@@ -119,6 +168,29 @@ def test_workflow_category_drift_merges_only_with_shared_specific_sink():
 
     assert {finding.id for finding in survivors} == {"title-detector", "other-command"}
     assert dropped == ["title-llm"]
+
+
+def test_workflow_pr_title_fingerprint_recognizes_chinese_reviewer_message():
+    detector = _finding(
+        "detector",
+        file=".github/workflows/gauntlet-deploy.yml",
+        line=19,
+        category="ci-security",
+        message="Pull-request title is interpolated directly into a workflow shell command.",
+        verified_by="detector",
+    )
+    reviewer = _finding(
+        "reviewer",
+        file=".github/workflows/gauntlet-deploy.yml",
+        line=16,
+        category="command-injection",
+        message="PR标题未经转义就传给 shell 命令，攻击者可注入参数。",
+    )
+
+    survivors, dropped = Verifier().verify([reviewer, detector])
+
+    assert [finding.id for finding in survivors] == ["detector"]
+    assert dropped == ["reviewer"]
 
 
 def test_same_line_secret_output_category_drift_prefers_detector():

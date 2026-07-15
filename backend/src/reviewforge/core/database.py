@@ -272,15 +272,15 @@ class Database:
             SELECT run_id, repo, pr_number, head_sha, base_sha, status,
                    started_at, completed_at, summary_json
             FROM (
-                SELECT *, ROW_NUMBER() OVER (
+                SELECT review_runs.*, rowid AS _sequence, ROW_NUMBER() OVER (
                     PARTITION BY repo, pr_number, head_sha
-                    ORDER BY started_at DESC, run_id DESC
+                    ORDER BY started_at DESC, rowid DESC
                 ) AS _rn
                 FROM review_runs
                 {where}
             )
             WHERE _rn = 1
-            ORDER BY started_at DESC
+            ORDER BY started_at DESC, _sequence DESC
             LIMIT ? OFFSET ?
             """,
             (*params, limit, offset),

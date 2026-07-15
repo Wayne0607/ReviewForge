@@ -144,7 +144,7 @@ _SINK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("pickle.loads", re.compile(r"pickle\s*\.\s*loads?", re.IGNORECASE)),
     (
         "pr-title",
-        re.compile(r"pull[- ]?request\s+title|\bpr\s+title\b|拉取请求标题|合并请求标题", re.IGNORECASE),
+        re.compile(r"pull[- ]?request\s+title|\bpr\s+title\b|PR\s*标题|拉取请求标题|合并请求标题", re.IGNORECASE),
     ),
     ("runtime.exec", re.compile(r"runtime(?:\s*\.\s*getruntime\s*\(\s*\))?\s*\.\s*exec", re.IGNORECASE)),
     ("subprocess", re.compile(r"subprocess\s*\.\s*(?:run|popen|call|check_output)", re.IGNORECASE)),

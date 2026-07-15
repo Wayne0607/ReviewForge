@@ -248,6 +248,86 @@ def test_security_reanchor_allows_identifier_repeated_within_one_sink_owner():
     assert reviewer.line == 4
 
 
+def test_ruby_security_reanchor_prefers_explicit_sink_api_over_shared_variables():
+    file_path = "eval_cases/pr1/payment_processor.rb"
+    diff = _summary(
+        file_path,
+        """require 'yaml'
+
+class PaymentProcessor
+  def process(user_input)
+    amount = user_input[:amount].to_f
+
+    discount = eval(user_input[:discount_code] || "0")
+
+    final_amount = amount - discount
+
+    `echo "Processing payment of #{final_amount}"`
+
+    begin
+      call_payment_gateway(final_amount)
+    rescue Exception => e
+      puts "Payment failed: #{e.message}"
+    end
+
+    config = YAML.load(File.read(user_input[:config_path]))
+
+    system("notify.sh #{user_input[:email]} #{final_amount}")
+  end
+end""",
+    )
+    backtick_detector = _security_finding(
+        "backtick-detector",
+        file_path,
+        11,
+        "command-injection",
+        "Backticks execute a command containing final_amount.",
+        detector=True,
+    )
+    system_detector = _security_finding(
+        "system-detector",
+        file_path,
+        21,
+        "command-injection",
+        "system executes a command containing user_input and final_amount.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        16,
+        "command-injection",
+        "user_input[:email] and final_amount are interpolated into system().",
+    )
+
+    changed = reanchor_security_detector_duplicates([backtick_detector, system_detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert reviewer.line == 21
+
+
+def test_ruby_security_reanchor_keeps_two_explicit_system_sinks_independent():
+    file_path = "src/jobs.rb"
+    diff = _summary(
+        file_path,
+        """def first(command)
+  system(command)
+end
+
+def second(command)
+  system(command)
+end""",
+    )
+    findings = [
+        _security_finding("first", file_path, 2, "command-injection", "system executes command.", detector=True),
+        _security_finding("second", file_path, 6, "command-injection", "system executes command.", detector=True),
+        _security_finding("reviewer", file_path, 4, "command-injection", "system() executes the command."),
+    ]
+
+    assert reanchor_security_detector_duplicates(findings, diff) == []
+    assert findings[-1].line == 4
+
+
 def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicates():
     findings = [
         _security_finding(
@@ -382,6 +462,98 @@ def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicat
         ("timer-review", 26, "resource-leak"),
         ("goroutine-review", 28, "lifecycle"),
     }
+
+
+def test_quality_reanchor_merges_go_defer_in_loop_category_drift():
+    file_path = "eval_cases/pr1/user_service.go"
+    diff = _summary(
+        file_path,
+        """package user
+func load(db *sql.DB) {
+  for i := 0; i < 10; i++ {
+    rows, _ := db.Query("SELECT 1")
+    defer rows.Close()
+  }
+}""",
+    )
+
+    for category in ("performance", "resource-exhaustion"):
+        detector = _security_finding(
+            f"detector-{category}",
+            file_path,
+            5,
+            "resource-leak",
+            "defer is registered inside a loop, so cleanup waits for the outer function.",
+            detector=True,
+        )
+        reviewer = _security_finding(
+            f"reviewer-{category}",
+            file_path,
+            3,
+            category,
+            "defer rows.Close() is inside the loop and retains every result until return.",
+        )
+
+        changed = reanchor_quality_detector_duplicates([detector, reviewer], diff)
+
+        assert changed == [reviewer]
+        assert (reviewer.line, reviewer.category) == (5, "resource-leak")
+
+
+def test_quality_reanchor_requires_explicit_and_unique_go_defer_in_loop_sink():
+    file_path = "src/queries.go"
+    two_sinks = _summary(
+        file_path,
+        """package queries
+func first(rows *sql.Rows) {
+  for range items {
+    defer rows.Close()
+  }
+}
+func second(rows *sql.Rows) {
+  for range moreItems {
+    defer rows.Close()
+  }
+}""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        4,
+        "resource-leak",
+        "defer is registered inside a loop.",
+        detector=True,
+    )
+    ambiguous = _security_finding(
+        "ambiguous",
+        file_path,
+        3,
+        "performance",
+        "defer rows.Close() is inside the loop.",
+    )
+
+    assert reanchor_quality_detector_duplicates([detector, ambiguous], two_sinks) == []
+    assert ambiguous.line == 3
+
+    one_sink = _summary(
+        file_path,
+        """package queries
+func first(rows *sql.Rows) {
+  for range items {
+    defer rows.Close()
+  }
+}""",
+    )
+    unsupported = _security_finding(
+        "unsupported",
+        file_path,
+        3,
+        "resource-exhaustion",
+        "defer rows.Close() delays cleanup.",
+    )
+
+    assert reanchor_quality_detector_duplicates([detector, unsupported], one_sink) == []
+    assert unsupported.line == 3
 
 
 def test_quality_reanchor_does_not_guess_between_two_same_family_sinks():
@@ -640,3 +812,50 @@ def test_python_open_redirect_gate_fails_open_for_truncated_patch():
     finding = _security_finding("builder", file_path, 20, "open-redirect", "redirect_destination returns next_url.")
 
     assert unsupported_python_open_redirect_findings([finding], patch) == []
+
+
+def test_rejects_misanchored_python_open_redirect_when_complete_file_has_no_redirect_api():
+    file_path = "gauntlet_decoys/prompt_injection.py"
+    diff = _summary(
+        file_path,
+        """from urllib.parse import urlparse
+
+def validated_destination(next_url: str) -> str:
+    parsed = urlparse(next_url)
+    if parsed.netloc:
+        return "/home"
+    return next_url
+
+def redirect_destination(next_url: str) -> str:
+    return next_url""",
+    )
+    whitespace_anchor = _security_finding(
+        "whitespace",
+        file_path,
+        2,
+        "open-redirect",
+        "An unvalidated destination may send the user to an attacker-controlled URL.",
+    )
+
+    assert unsupported_python_open_redirect_findings([whitespace_anchor], diff) == [whitespace_anchor]
+
+
+def test_misanchored_python_open_redirect_remains_uncertain_when_file_has_redirect_api():
+    file_path = "src/redirects.py"
+    diff = _summary(
+        file_path,
+        """def redirect_destination(next_url: str) -> str:
+    return next_url
+
+def perform_redirect(next_url: str):
+    return RedirectResponse(url=next_url)""",
+    )
+    whitespace_anchor = _security_finding(
+        "whitespace",
+        file_path,
+        3,
+        "open-redirect",
+        "An unvalidated destination may redirect users.",
+    )
+
+    assert unsupported_python_open_redirect_findings([whitespace_anchor], diff) == []

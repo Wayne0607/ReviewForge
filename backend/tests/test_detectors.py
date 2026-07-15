@@ -54,6 +54,26 @@ def test_security_detector_covers_core_languages():
         finding for finding in findings if finding.file == "raw.rs" and finding.category == "unsafe-block"
     )
     assert raw_unsafe.confidence >= 0.96
+    assert "public unsafe function" in raw_unsafe.message.lower()
+    assert "# Safety" in raw_unsafe.message
+
+
+def test_rust_unsafe_detector_distinguishes_public_contract_and_local_scope_evidence():
+    findings = detect_security_findings(
+        {
+            "documented.rs": _diff(
+                "/// # Safety\n"
+                "/// `ptr` must be non-null, aligned, and readable.\n"
+                "pub unsafe fn raw_read(ptr: *const u8) -> u8 { *ptr }"
+            ),
+            "scoped.rs": _diff("fn read(ptr: *const u8) -> u8 {\n    unsafe { *ptr }\n}"),
+        }
+    )
+
+    assert all(finding.file != "documented.rs" for finding in findings if finding.category == "unsafe-block")
+    scoped = next(finding for finding in findings if finding.file == "scoped.rs" and finding.category == "unsafe-block")
+    assert "unsafe block" in scoped.message.lower()
+    assert "SAFETY:" in scoped.message
 
 
 def test_svelte_raw_html_directive_is_code_but_comment_and_string_decoys_are_not():

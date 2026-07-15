@@ -9,6 +9,7 @@ does not create or confirm findings.
 
 from __future__ import annotations
 
+import ast
 import re
 from collections import defaultdict
 
@@ -36,6 +37,44 @@ _NON_TEXT_INPUT = re.compile(
     re.IGNORECASE,
 )
 _STATIC_ID = re.compile(r"\bid\s*=\s*['\"](?P<id>[A-Za-z][\w:.-]*)['\"]", re.IGNORECASE)
+_DETECTOR_PROVENANCE = {"detector", "detector-auto"}
+_CODE_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_$])(?:[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*")
+_IDENTIFIER_STOPWORDS = {
+    "allow",
+    "application",
+    "code",
+    "command",
+    "data",
+    "database",
+    "directly",
+    "execute",
+    "file",
+    "function",
+    "input",
+    "method",
+    "password",
+    "query",
+    "secret",
+    "shell",
+    "sql",
+    "string",
+    "token",
+    "user",
+    "value",
+}
+_SECURITY_ANCHOR_CATEGORY_PAIRS = {
+    frozenset({"hardcoded-secrets", "data-leak"}),
+    frozenset({"command-injection", "ci-security"}),
+}
+_REMOTE_DOWNLOAD_CATEGORIES = {"insecure-download", "supply-chain-risk"}
+_PYTHON_REDIRECT_CALLS = {
+    "httpresponseredirect",
+    "httpresponseredirectpermanent",
+    "redirect",
+    "redirect_to",
+    "redirectresponse",
+    "sendredirect",
+}
 
 
 def _extract_file_patch(diff_summary: str, file_path: str) -> str:
@@ -189,3 +228,185 @@ def reanchor_accessibility_findings(findings: list[Finding], diff_summary: str) 
         candidates = _missing_alt_candidates(patch) if category == "missing-alt" else _missing_label_candidates(patch)
         changed.extend(_assign_nearest(group, candidates))
     return changed
+
+
+def _message_code_identifiers(message: str, patch_lines: list[tuple[int, str]]) -> set[str]:
+    """Return code-like message terms that identify exactly one line in the patch."""
+
+    code = "\n".join(content for _line, content in patch_lines)
+    identifiers: set[str] = set()
+    for match in _CODE_IDENTIFIER.finditer(message or ""):
+        raw = re.sub(r"\s+", "", match.group(0))
+        lowered = raw.lower()
+        if len(raw) < 4 or lowered in _IDENTIFIER_STOPWORDS:
+            continue
+        occurrence = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(raw)}(?![A-Za-z0-9_$])", re.IGNORECASE)
+        if len(occurrence.findall(code)) == 1:
+            identifiers.add(lowered)
+    return identifiers
+
+
+def _window_contains_identifier(patch_lines: list[tuple[int, str]], detector_line: int, identifiers: set[str]) -> bool:
+    window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3).lower()
+    return any(
+        re.search(rf"(?<![a-z0-9_$]){re.escape(identifier)}(?![a-z0-9_$])", window, re.IGNORECASE)
+        for identifier in identifiers
+    )
+
+
+def _security_anchor_categories_compatible(
+    detector_category: str,
+    reviewer_category: str,
+    patch_lines: list[tuple[int, str]],
+    detector_line: int,
+) -> bool:
+    if detector_category == reviewer_category:
+        return True
+    if frozenset({detector_category, reviewer_category}) in _SECURITY_ANCHOR_CATEGORY_PAIRS:
+        return True
+    categories = {detector_category, reviewer_category}
+    if "code-injection" not in categories or not categories.intersection(_REMOTE_DOWNLOAD_CATEGORIES):
+        return False
+    window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3)
+    return bool(re.search(r"\b(?:curl|wget)\b[^\n]*\|", window, re.IGNORECASE))
+
+
+def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary: str) -> list[Finding]:
+    """Move an LLM duplicate onto a detector line only with unique diff evidence.
+
+    Reviewer line numbers often point at a method declaration while a detector
+    points at the concrete sink a few lines later.  A detector is eligible only
+    when a code identifier/API named by the reviewer occurs exactly once in the
+    file patch and inside that detector's three-line context window.  Candidate
+    matching is one-to-one, so adjacent independent sinks are never consumed by
+    one deterministic finding.
+    """
+
+    grouped: dict[str, dict[str, list[Finding]]] = defaultdict(lambda: {"detectors": [], "reviewers": []})
+    for finding in findings:
+        bucket = "detectors" if finding.verified_by.strip().lower() in _DETECTOR_PROVENANCE else "reviewers"
+        grouped[finding.file][bucket].append(finding)
+
+    proposals: list[tuple[int, int, str, Finding, Finding]] = []
+    for file_path, group in grouped.items():
+        detectors = group["detectors"]
+        reviewers = group["reviewers"]
+        if not detectors or not reviewers:
+            continue
+        patch_lines = iter_right_lines(_extract_file_patch(diff_summary, file_path))
+        if not patch_lines:
+            continue
+        for finding in reviewers:
+            identifiers = _message_code_identifiers(finding.message, patch_lines)
+            if not identifiers:
+                continue
+            matching = [
+                detector
+                for detector in detectors
+                if _security_anchor_categories_compatible(
+                    normalize_category(detector.category),
+                    normalize_category(finding.category),
+                    patch_lines,
+                    detector.line,
+                )
+                and _window_contains_identifier(patch_lines, detector.line, identifiers)
+            ]
+            if len(matching) != 1:
+                continue
+            detector = matching[0]
+            shared_count = sum(
+                1 for identifier in identifiers if _window_contains_identifier(patch_lines, detector.line, {identifier})
+            )
+            proposals.append((-shared_count, abs(finding.line - detector.line), finding.id, finding, detector))
+
+    changed: list[Finding] = []
+    claimed_detectors: set[str] = set()
+    claimed_reviewers: set[str] = set()
+    for _score, _distance, _finding_id, finding, detector in sorted(proposals):
+        if finding.id in claimed_reviewers or detector.id in claimed_detectors:
+            continue
+        finding.line = detector.line
+        finding.category = normalize_category(detector.category)
+        claimed_reviewers.add(finding.id)
+        claimed_detectors.add(detector.id)
+        changed.append(finding)
+    return changed
+
+
+def _complete_python_tree(patch: str) -> tuple[ast.Module, list[tuple[int, str]]] | None:
+    """Parse a complete post-image beginning at line one, otherwise fail open."""
+
+    new_file_hunk = re.search(r"^@@ -0,0 \+1(?:,(?P<count>\d+))? @@", patch or "", re.MULTILINE)
+    if new_file_hunk is None:
+        return None
+    patch_lines = iter_right_lines(patch)
+    if not patch_lines:
+        return None
+    line_numbers = [line for line, _content in patch_lines]
+    declared_count = int(new_file_hunk.group("count") or 1)
+    if line_numbers != list(range(1, declared_count + 1)):
+        return None
+    try:
+        return ast.parse("\n".join(content for _line, content in patch_lines)), patch_lines
+    except SyntaxError:
+        return None
+
+
+def _python_function_has_redirect_call(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether a function body itself invokes a known redirect API."""
+
+    stack: list[ast.AST] = list(function.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                call_name = node.func.id.lower()
+            elif isinstance(node.func, ast.Attribute):
+                call_name = node.func.attr.lower()
+            else:
+                call_name = ""
+            if call_name in _PYTHON_REDIRECT_CALLS:
+                return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def unsupported_python_open_redirect_findings(findings: list[Finding], diff_summary: str) -> list[Finding]:
+    """Reject LLM open-redirect claims whose Python function has no redirect sink.
+
+    The gate intentionally requires a complete, parseable post-image and one
+    unambiguous function scope.  Truncated patches and uncertain anchors remain
+    untouched so a URL builder is rejected only when the diff proves it never
+    performs a redirect.
+    """
+
+    rejected: list[Finding] = []
+    parsed_files: dict[str, tuple[ast.Module, list[tuple[int, str]]] | None] = {}
+    for finding in findings:
+        if finding.verified_by.strip().lower() in _DETECTOR_PROVENANCE:
+            continue
+        if normalize_category(finding.category) != "open-redirect" or not finding.file.lower().endswith(".py"):
+            continue
+        if finding.file not in parsed_files:
+            patch = _extract_file_patch(diff_summary, finding.file)
+            parsed_files[finding.file] = _complete_python_tree(patch)
+        parsed = parsed_files[finding.file]
+        if parsed is None:
+            continue
+        tree, patch_lines = parsed
+        functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        scopes = [
+            function
+            for function in functions
+            if function.lineno <= finding.line <= (function.end_lineno or function.lineno)
+        ]
+        if not scopes:
+            identifiers = _message_code_identifiers(finding.message, patch_lines)
+            scopes = [function for function in functions if function.name.lower() in identifiers]
+        if len(scopes) != 1:
+            continue
+        if not _python_function_has_redirect_call(scopes[0]):
+            rejected.append(finding)
+    return rejected

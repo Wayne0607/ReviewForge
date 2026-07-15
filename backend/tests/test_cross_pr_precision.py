@@ -15,7 +15,11 @@ import aiosqlite
 
 from reviewforge.core.database import Database
 from reviewforge.core.state import Finding, StateStore
-from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer, CrossPRChain
+from reviewforge.engine.cross_pr_analyzer import (
+    _MAX_LLM_USER_PROMPT_CHARS,
+    CrossPRAnalyzer,
+    CrossPRChain,
+)
 from reviewforge.engine.symbol_extractor import extract_calls, extract_diff_calls, extract_diff_symbols, extract_imports
 
 
@@ -111,6 +115,274 @@ def test_diff_symbol_and_call_lines_use_right_side_coordinates():
     assert any(c.callee == "run_query" and c.line == 83 for c in calls)
 
 
+def test_diff_calls_ignore_call_shapes_inside_strings_comments_and_regex_literals():
+    cases = {
+        "consumer.py": ("text = \"danger(raw)\"\ndoc = '''danger(raw)'''\n# danger(raw)\nvalue = safe(raw)"),
+        "consumer.ts": (
+            'const text = "danger(raw)";\n'
+            "const template = `danger(raw)`;\n"
+            "const pattern = /danger(raw)/;\n"
+            "// danger(raw)\n"
+            "interface Local { danger(raw: string): void; }\n"
+            "type Shape = { danger(raw: string): void };\n"
+            "const api = { danger(raw: string) { return raw; } };\n"
+            "class Service { danger(raw: string) { return raw; } }\n"
+            "abstract class AbstractService { abstract danger(\n  raw: string\n): void; }\n"
+            "const asserted = <Danger>raw;\n"
+            "safe(raw);"
+        ),
+        "consumer.go": ("package p\nvar text = `danger(raw)`\n// danger(raw)\nfunc run() { safe(raw) }"),
+        "Consumer.java": (
+            'String text = "danger(raw)";\nString block = """danger(raw)""";\n/* danger(raw) */\nsafe(raw);'
+        ),
+        "consumer.rs": ('let text = r#"danger(raw)"#;\n// danger(raw)\nsafe(raw);'),
+        "consumer.rb": ('text = "danger(raw)"\ndoc = <<~TEXT\ndanger(raw)\nTEXT\n# danger(raw)\nsafe(raw)'),
+    }
+
+    for file_path, body in cases.items():
+        calls = extract_diff_calls(_diff(file_path, body), file_path)
+        assert "danger" not in {call.callee for call in calls}, file_path
+        assert "safe" in {call.callee for call in calls}, file_path
+
+
+def test_javascript_regex_literals_after_arrow_and_yield_are_not_calls():
+    body = "const matcher = () => /danger(raw)/gi;\nfunction* patterns() { yield /danger(raw)/; }\nsafe(raw);"
+
+    calls = extract_diff_calls(_diff("consumer.ts", body), "consumer.ts")
+
+    assert "danger" not in {call.callee for call in calls}
+    assert "safe" in {call.callee for call in calls}
+
+
+def test_imports_inside_comments_and_strings_do_not_create_bindings():
+    body = (
+        "# from pkg.sink import danger\n"
+        'doc = """from pkg.sink import danger"""\n'
+        "def route(raw):\n"
+        "    return danger(raw)\n"
+    )
+
+    _symbols, imports = extract_diff_symbols(_diff("consumer.py", body), "consumer.py")
+
+    assert not any(item.source == "pkg.sink" for item in imports)
+
+
+def test_python_exact_binding_requires_a_complete_unshadowed_runtime_import():
+    safe = "from pkg.sink import danger\n\ndef route(raw):\n    return danger(raw)\n"
+    safe_call = next(
+        call for call in extract_diff_calls(_diff("consumer.py", safe), "consumer.py") if call.callee == "danger"
+    )
+    assert safe_call.binding_proven
+
+    unsafe_bodies = [
+        (
+            "from typing import TYPE_CHECKING\n"
+            "if TYPE_CHECKING:\n"
+            "    from pkg.sink import danger\n"
+            "def route(raw):\n"
+            "    return danger(raw)\n"
+        ),
+        (
+            "from pkg.sink import danger\n"
+            "def route(xs, safe_functions):\n"
+            "    return [danger(x) for danger in safe_functions for x in xs]\n"
+        ),
+        ("from pkg.sink import danger\ndef route(raw):\n    danger = lambda value: value\n    return danger(raw)\n"),
+        "from pkg.sink import danger\ndel danger\ndef route(raw):\n    return danger(raw)\n",
+    ]
+    for body in unsafe_bodies:
+        danger_calls = [
+            call for call in extract_diff_calls(_diff("consumer.py", body), "consumer.py") if call.callee == "danger"
+        ]
+        assert danger_calls and not any(call.binding_proven for call in danger_calls), body
+
+    modified_patch = "@@ -10,0 +10,4 @@\n+from pkg.sink import danger\n+\n+def route(raw):\n+    return danger(raw)\n"
+    modified_call = next(call for call in extract_diff_calls(modified_patch, "consumer.py") if call.callee == "danger")
+    assert not modified_call.binding_proven
+
+    multi_hunk_patch = _diff("consumer.py", safe) + "\n@@ -90,0 +91,1 @@\n+# later old-file context"
+    multi_hunk_call = next(
+        call for call in extract_diff_calls(multi_hunk_patch, "consumer.py") if call.callee == "danger"
+    )
+    assert not multi_hunk_call.binding_proven
+
+
+def test_declaration_filter_preserves_real_calls_followed_by_blocks():
+    cases = {
+        "consumer.ts": "if (danger(raw)) { handle(); }",
+        "consumer.go": "if danger(raw) { handle() }",
+        "Consumer.java": "Object value = new Danger() { };",
+        "consumer.rs": "if danger(raw) { handle(); }",
+        "consumer.rb": "danger(raw) { |value| handle(value) }",
+    }
+
+    for file_path, body in cases.items():
+        calls = extract_diff_calls(_diff(file_path, body), file_path)
+        expected = "Danger" if file_path.endswith(".java") else "danger"
+        assert expected in {call.callee for call in calls}, file_path
+
+
+async def test_string_only_import_reference_is_not_an_exact_cross_pr_call(tmp_path):
+    db = Database(tmp_path / "string_call.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+    repo = "owner/repo"
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="seed",
+        repo=repo,
+        pr_number=1,
+        head_sha="base-head",
+        file_path="pkg/sink.py",
+        category="code-injection",
+    )
+
+    body = 'from pkg.sink import danger\n\ndef route(raw):\n    text = "danger(raw)"\n    return raw\n'
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="base-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+
+    assert await analyzer.analyze("consumer", state, []) == []
+    await db.close()
+
+
+async def test_exact_import_call_requires_semantic_confirmation(tmp_path):
+    db = Database(tmp_path / "semantic_cross_gate.db")
+    await db.connect()
+    llm = _RejectEveryChainLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    repo = "owner/repo"
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="seed",
+        repo=repo,
+        pr_number=1,
+        head_sha="base-head",
+        file_path="pkg/sink.py",
+        category="sql-injection",
+    )
+    body = 'from pkg.sink import danger\n\ndef route():\n    return danger("fixed-safe-value")\n'
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="base-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+
+    assert await analyzer.analyze("consumer", state, []) == []
+    assert llm.invocations == 1
+    await db.close()
+
+
+async def test_go_interface_method_signature_is_not_an_exact_cross_pr_call(tmp_path):
+    db = Database(tmp_path / "go_interface_call.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+    repo = "owner/repo"
+    await db.create_run("seed", repo, 1, "base-head", "parent")
+    await db.upsert_symbol(
+        file_path="pkg/sink.go",
+        symbol_name="Danger",
+        symbol_type="function",
+        run_id="seed",
+        pr_number=1,
+        language="go",
+        risk_level="critical",
+        risk_categories=["code-injection"],
+    )
+    await db.upsert_file_risk("pkg/sink.go", "critical", ["code-injection"], 1, "seed")
+    await db.complete_run("seed", {})
+
+    body = 'package consumer\nimport sink "pkg/sink"\ntype Local interface {\n  sink.Danger()\n}'
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="base-head",
+        files_changed=["consumer.go"],
+        diff_summary=_diff("consumer.go", body),
+    )
+
+    assert "Danger" not in {call.callee for call in extract_diff_calls(state.diff_summary, "consumer.go")}
+    assert await analyzer.analyze("consumer", state, []) == []
+    await db.close()
+
+
+async def test_typescript_declarations_are_not_exact_cross_pr_calls(tmp_path):
+    db = Database(tmp_path / "typescript_declaration_call.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+    repo = "owner/repo"
+    await db.create_run("seed", repo, 1, "base-head", "parent")
+    await db.upsert_symbol(
+        file_path="pkg/sink.ts",
+        symbol_name="danger",
+        symbol_type="function",
+        run_id="seed",
+        pr_number=1,
+        language="typescript",
+        risk_level="critical",
+        risk_categories=["code-injection"],
+    )
+    await db.upsert_file_risk("pkg/sink.ts", "critical", ["code-injection"], 1, "seed")
+    await db.complete_run("seed", {})
+
+    body = (
+        'import { danger, Danger } from "pkg/sink";\n'
+        "interface Local { danger(raw: string): void; }\n"
+        "type Shape = { danger(raw: string): void };\n"
+        "const api = { danger(raw: string) { return raw; } };\n"
+        "class Service { danger(raw: string) { return raw; } }\n"
+        "abstract class AbstractService { abstract danger(\n  raw: string\n): void; }\n"
+        "const asserted = <Danger>raw;"
+    )
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="base-head",
+        files_changed=["consumer.ts"],
+        diff_summary=_diff("consumer.ts", body),
+    )
+
+    calls = extract_diff_calls(state.diff_summary, "consumer.ts")
+    assert {"danger", "Danger"}.isdisjoint(call.callee for call in calls)
+    assert await analyzer.analyze("consumer", state, []) == []
+    await db.close()
+
+
+def test_go_block_import_preserves_alias_and_right_side_coordinate():
+    patch = (
+        "@@ -0,0 +10,8 @@\n"
+        "+package consumer\n"
+        "+import (\n"
+        '+\t"fmt"\n'
+        '+\tseed "gauntlet_fullstack/seed_go"\n'
+        "+)\n"
+        "+func report(id string) {\n"
+        "+\tseed.RunAccountQuery(nil, id)\n"
+        "+}\n"
+    )
+
+    _symbols, imports = extract_diff_symbols(patch, "gauntlet_services/consumer.go")
+    calls = extract_diff_calls(patch, "gauntlet_services/consumer.go")
+
+    assert any(
+        item.source == "gauntlet_fullstack/seed_go" and item.local_name == "seed" and item.line == 13
+        for item in imports
+    )
+    assert any(item.receiver == "seed" and item.callee == "RunAccountQuery" and item.line == 16 for item in calls)
+
+
 def test_cross_pr_file_slice_preserves_rename_headers_and_stops_at_next_summary_file():
     summary = (
         "--- new.py (+1 -0)\n"
@@ -140,7 +412,7 @@ def test_cross_pr_file_slice_preserves_rename_headers_and_stops_at_next_summary_
 async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.connect()
-    analyzer = CrossPRAnalyzer(db, llm=None)  # no LLM → deterministic structural findings
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM())
 
     # --- PR-A: db.py defines run_query (sql-injection) and cache_load (insecure-deserialization) ---
     db_src = (
@@ -216,7 +488,7 @@ async def test_cross_pr_propagates_only_imported_symbol_risk(tmp_path):
 async def test_cross_pr_normalizes_security_category_aliases(tmp_path):
     db = Database(tmp_path / "aliases.db")
     await db.connect()
-    analyzer = CrossPRAnalyzer(db, llm=None)
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM())
 
     seed_src = "def risky_eval(expr):\n    return eval(expr)\n"
     state_a = StateStore(
@@ -274,6 +546,80 @@ async def test_cross_pr_ignores_stdlib_import_fuzzy_matches(tmp_path):
 
     assert await analyzer.analyze("stdlib", state, existing_findings=[]) == []
     await db.close()
+
+
+async def test_ambiguous_historical_import_stays_llm_gated(tmp_path):
+    db = Database(tmp_path / "ambiguous_import.db")
+    await db.connect()
+    llm = _RejectEveryChainLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    repo = "owner/repo"
+
+    await db.create_run("base", repo, 1, "base-head", "parent")
+    for file_path in ("app/pkg/sink.py", "vendor/pkg/sink.py"):
+        await db.upsert_symbol(
+            file_path=file_path,
+            symbol_name="danger",
+            symbol_type="function",
+            run_id="base",
+            pr_number=1,
+            language="python",
+            risk_level="critical",
+            risk_categories=["code-injection"],
+        )
+        await db.upsert_file_risk(file_path, "critical", ["code-injection"], 1, "base")
+    await db.complete_run("base", {})
+
+    body = "from pkg.sink import danger\n\ndef route(raw):\n    return danger(raw)\n"
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="base-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+    findings = await analyzer.analyze("consumer", state, [])
+    await db.close()
+
+    assert findings == []
+    assert llm.invocations == 1
+
+
+async def test_ambiguous_historical_import_is_not_confirmed_without_llm(tmp_path):
+    db = Database(tmp_path / "ambiguous_import_no_llm.db")
+    await db.connect()
+    analyzer = CrossPRAnalyzer(db, llm=None)
+    repo = "owner/repo"
+
+    await db.create_run("base", repo, 1, "base-head", "parent")
+    for file_path in ("app/pkg/sink.py", "vendor/pkg/sink.py"):
+        await db.upsert_symbol(
+            file_path=file_path,
+            symbol_name="danger",
+            symbol_type="function",
+            run_id="base",
+            pr_number=1,
+            language="python",
+            risk_level="critical",
+            risk_categories=["code-injection"],
+        )
+        await db.upsert_file_risk(file_path, "critical", ["code-injection"], 1, "base")
+    await db.complete_run("base", {})
+
+    body = "from pkg.sink import danger\n\ndef route(raw):\n    return danger(raw)\n"
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="base-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+    findings = await analyzer.analyze("consumer", state, [])
+    await db.close()
+
+    assert findings == []
 
 
 async def test_symbol_risk_prefers_function_name_over_drifted_line(tmp_path):
@@ -602,7 +948,7 @@ fn next() {}
 async def test_online_detector_finding_in_destructured_typescript_function_seeds_cross_pr_risk(tmp_path):
     db = Database(tmp_path / "destructured-typescript.db")
     await db.connect()
-    analyzer = CrossPRAnalyzer(db, llm=None)
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM())
     repo = "Wayne0607/ReviewForge"
     seed_file = "gauntlet_fullstack/seed_frontend.tsx"
     seed_source = """import React from "react";
@@ -668,7 +1014,7 @@ export function bridge(html: string) {
 async def test_adjacent_symbol_boundary_does_not_leak_next_sink_into_previous_symbol(tmp_path):
     db = Database(tmp_path / "adjacent-symbols.db")
     await db.connect()
-    analyzer = CrossPRAnalyzer(db, llm=None)
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM())
 
     seed_source = """package gauntlet_fullstack
 
@@ -926,7 +1272,7 @@ async def test_cross_pr_keeps_stacked_base_and_skips_inapplicable_first_fuzzy_ca
             (repo, stacked_sha, stale_path): "def danger(raw): return raw\n",
         }
     )
-    analyzer = CrossPRAnalyzer(db, llm=None, github_client=github)
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM(), github_client=github)
     # Insert the stale fuzzy match first: selection must continue to the
     # applicable stacked-base candidate instead of trusting DB row order.
     await _seed_completed_risk(
@@ -982,7 +1328,7 @@ async def test_cross_pr_keeps_risk_when_source_and_base_file_contents_match(tmp_
             (repo, base_sha, sink_path): unchanged,
         }
     )
-    analyzer = CrossPRAnalyzer(db, llm=None, github_client=github)
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM(), github_client=github)
     await _seed_completed_risk(
         db,
         analyzer,
@@ -1116,7 +1462,7 @@ async def test_cross_pr_depth_two_rejects_relation_from_unmerged_branch(tmp_path
             (repo, base_sha, gateway_path): "def gateway(raw): return raw\n",
         }
     )
-    analyzer = CrossPRAnalyzer(db, llm=None, github_client=github)
+    analyzer = CrossPRAnalyzer(db, llm=_ConfirmEveryChainLLM(), github_client=github)
     await _seed_completed_risk(
         db,
         analyzer,
@@ -1271,6 +1617,381 @@ class _FailMiddleBatchLLM(_ConfirmEveryChainLLM):
         return await super().ainvoke(messages)
 
 
+class _RejectEveryChainLLM:
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    async def ainvoke(self, messages):
+        self.invocations += 1
+        chain_ids = [int(value) for value in re.findall(r"^Chain (\d+):", messages[-1].content, re.MULTILINE)]
+        return SimpleNamespace(
+            content=json.dumps(
+                [
+                    {"chain_id": chain_id, "exploitable": False, "confidence": 0.99, "reason": "rejected"}
+                    for chain_id in chain_ids
+                ]
+            )
+        )
+
+
+class _CaptureRejectLLM(_RejectEveryChainLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[str] = []
+
+    async def ainvoke(self, messages):
+        self.prompts.append(messages[-1].content)
+        return await super().ainvoke(messages)
+
+
+class _CaptureConfirmLLM(_ConfirmEveryChainLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[str] = []
+
+    async def ainvoke(self, messages):
+        self.prompts.append(messages[-1].content)
+        return await super().ainvoke(messages)
+
+
+class _PoisonChainLLM(_ConfirmEveryChainLLM):
+    async def ainvoke(self, messages):
+        if "Source: consumer_2.py:" in messages[-1].content:
+            raise RuntimeError("poison chain")
+        return await super().ainvoke(messages)
+
+
+def _confirmation_chain(index: int, *, evidence_kind: str = "call") -> CrossPRChain:
+    return CrossPRChain(
+        source_file=f"consumer_{index}.py",
+        source_symbol=f"caller_{index}",
+        source_line=100 + index,
+        target_file=f"sink_{index}.py",
+        target_symbol=f"sink_{index}",
+        risk_category="sql-injection",
+        risk_level="critical",
+        depth=1,
+        path=[
+            {"file": f"consumer_{index}.py", "symbol": f"caller_{index}"},
+            {"file": f"sink_{index}.py", "symbol": f"sink_{index}", "risk": "sql-injection"},
+        ],
+        evidence_kind=evidence_kind,
+        source_column=12,
+        call_callee=f"sink_{index}",
+    )
+
+
+async def test_cross_pr_without_llm_never_publishes_even_exact_structural_edges(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "no_semantic_judge.db"), llm=None)
+
+    findings = await analyzer._confirm_suspicious_chains(
+        [_confirmation_chain(1, evidence_kind="exact-import-call")],
+        "",
+        StateStore(repo="o/r", head_sha="head"),
+    )
+
+    assert findings == []
+
+
+async def test_cross_pr_prompt_keeps_exact_call_arguments_in_long_multifile_diff(tmp_path):
+    first_lines = ["def caller_1():", *[f"    filler_{index} = {index}" for index in range(180)]]
+    first_lines.append('    return sink_1("fixed-safe-value")')
+    first_body = "\n".join(first_lines)
+    second_body = "def caller_2(request):\n    clean = allowlist(request.value)\n    return sink_2(clean)"
+    first_line = len(first_lines)
+    second_line = 3
+
+    chains = [_confirmation_chain(1), _confirmation_chain(2)]
+    chains[0].source_line = first_line
+    chains[1].source_line = second_line
+    github = _FakeGitHub(
+        {
+            ("o/r", "head", "consumer_1.py"): first_body,
+            ("o/r", "head", "consumer_2.py"): second_body,
+            ("o/r", "base", "sink_1.py"): "def sink_1(raw):\n    return eval(raw)",
+            ("o/r", "base", "sink_2.py"): "def sink_2(raw):\n    return eval(raw)",
+        }
+    )
+    llm = _CaptureRejectLLM()
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "prompt_context.db"), llm=llm, github_client=github)
+    diff_summary = "\n".join([_diff("consumer_1.py", first_body), _diff("consumer_2.py", second_body)])
+
+    findings = await analyzer._llm_confirm_chain_batch(
+        chains,
+        diff_summary,
+        StateStore(repo="o/r", head_sha="head", base_sha="base"),
+    )
+
+    assert findings == []
+    assert len(llm.prompts) == 1
+    prompt = llm.prompts[0]
+    assert 'sink_1("fixed-safe-value")' in prompt
+    assert "clean = allowlist(request.value)" in prompt
+    assert "return sink_2(clean)" in prompt
+    assert "def sink_1(raw)" in prompt
+    assert "def sink_2(raw)" in prompt
+    assert prompt.index("Chain 1:") < prompt.index("Chain 2:")
+
+
+def test_cross_pr_confirmation_parser_rejects_truthy_types_low_confidence_and_duplicates(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "strict_json.db"), llm=None)
+    chains = [_confirmation_chain(index) for index in range(1, 6)]
+    payload = json.dumps(
+        [
+            {"chain_id": 1, "exploitable": "false", "confidence": 0.99, "reason": "string bool"},
+            {"chain_id": 2, "exploitable": True, "confidence": "0.99", "reason": "string confidence"},
+            {"chain_id": 3, "exploitable": True, "confidence": 0.64, "reason": "below threshold"},
+            {"chain_id": 4, "exploitable": True, "confidence": 0.99, "reason": "first accepted"},
+            {"chain_id": 4, "exploitable": True, "confidence": 1.0, "reason": "duplicate"},
+            {"chain_id": 5, "exploitable": True, "confidence": 0.9, "reason": "accepted"},
+        ]
+    )
+
+    findings = analyzer._parse_confirmation(payload, chains)
+
+    assert [(finding.file, finding.confidence) for finding in findings] == [
+        ("consumer_4.py", 0.99),
+        ("consumer_5.py", 0.9),
+    ]
+
+
+def test_cross_pr_confirmation_parser_bounds_long_reason_without_dropping_sibling(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "long_reason.db"), llm=None)
+    payload = json.dumps(
+        [
+            {"chain_id": 1, "exploitable": True, "confidence": 0.99, "reason": "长" * 10_000},
+            {"chain_id": 2, "exploitable": True, "confidence": 0.99, "reason": "正常理由"},
+        ]
+    )
+
+    findings = analyzer._parse_confirmation(payload, [_confirmation_chain(1), _confirmation_chain(2)])
+
+    assert [finding.file for finding in findings] == ["consumer_1.py", "consumer_2.py"]
+    assert len(findings[0].verify_reason) <= 500
+    assert findings[1].verify_reason == "正常理由"
+
+
+async def test_same_file_safe_then_unsafe_calls_are_both_semantic_gated(tmp_path):
+    db = Database(tmp_path / "distinct_calls.db")
+    await db.connect()
+    repo = "owner/repo"
+    llm = _CaptureRejectLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="seed",
+        repo=repo,
+        pr_number=1,
+        head_sha="seed-head",
+        file_path="pkg/sink.py",
+    )
+    body = (
+        "from pkg.sink import danger\n\n"
+        "def safe_path():\n"
+        '    return danger("fixed-safe-value")\n\n'
+        "def unsafe_path(request):\n"
+        '    return danger(request.args["q"])\n'
+    )
+    await db.create_run("consumer", repo, 2, "consumer-head", "seed-head")
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=["consumer.py"],
+        diff_summary=_diff("consumer.py", body),
+    )
+
+    findings = await analyzer.analyze("consumer", state, [])
+    await db.close()
+
+    assert findings == []
+    prompt = llm.prompts[-1]
+    assert len(re.findall(r"^Chain \d+:", prompt, re.MULTILINE)) == 2
+    assert 'danger("fixed-safe-value")' in prompt
+    assert 'danger(request.args["q"])' in prompt
+    assert "Source: consumer.py:L4" in prompt
+    assert "Source: consumer.py:L7" in prompt
+
+
+async def test_depth_two_filters_relation_by_source_symbol_and_keeps_intermediate_context(tmp_path):
+    db = Database(tmp_path / "depth_two_symbol.db")
+    await db.connect()
+    repo = "owner/repo"
+    await db.create_run("seed", repo, 1, "seed-head", "parent")
+    for file_path, symbol in (
+        ("pkg/gateway.py", "gateway"),
+        ("pkg/intended.py", "danger"),
+        ("pkg/unrelated.py", "other"),
+    ):
+        await db.upsert_symbol(
+            file_path=file_path,
+            symbol_name=symbol,
+            symbol_type="function",
+            run_id="seed",
+            pr_number=1,
+            language="python",
+            risk_level="critical",
+            risk_categories=["sql-injection"],
+        )
+        await db.upsert_file_risk(file_path, "critical", ["sql-injection"], 1, "seed")
+    await db.upsert_relation(
+        run_id="seed",
+        source_file="pkg/gateway.py",
+        source_symbol="gateway",
+        target_file="pkg/intended.py",
+        target_symbol="danger",
+        relation_type="call",
+    )
+    await db.upsert_relation(
+        run_id="seed",
+        source_file="pkg/gateway.py",
+        source_symbol="unrelated",
+        target_file="pkg/unrelated.py",
+        target_symbol="other",
+        relation_type="call",
+    )
+    await db.complete_run("seed", {})
+
+    body = "from pkg.gateway import gateway\n\ndef route(raw):\n    return gateway(raw)\n"
+    patch = _diff("consumer.py", body)
+    _symbols, imports = extract_diff_symbols(patch, "consumer.py")
+    calls = extract_diff_calls(patch, "consumer.py")
+    state = StateStore(
+        pr_number=2,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha="seed-head",
+        files_changed=["consumer.py"],
+        diff_summary=patch,
+    )
+    analyzer = CrossPRAnalyzer(db, llm=_RejectEveryChainLLM())
+    chains = await analyzer._find_suspicious_chains(imports, calls, ["consumer.py"], "consumer", state)
+    depth_two = [chain for chain in chains if chain.depth == 2]
+
+    assert len(depth_two) == 1
+    assert depth_two[0].path[1] == {"file": "pkg/gateway.py", "symbol": "gateway"}
+    assert depth_two[0].target_file == "pkg/intended.py"
+    assert all(chain.target_file != "pkg/unrelated.py" for chain in depth_two)
+
+    github = _FakeGitHub(
+        {
+            (repo, "seed-head", "pkg/gateway.py"): (
+                "def gateway(raw):\n    checked = allowlist(raw)\n    return danger(checked)\n\n"
+                "def unrelated(raw):\n    return other(raw)\n"
+            ),
+            (repo, "seed-head", "pkg/intended.py"): "def danger(raw):\n    return eval(raw)\n",
+        }
+    )
+    context_analyzer = CrossPRAnalyzer(db, llm=_RejectEveryChainLLM(), github_client=github)
+    context = await context_analyzer._chain_confirmation_context(1, depth_two[0], patch, state)
+    await db.close()
+
+    assert "Intermediate function pkg/gateway.py:gateway" in context
+    assert "checked = allowlist(raw)" in context
+    assert "def unrelated" not in context
+
+
+def test_symbol_context_and_callers_cover_rust_ruby_and_multiline_ts_java():
+    analyzer = CrossPRAnalyzer.__new__(CrossPRAnalyzer)
+    cases = {
+        "review.rs": (
+            "pub async fn review(\n    request: Request,\n) -> Result<String, Error>\nwhere Request: Send\n"
+            "{\n    danger(request.body())\n}\nfn next_marker() {}\n",
+            "danger(request.body())",
+        ),
+        "review.ts": (
+            "class Service {\n  async review(\n    request: Request,\n    options: Options,\n"
+            "  ): Promise<Result> {\n    return danger(request.body);\n  }\n}\nfunction next_marker() {}\n",
+            "danger(request.body)",
+        ),
+        "Review.java": (
+            "class Review {\n  public Result review(\n"
+            "    HttpServletRequest request,\n    Map<String, String> options\n"
+            "  ) throws IOException {\n    return danger(request.getBody());\n  }\n}\nclass NextMarker {}\n",
+            "danger(request.getBody())",
+        ),
+        "review.rb": (
+            "def review(request)\n  danger(request.body)\nend\ndef next_marker\nend\n",
+            "danger(request.body)",
+        ),
+    }
+
+    for file_path, (source, evidence) in cases.items():
+        context = analyzer._extract_function(source, "review", file_path)
+        calls = extract_calls(source, file_path)
+        assert evidence in context, file_path
+        assert "next_marker" not in context, file_path
+        assert any(call.callee == "danger" and call.caller == "review" for call in calls), file_path
+
+
+async def test_multiline_call_keeps_last_argument_and_minified_line_has_hard_budget(tmp_path):
+    before = ["def caller(request):", *[f"    filler_{index} = {index}" for index in range(80)]]
+    call = ["    return sink_1(", *[f"        arg_{index}," for index in range(30)]]
+    call.extend(["        request.ATTACKER_CONTROLLED,", "    )"])
+    body = "\n".join([*before, *call])
+    chain = _confirmation_chain(1)
+    chain.source_file = "consumer_1.py"
+    chain.source_symbol = "caller"
+    chain.source_line = len(before) + 1
+    chain.source_column = 12
+    github = _FakeGitHub(
+        {
+            ("o/r", "head", "consumer_1.py"): body,
+            ("o/r", "base", "sink_1.py"): "def sink_1(raw):\n    return eval(raw)",
+        }
+    )
+    llm = _CaptureRejectLLM()
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "multiline_call.db"), llm=llm, github_client=github)
+    await analyzer._llm_confirm_chain_batch(
+        [chain],
+        _diff("consumer_1.py", body),
+        StateStore(repo="o/r", head_sha="head", base_sha="base"),
+    )
+
+    assert "arg_29" in llm.prompts[0]
+    assert "request.ATTACKER_CONTROLLED" in llm.prompts[0]
+    assert "Exact complete call expression" in llm.prompts[0]
+
+    huge = "A" * 200_000
+    huge_body = f'def caller():\n    return sink_1("{huge}")'
+    chain.source_line = 2
+    huge_llm = _CaptureRejectLLM()
+    huge_analyzer = CrossPRAnalyzer(Database(tmp_path / "huge_call.db"), llm=huge_llm, github_client=github)
+    await huge_analyzer._llm_confirm_chain_batch(
+        [chain],
+        _diff("consumer_1.py", huge_body),
+        StateStore(repo="o/r", head_sha="head", base_sha="base"),
+    )
+    assert len(huge_llm.prompts[0]) <= _MAX_LLM_USER_PROMPT_CHARS
+    assert "TRUNCATED" in huge_llm.prompts[0]
+
+
+async def test_poison_chain_does_not_drop_healthy_batch_siblings(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "poison_chain.db"), llm=_PoisonChainLLM())
+    chains = [_confirmation_chain(index) for index in range(5)]
+
+    findings = await analyzer._llm_confirm_chains(chains, "", StateStore(repo="o/r", head_sha="head"))
+
+    assert {finding.file for finding in findings} == {
+        "consumer_0.py",
+        "consumer_1.py",
+        "consumer_3.py",
+        "consumer_4.py",
+    }
+
+
+async def test_test_path_variants_are_marked_nonproduction(tmp_path):
+    analyzer = CrossPRAnalyzer(Database(tmp_path / "test_paths.db"), llm=_RejectEveryChainLLM())
+    for file_path in ("test_foo.py", "foo.spec.ts", "__tests__/x.ts", "spec/x.rb"):
+        chain = _confirmation_chain(1)
+        chain.source_file = file_path
+        chain.path[0]["file"] = file_path
+        context = await analyzer._chain_confirmation_context(1, chain, "", StateStore(repo="o/r"))
+        assert "Path signal:" in context, file_path
+
+
 async def test_cross_pr_llm_batches_every_chain_and_maps_local_chain_ids(tmp_path):
     db = Database(tmp_path / "llm_batches.db")
     llm = _ConfirmEveryChainLLM()
@@ -1301,7 +2022,7 @@ async def test_cross_pr_llm_batches_every_chain_and_maps_local_chain_ids(tmp_pat
     assert [finding.file for finding in findings] == [f"consumer_{index}.py" for index in range(12)]
 
 
-async def test_cross_pr_llm_batch_failure_preserves_prior_results_and_continues(tmp_path):
+async def test_cross_pr_llm_batch_failure_isolates_and_recovers_healthy_chains(tmp_path):
     db = Database(tmp_path / "llm_batch_failure.db")
     llm = _FailMiddleBatchLLM()
     analyzer = CrossPRAnalyzer(db, llm=llm)
@@ -1326,8 +2047,8 @@ async def test_cross_pr_llm_batch_failure_preserves_prior_results_and_continues(
 
     findings = await analyzer._llm_confirm_chains(chains, "", StateStore(repo="o/r", head_sha="head"))
 
-    assert llm.attempts == 3
-    assert [finding.line for finding in findings] == [100, 101, 102, 103, 104, 110, 111]
+    assert llm.attempts > 3
+    assert [finding.line for finding in findings] == list(range(100, 112))
     assert all(finding.verified_by == "cross-pr-analysis" for finding in findings)
 
 
@@ -1617,7 +2338,11 @@ _REAL_PR74_EXPECTED = {
 async def test_real_pr73_to_pr74_stacked_fixture_hits_all_manifest_cross_pr_truth(tmp_path):
     db = Database(tmp_path / "real_stacked.db")
     await db.connect()
-    analyzer = CrossPRAnalyzer(db, llm=None)
+    # Python's complete-file AST binding proof is deterministic. Other
+    # languages remain semantic-confirmation gated until their package and
+    # lexical scopes can be resolved with equal rigor.
+    llm = _ConfirmEveryChainLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm)
     repo = "Wayne0607/ReviewForge"
     seed_sha = "c8a3d8ad11529c348a8565a771345e201529c680"
 
@@ -1664,9 +2389,15 @@ async def test_real_pr73_to_pr74_stacked_fixture_hits_all_manifest_cross_pr_trut
         diff_summary="\n".join(_diff(path, body) for path, body in _REAL_PR74_CONSUMER.items()),
     )
     findings = await analyzer.analyze("real-pr74", consumer_state, [])
-
-    assert {(finding.file, finding.line, finding.category) for finding in findings} == _REAL_PR74_EXPECTED
+    actual = {(finding.file, finding.line, finding.category) for finding in findings}
     await db.close()
+
+    assert actual == _REAL_PR74_EXPECTED, {
+        "missing": sorted(_REAL_PR74_EXPECTED - actual),
+        "extra": sorted(actual - _REAL_PR74_EXPECTED),
+    }
+    assert sum(llm.batch_sizes) > 0
+    assert {finding.verified_by for finding in findings} == {"cross-pr-analysis"}
 
 
 _REAL_PR73_SEED.update(

@@ -26,7 +26,11 @@ from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
-from reviewforge.engine.finding_anchors import reanchor_accessibility_findings
+from reviewforge.engine.finding_anchors import (
+    reanchor_accessibility_findings,
+    reanchor_security_detector_duplicates,
+    unsupported_python_open_redirect_findings,
+)
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.planner import Planner
@@ -507,11 +511,26 @@ class Orchestrator:
 
             # Phase 3: Verifier (#5, pure-logic de-dupe/merge) → Dynamic Calibration.
             raw_candidates = state.list_findings(status="candidate")
-            reanchored = reanchor_accessibility_findings(raw_candidates, state.diff_summary)
+            unsupported_redirects = unsupported_python_open_redirect_findings(raw_candidates, state.diff_summary)
+            unsupported_redirect_ids = {finding.id for finding in unsupported_redirects}
+            for finding in unsupported_redirects:
+                state.update_finding(
+                    finding.id,
+                    status="false_positive",
+                    verified_by="diff-evidence",
+                    verify_reason="The enclosing Python function contains no redirect response API.",
+                )
+            raw_candidates = [finding for finding in raw_candidates if finding.id not in unsupported_redirect_ids]
+            reanchored = [
+                *reanchor_accessibility_findings(raw_candidates, state.diff_summary),
+                *reanchor_security_detector_duplicates(raw_candidates, state.diff_summary),
+            ]
             for finding in reanchored:
                 state.update_finding(finding.id, line=finding.line, category=finding.category)
             if reanchored:
                 self._events.emit("anchors.repaired", {"count": len(reanchored)})
+            if unsupported_redirects:
+                self._events.emit("anchors.rejected", {"count": len(unsupported_redirects)})
             candidates, dropped_ids = self._verifier.verify(raw_candidates)
             for fid in dropped_ids:
                 state.update_finding(

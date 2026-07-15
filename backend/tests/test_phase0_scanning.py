@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
+
+import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
@@ -66,7 +73,64 @@ class _SecurityOnlyPlanner:
 
 class _NeverCalledLLM:
     async def ainvoke(self, messages: list[Any]) -> Any:
-        raise AssertionError("Phase 0 must not invoke an LLM")
+        raise AssertionError("Planner/reviewer LLM must not be invoked")
+
+
+class _ConfirmingCalibratorLLM(BaseChatModel):
+    calls: int = 0
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.calls += 1
+        finding_ids = re.findall(r"^- \[([^]]+)]", str(messages[-1].content), re.MULTILINE)
+        if '"adjusted_confidence"' not in str(messages[-1].content):
+            payload = [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "confirmed",
+                    "confidence": 0.98,
+                    "reason": "动态用户输入进入危险命令执行接口。",
+                }
+                for finding_id in finding_ids
+            ]
+        else:
+            payload = [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "confirmed",
+                    "adjusted_confidence": 0.98,
+                    "challenge": "无法推翻动态输入到危险 sink 的完整证据。",
+                }
+                for finding_id in finding_ids
+            ]
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content=json.dumps(payload, ensure_ascii=False)))]
+        )
+
+    @property
+    def _llm_type(self) -> str:
+        return "confirming-calibrator-test"
+
+
+@pytest.fixture
+async def db_factory():
+    opened: list[Database] = []
+
+    async def create(path: Any) -> Database:
+        db = Database(path)
+        await db.connect()
+        opened.append(db)
+        return db
+
+    yield create
+
+    for db in reversed(opened):
+        await db.close()
 
 
 def _orchestrator(
@@ -84,7 +148,7 @@ def _orchestrator(
         event_bus=events,
         planner_llm=_NeverCalledLLM(),
         reviewer_llm=reviewer_llm or _NeverCalledLLM(),
-        calibrator_llm=calibrator_llm or _NeverCalledLLM(),
+        calibrator_llm=calibrator_llm or _ConfirmingCalibratorLLM(),
         db=db,
         agentic_default=False,
     )
@@ -102,24 +166,26 @@ def _state(files: list[str]) -> StateStore:
     )
 
 
-async def test_phase0_scans_security_and_dependencies_and_isolates_read_errors():
+async def test_phase0_scans_security_dependencies_and_quality_and_isolates_read_errors():
     github = _DiffGitHub(
         {
             "app.py": _diff("import os\nos.system(user_command)"),
             "requirements.txt": _diff("requests==2.31.0\nflask>=2.0"),
+            "quality.rs": _diff("pub fn parse(raw: &str) -> u32 { raw.parse::<u32>().unwrap() }"),
             "unavailable.py": RuntimeError("patch unavailable"),
         }
     )
     registry = build_registry()
     result = await scan_changed_files(
         ToolGateway(registry, github),
-        _state(["app.py", "requirements.txt", "unavailable.py"]),
+        _state(["app.py", "requirements.txt", "quality.rs", "unavailable.py"]),
     )
 
     categories = {finding.category for finding in result.findings}
     assert "command-injection" in categories
     assert "dependency-version-range" in categories
-    assert result.files_scanned == 2
+    assert "panic-risk" in categories
+    assert result.files_scanned == 3
     assert set(result.file_errors) == {"unavailable.py"}
     assert not result.scanner_errors
     assert github.pr_files_calls == 1
@@ -127,7 +193,8 @@ async def test_phase0_scans_security_and_dependencies_and_isolates_read_errors()
 
 async def test_phase0_survives_planner_omission_without_reviewer_llm_tokens():
     github = _DiffGitHub({"app.py": _diff("import os\nos.system(user_command)")})
-    orchestrator, _ = _orchestrator(github)
+    calibrator_llm = _ConfirmingCalibratorLLM()
+    orchestrator, _ = _orchestrator(github, calibrator_llm=calibrator_llm)
     orchestrator._planner = _NoTaskPlanner()
     state = _state(["app.py"])
 
@@ -136,7 +203,8 @@ async def test_phase0_survives_planner_omission_without_reviewer_llm_tokens():
     command_findings = [finding for finding in state.list_findings() if finding.category == "command-injection"]
     assert len(command_findings) == 1
     assert command_findings[0].status == "reported"
-    assert command_findings[0].verified_by == "detector-auto"
+    assert command_findings[0].verified_by == "judge"
+    assert calibrator_llm.calls == 2
     assert summary["confirmed"] == 1
     assert not state.list_tasks()
 
@@ -157,9 +225,8 @@ async def test_phase0_survives_planner_exception_and_emits_failure_event():
     assert "planner.completed" not in seen
 
 
-async def test_planner_exception_delivers_phase0_but_run_remains_retryable(tmp_path):
-    db = Database(tmp_path / "planner-retry.db")
-    await db.connect()
+async def test_planner_exception_delivers_phase0_but_run_remains_retryable(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "planner-retry.db")
     github = _DiffGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     orchestrator, events = _orchestrator(github, db=db)
     orchestrator._planner = _ExplodingPlanner()
@@ -189,7 +256,6 @@ async def test_planner_exception_delivers_phase0_but_run_remains_retryable(tmp_p
     resumed = await db.get_run(runs[0]["run_id"])
     assert resumed["status"] == "completed"
     assert await db.has_active_run_for_head("owner/repo", 11, "head") is True
-    await db.close()
 
 
 async def test_phase0_survives_reviewer_llm_failure():
@@ -212,7 +278,7 @@ async def test_reviewer_detector_overlap_is_ingested_once():
     orchestrator, _ = _orchestrator(
         github,
         reviewer_llm=MockChatLLM(),
-        calibrator_llm=MockChatLLM(),
+        calibrator_llm=_ConfirmingCalibratorLLM(),
     )
     orchestrator._planner = _SecurityOnlyPlanner()
     state = _state(["app.py"])
@@ -251,7 +317,7 @@ async def _seed_confirmed_finding(db: Database, state: StateStore) -> Finding:
         confidence=0.96,
         reviewer="security_reviewer",
         status="confirmed",
-        verified_by="detector-auto",
+        verified_by="judge",
     )
     state.add_finding(finding)
     await db.create_run("delivery-run", state.repo, state.pr_number, state.head_sha, state.base_sha)
@@ -259,9 +325,8 @@ async def _seed_confirmed_finding(db: Database, state: StateStore) -> Finding:
     return finding
 
 
-async def test_successful_comment_updates_state_and_database_to_reported(tmp_path):
-    db = Database(tmp_path / "success.db")
-    await db.connect()
+async def test_successful_comment_updates_state_and_database_to_reported(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "success.db")
     github = _DiffGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     state = _state(["app.py"])
     finding = await _seed_confirmed_finding(db, state)
@@ -274,13 +339,11 @@ async def test_successful_comment_updates_state_and_database_to_reported(tmp_pat
     assert state.get_finding(finding.id).status == "reported"
     rows = await db.get_findings(run_id="delivery-run")
     assert rows[0]["status"] == "reported"
-    assert rows[0]["verified_by"] == "detector-auto"
-    await db.close()
+    assert rows[0]["verified_by"] == "judge"
 
 
-async def test_permanent_legacy_validation_retires_finding_in_state_and_database(tmp_path):
-    db = Database(tmp_path / "rejected.db")
-    await db.connect()
+async def test_permanent_legacy_validation_retires_finding_in_state_and_database(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "rejected.db")
     github = _RejectedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     state = _state(["app.py"])
     finding = await _seed_confirmed_finding(db, state)
@@ -297,12 +360,10 @@ async def test_permanent_legacy_validation_retires_finding_in_state_and_database
     rows = await db.get_findings(run_id="delivery-run")
     assert rows[0]["status"] == "false_positive"
     assert rows[0]["verified_by"] == "github-comment-validation"
-    await db.close()
 
 
-async def test_transient_legacy_failure_leaves_finding_confirmed(tmp_path):
-    db = Database(tmp_path / "network.db")
-    await db.connect()
+async def test_transient_legacy_failure_leaves_finding_confirmed(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "network.db")
     github = _FailedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     state = _state(["app.py"])
     finding = await _seed_confirmed_finding(db, state)
@@ -316,12 +377,10 @@ async def test_transient_legacy_failure_leaves_finding_confirmed(tmp_path):
     assert state.get_finding(finding.id).status == "confirmed"
     rows = await db.get_findings(run_id="delivery-run")
     assert rows[0]["status"] == "confirmed"
-    await db.close()
 
 
-async def test_transient_comment_failure_marks_run_partial_and_resumable(tmp_path):
-    db = Database(tmp_path / "comment-retry.db")
-    await db.connect()
+async def test_transient_comment_failure_marks_run_partial_and_resumable(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "comment-retry.db")
     github = _FailedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     orchestrator, _events = _orchestrator(github, db=db)
     orchestrator._planner = _NoTaskPlanner()
@@ -338,12 +397,10 @@ async def test_transient_comment_failure_marks_run_partial_and_resumable(tmp_pat
     assert runs[0]["status"] == "failed"
     assert await db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha) is False
     assert await db.get_resumable_run(state.repo, state.pr_number, state.head_sha) is not None
-    await db.close()
 
 
-async def test_permanent_comment_validation_allows_run_to_complete(tmp_path):
-    db = Database(tmp_path / "comment-permanent.db")
-    await db.connect()
+async def test_permanent_comment_validation_allows_run_to_complete(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "comment-permanent.db")
     github = _RejectedCommentGitHub({"app.py": _diff("import os\nos.system(user_command)")})
     orchestrator, _events = _orchestrator(github, db=db)
     orchestrator._planner = _NoTaskPlanner()
@@ -361,4 +418,3 @@ async def test_permanent_comment_validation_allows_run_to_complete(tmp_path):
     runs = await db.get_runs(repo=state.repo)
     assert runs[0]["status"] == "completed"
     assert await db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha) is True
-    await db.close()

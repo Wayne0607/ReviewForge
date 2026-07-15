@@ -1,8 +1,9 @@
 """Zero-token deterministic scanning that runs independently of LLM routing.
 
-The security, dependency, and concrete accessibility scanners are intentionally executed before the
-Planner. This keeps their coverage available when planning fails, returns no
-tasks, or simply omits the corresponding reviewer.
+The security, dependency, concrete accessibility, and conservative quality
+scanners are intentionally executed before the Planner. This keeps their
+coverage available when planning fails, returns no tasks, or simply omits the
+corresponding reviewer.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from reviewforge.engine.detectors import (
     detect_security_findings,
 )
 from reviewforge.engine.detectors.accessibility import detect_accessibility_findings
+from reviewforge.engine.detectors.quality import detect_quality_findings
 from reviewforge.engine.security_categories import normalize_category
 from reviewforge.tools.gateway import ToolGateway
 
@@ -45,7 +47,7 @@ async def scan_changed_files(
     *,
     concurrency: int = 4,
 ) -> Phase0ScanResult:
-    """Read every changed diff and run security/dependency rules without an LLM.
+    """Read every changed diff and run deterministic rules without an LLM.
 
     File reads and scanner families are isolated: one unavailable patch or one
     scanner failure must not suppress findings from the remaining inputs.
@@ -83,6 +85,7 @@ async def scan_changed_files(
         ("security", "security_reviewer", detect_security_findings),
         ("dependency", "dependency_reviewer", detect_dependency_findings),
         ("accessibility", "accessibility_reviewer", detect_accessibility_findings),
+        ("quality", "quality_reviewer", detect_quality_findings),
     )
     deduped: dict[tuple[str, int, str], Finding] = {}
     for scanner_name, reviewer_name, scanner in scanner_specs:

@@ -56,6 +56,34 @@ def test_security_detector_covers_core_languages():
     assert raw_unsafe.confidence >= 0.96
 
 
+def test_svelte_raw_html_directive_is_code_but_comment_and_string_decoys_are_not():
+    findings = detect_security_findings(
+        {
+            "raw.svelte": _diff(
+                "<p>{@html userHtml}</p>\n"
+                "<!-- <p>{@html ignoredComment}</p> -->\n"
+                "<script>const text = '{@html ignoredString}'</script>"
+            )
+        }
+    )
+
+    assert [finding.line for finding in findings if finding.category == "xss"] == [1]
+
+
+def test_java_fixed_runtime_exec_is_not_command_injection():
+    findings = detect_security_findings(
+        {
+            "Safe.java": _diff(
+                'Runtime.getRuntime().exec(new String[]{"/usr/bin/true"});\nRuntime.getRuntime().exec("/usr/bin/true");'
+            ),
+            "Dynamic.java": _diff("Runtime.getRuntime().exec(command);"),
+        }
+    )
+
+    commands = [finding for finding in findings if finding.category == "command-injection"]
+    assert [(finding.file, finding.line) for finding in commands] == [("Dynamic.java", 1)]
+
+
 def test_rust_unwrap_is_not_mislabeled_as_unsafe_security_usage():
     findings = detect_security_findings({"lib.rs": _diff("let value = result.unwrap();")})
 
@@ -230,6 +258,106 @@ def test_raw_html_requires_strong_source_and_ruby_fixed_scalars_are_contextual()
     assert confidence[("scalar.rb", 4)] < 0.96
     assert confidence[("scalar.rb", 5)] < 0.96
     assert confidence[("scalar.rb", 6)] >= 0.96
+
+
+def test_raw_html_function_parameter_is_high_signal_but_safe_named_prop_is_contextual():
+    findings = detect_security_findings(
+        {
+            "preview.tsx": _diff(
+                "export function HtmlPreview({ html }: { html: string }) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}\n"
+                "export function TrustedPreview({ safeHtml }: { safeHtml: string }) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: safeHtml }} />;\n"
+                "}"
+            )
+        }
+    )
+
+    xss = {finding.line: finding.confidence for finding in findings if finding.category == "xss"}
+    assert xss[2] >= 0.96
+    assert xss[5] < 0.96
+
+
+def test_raw_html_static_default_and_trusted_type_are_not_auto_signal():
+    findings = detect_security_findings(
+        {
+            "default.tsx": _diff(
+                'export function Preview({ html = "<strong>safe</strong>" }) {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "trusted.tsx": _diff(
+                "export function Preview(html: TrustedHTML) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "ordinary-default.tsx": _diff(
+                'export function Preview(html = "<strong>safe</strong>") {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "arrow-default.tsx": _diff(
+                'export const Preview = (html = "<strong>safe</strong>") => {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "trusted-global.tsx": _diff(
+                "export function Preview(html: globalThis.TrustedHTML) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "parenthesized-default.tsx": _diff(
+                'export function Preview(html = ("<strong>safe</strong>")) {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "untrusted.tsx": _diff(
+                "export function Preview(html: UntrustedHTML) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "unsafe.tsx": _diff(
+                "export function Preview(html: UnsafeHTML) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "trusted-union.tsx": _diff(
+                "export function Preview(html: TrustedHTML | string) {\n"
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "neighbor-default.tsx": _diff(
+                'export function Preview(html: string, mode = "compact") {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "trusted-neighbor-union.tsx": _diff(
+                'export function Preview(html: TrustedHTML, mode: "a" | "b") {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+            "destructured-whole-default.tsx": _diff(
+                'export function Preview({ html }: { html: string } = { html: "<b>safe</b>" }) {\n'
+                "  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n"
+                "}"
+            ),
+        }
+    )
+
+    confidence = {(finding.file, finding.line): finding.confidence for finding in findings if finding.category == "xss"}
+    assert confidence[("default.tsx", 2)] < 0.96
+    assert confidence[("trusted.tsx", 2)] < 0.96
+    assert confidence[("ordinary-default.tsx", 2)] < 0.96
+    assert confidence[("arrow-default.tsx", 2)] < 0.96
+    assert confidence[("trusted-global.tsx", 2)] < 0.96
+    assert confidence[("parenthesized-default.tsx", 2)] < 0.96
+    assert confidence[("untrusted.tsx", 2)] >= 0.96
+    assert confidence[("unsafe.tsx", 2)] >= 0.96
+    assert confidence[("trusted-union.tsx", 2)] >= 0.96
+    assert confidence[("neighbor-default.tsx", 2)] >= 0.96
+    assert confidence[("trusted-neighbor-union.tsx", 2)] < 0.96
+    assert confidence[("destructured-whole-default.tsx", 2)] < 0.96
 
 
 def test_rust_path_detector_distinguishes_internal_constants_and_axum_extractors():
@@ -618,6 +746,7 @@ def test_dependency_detector_covers_manifests_and_ci_without_exact_pin_noise():
 
 def test_dependency_detector_exactly_pinned_manifests_are_clean():
     sha = "a" * 40
+    digest = "b" * 64
     findings = detect_dependency_findings(
         {
             "requirements.txt": _diff("requests==2.31.0"),
@@ -626,12 +755,137 @@ def test_dependency_detector_exactly_pinned_manifests_are_clean():
             "go.mod": _diff("require example.com/lib v1.2.3"),
             "pom.xml": _diff("<dependency><version>1.2.3</version></dependency>"),
             "Gemfile": _diff('source "https://rubygems.org"\ngem "rack", "3.0.8"'),
-            "Cargo.toml": _diff('serde = "=1.0.197"\nlegacy = "=0.8.1"'),
-            ".github/workflows/build.yml": _diff(f"- uses: actions/checkout@{sha}"),
+            "Cargo.toml": _diff('[dependencies]\nserde = "=1.0.197"\nlegacy = "=0.8.1"'),
+            ".github/workflows/build.yml": _diff(
+                f"- uses: actions/checkout@{sha}\n- uses: docker://alpine@sha256:{digest}"
+            ),
         }
     )
 
     assert findings == []
+
+
+def test_dependency_detector_ignores_version_shapes_outside_dependency_declarations():
+    digest = "c" * 64
+    findings = detect_dependency_findings(
+        {
+            "pyproject.toml": _diff('requires-python = ">=3.11"'),
+            "package.json": _diff('{"buildTarget":"latest"}'),
+            "nested.package.json": _diff(
+                '{\n  "tool": {\n    "dependencies": {\n      "mode": "latest"\n    }\n  }\n}'
+            ),
+            "requirements.txt": _diff("# supported versions: *"),
+            "Cargo.toml": _diff('[package.metadata]\ncompatibility = ">=1.0"'),
+            "metadata.Cargo.toml": _diff('[package.metadata.mytool.dependencies]\nthreshold = ">=1.0"'),
+            "tool.pyproject.toml": _diff('[tool.my_linter.dependencies]\nthreshold = ">=1.0"'),
+            "pom.xml": _diff("<project><version>1.0-SNAPSHOT</version></project>"),
+            ".github/workflows/build.yml": _diff(f"- uses: docker://alpine@sha256:{digest}"),
+        }
+    )
+
+    assert not [finding for finding in findings if finding.category == "dependency-version-range"]
+
+
+def test_dependency_detector_masks_inactive_manifest_text_and_supports_cargo_workspace():
+    findings = detect_dependency_findings(
+        {
+            "config/backup-package.json": _diff('{"dependencies":{"theme":"*"}}'),
+            "config/notcargo.toml": _diff('[dependencies]\nserde = "*"'),
+            "Gemfile": _diff(
+                "DOC = <<~TEXT\n"
+                'gem "from_doc", "*"\n'
+                "TEXT\n"
+                'NOTE = %q{ gem "from_percent", "*" }\n'
+                "if false\n"
+                '  gem "inactive", "*"\n'
+                "end"
+            ),
+            "pom.xml": _diff(
+                "<dependency>\n  <configuration><![CDATA[<version>RELEASE</version>]]></configuration>\n</dependency>"
+            ),
+            "poetry/pyproject.toml": _diff('[tool.poetry.dependencies]\npython = "^3.11"'),
+            "maven/pom.xml": _diff(
+                "<project>\n"
+                "  <dependencies><dependency/></dependencies>\n"
+                "  <version>RELEASE</version>\n"
+                "  <dependency><version>1.2.3.RELEASE</version></dependency>\n"
+                "</project>"
+            ),
+            "optional/Gemfile": _diff('def optional_dependencies\n  gem "rails", "*"\nend'),
+            "proc/Gemfile": _diff('optional = proc do\n  gem "rails", "*"\nend'),
+            "strings/pyproject.toml": _diff(
+                '[project]\ndescription = """\n[tool.poetry.dependencies]\nfake = "*"\n"""'
+            ),
+            "strings/Cargo.toml": _diff('[package]\ndescription = """\n[dependencies]\nfake = "*"\n"""'),
+            "duplicate/package.json": _diff('{"dependencies":{"theme":"*"},"dependencies":{"theme":"1.2.3"}}'),
+            "tests/fixtures/package.json": _diff('{"dependencies":{"fake":"*"}}'),
+            "tests/fixtures/requirements.txt": _diff("fake>=1"),
+            "examples/demo/Cargo.toml": _diff('[dependencies]\nfake = "*"'),
+            ".github/workflows/notes.yml": _diff(
+                "jobs:\n"
+                "  audit:\n"
+                "    env:\n"
+                "      NOTES: |\n"
+                "        - uses: fake/action@main\n"
+                "    steps:\n"
+                "      - run: echo done"
+            ),
+            ".github/workflows/scalars.yml": _diff(
+                "jobs:\n"
+                "  audit:\n"
+                "    steps:\n"
+                "      - run: |\n"
+                "          - uses: fake/action@main\n"
+                '      - name: "documentation\n'
+                "          - uses: fake/quoted@main\n"
+                '        continued"\n'
+                "      - run: echo done"
+            ),
+            ".github/workflows/matrix.yml": _diff(
+                "jobs:\n"
+                "  audit:\n"
+                "    strategy:\n"
+                "      matrix:\n"
+                "        steps:\n"
+                "          - uses: fake/matrix@main\n"
+                "    steps:\n"
+                "      - run: echo done"
+            ),
+            "Cargo.toml": _diff('[workspace.dependencies]\nserde = "*"\n[dependencies.hyper]\nversion = ">=0.13"'),
+            "go.mod": _diff("require (\n  example.com/lib v1.2.3-beta\n)"),
+        }
+    )
+
+    ranges = {(finding.file, finding.line) for finding in findings if finding.category == "dependency-version-range"}
+    assert ranges == {
+        ("Cargo.toml", 2),
+        ("Cargo.toml", 4),
+    }
+
+
+def test_gemfile_condition_stack_ignores_end_tokens_inside_multiline_strings():
+    findings = detect_dependency_findings(
+        {
+            "heredoc/Gemfile": _diff('if false\n  DOC = <<~TEXT\nend\nTEXT\n  gem "inactive", "*"\nend'),
+            "percent-q/Gemfile": _diff('if false\n  DOC = %q{\nend\n}\n  gem "inactive", "*"\nend'),
+        }
+    )
+
+    assert not [finding for finding in findings if finding.category == "dependency-version-range"]
+
+
+def test_dependency_sections_do_not_cross_unknown_or_discontinuous_diff_context():
+    findings = detect_dependency_findings(
+        {
+            "unknown/pyproject.toml": '@@ -100,0 +100,1 @@\n+target = "^1.0"',
+            "gapped/pyproject.toml": (
+                '@@ -10,1 +10,2 @@\n [tool.poetry.dependencies]\n+known = "^1.0"\n@@ -100,0 +100,1 @@\n+target = "^1.0"'
+            ),
+        }
+    )
+
+    ranges = [finding for finding in findings if finding.category == "dependency-version-range"]
+    assert [(finding.file, finding.line) for finding in ranges] == [("gapped/pyproject.toml", 11)]
 
 
 def test_dependency_detector_reports_actionable_ranges_and_workflow_context():
@@ -640,7 +894,7 @@ def test_dependency_detector_reports_actionable_ranges_and_workflow_context():
         {
             "requirements.txt": _diff("unversioned-package\nflask>=2.0"),
             "Gemfile": _diff('gem "rack"\ngem "rails", "~> 7.0"\ngem "json", "3.0.0"'),
-            "Cargo.toml": _diff('serde = "0.8"\nhyper = ">=0.13"\nfixed = "=1.2.3"'),
+            "Cargo.toml": _diff('[dependencies]\nserde = "0.8"\nhyper = ">=0.13"\nfixed = "=1.2.3"'),
             "pom.xml": _diff("<dependency><version>[2.9,)</version></dependency>"),
             ".github/workflows/review.yml": _diff(
                 "on:\n"
@@ -671,9 +925,12 @@ def test_dependency_detector_reports_actionable_ranges_and_workflow_context():
 
 def test_workflow_context_does_not_correlate_distant_right_side_hunks():
     patch = (
-        "@@ -0,0 +1,2 @@\n"
+        "@@ -0,0 +1,5 @@\n"
         "+on: pull_request_target\n"
-        "+  - uses: actions/checkout@v3\n"
+        "+jobs:\n"
+        "+  build:\n"
+        "+    steps:\n"
+        "+      - uses: actions/checkout@v3\n"
         "@@ -0,0 +100,1 @@\n"
         "+    ref: ${{ github.event.pull_request.head.sha }}\n"
     )

@@ -12,19 +12,27 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding
-from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks
+from reviewforge.engine.detectors.accessibility import is_deterministic_accessibility_finding
+from reviewforge.engine.detectors.dependency import is_deterministic_dependency_version_range
+from reviewforge.engine.detectors.quality import is_deterministic_quality_finding
+from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks, is_deterministic_security_finding
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 
 logger = logging.getLogger(__name__)
+
+
+class CalibrationResponseError(RuntimeError):
+    """Raised when semantic calibration has no complete, trustworthy verdict."""
 
 
 # Only findings backed by a deterministic detector and a near-certain rule may
@@ -32,7 +40,24 @@ logger = logging.getLogger(__name__)
 # reviewers can misread sanitizers, allow-lists, test fixtures, or safe process
 # argument APIs just like any other reviewer.
 _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE = 0.96
+# Quality heuristics are valuable candidates, but replaying the same lexical
+# rule is not independent proof of semantics (constants, re-raises and control
+# flow can make an apparent defect safe). Route every quality finding through
+# adversarial calibration until parser-backed proofs are introduced.
+_QUALITY_AUTO_CONFIRM_MIN_CONFIDENCE = 1.01
+# Detector replay is useful provenance, not independent verification. Keep the
+# plumbing available for future parser/type-backed proofs, but require the
+# adversarial verifier and judge for every current detector family.
+_DETECTOR_AUTO_CONFIRM_ENABLED = False
 _SUMMARY_FILE_HEADER = re.compile(r"^--- (?P<file>.+?) \(\+\d+ -\d+\)$")
+# Keep calibration requests comfortably below common model output limits.  The
+# model must return one JSON object per finding, so candidate count is the
+# useful hard boundary; file-local diff selection bounds the input side.
+_CALIBRATION_BATCH_SIZE = 16
+_CALIBRATION_MAX_DIFF_CHARS = 24_000
+_CALIBRATION_DIFF_CONTEXT_LINES = 30
+_CALIBRATION_MAX_MESSAGE_CHARS = 800
+_CALIBRATION_MAX_SUGGESTION_CHARS = 600
 _SUBPROCESS_CALLS = {
     "subprocess.run",
     "subprocess.Popen",
@@ -96,7 +121,22 @@ _GENERIC_PERFORMANCE_CATEGORIES = {
     "performance",
     "unnecessary-computation",
 }
-_DETERMINISTIC_A11Y_CATEGORIES = {"missing-alt"}
+# Markup absence still depends on renderability (hidden/dead JSX, stories,
+# framework conditions), so accessibility findings remain contextual.
+_DETERMINISTIC_A11Y_CATEGORIES: set[str] = set()
+_DETERMINISTIC_QUALITY_CATEGORIES = {
+    "api-contract",
+    "computed-side-effect",
+    "correctness",
+    "exception-handling",
+    "ignored-error",
+    "import-error",
+    "lifecycle",
+    "null-safety",
+    "panic-risk",
+    "resource-leak",
+    "state-management",
+}
 _TEST_FILE = re.compile(
     r"(?:^|/)(?:tests?|specs?)(?:/|$)|(?:^|[._-])test(?:[._-]|$)|"
     r"(?:^|[._-])spec(?:[._-]|$)|_test\.go$|test\.java$",
@@ -185,6 +225,95 @@ def _extract_file_patch(diff_summary: str, file_path: str) -> str:
         if in_target:
             selected.append(line)
     return "\n".join(selected)
+
+
+def _finding_batches(findings: list[Finding]) -> list[list[Finding]]:
+    """Return stable, file-local batches with complete finding identities."""
+
+    by_file: dict[str, list[Finding]] = {}
+    for finding in findings:
+        by_file.setdefault(finding.file, []).append(finding)
+
+    batches: list[list[Finding]] = []
+    pending: list[Finding] = []
+    for file_findings in by_file.values():
+        offset = 0
+        while offset < len(file_findings):
+            room = _CALIBRATION_BATCH_SIZE - len(pending)
+            pending.extend(file_findings[offset : offset + room])
+            offset += room
+            if len(pending) == _CALIBRATION_BATCH_SIZE:
+                batches.append(pending)
+                pending = []
+    if pending:
+        batches.append(pending)
+    return batches
+
+
+def _focused_patch(patch: str, line_numbers: list[int], budget: int) -> str:
+    """Bound a large patch while retaining context around every finding line."""
+
+    if len(patch) <= budget:
+        return patch
+
+    right_lines = iter_right_lines(patch)
+    targets = sorted(set(line_numbers))
+    if not right_lines or not targets:
+        suffix = "\n...[patch truncated to calibration budget]"
+        return patch[: max(0, budget - len(suffix))] + suffix
+
+    per_target = max(256, budget // len(targets))
+    snippets: list[str] = []
+    for target in targets:
+        nearby = [
+            (line_no, content)
+            for line_no, content in right_lines
+            if abs(line_no - target) <= _CALIBRATION_DIFF_CONTEXT_LINES
+        ]
+        if not nearby:
+            nearby = sorted(right_lines, key=lambda row: abs(row[0] - target))[:8]
+            nearby.sort(key=lambda row: row[0])
+        rendered = f"@@ focused around RIGHT line {target} @@\n" + "\n".join(
+            f"L{line_no}: {content}" for line_no, content in nearby
+        )
+        snippets.append(rendered[:per_target])
+    return "\n".join(snippets)[:budget]
+
+
+def _relevant_diff(code_diff: str, findings: list[Finding]) -> str:
+    """Select only file sections relevant to one calibration batch."""
+
+    files: list[str] = []
+    lines_by_file: dict[str, list[int]] = {}
+    for finding in findings:
+        if finding.file not in lines_by_file:
+            files.append(finding.file)
+            lines_by_file[finding.file] = []
+        lines_by_file[finding.file].append(finding.line)
+
+    summary_lines = (code_diff or "").splitlines()
+    has_summary_headers = any(_SUMMARY_FILE_HEADER.match(line) for line in summary_lines)
+    if not has_summary_headers:
+        return _focused_patch(
+            code_diff or "",
+            [finding.line for finding in findings],
+            _CALIBRATION_MAX_DIFF_CHARS,
+        )
+
+    patches = {file_path: _extract_file_patch(code_diff, file_path) for file_path in files}
+    sections = [f"--- {file_path} (relevant patch)\n{patches[file_path]}" for file_path in files]
+    combined = "\n".join(sections)
+    if len(combined) <= _CALIBRATION_MAX_DIFF_CHARS:
+        return combined
+
+    header_budget = sum(len(file_path) + 32 for file_path in files)
+    patch_budget = max(256, (_CALIBRATION_MAX_DIFF_CHARS - header_budget) // max(1, len(files)))
+    focused_sections = [
+        f"--- {file_path} (focused relevant patch)\n"
+        f"{_focused_patch(patches[file_path], lines_by_file[file_path], patch_budget)}"
+        for file_path in files
+    ]
+    return "\n".join(focused_sections)[:_CALIBRATION_MAX_DIFF_CHARS]
 
 
 def _python_added_tree(diff_summary: str, file_path: str) -> ast.Module | None:
@@ -554,9 +683,9 @@ class DynamicCalibrator:
     2. Adversarial Verifier tries to refute each finding
     3. Judge rules on disputed findings (only if Round 2 disagrees with Round 1)
 
-    Near-certain deterministic security findings skip calibration.  Security
-    findings produced by an LLM, or by a contextual/low-confidence detector,
-    are calibrated like every other finding.
+    Every current detector and reviewer finding requires independent semantic
+    calibration. Detector replay remains provenance only until a parser/type-
+    backed proof is introduced and explicitly enabled.
     """
 
     def __init__(
@@ -574,10 +703,14 @@ class DynamicCalibrator:
     async def calibrate(self, findings: list[Finding], code_diff: str) -> list[Finding]:
         """Run dynamic calibration loop. Returns calibrated findings.
 
-        Only near-certain detector-backed security findings are auto-confirmed.
+        Invalid, incomplete or malformed semantic verdicts raise instead of
+        allowing an unverified candidate to reach comment publication.
         """
         if not findings:
             return []
+        input_ids = [finding.id for finding in findings]
+        if len(set(input_ids)) != len(input_ids):
+            raise CalibrationResponseError("Calibration input contains duplicate finding ids")
 
         need_actionability, evidence_rejected = apply_actionability_gate(findings, code_diff)
         auto_confirmed = []
@@ -594,21 +727,69 @@ class DynamicCalibrator:
                 evidence_rejected.append(f)
                 continue
             detector_backed = f.verified_by == "detector"
-            if (
-                detector_backed
+            deterministic_manifest_range = (
+                _DETECTOR_AUTO_CONFIRM_ENABLED
+                and detector_backed
+                and f.category == "dependency-version-range"
+                and is_deterministic_dependency_version_range(
+                    f.file,
+                    f.line,
+                    _extract_file_patch(code_diff, f.file),
+                )
+            )
+            deterministic_quality = (
+                _DETECTOR_AUTO_CONFIRM_ENABLED
+                and detector_backed
+                and f.confidence >= _QUALITY_AUTO_CONFIRM_MIN_CONFIDENCE
+                and f.category in _DETERMINISTIC_QUALITY_CATEGORIES
+                and is_deterministic_quality_finding(
+                    f.file,
+                    f.line,
+                    f.category,
+                    _extract_file_patch(code_diff, f.file),
+                )
+            )
+            deterministic_security = (
+                _DETECTOR_AUTO_CONFIRM_ENABLED
+                and detector_backed
                 and f.confidence >= _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE
-                and (is_security_category(f.category) or f.category in _DETERMINISTIC_A11Y_CATEGORIES)
+                and is_security_category(f.category)
+                and f.category != "dependency-version-range"
+                and is_deterministic_security_finding(
+                    f.file,
+                    f.line,
+                    f.category,
+                    _extract_file_patch(code_diff, f.file),
+                )
+            )
+            deterministic_accessibility = (
+                _DETECTOR_AUTO_CONFIRM_ENABLED
+                and detector_backed
+                and f.confidence >= _DETECTOR_AUTO_CONFIRM_MIN_CONFIDENCE
+                and f.category in _DETERMINISTIC_A11Y_CATEGORIES
+                and is_deterministic_accessibility_finding(
+                    f.file,
+                    f.line,
+                    f.category,
+                    _extract_file_patch(code_diff, f.file),
+                )
+            )
+            if (
+                deterministic_manifest_range
+                or deterministic_quality
+                or deterministic_security
+                or deterministic_accessibility
             ):
                 f.status = "confirmed"
                 f.verified_by = "detector-auto"
-                f.verify_reason = "高置信确定性安全/可访问性规则命中"
+                f.verify_reason = "Deterministic detector rule matched the changed source line."
                 auto_confirmed.append(f)
             else:
                 need_calibration.append(f)
 
         if auto_confirmed:
             logger.info(
-                "Detector auto-confirm: %d near-certain security findings skip calibration",
+                "Detector auto-confirm: %d deterministic findings skip calibration",
                 len(auto_confirmed),
             )
 
@@ -643,13 +824,33 @@ class DynamicCalibrator:
         return evidence_rejected + auto_confirmed + updated
 
     async def _adversarial_round(self, findings: list[Finding], code_diff: str) -> list[ChallengeResult]:
-        """Attempt to refute each finding. Returns challenge results."""
+        """Verify bounded batches and return results only after every batch succeeds."""
+
+        batches = _finding_batches(findings)
+        results: list[ChallengeResult] = []
+        for index, batch in enumerate(batches):
+            logger.info(
+                "Calibration adversarial batch %d/%d (%d findings)",
+                index + 1,
+                len(batches),
+                len(batch),
+            )
+            try:
+                results.extend(await self._adversarial_batch(batch, _relevant_diff(code_diff, batch)))
+            except CalibrationResponseError:
+                raise
+            except Exception as exc:
+                raise CalibrationResponseError(f"Adversarial verifier batch {index + 1}/{len(batches)} failed") from exc
+        return results
+
+    async def _adversarial_batch(self, findings: list[Finding], code_diff: str) -> list[ChallengeResult]:
+        """Attempt to refute one complete finding batch."""
         findings_text = "\n".join(
             f"- [{f.id}] {f.file}:{f.line} ({f.severity}) "
             f"category={f.category} confidence={f.confidence:.2f} "
             f"source={f.verified_by or f.reviewer or 'unknown'}\n"
-            f"  message: {f.message}\n"
-            f"  suggestion: {f.suggestion}"
+            f"  message: {f.message[:_CALIBRATION_MAX_MESSAGE_CHARS]}\n"
+            f"  suggestion: {f.suggestion[:_CALIBRATION_MAX_SUGGESTION_CHARS]}"
             for f in findings
         )
 
@@ -700,6 +901,9 @@ class DynamicCalibrator:
 
 {findings_text}
 
+Return exactly one JSON object for every listed finding_id, with no omissions or extras.
+Keep each challenge concise (at most 300 characters).
+
 ## 输出格式
 
 对每个 finding 输出 JSON 数组：
@@ -724,12 +928,35 @@ class DynamicCalibrator:
         return self._parse_challenges(response.content, findings)
 
     async def _judge_round(self, disputed: list[Finding], code_diff: str) -> list[Finding]:
-        """Final judgment on disputed findings."""
+        """Judge bounded batches atomically after every response validates."""
+
+        batches = _finding_batches(disputed)
+        judged: list[Finding] = []
+        for index, batch in enumerate(batches):
+            logger.info(
+                "Calibration judge batch %d/%d (%d findings)",
+                index + 1,
+                len(batches),
+                len(batch),
+            )
+            # Parsing a judgment mutates findings.  Parse against copies so an
+            # invalid later batch cannot leave a partially judged input set.
+            batch_copies = [replace(finding) for finding in batch]
+            try:
+                judged.extend(await self._judge_batch(batch_copies, _relevant_diff(code_diff, batch)))
+            except CalibrationResponseError:
+                raise
+            except Exception as exc:
+                raise CalibrationResponseError(f"Judge batch {index + 1}/{len(batches)} failed") from exc
+        return judged
+
+    async def _judge_batch(self, disputed: list[Finding], code_diff: str) -> list[Finding]:
+        """Final judgment on one complete disputed batch."""
         disputed_text = "\n".join(
             f"- [{f.id}] {f.file}:{f.line} ({f.severity}) "
             f"category={f.category} confidence={f.confidence:.2f} "
             f"source={f.verified_by or f.reviewer or 'unknown'}\n"
-            f"  message: {f.message}"
+            f"  message: {f.message[:_CALIBRATION_MAX_MESSAGE_CHARS]}"
             for f in disputed
         )
 
@@ -774,6 +1001,9 @@ class DynamicCalibrator:
 
 {disputed_text}
 
+Return exactly one JSON object for every listed finding_id, with no omissions or extras.
+Keep each reason concise (at most 300 characters).
+
 ## 输出格式
 
 ```json
@@ -797,64 +1027,96 @@ class DynamicCalibrator:
         return self._parse_judgment(response.content, disputed)
 
     def _parse_challenges(self, content: str, findings: list[Finding]) -> list[ChallengeResult]:
-        """Parse adversarial verifier output."""
+        """Parse a complete adversarial verdict set or fail closed."""
         data = self._extract_json(content)
-        if data is None:
-            logger.warning("Adversarial verifier returned invalid JSON, keeping original")
-            return [
-                ChallengeResult(
-                    finding_id=f.id,
-                    verdict="confirmed",
-                    adjusted_confidence=f.confidence,
-                    challenge="验证器输出无效，保留原始判断",
-                )
-                for f in findings
-            ]
-
         if not isinstance(data, list):
-            logger.warning("期望 JSON 数组，收到非数组，按解析失败处理")
-            return [
-                ChallengeResult(
-                    finding_id=f.id,
-                    verdict="confirmed",
-                    adjusted_confidence=f.confidence,
-                    challenge="验证器输出格式错误，保留原始判断",
-                )
-                for f in findings
-            ]
+            raise CalibrationResponseError("Adversarial verifier returned invalid JSON or a non-array response")
 
-        results = []
-        for item in data:
+        expected_ids = {finding.id for finding in findings}
+        seen_ids: set[str] = set()
+        results: list[ChallengeResult] = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise CalibrationResponseError(f"Adversarial verifier item {index + 1} is not an object")
+            finding_id = item.get("finding_id")
+            verdict = item.get("verdict")
+            confidence = item.get("adjusted_confidence")
+            challenge = item.get("challenge")
+            if not isinstance(finding_id, str) or finding_id not in expected_ids:
+                raise CalibrationResponseError(
+                    f"Adversarial verifier returned an unknown finding_id at item {index + 1}"
+                )
+            if finding_id in seen_ids:
+                raise CalibrationResponseError(f"Adversarial verifier duplicated finding_id {finding_id}")
+            seen_ids.add(finding_id)
+            if verdict not in {"confirmed", "false_positive"}:
+                raise CalibrationResponseError(f"Adversarial verifier returned an invalid verdict for {finding_id}")
+            if type(confidence) not in {int, float}:
+                raise CalibrationResponseError(
+                    f"Adversarial verifier returned a non-numeric confidence for {finding_id}"
+                )
+            numeric_confidence = float(confidence)
+            if not math.isfinite(numeric_confidence) or not 0.0 <= numeric_confidence <= 1.0:
+                raise CalibrationResponseError(
+                    f"Adversarial verifier returned an out-of-range confidence for {finding_id}"
+                )
+            if not isinstance(challenge, str) or not challenge.strip():
+                raise CalibrationResponseError(f"Adversarial verifier returned no reasoning for {finding_id}")
             results.append(
                 ChallengeResult(
-                    finding_id=item.get("finding_id", ""),
-                    verdict=item.get("verdict", "confirmed"),
-                    adjusted_confidence=item.get("adjusted_confidence", 0.5),
-                    challenge=item.get("challenge", ""),
+                    finding_id=finding_id,
+                    verdict=verdict,
+                    adjusted_confidence=numeric_confidence,
+                    challenge=challenge.strip()[:500],
                 )
             )
+
+        missing_ids = expected_ids - seen_ids
+        if missing_ids:
+            raise CalibrationResponseError("Adversarial verifier omitted findings: " + ", ".join(sorted(missing_ids)))
         return results
 
     def _parse_judgment(self, content: str, findings: list[Finding]) -> list[Finding]:
-        """Parse judge output and update findings."""
+        """Parse a complete final verdict set or fail closed."""
         data = self._extract_json(content)
-        if data is None:
-            logger.warning("Judge returned invalid JSON, keeping findings as-is")
-            return findings
-
         if not isinstance(data, list):
-            logger.warning("Judge 输出非数组，保留原 findings")
-            return findings
+            raise CalibrationResponseError("Judge returned invalid JSON or a non-array response")
 
-        judged_map = {item.get("finding_id"): item for item in data}
+        expected_ids = {finding.id for finding in findings}
+        judged_map: dict[str, tuple[str, float, str]] = {}
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise CalibrationResponseError(f"Judge item {index + 1} is not an object")
+            finding_id = item.get("finding_id")
+            verdict = item.get("verdict")
+            confidence = item.get("confidence")
+            reason = item.get("reason")
+            if not isinstance(finding_id, str) or finding_id not in expected_ids:
+                raise CalibrationResponseError(f"Judge returned an unknown finding_id at item {index + 1}")
+            if finding_id in judged_map:
+                raise CalibrationResponseError(f"Judge duplicated finding_id {finding_id}")
+            if verdict not in {"confirmed", "false_positive"}:
+                raise CalibrationResponseError(f"Judge returned an invalid verdict for {finding_id}")
+            if type(confidence) not in {int, float}:
+                raise CalibrationResponseError(f"Judge returned a non-numeric confidence for {finding_id}")
+            numeric_confidence = float(confidence)
+            if not math.isfinite(numeric_confidence) or not 0.0 <= numeric_confidence <= 1.0:
+                raise CalibrationResponseError(f"Judge returned an out-of-range confidence for {finding_id}")
+            if not isinstance(reason, str) or not reason.strip():
+                raise CalibrationResponseError(f"Judge returned no reasoning for {finding_id}")
+            judged_map[finding_id] = (verdict, numeric_confidence, reason.strip()[:500])
+
+        missing_ids = expected_ids - judged_map.keys()
+        if missing_ids:
+            raise CalibrationResponseError("Judge omitted findings: " + ", ".join(sorted(missing_ids)))
+
         updated = []
         for f in findings:
-            judgment = judged_map.get(f.id)
-            if judgment:
-                f.status = judgment.get("verdict", f.status)
-                f.confidence = judgment.get("confidence", f.confidence)
-                f.verify_reason = judgment.get("reason", "")
-                f.verified_by = "judge"
+            verdict, confidence, reason = judged_map[f.id]
+            f.status = verdict
+            f.confidence = confidence
+            f.verify_reason = reason
+            f.verified_by = "judge"
             updated.append(f)
         return updated
 

@@ -7,6 +7,7 @@ Pattern: first call returns tool_call, second call returns findings.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -50,7 +51,11 @@ class MockChatLLM(BaseChatModel):
 
         # Original single-shot behavior
         content = messages[-1].content if messages else ""
-        if "Planner" in system or "planner" in system.lower():
+        if "对抗性验证器" in system or "adversarial verifier" in system.lower():
+            response = self._mock_adversarial_calibration(content)
+        elif "最终裁决者" in system or "final judge" in system.lower():
+            response = self._mock_final_judgment(content)
+        elif "Planner" in system or "planner" in system.lower():
             response = self._mock_planner(content)
         elif "Verifier" in system or "verifier" in system.lower():
             response = self._mock_verifier(content)
@@ -136,6 +141,36 @@ class MockChatLLM(BaseChatModel):
                     }
                 ]
             }
+        )
+
+    @staticmethod
+    def _finding_ids(content: str) -> list[str]:
+        return list(dict.fromkeys(re.findall(r"^- \[([^]]+)]", content or "", re.MULTILINE)))
+
+    def _mock_adversarial_calibration(self, content: str) -> str:
+        return json.dumps(
+            [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "confirmed",
+                    "adjusted_confidence": 0.9,
+                    "challenge": "Mock calibration found the issue actionable.",
+                }
+                for finding_id in self._finding_ids(content)
+            ]
+        )
+
+    def _mock_final_judgment(self, content: str) -> str:
+        return json.dumps(
+            [
+                {
+                    "finding_id": finding_id,
+                    "verdict": "confirmed",
+                    "confidence": 0.9,
+                    "reason": "Mock final judgment confirmed the issue.",
+                }
+                for finding_id in self._finding_ids(content)
+            ]
         )
 
     @property

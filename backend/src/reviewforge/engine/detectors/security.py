@@ -16,8 +16,8 @@ from reviewforge.engine.detectors.base import (
     normalize_category_for_detector,
     safe_confidence,
 )
-from reviewforge.engine.detectors.unified_diff import iter_added_lines
-from reviewforge.engine.symbol_extractor import detect_language
+from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
+from reviewforge.engine.symbol_extractor import detect_language, mask_comments, mask_non_code
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.97,
         ),
         _Rule(
-            r"\b(?:eval|exec)\s*\(\s*(?![rub]*[\"'][^{}\"']*[\"']\s*(?:,|\)))",
+            r"(?<![\w.])\b(?:eval|exec)\s*\(\s*(?![rub]*[\"'][^{}\"']*[\"']\s*(?:,|\)))",
             "code-injection",
             "error",
             "Dynamic code execution detected.",
@@ -178,7 +178,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
     ],
     "javascript": [
         _Rule(
-            r"\beval\s*\(",
+            r"(?<![\w.])\beval\s*\(",
             "code-injection",
             "error",
             "Direct eval usage found.",
@@ -279,7 +279,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
     ],
     "typescript": [
         _Rule(
-            r"\beval\s*\(",
+            r"(?<![\w.])\beval\s*\(",
             "code-injection",
             "error",
             "Direct eval usage found.",
@@ -469,7 +469,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
     ],
     "ruby": [
         _Rule(
-            r"\beval\s*\(\s*(?![\"'][^#{}\"']*[\"']\s*\))",
+            r"(?<![\w.])\beval\s*\(\s*(?![\"'][^#{}\"']*[\"']\s*\))",
             "code-injection",
             "error",
             "Ruby eval usage detected.",
@@ -702,6 +702,61 @@ def _is_comment_only(line: str) -> bool:
     return stripped.startswith(("#", "//", "/*", "*", "<!--", "--"))
 
 
+def _masked_right_line_map(
+    diff: str,
+    language: str,
+    *,
+    comments_only: bool = False,
+    preserve_ruby_commands: bool = False,
+) -> dict[int, str]:
+    """Return coordinate-preserving lexical masks for visible post-image groups."""
+
+    lexer_language = "typescript" if language in {"vue", "svelte"} else language
+    rows = iter_right_lines(diff)
+    masked: dict[int, str] = {}
+    group: list[tuple[int, str]] = []
+
+    def flush() -> None:
+        if not group:
+            return
+        source = "\n".join(content for _line, content in group)
+        code = (
+            mask_comments(source, lexer_language)
+            if comments_only
+            else mask_non_code(
+                source,
+                lexer_language,
+                preserve_ruby_commands=preserve_ruby_commands,
+            )
+        ).split("\n")
+        masked.update((row[0], code[index]) for index, row in enumerate(group))
+        group.clear()
+
+    for row in rows:
+        if group and row[0] != group[-1][0] + 1:
+            flush()
+        group.append(row)
+    flush()
+    return masked
+
+
+def _match_starts_in_mask(line_no: int, match: re.Match[str], masked: dict[int, str]) -> bool:
+    line = masked.get(line_no, "")
+    return match.start() < len(line) and not line[match.start()].isspace()
+
+
+def _is_complete_new_file_patch(diff: str) -> bool:
+    """Require one exact ``-0,0 +1,N`` hunk before bypassing calibration."""
+
+    headers = list(re.finditer(r"^@@ .* @@", diff, re.MULTILINE))
+    new_file = re.search(r"^@@ -0,0 \+1(?:,(?P<count>\d+))? @@", diff, re.MULTILINE)
+    if new_file is None or len(headers) != 1 or headers[0].start() != new_file.start():
+        return False
+    expected = int(new_file.group("count") or 1)
+    additions = iter_added_lines(diff)
+    return len(additions) == expected and [line for line, _content in additions] == list(range(1, expected + 1))
+
+
 def _is_import_only(line: str) -> bool:
     """Ignore dangerous API names that only select a module or type."""
 
@@ -713,6 +768,24 @@ def _is_import_only(line: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+def _is_dynamic_code_declaration(language: str, line: str) -> bool:
+    """Reject method/function declarations named like builtin execution APIs."""
+
+    if language == "python":
+        return bool(re.match(r"^\s*(?:async\s+)?def\s+(?:eval|exec)\b", line))
+    if language == "ruby":
+        return bool(re.match(r"^\s*def\s+(?:self\.)?(?:eval|exec)\b", line))
+    if language in {"javascript", "typescript", "vue", "svelte"}:
+        return bool(
+            re.search(
+                r"(?:^|[,{;])\s*(?:(?:public|private|protected|static|async)\s+)*"
+                r"(?:eval|exec)\s*\([^)]*\)\s*\{",
+                line,
+            )
+        )
+    return False
 
 
 def _match_starts_inside_string(line: str, start: int) -> bool:
@@ -796,6 +869,34 @@ def _starts_inside_javascript_template_expression(line: str, start: int) -> bool
     return in_template and expression_depth > 0 and not code_quote
 
 
+def _template_expression_match_is_code(line: str, start: int) -> bool:
+    """Distinguish executable template expressions from comments/regex inside them."""
+
+    if not _starts_inside_javascript_template_expression(line, start):
+        return False
+    opening = (line or "")[:start].rfind("${")
+    if opening < 0:
+        return False
+    expression = (line or "")[opening + 2 :]
+    offset = start - opening - 2
+    masked = mask_non_code(expression, "typescript")
+    return offset < len(masked) and not masked[offset].isspace()
+
+
+def _starts_in_markup_text(line: str, start: int) -> bool:
+    """Return true for JSX/Vue text nodes rather than executable expressions."""
+
+    prefix = (line or "")[:start]
+    closing = prefix.rfind(">")
+    opening = prefix.rfind("<", 0, closing + 1)
+    if opening < 0 or closing < opening:
+        return False
+    if not re.match(r"</?[A-Za-z][^>]*>$", prefix[opening : closing + 1].strip()):
+        return False
+    after_tag = prefix[closing + 1 :]
+    return after_tag.rfind("{") <= after_tag.rfind("}")
+
+
 def _is_static_python_eval(line: str, match_start: int) -> bool:
     """Return whether eval/exec receives only a compile-time string literal."""
 
@@ -813,6 +914,17 @@ def _is_static_python_eval(line: str, match_start: int) -> bool:
             continue
         return bool(node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
     return False
+
+
+def _is_static_javascript_eval(line: str, match_start: int) -> bool:
+    """Return whether a direct eval receives one fixed literal string."""
+
+    return bool(
+        re.match(
+            r"eval\s*\(\s*(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`[^`$]*`)\s*\)",
+            (line or "")[match_start:],
+        )
+    )
 
 
 _POSTIMAGE_HUNK_HEADER = re.compile(
@@ -1306,7 +1418,9 @@ def _rust_function_blocks(diff: str) -> list[list[tuple[int, str, bool]]]:
 
     blocks: list[list[tuple[int, str, bool]]] = []
     function_start = re.compile(r"\bfn\s+[A-Za-z_]\w*\b")
-    for hunk in _postimage_hunks(diff):
+    for raw_hunk in _postimage_hunks(diff):
+        masked_lines = mask_comments("\n".join(content for _line, content, _added in raw_hunk), "rust").split("\n")
+        hunk = [(line_no, masked_lines[index], added) for index, (line_no, _content, added) in enumerate(raw_hunk)]
         current: list[tuple[int, str, bool]] = []
         depth = 0
         saw_open = False
@@ -1634,9 +1748,11 @@ def _rust_contextual_path_sinks(diff: str, *, excluded: set[int]) -> list[int]:
     """Find added inline path construction when the enclosing Rust function is not visible."""
 
     sink_lines: list[int] = []
-    for line_no, content in iter_added_lines(diff):
+    code_by_line = _masked_right_line_map(diff, "rust", comments_only=True)
+    for line_no, _content in iter_added_lines(diff):
         if line_no in excluded:
             continue
+        content = code_by_line.get(line_no, "")
         if any(
             _rust_has_contextual_path_construction(argument) for _start, _end, argument in _rust_fs_read_calls(content)
         ):
@@ -1724,6 +1840,133 @@ def _javascript_storage_value_is_static(diff: str, line_no: int, source_line: st
     return bool(rhs and _JAVASCRIPT_STATIC_VALUE.fullmatch(rhs))
 
 
+def _javascript_top_level_positions(source: str, targets: set[str]) -> list[int]:
+    """Return target delimiters outside nested parameter syntax and strings."""
+
+    depths = {"(": 0, "[": 0, "{": 0, "<": 0}
+    pairs = {")": "(", "]": "[", "}": "{", ">": "<"}
+    positions: list[int] = []
+    quote = ""
+    escaped = False
+    for index, char in enumerate(source):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char in depths:
+            depths[char] += 1
+        elif char in pairs:
+            opener = pairs[char]
+            depths[opener] = max(0, depths[opener] - 1)
+        elif not any(depths.values()) and char in targets:
+            positions.append(index)
+    return positions
+
+
+def _javascript_parameter_fragment(parameter_source: str, name: str) -> str:
+    """Return the top-level parameter fragment that binds ``name``."""
+
+    commas = _javascript_top_level_positions(parameter_source, {","})
+    starts = [0, *(position + 1 for position in commas)]
+    ends = [*commas, len(parameter_source)]
+    for start, end in zip(starts, ends, strict=True):
+        fragment = parameter_source[start:end]
+        boundaries = _javascript_top_level_positions(fragment, {":", "="})
+        binding = fragment[: boundaries[0]] if boundaries else fragment
+        if re.search(rf"\b{re.escape(name)}\b", binding):
+            return fragment
+    return ""
+
+
+def _javascript_parameter_is_defaulted(fragment: str, name: str) -> bool:
+    """Return whether the target binding or its whole fragment has a default."""
+
+    if _javascript_top_level_positions(fragment, {"="}):
+        return True
+    return bool(re.search(rf"\b{re.escape(name)}\b\s*=", fragment))
+
+
+def _javascript_html_is_function_parameter(diff: str, line_no: int, expression: str) -> bool:
+    """Prove that a raw-HTML value is an explicit parameter of the active function."""
+
+    location = _hunk_lines_for_right_line(diff, line_no)
+    if location is None:
+        return False
+    hunk, index = location
+    context = "\n".join(content for _line, content, _added in hunk[max(0, index - 16) : index + 1])
+    context = mask_comments(context, "typescript")
+    sink_offset = context.rfind("dangerouslySetInnerHTML")
+    if sink_offset < 0:
+        return False
+    prefix = context[:sink_offset]
+    signatures = [
+        *re.finditer(
+            r"\bfunction\b[^\n(]*\((?P<params>.*?)\)\s*(?:\:[^={\n]+)?\s*\{",
+            prefix,
+            re.DOTALL,
+        ),
+        *re.finditer(
+            r"(?:^|[;\n])\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*"
+            r"\((?P<params>.*?)\)\s*(?:\:[^=\n]+)?=>\s*\{",
+            prefix,
+            re.DOTALL,
+        ),
+    ]
+    if not signatures:
+        return False
+    signature = max(signatures, key=lambda match: match.start())
+    structural_body = re.sub(
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`', "", prefix[signature.end() - 1 :]
+    )
+    if structural_body.count("{") <= structural_body.count("}"):
+        return False
+    parameter_source = signature.group("params")
+    root = expression.split(".", 1)[0]
+    parameter_fragment = _javascript_parameter_fragment(parameter_source, root)
+    if not parameter_fragment:
+        return False
+
+    # Defaults can be arbitrarily nested expressions and a lexical signature
+    # is not a full JavaScript parser. Keep every defaulted parameter
+    # contextual instead of trying to prove that the initializer is dynamic.
+    if _javascript_parameter_is_defaulted(parameter_fragment, root):
+        return False
+
+    # Only an exact branded safe type is a safety contract. Substring checks
+    # would incorrectly trust names such as UntrustedHTML, and a union with
+    # string/any/unknown does not preserve the contract.
+    type_matches = re.findall(
+        rf"\b{re.escape(root)}\b\s*\??\s*:\s*(?P<type>[A-Za-z_$][\w$]*"
+        rf"(?:\s*\.\s*[A-Za-z_$][\w$]*)*(?:\s*<[^,}}]+>)?)\s*(?=[,}}]|$)",
+        parameter_fragment,
+    )
+    alias = re.search(rf"\b(?P<property>[A-Za-z_$][\w$]*)\s*:\s*{re.escape(root)}\b", parameter_fragment)
+    if alias is not None:
+        type_matches.extend(
+            re.findall(
+                rf"\b{re.escape(alias.group('property'))}\b\s*\??\s*:\s*"
+                rf"(?P<type>[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*"
+                rf"(?:\s*<[^,}}]+>)?)\s*(?=[,}}]|$)",
+                parameter_fragment,
+            )
+        )
+    if any(
+        re.fullmatch(
+            r"(?:(?:globalThis|window)\.)?(?:TrustedHTML|SafeHTML|SafeHtml|SanitizedHTML|SanitizedHtml)",
+            re.sub(r"\s+", "", item),
+        )
+        for item in type_matches
+    ):
+        return False
+    return True
+
+
 def _javascript_html_has_strong_source(diff: str, line_no: int, source_line: str) -> bool:
     """Require explicit request/DOM/network provenance before XSS auto-confirm."""
 
@@ -1737,6 +1980,8 @@ def _javascript_html_has_strong_source(diff: str, line_no: int, source_line: str
     if re.search(r"(?:^|\.)(?:safe|trusted|saniti[sz]ed|clean)(?:Html|HTML|Markup)?$", expression, re.IGNORECASE):
         return False
     if _JAVASCRIPT_STRONG_HTML_SOURCE.search(expression):
+        return True
+    if _javascript_html_is_function_parameter(diff, line_no, expression):
         return True
 
     context = _javascript_prior_context(diff, line_no)
@@ -1809,6 +2054,25 @@ def _ruby_backtick_interpolation_is_escaped(diff: str, line_no: int, source_line
     return True
 
 
+def _java_runtime_exec_is_static(source_line: str) -> bool:
+    """Return true when Runtime.exec receives only fixed string literals."""
+
+    match = re.search(
+        r"\bRuntime\.getRuntime\(\)\.exec\(\s*(?P<argument>.*?)\s*\)\s*;?\s*$",
+        source_line,
+    )
+    if match is None:
+        return False
+    argument = match.group("argument").strip()
+    if re.fullmatch(r'"(?:\\.|[^"\\])*"', argument):
+        return True
+    array = re.fullmatch(r"new\s+String\s*\[\s*]\s*\{(?P<items>.*)}", argument)
+    if array is None:
+        return False
+    items = [item.strip() for item in array.group("items").split(",")]
+    return bool(items) and all(re.fullmatch(r'"(?:\\.|[^"\\])*"', item) for item in items)
+
+
 def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
     """Scan modified file diffs for deterministic security findings."""
 
@@ -1816,6 +2080,11 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
 
     for file_path, diff in diffs.items():
         language = normalize_language(file_path)
+        code_by_line = _masked_right_line_map(diff, language)
+        comments_by_line = _masked_right_line_map(diff, language, comments_only=True)
+        ruby_commands_by_line = (
+            _masked_right_line_map(diff, language, preserve_ruby_commands=True) if language == "ruby" else {}
+        )
         rules = list(_rules_for_language(language))
         if language in {"javascript", "typescript"} and _has_named_child_process_exec(diff):
             rules.append(
@@ -1833,6 +2102,8 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
         for rule in _UNIVERSAL_RULES:
             matches = match_lines(diff, rule.pattern)
             for line_no, match in matches:
+                if not _match_starts_in_mask(line_no, match, comments_by_line):
+                    continue
                 if language == "python":
                     ignored_span = _ignored_span_at(line_no, match.start(), python_ignored)
                     allow_literal = (
@@ -1860,9 +2131,34 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
 
         for rule in rules:
             for line_no, match in match_lines(diff, rule.pattern):
+                template_expression = language in {"javascript", "typescript", "vue", "svelte"} and (
+                    _template_expression_match_is_code(match.string, match.start())
+                )
+                ruby_command = rule.category == "command-injection" and _match_starts_in_mask(
+                    line_no,
+                    match,
+                    ruby_commands_by_line,
+                )
+                if (
+                    not _match_starts_in_mask(line_no, match, code_by_line)
+                    and not template_expression
+                    and not ruby_command
+                ):
+                    continue
                 if language == "python" and _ignored_span_at(line_no, match.start(), python_ignored) is not None:
                     continue
                 if _is_import_only(match.string):
+                    continue
+                svelte_raw_html_directive = (
+                    language == "svelte" and rule.category == "xss" and match.group(0).lstrip().startswith("{@html")
+                )
+                if (
+                    language in {"javascript", "typescript", "vue", "svelte"}
+                    and not svelte_raw_html_directive
+                    and _starts_in_markup_text(match.string, match.start())
+                ):
+                    continue
+                if rule.category == "code-injection" and _is_dynamic_code_declaration(language, match.string):
                     continue
                 inside_string = _match_starts_inside_string(match.string, match.start())
                 if language in {"javascript", "typescript"} and _starts_inside_javascript_template_expression(
@@ -1902,6 +2198,18 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     and rule.confidence >= 0.96
                     and rule.category == "command-injection"
                     and _ruby_backtick_interpolation_is_escaped(diff, line_no, match.string)
+                ):
+                    continue
+                if (
+                    language in {"javascript", "typescript", "vue", "svelte"}
+                    and rule.category == "code-injection"
+                    and _is_static_javascript_eval(match.string, match.start())
+                ):
+                    continue
+                if (
+                    language == "java"
+                    and rule.category == "command-injection"
+                    and _java_runtime_exec_is_static(match.string)
                 ):
                     continue
                 if rule.category == "open-redirect" and _browser_redirect_is_guarded(diff, line_no, match.string):
@@ -1988,6 +2296,13 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
             and any(abs(finding.line - line) <= 1 for line in transmute_lines.get(finding.file, set()))
         )
     ]
+
+
+def is_deterministic_security_finding(file_path: str, line: int, category: str, diff: str) -> bool:
+    """Security regex/data-flow candidates always require independent calibration."""
+
+    del file_path, line, category, diff
+    return False
 
 
 def normalize_language(file_path: str) -> str:

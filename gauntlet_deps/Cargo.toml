@@ -1,0 +1,9 @@
+[package]
+name = "reviewforge-gauntlet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openssl = "*"
+serde_yaml = "0.8"
+hyper = ">=0.13"

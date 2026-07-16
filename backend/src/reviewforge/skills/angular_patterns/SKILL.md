@@ -23,6 +23,7 @@ frameworks: [angular]
 ## Security（必查，最高优先级）
 
 ### XSS
+- Do not treat an imported helper that merely returns `SafeHtml` as a rendered XSS sink. Require a binding/mount in the changed code, or a direct `bypassSecurityTrust*` call introduced by the diff; historical helper risks are handled by cross-PR analysis.
 - Angular 默认会清洗普通 `[innerHTML]` 绑定；不要仅凭绑定本身报 XSS。只有数据被包装为不可信 `SafeHtml`、调用 sanitizer bypass，或存在明确绕过证据时才报告。
 - `bypassSecurityTrustHtml(userContent)` 清洗不可信数据 → **error**
 - `bypassSecurityTrustScript/Style/ResourceUrl/Url` → **error**

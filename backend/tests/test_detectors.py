@@ -5,6 +5,7 @@ import pytest
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import ReviewTask, StateStore
 from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
+from reviewforge.engine.detectors.security import is_deterministic_security_finding
 from reviewforge.engine.reviewers import SecurityReviewer
 from reviewforge.tools.gateway import ToolGateway
 
@@ -1107,6 +1108,507 @@ def test_security_detector_drops_placeholders_and_calibrates_test_code():
     assert "hardcoded-secrets" not in _cats(findings)
     assert {"code-injection", "command-injection"} <= _cats(findings)
     assert all(f.confidence <= 0.75 for f in findings)
+
+
+def test_security_detector_auto_confirms_realistic_go_secret_even_when_unused():
+    patch = _diff('package main\n\nfunc main() {\n    apiKey := "sk-proj-abc123def456ghi789jkl"\n}')
+
+    findings = detect_security_findings({"main.go": patch})
+    secrets = [finding for finding in findings if finding.category == "hardcoded-secrets"]
+
+    assert [(finding.line, finding.confidence) for finding in secrets] == [(4, 0.97)]
+    assert is_deterministic_security_finding("main.go", 4, "hardcoded-secrets", patch)
+
+
+def test_security_detector_ignores_non_secret_go_configuration_values():
+    findings = detect_security_findings(
+        {
+            "config.go": _diff(
+                "package config\n"
+                "\n"
+                'const publicAPIKey = "public-client-identifier"\n'
+                'const disabledToken = "disabled"\n'
+                'var apiKey = os.Getenv("API_KEY")\n'
+                'const featureName = "sk-projection-feature-name"'
+            )
+        }
+    )
+
+    assert "hardcoded-secrets" not in _cats(findings)
+
+
+def test_secret_placeholder_markers_only_apply_to_literal_values_not_identifiers():
+    real_findings = detect_security_findings(
+        {
+            "credentials.go": _diff(
+                "package credentials\n"
+                '\nvar unusedPassword = "correct-horse-battery-staple"\n'
+                'var disabledApiKey = "sk-proj-real123456789abcdef"\n'
+                'var redactedToken = "ghp_abcdefghijklmnop"'
+            )
+        }
+    )
+
+    assert {
+        (finding.line, finding.confidence) for finding in real_findings if finding.category == "hardcoded-secrets"
+    } == {
+        (3, 0.92),
+        (4, 0.97),
+        (5, 0.97),
+    }
+
+    placeholder_findings = detect_security_findings(
+        {
+            "defaults.go": _diff(
+                "package defaults\n"
+                '\nvar password = "unused"\n'
+                'var apiKey = "public-client-identifier"\n'
+                'var token = "redacted"'
+            )
+        }
+    )
+
+    assert "hardcoded-secrets" not in _cats(placeholder_findings)
+
+
+def test_security_detector_auto_confirms_ruby_open3_single_parameter_shell_command():
+    patch = _diff(
+        'require "open3"\n\nmodule JobRuntime\n  def self.capture(command)\n    Open3.capture3(command)\n  end\nend'
+    )
+
+    findings = detect_security_findings({"job_runtime.rb": patch})
+    commands = [finding for finding in findings if finding.category == "command-injection"]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [(5, 0.97)]
+    assert is_deterministic_security_finding("job_runtime.rb", 5, "command-injection", patch)
+
+
+def test_security_detector_ignores_ruby_open3_static_and_shellless_argv_forms():
+    findings = detect_security_findings(
+        {
+            "safe_runner.rb": _diff(
+                'require "open3"\n'
+                "\n"
+                'command = "git status --short"\n'
+                "Open3.capture3(command)\n"
+                'Open3.capture3("git status --short")\n'
+                'Open3.capture3("git", "show", revision)\n'
+                'Open3.capture3({"LC_ALL" => "C"}, "git", "status")\n'
+                'Open3.capture3(ENV.to_h, "git", "status")\n'
+                'Open3.capture3("/usr/bin/env", "git", "status")\n'
+                'Open3.capture3("python", "script.py", input)\n'
+                'Open3.capture3("python", "-c", "print(1)")\n'
+                'Open3.capture3("printf", "bash", "-c", command)\n'
+                "\n"
+                "def fixed_command(command)\n"
+                '  command = "git status --short"\n'
+                "  Open3.capture3(command)\n"
+                "end"
+            )
+        }
+    )
+
+    assert "command-injection" not in _cats(findings)
+
+
+def test_security_detector_keeps_ruby_open3_explicit_shell_wrappers_and_env_single_string():
+    patch = _diff(
+        'require "open3"\n'
+        "\n"
+        "def run(env, command)\n"
+        '  Open3.capture3("bash", "-c", command)\n'
+        '  Open3.capture3(env, "sh", "-lc", command)\n'
+        "  Open3.capture3(env, command)\n"
+        '  Open3.capture3(env, "git", "show", command)\n'
+        '  Open3.capture3("/usr/bin/env", "bash", "-c", command)\n'
+        '  Open3.capture3("python", "-c", command)\n'
+        '  Open3.capture3("node", "-e", command)\n'
+        '  Open3.capture3("env", command)\n'
+        '  Open3.capture3("lua", "-e", command)\n'
+        '  Open3.capture3(command, "--version")\n'
+        "end"
+    )
+
+    findings = detect_security_findings({"shell_runner.rb": patch})
+    commands = [finding for finding in findings if finding.category == "command-injection"]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (4, 0.97),
+        (5, 0.9),
+        (6, 0.9),
+        (7, 0.9),
+        (8, 0.97),
+        (9, 0.97),
+        (10, 0.97),
+        (11, 0.97),
+        (12, 0.97),
+        (13, 0.97),
+    ]
+    assert all(
+        is_deterministic_security_finding("shell_runner.rb", line, "command-injection", patch)
+        for line in (4, 8, 9, 10, 11, 12, 13)
+    )
+    assert all(
+        not is_deterministic_security_finding("shell_runner.rb", line, "command-injection", patch) for line in (5, 6, 7)
+    )
+
+
+def test_security_detector_fails_open_for_dynamic_wrappers_and_unwraps_env_options():
+    patch = _diff(
+        'require "open3"\n'
+        "\n"
+        "def run(shell, flag, command)\n"
+        '  shell = "bash"\n'
+        '  flag = "-c"\n'
+        '  Open3.capture3(shell, "-c", command)\n'
+        '  Open3.capture3("bash", flag, command)\n'
+        '  Open3.capture3("env", "-i", "bash", "-c", command)\n'
+        '  Open3.capture3("env", "-u", "PATH", "bash", "-c", command)\n'
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"dynamic_wrappers.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (6, 0.9),
+        (7, 0.9),
+        (8, 0.97),
+        (9, 0.97),
+    ]
+    assert all(
+        not is_deterministic_security_finding("dynamic_wrappers.rb", line, "command-injection", patch)
+        for line in (6, 7)
+    )
+    assert all(
+        is_deterministic_security_finding("dynamic_wrappers.rb", line, "command-injection", patch) for line in (8, 9)
+    )
+
+
+def test_security_detector_keeps_ambiguous_env_hash_variables_contextual_and_respects_command_guard():
+    patch = _diff(
+        "def run(env_hash, command)\n"
+        '  Open3.capture3(env_hash, "git status")\n'
+        "  raise unless ALLOWED_COMMANDS.include?(command)\n"
+        "  Open3.capture3(env_hash, command)\n"
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"env_hash_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [(2, 0.9), (4, 0.9)]
+    assert all(
+        not is_deterministic_security_finding("env_hash_runner.rb", line, "command-injection", patch) for line in (2, 4)
+    )
+
+
+def test_security_detector_unwraps_only_known_ruby_command_launchers():
+    patch = _diff(
+        "def run(command)\n"
+        '  Open3.capture3("busybox", "ash", "-c", command)\n'
+        '  Open3.capture3("sudo", "bash", "-c", command)\n'
+        '  Open3.capture3("sudo", "-u", "nobody", "bash", "-c", command)\n'
+        '  Open3.capture3("timeout", "5", "bash", "-c", command)\n'
+        '  Open3.capture3("env", "sudo", "bash", "-c", command)\n'
+        '  Open3.capture3("my_wrapper", "bash", "-c", command)\n'
+        '  Open3.capture3("logger", "bash", "-c", command)\n'
+        '  Open3.capture3("printf", "bash", "-c", command)\n'
+        '  Open3.capture3("sudo", "--edit", "bash", "-c", command)\n'
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"launcher_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (2, 0.97),
+        (3, 0.97),
+        (4, 0.97),
+        (5, 0.97),
+        (6, 0.97),
+        (7, 0.9),
+    ]
+    assert all(
+        is_deterministic_security_finding("launcher_runner.rb", line, "command-injection", patch)
+        for line in range(2, 7)
+    )
+    assert not is_deterministic_security_finding("launcher_runner.rb", 7, "command-injection", patch)
+
+
+def test_security_detector_keeps_known_ruby_command_forwarders_contextual():
+    patch = _diff(
+        "def run(command)\n"
+        '  Open3.capture3("docker", "run", "image", "bash", "-c", command)\n'
+        '  Open3.capture3("kubectl", "exec", "pod", "--", "sh", "-c", command)\n'
+        '  Open3.capture3("find", ".", "-exec", "sh", "-c", command, ";")\n'
+        '  Open3.capture3("chroot", "/srv/jail", "bash", "-c", command)\n'
+        '  Open3.capture3("unshare", "--fork", "bash", "-c", command)\n'
+        '  Open3.capture3("ssh", "host", command)\n'
+        '  Open3.capture3("ssh", "host", command, "--verbose")\n'
+        '  Open3.capture3("ssh", "-p", "22", "host", command, "arg")\n'
+        '  Open3.capture3("docker", "run", "image", "bash", "-c", "echo safe")\n'
+        '  Open3.capture3("ssh", "host", "uptime")\n'
+        '  Open3.capture3("cat", "bash", "-c", command)\n'
+        '  Open3.capture3("tar", "bash", "-c", command)\n'
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"forwarder_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (2, 0.9),
+        (3, 0.9),
+        (4, 0.9),
+        (5, 0.9),
+        (6, 0.9),
+        (7, 0.9),
+        (8, 0.9),
+        (9, 0.9),
+    ]
+    assert all(
+        not is_deterministic_security_finding("forwarder_runner.rb", line, "command-injection", patch)
+        for line in range(2, 10)
+    )
+
+
+def test_security_detector_keeps_busybox_launcher_chains_and_env_split_string_contextual():
+    patch = _diff(
+        "def run(command)\n"
+        '  Open3.capture3("busybox", "env", "bash", "-c", command)\n'
+        '  Open3.capture3("busybox", "timeout", "5", "bash", "-c", command)\n'
+        '  Open3.capture3("busybox", "nohup", "bash", "-c", command)\n'
+        '  Open3.capture3("env", "-S", "bash -c", command)\n'
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"busybox_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (2, 0.97),
+        (3, 0.97),
+        (4, 0.97),
+        (5, 0.9),
+    ]
+    assert all(
+        is_deterministic_security_finding("busybox_runner.rb", line, "command-injection", patch) for line in range(2, 5)
+    )
+    assert not is_deterministic_security_finding("busybox_runner.rb", 5, "command-injection", patch)
+
+
+def test_security_detector_keeps_ruby_interpreter_stdin_and_cmd_keep_open_modes():
+    patch = _diff(
+        "def run(command)\n"
+        '  Open3.capture3("cmd", "/k", command)\n'
+        '  Open3.capture3("cmd.exe", stdin_data: command)\n'
+        '  Open3.capture3("sh", "-s", stdin_data: command)\n'
+        '  Open3.capture3("bash", stdin_data: command)\n'
+        '  Open3.capture3("sh", chdir: "/tmp", stdin_data: command)\n'
+        '  Open3.capture3("python", "-", stdin_data: command)\n'
+        '  Open3.capture3("python", "script.py", stdin_data: command)\n'
+        '  Open3.capture3("sh", "-s", stdin_data: "echo safe")\n'
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"stdin_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (2, 0.97),
+        (3, 0.97),
+        (4, 0.97),
+        (5, 0.97),
+        (6, 0.97),
+        (7, 0.97),
+    ]
+    assert all(
+        is_deterministic_security_finding("stdin_runner.rb", line, "command-injection", patch) for line in range(2, 8)
+    )
+
+
+def test_security_detector_does_not_auto_confirm_guarded_ruby_open3_parameters():
+    patches = {
+        "allowlist_runner.rb": _diff(
+            "ALLOWED_COMMANDS = ['git status', 'git log'].freeze\n"
+            "def run(command)\n"
+            '  raise ArgumentError, "unsupported" unless ALLOWED_COMMANDS.include?(command)\n'
+            "  Open3.capture3(command)\n"
+            "end"
+        ),
+        "match_runner.rb": _diff(
+            "def run(command)\n  return unless command.match?(/\\A[a-z0-9_-]+\\z/)\n  Open3.capture3(command)\nend"
+        ),
+        "block_runner.rb": _diff(
+            "def run(command)\n"
+            "  unless SAFE_COMMANDS.include?(command)\n"
+            '    raise "unsupported"\n'
+            "  end\n"
+            "  Open3.capture3(command)\n"
+            "end"
+        ),
+        "case_runner.rb": _diff(
+            "def run(command)\n"
+            "  case command\n"
+            "  when 'git status', 'git log'\n"
+            "    Open3.capture3(command)\n"
+            "  else\n"
+            '    raise "unsupported"\n'
+            "  end\n"
+            "end"
+        ),
+    }
+
+    findings = detect_security_findings(patches)
+    commands = [finding for finding in findings if finding.category == "command-injection"]
+
+    assert {(finding.file, finding.confidence) for finding in commands} == {
+        ("allowlist_runner.rb", 0.9),
+        ("match_runner.rb", 0.9),
+        ("block_runner.rb", 0.9),
+        ("case_runner.rb", 0.9),
+    }
+    assert all(
+        not is_deterministic_security_finding(finding.file, finding.line, finding.category, patches[finding.file])
+        for finding in commands
+    )
+
+
+def test_security_detector_applies_ruby_open3_guards_to_parameter_aliases():
+    guarded_patch = _diff(
+        "def run(input)\n"
+        "  command = input\n"
+        "  raise unless ALLOWED_COMMANDS.include?(command)\n"
+        "  Open3.capture3(command)\n"
+        "end"
+    )
+    source_guarded_patch = _diff(
+        "def run(input)\n"
+        "  raise unless ALLOWED_COMMANDS.include?(input)\n"
+        "  command = input\n"
+        "  Open3.capture3(command)\n"
+        "end"
+    )
+    unguarded_patch = _diff("def run(input)\n  command = input\n  Open3.capture3(command)\nend")
+
+    guarded = [
+        finding
+        for finding in detect_security_findings({"guarded_alias.rb": guarded_patch})
+        if finding.category == "command-injection"
+    ]
+    source_guarded = [
+        finding
+        for finding in detect_security_findings({"source_guarded_alias.rb": source_guarded_patch})
+        if finding.category == "command-injection"
+    ]
+    unguarded = [
+        finding
+        for finding in detect_security_findings({"unguarded_alias.rb": unguarded_patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in guarded] == [(4, 0.9)]
+    assert not is_deterministic_security_finding("guarded_alias.rb", 4, "command-injection", guarded_patch)
+    assert [(finding.line, finding.confidence) for finding in source_guarded] == [(4, 0.9)]
+    assert not is_deterministic_security_finding(
+        "source_guarded_alias.rb", 4, "command-injection", source_guarded_patch
+    )
+    assert [(finding.line, finding.confidence) for finding in unguarded] == [(3, 0.97)]
+    assert is_deterministic_security_finding("unguarded_alias.rb", 3, "command-injection", unguarded_patch)
+
+
+def test_security_detector_does_not_treat_a_completed_case_as_a_dominating_guard():
+    patch = _diff(
+        "def run(command)\n"
+        "  case command\n"
+        "  when 'git status'\n"
+        "    audit(command)\n"
+        "  end\n"
+        "  Open3.capture3(command)\n"
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"unguarded_after_case.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [(6, 0.97)]
+    assert is_deterministic_security_finding("unguarded_after_case.rb", 6, "command-injection", patch)
+
+
+@pytest.mark.parametrize(
+    ("content", "sink_line"),
+    [
+        (
+            "def run(command)\n  return unless command.match?(/\\A.*\\z/)\n  Open3.capture3(command)\nend",
+            3,
+        ),
+        (
+            "def run(command, audit_enabled)\n"
+            "  if audit_enabled\n"
+            "    return unless ALLOWED_COMMANDS.include?(command)\n"
+            "  end\n"
+            "  Open3.capture3(command)\n"
+            "end",
+            5,
+        ),
+        (
+            "def run(command)\n  return unless command.match?(/^[a-z0-9_-]+$/)\n  Open3.capture3(command)\nend",
+            3,
+        ),
+        (
+            "def run(command)\n  return unless command.match?(/\\A[a-z0-9_\\s-]+\\z/)\n  Open3.capture3(command)\nend",
+            3,
+        ),
+        (
+            "def run(command, params)\n"
+            "  return unless [params[:allowed]].include?(command)\n"
+            "  Open3.capture3(command)\n"
+            "end",
+            3,
+        ),
+        (
+            "def run(command, params)\n"
+            "  raise unless ALLOWED_COMMANDS.include?(command)\n"
+            "  command = params[:command]\n"
+            "  Open3.capture3(command)\n"
+            "end",
+            4,
+        ),
+    ],
+)
+def test_security_detector_keeps_unrestricted_or_non_dominating_ruby_guards_high_confidence(content, sink_line):
+    patch = _diff(content)
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"still_unguarded.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [(sink_line, 0.97)]
+    assert is_deterministic_security_finding("still_unguarded.rb", sink_line, "command-injection", patch)
 
 
 def test_security_detector_ignores_import_only_api_names_but_keeps_usage():

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from reviewforge.core.state import Finding
 from reviewforge.engine.finding_anchors import (
     reanchor_accessibility_findings,
@@ -105,6 +107,106 @@ def test_does_not_guess_between_equidistant_sinks():
 
     assert reanchor_accessibility_findings([finding], diff) == []
     assert finding.line == 3
+
+
+def test_reanchors_duplicate_to_the_only_already_claimed_alt_sink():
+    file_path = "src/Profile.vue"
+    diff = _summary(
+        file_path,
+        """<template>
+  <section>
+    <img :src="avatar" />
+  </section>
+</template>""",
+    )
+    detector = Finding(
+        id="detector",
+        file=file_path,
+        line=3,
+        category="missing-alt",
+        message="An added image has no accessible alternative text.",
+        verified_by="detector",
+    )
+    reviewer = Finding(
+        id="reviewer",
+        file=file_path,
+        line=1,
+        category="missing-alt-text",
+        message="The img tag is missing alt text.",
+    )
+
+    changed = reanchor_accessibility_findings([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert reviewer.line == 3
+
+
+def test_does_not_reuse_occupied_alt_sink_without_complete_native_detector_evidence():
+    file_path = "src/Profile.tsx"
+    detector = Finding(
+        id="detector",
+        file=file_path,
+        line=10,
+        category="missing-alt",
+        message="An image has no alternative text.",
+        verified_by="detector",
+    )
+    reviewer = Finding(
+        id="reviewer",
+        file=file_path,
+        line=18,
+        category="missing-alt",
+        message="A different image may be missing alt text.",
+    )
+    partial = "@@ -9,0 +10,1 @@\n+<img src={avatar} />"
+
+    assert reanchor_accessibility_findings([detector, reviewer], partial) == []
+    assert reviewer.line == 18
+
+    component_diff = _summary(file_path, "<Image src={avatar} />")
+    component_detector = replace(detector, line=1)
+    component_reviewer = replace(reviewer, line=3)
+
+    assert reanchor_accessibility_findings([component_detector, component_reviewer], component_diff) == []
+    assert component_reviewer.line == 3
+
+    mixed_case_html = _summary(
+        "src/profile.html",
+        """<img src="one.png">
+<div></div>
+<IMG src="two.png">""",
+    )
+    html_detector = replace(detector, file="src/profile.html", line=1)
+    html_reviewer = replace(reviewer, file="src/profile.html", line=3)
+
+    assert reanchor_accessibility_findings([html_detector, html_reviewer], mixed_case_html) == []
+    assert html_reviewer.line == 3
+
+    independent_component = _summary(
+        file_path,
+        """export function Profile() {
+  return <>
+    <img src={photo} />
+    <Avatar image={teamPhoto} />
+  </>
+}""",
+    )
+    native_detector = replace(detector, line=3)
+    avatar_reviewer = replace(
+        reviewer,
+        line=4,
+        message="Avatar omits its required alt prop.",
+    )
+
+    assert reanchor_accessibility_findings([native_detector, avatar_reviewer], independent_component) == []
+    assert avatar_reviewer.line == 4
+
+    distant_diff = _summary("src/profile.html", '<img src="one.png">\n' + "\n" * 20)
+    distant_detector = replace(detector, file="src/profile.html", line=1)
+    distant_reviewer = replace(reviewer, file="src/profile.html", line=20)
+
+    assert reanchor_accessibility_findings([distant_detector, distant_reviewer], distant_diff) == []
+    assert distant_reviewer.line == 20
 
 
 def _security_finding(
@@ -448,7 +550,17 @@ def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicat
             _summary("src/Profile.vue", at_line(21, "fetchUser();")),
             _summary("src/List.vue", at_line(55, '<li v-for="item in items" v-if="item.active">')),
             _summary("src/Poll.vue", at_line(26, "setInterval(refresh, 1000);")),
-            _summary("src/service.go", at_line(28, "go func() {")),
+            _summary(
+                "src/service.go",
+                at_line(
+                    27,
+                    """go func() {
+  for {
+    poll()
+  }
+}()""",
+                ),
+            ),
         ]
     )
     changed = reanchor_quality_detector_duplicates(findings, diff)
@@ -498,6 +610,75 @@ func load(db *sql.DB) {
 
         assert changed == [reviewer]
         assert (reviewer.line, reviewer.category) == (5, "resource-leak")
+
+
+def test_quality_reanchor_scopes_computed_fetch_and_accepts_infinite_loop_alias():
+    vue_file = "src/Profile.vue"
+    vue_diff = _summary(
+        vue_file,
+        """const name = computed(() => {
+  fetchUser(id)
+  return user.value.name
+})
+watch(id, () => fetchUser(id))
+async function fetchUser(id) {
+  return fetch(`/users/${id}`)
+}""",
+    )
+    computed_detector = _security_finding(
+        "computed-detector",
+        vue_file,
+        2,
+        "computed-side-effect",
+        "A computed getter starts a fetch operation.",
+        detector=True,
+    )
+    computed_reviewer = _security_finding(
+        "computed-reviewer",
+        vue_file,
+        3,
+        "side-effect-in-computed",
+        "The computed property calls fetchUser and causes a side effect.",
+    )
+
+    go_file = "src/service.go"
+    go_diff = _summary(
+        go_file,
+        """package service
+func start() {
+  go func() {
+    for { poll() }
+  }()
+}""",
+    )
+    for detector_line in (3, 4):
+        goroutine_detector = _security_finding(
+            f"goroutine-detector-{detector_line}",
+            go_file,
+            detector_line,
+            "lifecycle",
+            "A goroutine performs work in an unbounded loop without cancellation.",
+            detector=True,
+        )
+        goroutine_reviewer = _security_finding(
+            f"goroutine-reviewer-{detector_line}",
+            go_file,
+            9,
+            "infinite-loop",
+            "The goroutine has an infinite loop and no exit path.",
+        )
+        per_run_computed = replace(computed_detector)
+        per_run_reviewer = replace(computed_reviewer)
+
+        changed = reanchor_quality_detector_duplicates(
+            [per_run_computed, per_run_reviewer, goroutine_detector, goroutine_reviewer],
+            "\n".join([vue_diff, go_diff]),
+        )
+
+        assert {(finding.id, finding.line, finding.category) for finding in changed} == {
+            ("computed-reviewer", 2, "computed-side-effect"),
+            (f"goroutine-reviewer-{detector_line}", detector_line, "lifecycle"),
+        }
 
 
 def test_quality_reanchor_requires_explicit_and_unique_go_defer_in_loop_sink():
@@ -696,6 +877,37 @@ def test_quality_reanchor_requires_one_concrete_sink_not_only_one_detector():
     assert (findings[1].line, findings[1].category) == (8, "goroutine-leak")
 
 
+def test_quality_reanchor_requires_unbounded_loop_in_complete_goroutine():
+    file_path = "src/workers.go"
+    diff = _summary(
+        file_path,
+        """package workers
+func start() {
+  go func() {
+    pollOnce()
+  }()
+}""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        3,
+        "lifecycle",
+        "A goroutine has an unbounded loop without cancellation.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        5,
+        "infinite-loop",
+        "The goroutine loops forever without a stop path.",
+    )
+
+    assert reanchor_quality_detector_duplicates([detector, reviewer], diff) == []
+    assert (reviewer.line, reviewer.category) == (5, "infinite-loop")
+
+
 def test_reanchors_workflow_semantic_category_drift_with_unique_diff_evidence():
     file_path = ".github/workflows/gauntlet-deploy.yml"
     diff = _summary(
@@ -727,6 +939,241 @@ def test_reanchors_workflow_semantic_category_drift_with_unique_diff_evidence():
         ("secret-llm", 5, "data-leak"),
         ("command-llm", 7, "ci-security"),
     }
+
+
+def test_reanchors_generic_remote_execution_message_to_unique_workflow_pipe():
+    file_path = ".github/workflows/deploy.yml"
+    diff = _summary(
+        file_path,
+        """steps:
+  - name: checkout
+    uses: actions/checkout@v4
+  - name: install
+    run: curl https://example.invalid/install.sh | bash
+""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        5,
+        "supply-chain-risk",
+        "Workflow executes remote script via piped shell.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        3,
+        "command-injection",
+        "工作流直接从远程 URL 下载并执行脚本，可能导致任意命令执行。",
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (5, "supply-chain-risk")
+
+
+def test_remote_execution_fallback_does_not_absorb_distant_independent_shell_sink():
+    file_path = ".github/workflows/deploy.yml"
+    diff = _summary(
+        file_path,
+        """steps:
+  - name: installer
+    run: curl https://example.invalid/install.sh | bash
+  - name: context
+    run: echo ok
+  - name: independent command
+    run: bash -c "${{ github.event.issue.title }}"
+""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        3,
+        "supply-chain-risk",
+        "Workflow executes remote script via piped shell.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        7,
+        "command-injection",
+        "A remote value is executed as a shell command.",
+    )
+
+    assert reanchor_security_detector_duplicates([detector, reviewer], diff) == []
+    assert (reviewer.line, reviewer.category) == (7, "command-injection")
+
+
+def test_remote_execution_fallback_does_not_absorb_nearby_independent_shell_sink():
+    file_path = ".github/workflows/deploy.yml"
+    diff = _summary(
+        file_path,
+        """steps:
+  - name: run remote input
+    run: bash -c "${{ inputs.remote_url }}"
+  - name: installer
+    run: curl https://example.invalid/install.sh | bash
+""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        5,
+        "supply-chain-risk",
+        "Workflow executes remote script via piped shell.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        3,
+        "command-injection",
+        "Remote URL input is executed as a shell command.",
+    )
+
+    assert reanchor_security_detector_duplicates([detector, reviewer], diff) == []
+    assert (reviewer.line, reviewer.category) == (3, "command-injection")
+
+
+def test_remote_execution_fallback_does_not_absorb_nearby_dynamic_run_expression():
+    file_path = ".github/workflows/deploy.yml"
+    diff = _summary(
+        file_path,
+        """steps:
+  - name: run remote input
+    run: "${{ inputs.remote_url }}"
+  - name: installer
+    run: curl https://example.invalid/install.sh | bash
+""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        5,
+        "supply-chain-risk",
+        "Workflow executes remote script via piped shell.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        3,
+        "command-injection",
+        "Remote URL input is executed as a shell command.",
+    )
+
+    assert reanchor_security_detector_duplicates([detector, reviewer], diff) == []
+    assert (reviewer.line, reviewer.category) == (3, "command-injection")
+
+
+def test_remote_detector_does_not_absorb_independent_eval_with_shared_identifier():
+    file_path = ".github/workflows/deploy.yml"
+    diff = _summary(
+        file_path,
+        """steps:
+  - name: installer
+    run: curl "${{ inputs.remote }}" | bash
+  - name: context
+    run: echo ok
+  - name: independent eval
+    run: ruby -e "eval('${{ inputs.remote }}')"
+""",
+    )
+    detector = _security_finding(
+        "detector",
+        file_path,
+        3,
+        "supply-chain-risk",
+        "Workflow executes a remote script via piped shell.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        7,
+        "code-injection",
+        "inputs.remote is passed to eval().",
+    )
+
+    assert reanchor_security_detector_duplicates([detector, reviewer], diff) == []
+    assert (reviewer.line, reviewer.category) == (7, "code-injection")
+
+
+def test_reanchors_normalized_security_aliases_with_exact_diff_symbols():
+    cases = [
+        (
+            "src/config.py",
+            "return yaml.load(config)",
+            "insecure-deserialization",
+            "unsafe-yaml",
+            "yaml.load parses untrusted input.",
+        ),
+        (
+            "src/password.py",
+            "return hashlib.md5(password).hexdigest()",
+            "crypto",
+            "weak-hash",
+            "MD5 is a weak hash for passwords.",
+        ),
+        (
+            "src/job.rb",
+            "send(name, payload)",
+            "code-injection",
+            "unsafe-dynamic-call",
+            "send dynamically invokes a user-selected method.",
+        ),
+    ]
+
+    for index, (file_path, source, detector_category, reviewer_category, message) in enumerate(cases):
+        diff = _summary(file_path, source)
+        detector = _security_finding(
+            f"detector-{index}",
+            file_path,
+            1,
+            detector_category,
+            "Dynamic dispatch/runtime execution API used."
+            if reviewer_category == "unsafe-dynamic-call"
+            else "Deterministic security sink detected.",
+            detector=True,
+        )
+        reviewer = _security_finding(
+            f"reviewer-{index}",
+            file_path,
+            2,
+            reviewer_category,
+            message,
+        )
+
+        changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+        assert changed == [reviewer]
+        assert (reviewer.line, reviewer.category) == (1, detector_category)
+
+
+def test_dynamic_call_anchor_does_not_merge_into_same_line_eval_detector():
+    file_path = "src/job.rb"
+    diff = _summary(file_path, "send(name, payload); eval(payload)")
+    eval_detector = _security_finding(
+        "eval-detector",
+        file_path,
+        1,
+        "code-injection",
+        "Ruby eval usage detected.",
+        detector=True,
+    )
+    send_reviewer = _security_finding(
+        "send-reviewer",
+        file_path,
+        1,
+        "unsafe-dynamic-call",
+        "send(name, payload) dynamically invokes a user-selected method.",
+    )
+
+    assert reanchor_security_detector_duplicates([eval_detector, send_reviewer], diff) == []
+    assert send_reviewer.category == "unsafe-dynamic-call"
 
 
 def test_reanchors_generic_workflow_secret_output_to_the_only_print_sink():

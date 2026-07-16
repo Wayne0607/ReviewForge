@@ -770,7 +770,8 @@ def find_entries(user_data: str) -> str:
         ["grep", user_data, "/var/log/app.log"],
         stdout=subprocess.PIPE,
     )
-    return proc.communicate()[0].decode()
+    stdout, _ = proc.communicate()
+    return stdout.decode()
 
 
 def list_logs() -> str:
@@ -783,6 +784,17 @@ def ping_host(host: str = "localhost") -> str:
     return subprocess.check_output(["ping", "-c", "1", host]).decode()
 '''
     findings = [
+        Finding(
+            id="finding_count_exit_status",
+            file="helpers.py",
+            line=6,
+            severity="warning",
+            category="error-handling",
+            message="subprocess.run return code is not checked before stdout is returned.",
+            suggestion="Pass check=True or inspect result.returncode.",
+            confidence=0.9,
+            reviewer="style_reviewer",
+        ),
         Finding(
             id="finding_safe_path",
             file="helpers.py",
@@ -802,6 +814,17 @@ def ping_host(host: str = "localhost") -> str:
             message="grep argument may contain options",
             confidence=0.8,
             reviewer="security_reviewer",
+        ),
+        Finding(
+            id="finding_grep_exit_status",
+            file="helpers.py",
+            line=19,
+            severity="warning",
+            category="error-handling",
+            message="The grep process exit code is ignored after communicate().",
+            suggestion="Inspect proc.returncode and distinguish no matches from an execution error.",
+            confidence=0.8,
+            reviewer="style_reviewer",
         ),
         Finding(
             id="finding_constant_shell",
@@ -828,9 +851,40 @@ def ping_host(host: str = "localhost") -> str:
 
     result = await calibrator.calibrate(findings, _summary("helpers.py", source))
 
-    assert len(result) == 4
+    assert len(result) == 6
     assert {finding.status for finding in result} == {"false_positive"}
     assert {finding.verified_by for finding in result} == {"code-evidence"}
+
+
+async def test_python_code_evidence_preserves_non_status_error_for_stdout_wrapper():
+    source = """import subprocess
+
+
+def read_count(path: str) -> str:
+    result = subprocess.run(["wc", "-l", path], capture_output=True, text=True)
+    return result.stdout
+"""
+    finding = Finding(
+        id="finding_stdout_encoding",
+        file="worker.py",
+        line=5,
+        severity="warning",
+        category="error-handling",
+        message=(
+            "subprocess.run decodes command stdout with the locale default; "
+            "non-UTF-8 output can raise UnicodeDecodeError."
+        ),
+        suggestion="Set an explicit encoding and errors policy for textual stdout.",
+        confidence=0.9,
+        reviewer="style_reviewer",
+    )
+    llm = ConfirmingBatchLLM([finding.id])
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate([finding], _summary("worker.py", source))
+
+    assert llm.calls == 2
+    assert result[0].status == "confirmed"
+    assert result[0].verified_by == "judge"
 
 
 async def test_python_code_evidence_preserves_dynamic_shell_and_open_path_findings():
@@ -847,6 +901,16 @@ def execute(command: str, user_path: str) -> str:
     os.system(command)
     with open(os.path.join("/srv/uploads", user_path)) as handle:
         return first.stdout + handle.read()
+
+
+def publish(package: str) -> str:
+    result = subprocess.run(["publishctl", package], capture_output=True, text=True)
+    return result.stdout
+
+
+def parsed_count(path: str) -> int:
+    result = subprocess.run(["wc", "-l", path], capture_output=True, text=True)
+    return int(result.stdout.split()[0])
 """
     findings = [
         Finding(
@@ -879,6 +943,28 @@ def execute(command: str, user_path: str) -> str:
             confidence=0.9,
             reviewer="security_reviewer",
         ),
+        Finding(
+            id="finding_publish_exit_status",
+            file="worker.py",
+            line=17,
+            severity="error",
+            category="error-handling",
+            message="The publish command return code is ignored, so a failed deployment is reported as output.",
+            suggestion="Check result.returncode before reporting deployment output.",
+            confidence=0.9,
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="finding_count_parse_exit_status",
+            file="worker.py",
+            line=22,
+            severity="warning",
+            category="ignored-error",
+            message="A non-zero wc exit status is ignored before its stdout is parsed as a count.",
+            suggestion="Check result.returncode and raise the command failure before parsing stdout.",
+            confidence=0.9,
+            reviewer="style_reviewer",
+        ),
     ]
     llm = ConfirmingBatchLLM([finding.id for finding in findings])
     calibrator = DynamicCalibrator(llm, build_registry())
@@ -886,9 +972,37 @@ def execute(command: str, user_path: str) -> str:
     result = await calibrator.calibrate(findings, _summary("worker.py", source))
 
     assert llm.calls == 2
-    assert len(result) == 3
+    assert len(result) == 5
     assert {finding.status for finding in result} == {"confirmed"}
     assert {finding.verified_by for finding in result} == {"judge"}
+
+
+async def test_python_code_evidence_does_not_suppress_output_wrapper_from_partial_hunk():
+    diff = """--- worker.py (+4 -0)
+@@ -40,0 +40,4 @@
++def count_lines(path: str) -> str:
++    result = subprocess.run(["wc", "-l", path], capture_output=True, text=True)
++    return result.stdout
++
+"""
+    finding = Finding(
+        id="partial_count_exit_status",
+        file="worker.py",
+        line=41,
+        severity="warning",
+        category="error-handling",
+        message="The subprocess return code is ignored before stdout is returned.",
+        suggestion="Pass check=True or inspect result.returncode.",
+        confidence=0.9,
+        reviewer="style_reviewer",
+    )
+    llm = ConfirmingBatchLLM([finding.id])
+
+    result = await DynamicCalibrator(llm, build_registry()).calibrate([finding], diff)
+
+    assert llm.calls == 2
+    assert result[0].status == "confirmed"
+    assert result[0].verified_by == "judge"
 
 
 def test_actionability_gate_only_rejects_narrow_missing_test_noise_before_calibration():

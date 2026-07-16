@@ -43,6 +43,7 @@ Focus on: user input handling, authentication flows, data serialization, file op
 ### XSS (Cross-Site Scripting)
 - Unsanitized user input rendered in HTML/templates
 - `dangerouslySetInnerHTML` in React, `v-html` in Vue, `{@html}` in Svelte; for Angular, ordinary `[innerHTML]` is sanitized by default, so require `bypassSecurityTrustHtml` or concrete sanitizer-bypass evidence
+- A call that only returns `SafeHtml`, `TrustedHTML`, or a React element is not yet a DOM sink. Report it only when the changed code also mounts/binds that value into rendered output, or directly introduces the sanitizer-bypass call. Leave imported historical contracts to the cross-PR analyzer instead of inferring exploitability from a helper name.
 - Missing Content-Security-Policy headers
 
 ### Path Traversal

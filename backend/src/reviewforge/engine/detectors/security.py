@@ -58,7 +58,7 @@ _UNIVERSAL_RULES: list[_Rule] = [
         0.88,
     ),
     _Rule(
-        r"[\"'](?:ghp_[A-Za-z0-9_]{12,}|sk_(?:live|proj)[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9._\-]{12,})[\"']",
+        r"[\"'](?:ghp_[A-Za-z0-9_]{12,}|sk[-_](?:live|proj)[-_][A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9._\-]{12,})[\"']",
         "hardcoded-secrets",
         "error",
         "Hard-coded token-like secret detected in added lines.",
@@ -664,6 +664,10 @@ _PLACEHOLDER_SECRET_MARKERS = (
     "test-token",
     "test-api",
     "sk-test",
+    "public-client",
+    "disabled",
+    "unused",
+    "redacted",
 )
 
 
@@ -683,8 +687,8 @@ def _is_test_path(file_path: str) -> bool:
 def _looks_like_placeholder_secret(matched_text: str) -> bool:
     """Recognize explicit non-secret values without hiding realistic tokens."""
 
-    text = (matched_text or "").lower()
-    return any(marker in text for marker in _PLACEHOLDER_SECRET_MARKERS)
+    literal_values = re.findall(r"[\"'](?P<value>[^\"']*)[\"']", matched_text or "")
+    return any(marker in value.lower() for value in literal_values for marker in _PLACEHOLDER_SECRET_MARKERS)
 
 
 def _detector_confidence(file_path: str, confidence: float) -> float:
@@ -2132,6 +2136,853 @@ def _javascript_html_has_strong_source(diff: str, line_no: int, source_line: str
     return False
 
 
+_RUBY_OPEN3_CALL = re.compile(
+    r"\bOpen3\.(?:capture(?:2e?|3)|popen(?:2e?|3))\s*\((?P<arguments>.*)\)\s*$",
+    re.IGNORECASE,
+)
+_RUBY_STRONG_COMMAND_SOURCE = re.compile(
+    r"\b(?:params|request|user_input|user_params|ARGV|STDIN|ENV)\b|\bgets\b",
+    re.IGNORECASE,
+)
+
+
+def _ruby_top_level_arguments(source: str) -> list[str] | None:
+    """Split a same-line Ruby argument list without splitting nested values."""
+
+    arguments: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(source):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "," and depth == 0:
+            arguments.append(source[start:index].strip())
+            start = index + 1
+    if quote or depth != 0:
+        return None
+    arguments.append(source[start:].strip())
+    return arguments
+
+
+def _ruby_static_string(expression: str) -> bool:
+    return bool(re.fullmatch(r'"(?:\\.|[^"\\])*"', expression) or re.fullmatch(r"'(?:\\.|[^'\\])*'", expression))
+
+
+def _ruby_static_string_value(expression: str) -> str | None:
+    if not _ruby_static_string(expression) or "#{" in expression:
+        return None
+    return expression[1:-1]
+
+
+def _ruby_open3_env_argument(expression: str) -> bool:
+    stripped = expression.strip()
+    return bool(
+        (stripped.startswith("{") and stripped.endswith("}")) or re.fullmatch(r"ENV\.to_h", stripped, re.IGNORECASE)
+    )
+
+
+def _ruby_open3_env_like_variable(expression: str) -> bool:
+    """Return whether a first argument may be Open3's optional env hash.
+
+    A variable name is not type proof: treating ``env`` or ``env_hash`` as a
+    Hash can hide a dynamic executable.  Callers retain a contextual finding
+    for this ambiguous shape instead of either suppressing or auto-confirming
+    it.
+    """
+
+    return bool(
+        re.fullmatch(
+            r"(?:(?:child|process|spawn|custom)_)?env(?:ironment)?"
+            r"(?:_(?:hash|vars|variables|overrides))?",
+            expression.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _ruby_command_interpreter(program: str) -> bool:
+    executable = re.split(r"[/\\]", program)[-1].lower()
+    return bool(
+        executable
+        in {
+            "sh",
+            "ash",
+            "ash.exe",
+            "bash",
+            "dash",
+            "zsh",
+            "ksh",
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "node",
+            "node.exe",
+            "ruby",
+            "ruby.exe",
+            "perl",
+            "perl.exe",
+            "php",
+            "php.exe",
+            "lua",
+            "lua.exe",
+        }
+        or re.fullmatch(r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", executable)
+    )
+
+
+def _ruby_shell_wrapper(program: str, flag: str) -> bool:
+    executable = re.split(r"[/\\]", program)[-1].lower()
+    option = flag.lower()
+    if executable in {"sh", "ash", "ash.exe", "bash", "dash", "zsh", "ksh"}:
+        return option.startswith("-") and "c" in option[1:]
+    if executable in {"cmd", "cmd.exe"}:
+        return option in {"/c", "/k"}
+    if executable in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        return option in {"-c", "-command", "-encodedcommand"}
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", executable):
+        return option == "-c"
+    if executable in {"node", "node.exe"}:
+        return option in {"-e", "--eval"}
+    if executable in {"ruby", "ruby.exe", "perl", "perl.exe"}:
+        return option == "-e"
+    if executable in {"php", "php.exe"}:
+        return option == "-r"
+    if executable in {"lua", "lua.exe"}:
+        return option == "-e"
+    return False
+
+
+def _ruby_env_launcher(program: str) -> bool:
+    return re.split(r"[/\\]", program)[-1].lower() in {"env", "env.exe"}
+
+
+def _ruby_launcher_option(
+    remaining: list[str],
+    *,
+    flag_only: set[str],
+    value_flags: set[str],
+) -> list[str] | None:
+    """Consume proven-static launcher options and return the command tail."""
+
+    while remaining:
+        value = _ruby_static_string_value(remaining[0].strip())
+        if value is None:
+            return None
+        if value == "--":
+            return remaining[1:]
+        if not value.startswith("-") or value == "-":
+            return remaining
+        normalized = value.lower() if value.startswith("--") else value
+        if normalized in flag_only or any(normalized.startswith(f"{flag}=") for flag in value_flags):
+            remaining = remaining[1:]
+            continue
+        if normalized in value_flags:
+            if len(remaining) < 2 or _ruby_static_string_value(remaining[1].strip()) is None:
+                return None
+            remaining = remaining[2:]
+            continue
+        return None
+    return remaining
+
+
+def _ruby_unwrap_command_launchers(positional: list[str]) -> list[str] | None:
+    """Remove a bounded chain of proven transparent command launchers.
+
+    Unknown options and dynamic launcher operands deliberately fail open to a
+    contextual finding.  We never scan arbitrary later arguments for a shell,
+    which keeps programs such as ``printf`` from turning data into a false
+    command-injection finding.
+    """
+
+    remaining = list(positional)
+    for _depth in range(4):
+        if not remaining:
+            return remaining
+        launcher = _ruby_static_string_value(remaining[0].strip())
+        if launcher is None:
+            return remaining
+        executable = re.split(r"[/\\]", launcher)[-1].lower()
+
+        if _ruby_env_launcher(launcher):
+            remaining = remaining[1:]
+            while remaining:
+                value = _ruby_static_string_value(remaining[0].strip())
+                if value is None:
+                    # With no preceding unknown option, this expression is the
+                    # executable selected by env; retain it for taint analysis.
+                    return remaining
+                if re.fullmatch(r"[A-Za-z_]\w*=.*", value):
+                    remaining = remaining[1:]
+                    continue
+                if value in {"-i", "--ignore-environment", "-0", "--null"}:
+                    remaining = remaining[1:]
+                    continue
+                if value in {"-u", "--unset", "-C", "--chdir"}:
+                    if len(remaining) < 2 or _ruby_static_string_value(remaining[1].strip()) is None:
+                        return None
+                    remaining = remaining[2:]
+                    continue
+                if value in {"-S", "--split-string"}:
+                    # env parses the following value as command argv.  Preserve
+                    # a lone static string, but never discard appended dynamic
+                    # operands that may become a shell payload.
+                    if len(remaining) < 2 or _ruby_static_string_value(remaining[1].strip()) is None:
+                        return None
+                    return remaining[1:2] if len(remaining) == 2 else None
+                if value == "--":
+                    remaining = remaining[1:]
+                elif value.startswith("-"):
+                    return None
+                break
+            continue
+
+        if executable == "busybox":
+            if len(remaining) < 2:
+                return None
+            applet = _ruby_static_string_value(remaining[1].strip())
+            if applet is None:
+                return None
+            applet_name = re.split(r"[/\\]", applet)[-1].lower()
+            if _ruby_command_interpreter(applet) or applet_name in {
+                "env",
+                "nice",
+                "nohup",
+                "setsid",
+                "timeout",
+            }:
+                remaining = remaining[1:]
+                continue
+            return remaining
+
+        if executable in {"sudo", "sudo.exe"}:
+            for expression in remaining[1:]:
+                value = _ruby_static_string_value(expression.strip())
+                if value is None or value == "--" or not value.startswith("-"):
+                    break
+                if value in {"-e", "--edit"} or value.startswith("--edit="):
+                    # sudo's edit mode treats later operands as file names; it
+                    # is not a transparent command launcher.
+                    return remaining
+            remaining = _ruby_launcher_option(
+                remaining[1:],
+                flag_only={
+                    "-b",
+                    "-E",
+                    "-H",
+                    "-k",
+                    "-K",
+                    "-n",
+                    "-S",
+                    "--background",
+                    "--non-interactive",
+                    "--preserve-env",
+                    "--reset-timestamp",
+                    "--remove-timestamp",
+                    "--stdin",
+                },
+                value_flags={
+                    "-C",
+                    "-D",
+                    "-g",
+                    "-h",
+                    "-p",
+                    "-R",
+                    "-T",
+                    "-u",
+                    "--chdir",
+                    "--chroot",
+                    "--close-from",
+                    "--command-timeout",
+                    "--group",
+                    "--host",
+                    "--prompt",
+                    "--role",
+                    "--type",
+                    "--user",
+                },
+            )
+            if remaining is None:
+                return None
+            continue
+
+        if executable in {"doas", "doas.exe"}:
+            remaining = _ruby_launcher_option(
+                remaining[1:],
+                flag_only={"-n", "-s"},
+                value_flags={"-c", "-u"},
+            )
+            if remaining is None:
+                return None
+            continue
+
+        if executable in {"timeout", "timeout.exe"}:
+            tail = _ruby_launcher_option(
+                remaining[1:],
+                flag_only={"--foreground", "--preserve-status", "-v", "--verbose"},
+                value_flags={"-k", "--kill-after", "-s", "--signal"},
+            )
+            if tail is None or len(tail) < 2 or _ruby_static_string_value(tail[0].strip()) is None:
+                return None
+            remaining = tail[1:]
+            continue
+
+        if executable in {"nice", "nice.exe"}:
+            tail = remaining[1:]
+            if tail:
+                adjustment = _ruby_static_string_value(tail[0].strip())
+                if adjustment is not None and re.fullmatch(r"-\d+", adjustment):
+                    tail = tail[1:]
+                else:
+                    tail = _ruby_launcher_option(
+                        tail,
+                        flag_only=set(),
+                        value_flags={"-n", "--adjustment"},
+                    )
+            if tail is None:
+                return None
+            remaining = tail
+            continue
+
+        if executable in {"nohup", "nohup.exe"}:
+            remaining = remaining[1:]
+            continue
+
+        if executable in {"setsid", "setsid.exe"}:
+            remaining = _ruby_launcher_option(
+                remaining[1:],
+                flag_only={"-c", "--ctty", "-f", "--fork", "-w", "--wait"},
+                value_flags=set(),
+            )
+            if remaining is None:
+                return None
+            continue
+
+        return remaining
+
+    # A fifth launcher is deliberately left uncertain instead of being
+    # classified as a safe ordinary argv call.
+    if remaining:
+        launcher = _ruby_static_string_value(remaining[0].strip())
+        if launcher is not None and re.split(r"[/\\]", launcher)[-1].lower() in {
+            "busybox",
+            "doas",
+            "env",
+            "env.exe",
+            "nice",
+            "nohup",
+            "setsid",
+            "sudo",
+            "timeout",
+        }:
+            return None
+    return remaining
+
+
+def _ruby_interpreter_reads_stdin(program: str, arguments: list[str]) -> bool:
+    """Return whether stdin is interpreted as code for a static invocation."""
+
+    executable = re.split(r"[/\\]", program)[-1].lower()
+    values = [_ruby_static_string_value(argument.strip()) for argument in arguments]
+    if any(value is None for value in values):
+        return False
+    if executable in {"sh", "ash", "ash.exe", "bash", "dash", "zsh", "ksh"}:
+        return not values or bool(values and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", values[0] or ""))
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", executable) or executable in {
+        "node",
+        "node.exe",
+        "ruby",
+        "ruby.exe",
+        "perl",
+        "perl.exe",
+        "php",
+        "php.exe",
+        "lua",
+        "lua.exe",
+    }:
+        return not values or values[0] == "-"
+    if executable in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        return len(values) >= 2 and values[0] in {"-c", "-command"} and values[1] == "-"
+    if executable in {"cmd", "cmd.exe"}:
+        return not values
+    return False
+
+
+def _ruby_forwarder_has_dynamic_shell(positional: list[str]) -> bool:
+    """Recognize nested shells only for programs known to forward commands."""
+
+    outer = _ruby_static_string_value(positional[0].strip()) if positional else None
+    if outer is None:
+        return False
+    executable = re.split(r"[/\\]", outer)[-1].lower()
+    if executable not in {
+        "chroot",
+        "chroot.exe",
+        "docker",
+        "docker.exe",
+        "find",
+        "find.exe",
+        "kubectl",
+        "kubectl.exe",
+        "podman",
+        "podman.exe",
+        "taskset",
+        "taskset.exe",
+        "unshare",
+        "unshare.exe",
+        "xargs",
+        "xargs.exe",
+    }:
+        return False
+    for index in range(1, len(positional) - 2):
+        program = _ruby_static_string_value(positional[index].strip())
+        flag = _ruby_static_string_value(positional[index + 1].strip())
+        if program is None or flag is None or not _ruby_shell_wrapper(program, flag):
+            continue
+        payload = positional[index + 2].strip()
+        return not _ruby_static_string(payload) or "#{" in payload
+    return False
+
+
+def _ruby_remote_shell_has_dynamic_command(positional: list[str]) -> bool:
+    """Recognize a dynamic remote command passed to ssh-like clients."""
+
+    if len(positional) < 3:
+        return False
+    outer = _ruby_static_string_value(positional[0].strip())
+    if outer is None or re.split(r"[/\\]", outer)[-1].lower() not in {
+        "mosh",
+        "mosh.exe",
+        "ssh",
+        "ssh.exe",
+    }:
+        return False
+
+    value_options = {
+        "-b",
+        "-c",
+        "-D",
+        "-E",
+        "-e",
+        "-F",
+        "-I",
+        "-i",
+        "-J",
+        "-L",
+        "-l",
+        "-m",
+        "-O",
+        "-o",
+        "-p",
+        "-Q",
+        "-R",
+        "-S",
+        "-W",
+        "-w",
+    }
+    flag_options = {
+        "-4",
+        "-6",
+        "-A",
+        "-a",
+        "-C",
+        "-f",
+        "-G",
+        "-g",
+        "-K",
+        "-k",
+        "-M",
+        "-N",
+        "-n",
+        "-q",
+        "-s",
+        "-T",
+        "-t",
+        "-V",
+        "-v",
+        "-X",
+        "-x",
+        "-Y",
+        "-y",
+    }
+    destination_index: int | None = None
+    index = 1
+    while index < len(positional):
+        value = _ruby_static_string_value(positional[index].strip())
+        if value is None:
+            # A dynamic destination alone is not command injection. If more
+            # operands follow it, conservatively treat those as remote command
+            # argv and inspect them below.
+            destination_index = index
+            break
+        if value == "--":
+            destination_index = index + 1 if index + 1 < len(positional) else None
+            break
+        if not value.startswith("-") or value == "-":
+            destination_index = index
+            break
+        if value in value_options:
+            index += 2
+            continue
+        if value in flag_options or re.fullmatch(r"-[46AaCfgKkMNnqstTvXxYy]+", value):
+            index += 1
+            continue
+        if any(value.startswith(option) and len(value) > len(option) for option in value_options):
+            index += 1
+            continue
+        # Unknown client options make the destination boundary uncertain. A
+        # later dynamic operand must remain a contextual finding.
+        return any(
+            not _ruby_static_string(argument.strip()) or "#{" in argument for argument in positional[index + 1 :]
+        )
+
+    if destination_index is None or destination_index + 1 >= len(positional):
+        return False
+    return any(
+        not _ruby_static_string(argument.strip()) or "#{" in argument
+        for argument in positional[destination_index + 1 :]
+    )
+
+
+def _ruby_method_parameters(header: str) -> set[str]:
+    match = re.match(
+        r"^\s*def\s+(?:self\.)?[A-Za-z_]\w*[!?=]?\s*(?:\((?P<paren>[^)]*)\)|(?P<plain>[^#]+))?\s*$",
+        header,
+    )
+    if match is None:
+        return set()
+    raw = (match.group("paren") or match.group("plain") or "").strip()
+    fragments = _ruby_top_level_arguments(raw)
+    if fragments is None:
+        return set()
+    parameters: set[str] = set()
+    for fragment in fragments:
+        name = re.match(r"\s*[*&]*(?P<name>[A-Za-z_]\w*)", fragment)
+        if name is not None:
+            parameters.add(name.group("name"))
+    return parameters
+
+
+def _ruby_safe_match_guard(expression: str, name: str) -> bool:
+    match = re.search(
+        rf"\b{re.escape(name)}\.match\?\s*\(\s*/(?P<pattern>(?:\\.|[^/])*)/[a-z]*\s*\)",
+        expression,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    pattern = match.group("pattern")
+    if pattern.startswith(r"\A") and pattern.endswith(r"\z"):
+        body = pattern[2:-2]
+    else:
+        return False
+    if r"\s" in body or re.search(r"\s", body):
+        # Whitespace (especially newlines) and ``\s`` make a command-token
+        # regex too permissive to count as a strong shell allowlist.
+        return False
+    if re.fullmatch(r"\[(?:A-Z|a-z|0-9|\\[sw./@:+-]|[ _./@:+-])+\][+*]", body):
+        return True
+    if body.startswith("(?:") and body.endswith(")"):
+        body = body[3:-1]
+    return bool(body) and all(re.fullmatch(r"[A-Za-z0-9_ ./@:+-]+", option) for option in body.split("|"))
+
+
+def _ruby_allowlist_guard(expression: str, name: str) -> bool:
+    if "||" in expression:
+        return False
+    include = re.search(rf"\.include\?\s*\(\s*{re.escape(name)}\s*\)", expression, re.IGNORECASE)
+    if include is None:
+        return _ruby_safe_match_guard(expression, name)
+    receiver = expression[: include.start()].strip().lstrip("(")
+    if receiver.startswith("!"):
+        return False
+    return bool(
+        re.search(r"(?:^|::)[A-Z][A-Z0-9_:]*$", receiver)
+        or (re.fullmatch(r"[A-Za-z_]\w*", receiver) and re.search(r"(?:allow|permit|safe)", receiver, re.IGNORECASE))
+    )
+
+
+def _ruby_parameter_has_command_guard(
+    hunk: list[tuple[int, str, bool]], method_index: int, sink_index: int, name: str
+) -> bool:
+    """Return whether a dominating guard constrains a command parameter."""
+
+    visible = hunk[method_index + 1 : sink_index]
+    assignments = [
+        index
+        for index, (_line, content, _added) in enumerate(visible)
+        if re.match(rf"^\s*{re.escape(name)}\s*=(?!=)", content)
+    ]
+    if assignments:
+        # A constraint on the old value does not dominate a later reassignment.
+        visible = visible[assignments[-1] + 1 :]
+    sink_indent = len(hunk[sink_index][1]) - len(hunk[sink_index][1].lstrip())
+    for _line, content, _added in visible:
+        stripped = content.strip()
+        if len(content) - len(content.lstrip()) != sink_indent:
+            continue
+        direct = re.match(r"^(?:raise|return|next|break)\b.*?\s+unless\s+(?P<condition>.+)$", stripped)
+        if direct is not None and _ruby_allowlist_guard(direct.group("condition"), name):
+            return True
+        inverted = re.match(r"^(?:raise|return|next|break)\b.*?\s+if\s+!(?P<condition>.+)$", stripped)
+        if inverted is not None and _ruby_allowlist_guard(inverted.group("condition"), name):
+            return True
+
+    for offset, (_line, content, _added) in enumerate(visible):
+        stripped = content.strip()
+        block = re.match(r"^unless\s+(?P<condition>.+)$", stripped)
+        if block is None:
+            block = re.match(r"^if\s+!(?P<condition>.+)$", stripped)
+        if block is None or not _ruby_allowlist_guard(block.group("condition"), name):
+            continue
+        guard_indent = len(content) - len(content.lstrip())
+        if guard_indent != sink_indent:
+            continue
+        for end_offset in range(offset + 1, len(visible)):
+            end_content = visible[end_offset][1]
+            if not re.match(r"^\s*end\b", end_content):
+                continue
+            if len(end_content) - len(end_content.lstrip()) != guard_indent:
+                continue
+            guarded = visible[offset + 1 : end_offset]
+            body_indents = [
+                len(row[1]) - len(row[1].lstrip())
+                for row in guarded
+                if row[1].strip() and not row[1].lstrip().startswith("#")
+            ]
+            body_indent = min(body_indents, default=-1)
+            if any(
+                len(row[1]) - len(row[1].lstrip()) == body_indent
+                and re.match(r"^\s*(?:raise|return|next|break)\b", row[1])
+                for row in guarded
+            ):
+                return True
+            break
+
+    for offset in range(len(visible) - 1, -1, -1):
+        content = visible[offset][1]
+        case = re.match(rf"^(?P<indent>\s*)case\s+{re.escape(name)}\s*$", content)
+        if case is None or len(case.group("indent")) >= sink_indent:
+            continue
+        case_indent = len(case.group("indent"))
+        branch: str | None = None
+        for _line, nested, _added in visible[offset + 1 :]:
+            if re.match(r"^\s*end\b", nested) and len(nested) - len(nested.lstrip()) == case_indent:
+                branch = None
+                break
+            candidate = re.match(r"^\s*when\s+(?P<values>.+)$", nested)
+            if candidate is not None:
+                branch = candidate.group("values")
+            elif re.match(r"^\s*else\b", nested):
+                branch = None
+        if branch is None:
+            continue
+        values = _ruby_top_level_arguments(branch)
+        if values and all(_ruby_static_string(value.strip()) and "#{" not in value for value in values):
+            return True
+    return False
+
+
+def _ruby_open3_shell_argument_risk(diff: str, line_no: int, source_line: str) -> bool | None:
+    """Classify whether Open3 receives one dynamic shell-command string.
+
+    Ruby's Open3 delegates a single string to a shell, while a fixed executable
+    with separate arguments uses the shellless argv form. Explicit shell
+    wrappers such as ``bash -c`` remain risky. Only a direct request source or
+    an enclosing method parameter is strong enough to auto-confirm.
+    """
+
+    call = _RUBY_OPEN3_CALL.search(source_line)
+    if call is None:
+        return None
+    arguments = _ruby_top_level_arguments(call.group("arguments"))
+    if not arguments or arguments == [""]:
+        return None
+
+    positional: list[str] = []
+    stdin_data: str | None = None
+    saw_keyword = False
+    for argument in arguments:
+        keyword = re.match(r"^(?P<name>[A-Za-z_]\w*)\s*:\s*(?P<value>.*)$", argument)
+        if keyword is not None:
+            saw_keyword = True
+            if keyword.group("name") == "stdin_data":
+                stdin_data = keyword.group("value").strip()
+            continue
+        if saw_keyword:
+            # Ruby normally rejects positional arguments after keyword
+            # arguments. Keep an uncertain finding if metaprogramming makes
+            # the call shape ambiguous rather than mis-parsing the command.
+            return None
+        positional.append(argument)
+    if len(positional) >= 2 and _ruby_open3_env_like_variable(positional[0]):
+        return None
+    if len(positional) >= 2 and _ruby_open3_env_argument(positional[0]):
+        positional = positional[1:]
+    positional = _ruby_unwrap_command_launchers(positional)
+    if positional is None:
+        return None
+    if not positional or positional[0].lstrip().startswith("*"):
+        return None
+    if _ruby_forwarder_has_dynamic_shell(positional) or _ruby_remote_shell_has_dynamic_command(positional):
+        return None
+
+    command = positional[0].strip()
+    uncertain_program = False
+    stdin_program = _ruby_static_string_value(positional[0].strip())
+    if (
+        stdin_data is not None
+        and stdin_program is not None
+        and _ruby_interpreter_reads_stdin(stdin_program, positional[1:])
+    ):
+        command = stdin_data
+    elif len(positional) >= 2:
+        if len(positional) >= 4:
+            nested_program = _ruby_static_string_value(positional[1].strip())
+            nested_flag = _ruby_static_string_value(positional[2].strip())
+            nested_payload = positional[3].strip()
+            outer_program = _ruby_static_string_value(positional[0].strip())
+            benign_data_programs = {
+                "cat",
+                "cat.exe",
+                "echo",
+                "echo.exe",
+                "logger",
+                "logger.exe",
+                "printf",
+                "printf.exe",
+                "tar",
+                "tar.exe",
+            }
+            if (
+                outer_program is not None
+                and re.split(r"[/\\]", outer_program)[-1].lower() not in benign_data_programs
+                and nested_program is not None
+                and nested_flag is not None
+                and _ruby_shell_wrapper(nested_program, nested_flag)
+                and (not _ruby_static_string(nested_payload) or "#{" in nested_payload)
+            ):
+                # A custom/static wrapper may transparently launch the nested
+                # interpreter (docker-like tools do this). Its semantics are
+                # uncertain, so retain only the contextual 0.9 finding.
+                return None
+        program = _ruby_static_string_value(positional[0].strip())
+        flag = _ruby_static_string_value(positional[1].strip())
+        if program is None:
+            uncertain_program = True
+        elif flag is None:
+            return None
+        elif _ruby_shell_wrapper(program, flag):
+            if len(positional) < 3:
+                return None
+            command = positional[2].strip()
+        elif flag.lower() in {
+            "-c",
+            "/c",
+            "/k",
+            "-e",
+            "--eval",
+            "-r",
+            "-command",
+            "-encodedcommand",
+        }:
+            return None
+        elif _ruby_command_interpreter(program) and flag.startswith(("-", "/")):
+            # Unknown interpreter modes (for example ``sh -s``) are not proof
+            # of a safe argv invocation. Keep the contextual detector result.
+            return None
+        else:
+            return False
+
+    if _ruby_static_string(command):
+        if "#{" not in command:
+            return False
+        return True if _RUBY_STRONG_COMMAND_SOURCE.search(command) else None
+    if _RUBY_STRONG_COMMAND_SOURCE.search(command):
+        return True
+
+    variable = re.fullmatch(r"(?P<name>[A-Za-z_]\w*)", command)
+    location = _hunk_lines_for_right_line(diff, line_no)
+    if variable is None or location is None:
+        return None
+    name = variable.group("name")
+    hunk, sink_index = location
+    sink_indent = len(source_line) - len(source_line.lstrip())
+
+    method_index: int | None = None
+    parameters: set[str] = set()
+    for index in range(sink_index - 1, -1, -1):
+        content = hunk[index][1]
+        if not re.match(r"^\s*def\b", content):
+            continue
+        method_indent = len(content) - len(content.lstrip())
+        if method_indent >= sink_indent:
+            continue
+        if any(
+            re.match(r"^\s*end\b", nested[1]) and len(nested[1]) - len(nested[1].lstrip()) <= method_indent
+            for nested in hunk[index + 1 : sink_index]
+        ):
+            continue
+        method_index = index
+        parameters = _ruby_method_parameters(content)
+        break
+
+    search_start = (method_index + 1) if method_index is not None else 0
+    assignment = re.compile(rf"^\s*{re.escape(name)}\s*=\s*(?P<value>.+?)\s*$")
+    for _right_line, content, _added in reversed(hunk[search_start:sink_index]):
+        assigned = assignment.match(content)
+        if assigned is None:
+            continue
+        value = assigned.group("value")
+        if _ruby_static_string(value):
+            if "#{" not in value:
+                assignment_indent = len(content) - len(content.lstrip())
+                if uncertain_program:
+                    return None
+                return False if assignment_indent == sink_indent else None
+            return True if _RUBY_STRONG_COMMAND_SOURCE.search(value) else None
+        if _RUBY_STRONG_COMMAND_SOURCE.search(value) or any(
+            re.search(rf"\b{re.escape(parameter)}\b", value) for parameter in parameters
+        ):
+            if method_index is not None:
+                if _ruby_parameter_has_command_guard(hunk, method_index, sink_index, name):
+                    return None
+                source_parameters = {
+                    parameter for parameter in parameters if re.search(rf"\b{re.escape(parameter)}\b", value)
+                }
+                if source_parameters and all(
+                    _ruby_parameter_has_command_guard(hunk, method_index, sink_index, parameter)
+                    for parameter in source_parameters
+                ):
+                    return None
+            return True
+        return None
+
+    if name not in parameters:
+        return None
+    if method_index is not None and _ruby_parameter_has_command_guard(hunk, method_index, sink_index, name):
+        return None
+    return True
+
+
 def _ruby_backtick_interpolation_is_escaped(diff: str, line_no: int, source_line: str) -> bool:
     """Return true when every interpolation is escaped or structurally scalar.
 
@@ -2253,6 +3104,7 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
 
         for rule in rules:
             for line_no, match in match_lines(diff, rule.pattern):
+                ruby_open3_risk: bool | None = None
                 template_expression = language in {"javascript", "typescript", "vue", "svelte"} and (
                     _template_expression_match_is_code(match.string, match.start())
                 )
@@ -2271,6 +3123,10 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     continue
                 if _is_import_only(match.string):
                     continue
+                if language == "ruby" and rule.category == "command-injection" and "Open3." in match.group(0):
+                    ruby_open3_risk = _ruby_open3_shell_argument_risk(diff, line_no, match.string)
+                    if ruby_open3_risk is False:
+                        continue
                 svelte_raw_html_directive = (
                     language == "svelte" and rule.category == "xss" and match.group(0).lstrip().startswith("{@html")
                 )
@@ -2344,6 +3200,11 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     continue
                 message = rule.message
                 suggestion = rule.suggestion
+                confidence = rule.confidence
+                if ruby_open3_risk is True:
+                    message = "A method/request value is executed as a single Open3 shell-command string."
+                    suggestion = "Use a fixed executable with separate argv elements and validate each argument."
+                    confidence = 0.97
                 if language == "rust" and rule.category == "unsafe-block":
                     if re.search(r"\bunsafe\s+fn\b", match.string):
                         if re.search(r"\bpub(?:\s*\([^)]*\))?\s+unsafe\s+fn\b", match.string):
@@ -2369,7 +3230,7 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                         category=normalize_category_for_detector(rule.category),
                         message=message,
                         suggestion=suggestion,
-                        confidence=_detector_confidence(file_path, safe_confidence(rule.confidence, 1)),
+                        confidence=_detector_confidence(file_path, safe_confidence(confidence, 1)),
                     )
                 )
 

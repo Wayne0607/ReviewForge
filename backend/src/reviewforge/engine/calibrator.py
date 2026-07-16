@@ -68,6 +68,26 @@ _SUBPROCESS_CALLS = {
     "subprocess.check_call",
     "subprocess.check_output",
 }
+_READ_ONLY_SUBPROCESS_TOOLS = {
+    "cat",
+    "cut",
+    "grep",
+    "head",
+    "ls",
+    "pwd",
+    "stat",
+    "tail",
+    "wc",
+    "which",
+}
+_PROCESS_STATUS_CATEGORIES = {"error-handling", "ignored-error"}
+_PROCESS_STATUS_CLAIM = re.compile(
+    r"\b(?:return\s*(?:code|status)|exit\s*(?:code|status)|status\s*code|"
+    r"(?:process|command)\s+status|returncode|check\s*=\s*true|"
+    r"non[- ]?zero(?:\s+(?:exit|return|status|code))?)\b|"
+    r"\u8fd4\u56de\u7801|\u9000\u51fa\u7801|\u9000\u51fa\u72b6\u6001|\u975e\u96f6\u72b6\u6001",
+    re.IGNORECASE,
+)
 _SHELL_CALLS = {"os.system", "os.popen"}
 _PATH_CALLS = {
     "open",
@@ -248,6 +268,7 @@ class _PythonCodeEvidence:
     unsafe_command_scopes: tuple[tuple[int, int], ...]
     suspicious_path_scopes: tuple[tuple[int, int], ...]
     constant_shell_scopes: tuple[tuple[int, int], ...]
+    stdout_projection_scopes: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -390,6 +411,18 @@ def _python_added_tree(diff_summary: str, file_path: str) -> ast.Module | None:
         return None
 
 
+def _is_complete_new_file_patch(patch: str) -> bool:
+    """Prove that one new-file hunk contains every advertised source line."""
+
+    headers = list(re.finditer(r"^@@ .* @@", patch or "", re.MULTILINE))
+    new_file = re.search(r"^@@ -0,0 \+1(?:,(?P<count>\d+))? @@", patch or "", re.MULTILINE)
+    if new_file is None or len(headers) != 1 or headers[0].start() != new_file.start():
+        return False
+    expected = int(new_file.group("count") or 1)
+    additions = iter_added_lines(patch)
+    return len(additions) == expected and [line for line, _content in additions] == list(range(1, expected + 1))
+
+
 def _call_name(call: ast.Call) -> str:
     parts: list[str] = []
     node: ast.expr = call.func
@@ -419,6 +452,116 @@ def _keyword_bool(call: ast.Call, name: str) -> bool | None:
     return False
 
 
+def _fixed_read_only_executable(call: ast.Call) -> bool:
+    """Recognize a deliberately small set of observational argv commands."""
+
+    if _keyword_bool(call, "shell") is not False or not call.args:
+        return False
+    argv = call.args[0]
+    if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts or not _constant_string(argv.elts[0]):
+        return False
+    executable = str(argv.elts[0].value).replace("\\", "/").rsplit("/", 1)[-1]
+    return executable in _READ_ONLY_SUBPROCESS_TOOLS
+
+
+def _captures_stdout(call: ast.Call) -> bool:
+    if _keyword_bool(call, "capture_output") is True:
+        return True
+    return any(
+        keyword.arg == "stdout"
+        and isinstance(keyword.value, ast.Attribute)
+        and keyword.value.attr == "PIPE"
+        and isinstance(keyword.value.value, ast.Name)
+        and keyword.value.value.id == "subprocess"
+        for keyword in call.keywords
+    )
+
+
+def _projection_from_name(node: ast.expr | None, name: str, *, require_stdout: bool = False) -> bool:
+    """Accept only direct, side-effect-free attribute/string projections."""
+
+    if isinstance(node, ast.Name):
+        return node.id == name and not require_stdout
+    if isinstance(node, ast.Attribute):
+        if isinstance(node.value, ast.Name) and node.value.id == name:
+            return not require_stdout or node.attr == "stdout"
+        return _projection_from_name(node.value, name, require_stdout=require_stdout)
+    if isinstance(node, ast.Call) and not node.args and not node.keywords:
+        return _projection_from_name(node.func, name, require_stdout=require_stdout)
+    return False
+
+
+def _body_without_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body.pop(0)
+    return body
+
+
+def _stdout_projection_wrapper(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Prove a fixed read-only command is merely exposed as textual output.
+
+    This intentionally excludes dynamic/shell commands, state-changing tools,
+    structured parsing, extra side effects, and all non-complete source views.
+    """
+
+    body = _body_without_docstring(node)
+    if len(body) == 2 and isinstance(body[0], ast.Assign) and isinstance(body[1], ast.Return):
+        assignment = body[0]
+        if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+            return False
+        result_name = assignment.targets[0].id
+        call = assignment.value
+        return (
+            isinstance(call, ast.Call)
+            and _call_name(call) == "subprocess.run"
+            and _fixed_read_only_executable(call)
+            and _captures_stdout(call)
+            and _projection_from_name(body[1].value, result_name, require_stdout=True)
+        )
+
+    if len(body) != 3 or not isinstance(body[0], ast.Assign) or not isinstance(body[1], ast.Assign):
+        return False
+    if not isinstance(body[2], ast.Return):
+        return False
+    process_assignment = body[0]
+    if len(process_assignment.targets) != 1 or not isinstance(process_assignment.targets[0], ast.Name):
+        return False
+    process_name = process_assignment.targets[0].id
+    process_call = process_assignment.value
+    if not (
+        isinstance(process_call, ast.Call)
+        and _call_name(process_call) == "subprocess.Popen"
+        and _fixed_read_only_executable(process_call)
+        and _captures_stdout(process_call)
+    ):
+        return False
+
+    communicate_assignment = body[1]
+    if len(communicate_assignment.targets) != 1 or not isinstance(communicate_assignment.targets[0], ast.Tuple):
+        return False
+    output_targets = communicate_assignment.targets[0].elts
+    if not output_targets or not isinstance(output_targets[0], ast.Name):
+        return False
+    communicate = communicate_assignment.value
+    if not (
+        isinstance(communicate, ast.Call)
+        and not communicate.args
+        and not communicate.keywords
+        and isinstance(communicate.func, ast.Attribute)
+        and communicate.func.attr == "communicate"
+        and isinstance(communicate.func.value, ast.Name)
+        and communicate.func.value.id == process_name
+    ):
+        return False
+    return _projection_from_name(body[2].value, output_targets[0].id)
+
+
 def _scope_for_line(tree: ast.Module, line: int) -> tuple[int, int]:
     scopes = [
         (node.lineno, node.end_lineno or node.lineno)
@@ -430,6 +573,7 @@ def _scope_for_line(tree: ast.Module, line: int) -> tuple[int, int]:
 
 
 def _python_code_evidence(diff_summary: str, file_path: str) -> _PythonCodeEvidence | None:
+    patch = _extract_file_patch(diff_summary, file_path)
     tree = _python_added_tree(diff_summary, file_path)
     if tree is None:
         return None
@@ -442,6 +586,15 @@ def _python_code_evidence(diff_summary: str, file_path: str) -> _PythonCodeEvide
     unsafe_command_scopes: list[tuple[int, int]] = []
     suspicious_path_scopes: list[tuple[int, int]] = []
     constant_shell_scopes: list[tuple[int, int]] = []
+    stdout_projection_scopes = (
+        [
+            (node.lineno, node.end_lineno or node.lineno)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _stdout_projection_wrapper(node)
+        ]
+        if _is_complete_new_file_patch(patch)
+        else []
+    )
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -496,6 +649,7 @@ def _python_code_evidence(diff_summary: str, file_path: str) -> _PythonCodeEvide
         unsafe_command_scopes=tuple(set(unsafe_command_scopes)),
         suspicious_path_scopes=tuple(set(suspicious_path_scopes)),
         constant_shell_scopes=tuple(set(constant_shell_scopes)),
+        stdout_projection_scopes=tuple(set(stdout_projection_scopes)),
     )
 
 
@@ -507,6 +661,20 @@ def _reject_by_code_evidence(finding: Finding, evidence: _PythonCodeEvidence | N
 
     def near(scopes: tuple[tuple[int, int], ...]) -> bool:
         return any(start - 2 <= finding.line <= end + 2 for start, end in scopes)
+
+    def inside(scopes: tuple[tuple[int, int], ...]) -> bool:
+        return any(start <= finding.line <= end for start, end in scopes)
+
+    text = f"{finding.message}\n{finding.suggestion}"
+    if (
+        finding.category in _PROCESS_STATUS_CATEGORIES
+        and _PROCESS_STATUS_CLAIM.search(text)
+        and inside(evidence.stdout_projection_scopes)
+    ):
+        return (
+            "The complete function is a fixed, read-only argv command wrapper that only projects stdout; "
+            "the diff does not establish a failure-propagation contract or a state-changing operation."
+        )
 
     if (
         finding.category == "command-injection"

@@ -19,6 +19,8 @@ from reviewforge.engine.security_categories import normalize_category
 
 _SUMMARY_FILE_HEADER = re.compile(r"^--- (?P<file>.+?) \(\+\d+ -\d+\)$")
 _ALT_TAG_START = re.compile(r"<(?:img|Image)\b")
+_NATIVE_ALT_TAG_START = re.compile(r"<img\b", re.IGNORECASE)
+_DETECTOR_NATIVE_ALT_TAG_START = re.compile(r"<img\b")
 _CONTROL_TAG_START = re.compile(r"<(?:input|select|textarea)\b")
 _ALT_ATTRIBUTE = re.compile(r"(?:\balt|:alt|v-bind:alt|\[alt\]|\[attr\.alt\])\s*=", re.IGNORECASE)
 _ACCESSIBLE_NAME = re.compile(
@@ -70,6 +72,15 @@ _SECURITY_ANCHOR_CATEGORY_PAIRS = {
     frozenset({"command-injection", "ci-security"}),
 }
 _REMOTE_DOWNLOAD_CATEGORIES = {"insecure-download", "supply-chain-risk"}
+_WORKFLOW_INDEPENDENT_EXECUTION_SINK = re.compile(
+    r"\b(?:ba|da|z|k)?sh\s+-[A-Za-z]*c\b|"
+    r"\bcmd(?:\.exe)?\s+/[ck]\b|"
+    r"\b(?:powershell|pwsh)(?:\.exe)?\s+-(?:c|command|encodedcommand)\b|"
+    r"\b(?:python(?:\d+(?:\.\d+)?)?|node|ruby|perl|lua|php)\s+(?:-c|-e|-r|--eval)\b|"
+    r"^\s*run\s*:[^\n]*\$\{\{|"
+    r"\beval\s+",
+    re.IGNORECASE,
+)
 _PYTHON_REDIRECT_CALLS = {
     "httpresponseredirect",
     "httpresponseredirectpermanent",
@@ -99,6 +110,18 @@ def _extract_file_patch(diff_summary: str, file_path: str) -> str:
         if in_target:
             selected.append(line)
     return "\n".join(selected)
+
+
+def _is_complete_new_file_patch(patch: str) -> bool:
+    """Whether a patch is one complete post-image beginning at line one."""
+
+    headers = list(re.finditer(r"^@@ .* @@", patch or "", re.MULTILINE))
+    new_file = re.search(r"^@@ -0,0 \+1(?:,(?P<count>\d+))? @@", patch or "", re.MULTILINE)
+    if new_file is None or len(headers) != 1 or headers[0].start() != new_file.start():
+        return False
+    expected = int(new_file.group("count") or 1)
+    additions = iter_added_lines(patch)
+    return len(additions) == expected and [line for line, _content in additions] == list(range(1, expected + 1))
 
 
 def _added_tags(patch: str, start_pattern: re.Pattern[str]) -> list[tuple[int, str]]:
@@ -230,6 +253,33 @@ def reanchor_accessibility_findings(findings: list[Finding], diff_summary: str) 
         patch = _extract_file_patch(diff_summary, file_path)
         candidates = _missing_alt_candidates(patch) if category == "missing-alt" else _missing_label_candidates(patch)
         changed.extend(_assign_nearest(group, candidates))
+        if category != "missing-alt" or len(candidates) != 1 or not _is_complete_new_file_patch(patch):
+            continue
+        target = candidates[0]
+        # Reusing an occupied target is safe only when it is a native ``img``
+        # sink covered by the deterministic detector, not a framework component
+        # such as ``Image`` whose accessibility contract is unknown.
+        covered_native_candidates = {line for line, _tag in _added_tags(patch, _NATIVE_ALT_TAG_START)}
+        detector_native_candidates = {line for line, _tag in _added_tags(patch, _DETECTOR_NATIVE_ALT_TAG_START)}
+        detector_claims = [
+            finding
+            for finding in group
+            if finding.line == target and finding.verified_by.strip().lower() in _DETECTOR_PROVENANCE
+        ]
+        if covered_native_candidates != {target} or detector_native_candidates != {target} or len(detector_claims) != 1:
+            continue
+        already_changed = {finding.id for finding in changed}
+        for finding in group:
+            if finding.line == target or finding.id in already_changed or abs(finding.line - target) > 12:
+                continue
+            reviewer_text = f"{finding.message}\n{finding.suggestion}"
+            if not re.search(r"<\s*img\b|\bimg\s+(?:tag|element)\b|\bimg\s*标签", reviewer_text, re.IGNORECASE):
+                # A Reviewer that names another component (for example Avatar)
+                # may describe an independent accessibility contract that the
+                # native-img detector deliberately does not cover.
+                continue
+            finding.line = target
+            changed.append(finding)
     return changed
 
 
@@ -283,7 +333,7 @@ def _quality_issue_family(finding: Finding) -> str:
             and re.search(r"\b(?:for|loop|iteration)\b|循环|迭代", text)
         ):
             return "go-defer-rows-close-loop"
-        if category in {"goroutine-leak", "lifecycle", "performance", "resource-leak"} and re.search(
+        if category in {"goroutine-leak", "infinite-loop", "lifecycle", "performance", "resource-leak"} and re.search(
             r"goroutine.{0,80}(?:unbounded|infinite|loop|no\s+(?:stop|exit|cancel)|without\s+cancellation)|"
             r"(?:unbounded|infinite|loop|no\s+(?:stop|exit|cancel)|without\s+cancellation).{0,80}goroutine|"
             r"goroutine.{0,40}(?:无限|退出|取消)",
@@ -308,10 +358,46 @@ def _quality_issue_family(finding: Finding) -> str:
     return ""
 
 
+def _calls_in_braced_scopes(
+    patch_lines: list[tuple[int, str]],
+    scope_start: re.Pattern[str],
+    call: re.Pattern[str],
+) -> set[int]:
+    """Return call lines only from complete, balanced lexical brace scopes."""
+
+    found: set[int] = set()
+    for index, (_line_no, content) in enumerate(patch_lines):
+        start = scope_start.search(content)
+        if start is None:
+            continue
+        depth = 0
+        opened = False
+        scoped: set[int] = set()
+        for line_no, scoped_content in patch_lines[index:]:
+            # Braces in ordinary quoted strings are not lexical scope.  This is
+            # deliberately a small fail-closed scanner rather than a JS parser;
+            # an unbalanced/template-heavy scope simply yields no candidates.
+            structural = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", scoped_content)
+            if not opened:
+                brace = structural.find("{", start.start() if line_no == patch_lines[index][0] else 0)
+                if brace < 0:
+                    continue
+                structural = structural[brace:]
+                opened = True
+            if call.search(scoped_content):
+                scoped.add(line_no)
+            depth += structural.count("{") - structural.count("}")
+            if opened and depth <= 0:
+                found.update(scoped)
+                break
+    return found
+
+
 def _quality_family_sink_lines(file_path: str, family: str, diff_summary: str) -> set[int]:
     """Return conservative concrete sink lines for one quality family."""
 
-    patch_lines = iter_right_lines(_extract_file_patch(diff_summary, file_path))
+    patch = _extract_file_patch(diff_summary, file_path)
+    patch_lines = iter_right_lines(patch)
     if not patch_lines:
         return set()
 
@@ -326,12 +412,23 @@ def _quality_family_sink_lines(file_path: str, family: str, diff_summary: str) -
     if family == "vue-empty-catch":
         return {line for line, content in patch_lines if re.search(r"\bcatch\s*(?:\([^)]*\))?\s*\{", content)}
     if family == "vue-computed-side-effect":
-        # Counting every fetch-like call is intentionally conservative: when a
-        # component has another independent fetch, do not guess which one an
-        # offset Reviewer anchor describes.
-        return {
+        # A component can legitimately fetch elsewhere in a watcher, event
+        # handler, or helper.  Only calls inside a complete computed getter are
+        # candidates for this semantic family.
+        scoped = _calls_in_braced_scopes(
+            patch_lines,
+            re.compile(r"\bcomputed\s*\(", re.IGNORECASE),
+            re.compile(r"\b[A-Za-z_$]*fetch\w*\s*\(", re.IGNORECASE),
+        )
+        if scoped:
+            return scoped
+        # Some gateway summaries contain only the concrete sink line rather
+        # than its surrounding computed declaration.  Preserve the established
+        # conservative fallback only when that summary has one fetch-like call.
+        all_fetches = {
             line for line, content in patch_lines if re.search(r"\b[A-Za-z_$]*fetch\w*\s*\(", content, re.IGNORECASE)
         }
+        return all_fetches if len(all_fetches) == 1 else set()
     if family == "vue-v-if-for":
         return {
             line
@@ -341,7 +438,20 @@ def _quality_family_sink_lines(file_path: str, family: str, diff_summary: str) -
     if family == "vue-interval-lifecycle":
         return {line for line, content in patch_lines if re.search(r"\bsetInterval\s*\(", content)}
     if family == "go-goroutine-lifecycle":
-        return {line for line, content in patch_lines if re.search(r"\bgo\s+(?:func\b|[A-Za-z_]\w*\s*\()", content)}
+        starts = {line for line, content in patch_lines if re.search(r"\bgo\s+(?:func\b|[A-Za-z_]\w*\s*\()", content)}
+        loops = _calls_in_braced_scopes(
+            patch_lines,
+            re.compile(r"\bgo\s+func\s*\([^)]*\)\s*\{"),
+            re.compile(r"^\s*for\s*\{"),
+        )
+        if len(starts) == 1 and len(loops) == 1:
+            # The detector may anchor either the goroutine declaration or the
+            # concrete unbounded loop, depending on scanner version.  A unique
+            # complete pair proves they represent the same lifecycle defect.
+            return starts | loops
+        # Preserve support for a deliberately abbreviated gateway summary that
+        # contains one goroutine declaration but omits its body.
+        return starts if len(starts) == 1 and not loops and not _is_complete_new_file_patch(patch) else set()
     if family == "go-log-and-continue":
         return {line for line, content in patch_lines if re.search(r"\bif\s+[A-Za-z_]\w*\s*!=\s*nil\s*\{", content)}
     if family == "go-defer-rows-close-loop":
@@ -379,7 +489,10 @@ def reanchor_quality_detector_duplicates(findings: list[Finding], diff_summary: 
         # second sink may simply be outside the deterministic rule's coverage.
         # Repair only when the changed source itself has one concrete sink for
         # this narrow family and the detector is anchored on it.
-        if sink_lines != {detector.line}:
+        if family == "go-goroutine-lifecycle":
+            if detector.line not in sink_lines:
+                continue
+        elif sink_lines != {detector.line}:
             continue
         for finding in group["reviewers"]:
             if family.startswith("java-jdbc-resource:"):
@@ -416,7 +529,7 @@ def _message_code_identifiers(message: str, patch_lines: list[tuple[int, str]]) 
     for match in _CODE_IDENTIFIER.finditer(message or ""):
         raw = re.sub(r"\s+", "", match.group(0))
         lowered = raw.lower()
-        if len(raw) < 4 or lowered in _IDENTIFIER_STOPWORDS:
+        if (len(raw) < 4 and lowered not in {"md5", "sha1"}) or lowered in _IDENTIFIER_STOPWORDS:
             continue
         occurrence = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(raw)}(?![A-Za-z0-9_$])", re.IGNORECASE)
         if occurrence.search(code):
@@ -455,19 +568,29 @@ def _security_anchor_categories_compatible(
     reviewer_category: str,
     patch_lines: list[tuple[int, str]],
     detector_line: int,
+    detector_message: str = "",
 ) -> bool:
     if detector_category == reviewer_category:
         return True
     if frozenset({detector_category, reviewer_category}) in _SECURITY_ANCHOR_CATEGORY_PAIRS:
         return True
     categories = {detector_category, reviewer_category}
+    if categories == {"code-injection", "unsafe-dynamic-call"}:
+        detector_text = detector_message.lower()
+        if not re.search(r"dynamic\s+dispatch|\b(?:send|public_send|instance_eval|class_eval)\b", detector_text):
+            return False
+        return any(
+            line == detector_line and re.search(r"\b(?:send|public_send|instance_eval|class_eval)\s*\(", content)
+            for line, content in patch_lines
+        )
     if "unsafe-script" in categories and categories.intersection(_REMOTE_DOWNLOAD_CATEGORIES):
         window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3)
         return bool(re.search(r"\b(?:curl|wget)\b[^\n]*\|\s*(?:sh|bash)\b", window, re.IGNORECASE))
-    if "code-injection" not in categories or not categories.intersection(_REMOTE_DOWNLOAD_CATEGORIES):
-        return False
-    window = "\n".join(content for line, content in patch_lines if abs(line - detector_line) <= 3)
-    return bool(re.search(r"\b(?:curl|wget)\b[^\n]*\|", window, re.IGNORECASE))
+    # Code-injection versus remote-download category drift needs the Reviewer's
+    # own anchor or explicit pipe evidence.  The workflow fallback below owns
+    # that check; a remote pipe near the detector alone cannot prove that a
+    # shared input identifier does not feed a second eval/command sink.
+    return False
 
 
 def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary: str) -> list[Finding]:
@@ -505,6 +628,7 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
                     normalize_category(finding.category),
                     patch_lines,
                     detector.line,
+                    detector.message,
                 )
                 and identifiers
                 and _window_contains_identifier(patch_lines, detector.line, identifiers)
@@ -522,6 +646,49 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
             # a nearby expression.  When the diff has exactly one concrete
             # secret-print sink, that sink is stronger evidence than a generic
             # identifier (``github`` occurs throughout workflow expressions).
+            if not matching and re.search(r"\.ya?ml$", file_path, re.IGNORECASE):
+                message_is_remote_execution = bool(
+                    re.search(
+                        r"(?:curl|wget|remote|external|\burl\b|download|\u8fdc\u7a0b|\u4e0b\u8f7d|\u5916\u90e8)",
+                        finding.message,
+                        re.IGNORECASE,
+                    )
+                    and re.search(
+                        r"(?:execute|executed|execution|run|script|shell|bash|command|执行|运行|脚本|命令)",
+                        finding.message,
+                        re.IGNORECASE,
+                    )
+                )
+                if message_is_remote_execution:
+                    remote_pipe_lines = {
+                        line
+                        for line, content in patch_lines
+                        if re.search(r"\b(?:curl|wget)\b[^\n]*\|\s*(?:sh|bash)\b", content, re.IGNORECASE)
+                    }
+                    explicit_pipe_evidence = bool(
+                        re.search(r"\b(?:curl|wget)\b", finding.message, re.IGNORECASE)
+                        and re.search(r"(?:\bpipe[sd]?\b|\|\s*(?:sh|bash)\b)", finding.message, re.IGNORECASE)
+                    )
+                    if len(remote_pipe_lines) == 1:
+                        pipe_line = next(iter(remote_pipe_lines))
+                        reviewer_is_near_pipe = abs(finding.line - pipe_line) <= 3
+                        reviewer_anchor_has_independent_sink = any(
+                            line != pipe_line
+                            and abs(line - finding.line) <= 1
+                            and _WORKFLOW_INDEPENDENT_EXECUTION_SINK.search(content)
+                            for line, content in patch_lines
+                        )
+                        proximity_supports_pipe = reviewer_is_near_pipe and not reviewer_anchor_has_independent_sink
+                        if proximity_supports_pipe or explicit_pipe_evidence:
+                            matching = [
+                                detector
+                                for detector in detectors
+                                if detector.line == pipe_line
+                                and normalize_category(detector.category) in _REMOTE_DOWNLOAD_CATEGORIES
+                                and normalize_category(finding.category)
+                                in {"code-injection", "command-injection", "unsafe-script"}
+                            ]
+
             if not matching and re.search(r"\.ya?ml$", file_path, re.IGNORECASE):
                 message_is_secret_output = bool(
                     re.search(r"(?:print|echo|log|output|write|打印|日志)", finding.message, re.IGNORECASE)

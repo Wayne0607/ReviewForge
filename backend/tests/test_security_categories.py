@@ -26,12 +26,21 @@ def test_security_category_aliases_normalize():
     assert normalize_category("missing-form-label") == "missing-label"
     assert normalize_category("unsafe-html") == "xss"
     assert normalize_category("dangerous-html") == "xss"
+    assert normalize_category("unsafe-yaml") == "insecure-deserialization"
+    assert normalize_category("unsafe-dynamic-call") == "unsafe-dynamic-call"
+    assert normalize_category("weak-hash") == "crypto"
+    assert normalize_category("side-effect-in-computed") == "computed-side-effect"
+    assert normalize_category("react-side-effects") == "side-effect-in-render"
+    assert normalize_category("panic") == "panic-risk"
     assert normalize_category("malicious-dependency") == "supply-chain-risk"
     assert normalize_category("insecure-download") == "insecure-download"
     assert is_security_category("unsafe-code")
     assert is_security_category("supply-chain")
     assert is_security_category("dangerous-html")
     assert is_security_category("malicious-dependency")
+    assert is_security_category("unsafe-yaml")
+    assert not is_security_category("unsafe-dynamic-call")
+    assert is_security_category("weak-hash")
     assert is_security_category("insecure-download")
     assert not is_security_category("missing-alt-text")
     assert is_security_category("版本范围不安全")

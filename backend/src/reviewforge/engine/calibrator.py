@@ -142,19 +142,51 @@ _GENERIC_PERFORMANCE_CATEGORIES = {
     "optimization",
     "performance",
     "unnecessary-computation",
+    "unnecessary-linear-count",
 }
 _NAMING_LANGUAGE = re.compile(
-    r"\b(?:name|naming|named|mislead(?:ing)?|imprecise|inconsistent|confusing|suggests?|implies?)\b|"
-    r"命名|名称|误导|不一致|不准确|含糊",
+    r"\b(?:package\s+name|name|naming|named|mislead(?:ing)?|imprecise|inconsistent|confusing|"
+    r"suggests?|implies?)\b|"
+    r"包名|命名|名称|误导|不一致|不准确|含糊",
     re.IGNORECASE,
 )
 _OBSERVABLE_NAMING_FAILURE = re.compile(
-    r"(?:\b(?:name|naming|named|mislead(?:ing)?)\b|\bapi\b)[^.\n]{0,100}"
+    r"(?:\b(?:package\s+name|name|naming|named|mislead(?:ing)?)\b|\bapi\b)[^.\n]{0,100}"
     r"\b(?:causes?|caused|results?\s+in|leads?\s+to|makes?)\b[^.\n]{0,100}"
     r"\b(?:fail(?:s|ed|ure)?|reject(?:s|ed|ion)?|crash(?:es|ed)?|throw(?:s|n)?|"
     r"exception|compile(?:s|d)?\s+(?:error|failure)|framework\s+(?:error|failure))\b|"
-    r"(?:命名|名称|误导)[^\n。]{0,80}(?:导致|使得|造成)[^\n。]{0,80}"
+    r"(?:包名|命名|名称|误导)[^\n。]{0,80}(?:导致|使得|造成)[^\n。]{0,80}"
     r"(?:API\s*)?(?:调用者)?(?:失败|拒绝|崩溃|异常|编译错误|运行时错误)",
+    re.IGNORECASE,
+)
+_OPTIONAL_PARAMETER_LANGUAGE = re.compile(
+    r"(?:\bOptional\b[^\n]{0,80}\b(?:method\s+|constructor\s+)?(?:parameter|argument)\b|"
+    r"\b(?:method\s+|constructor\s+)?(?:parameter|argument)\b[^\n]{0,80}\bOptional\b|"
+    r"\bOptional\b[^\n]{0,80}(?:方法|构造函数)?参数|"
+    r"(?:方法|构造函数)?参数[^\n]{0,80}\bOptional\b)",
+    re.IGNORECASE,
+)
+_OPTIONAL_PARAMETER_STYLE_RATIONALE = re.compile(
+    r"\b(?:anti[- ]?pattern|discouraged|design\s+(?:intent|purpose)|"
+    r"(?:adds?|increases?|introduces?)\s+(?:unnecessary\s+)?(?:design\s+)?complexity|"
+    r"should\s+(?:only\s+)?be\s+used\s+(?:as|for)\s+(?:a\s+)?return\s+value)\b|"
+    r"反模式|设计意图|增加(?:不必要的)?复杂(?:性|度)|只(?:应该|应)?用于返回值|"
+    r"不(?:应该|应)作为[^\n。]{0,40}参数",
+    re.IGNORECASE,
+)
+_OPTIONAL_CONCRETE_FAILURE = re.compile(
+    r"\bOptional\s*\.\s*get\s*\(|\bget\s*\(\s*\)|\bNoSuchElementException\b|"
+    r"\b(?:throws?|raises?|causes?|results?\s+in|leads?\s+to)\b[^.\n]{0,80}"
+    r"\b(?:exception|fail(?:s|ed|ure)?|crash(?:es|ed)?|NPE)\b|"
+    r"\b(?:empty|absent|missing)\s+Optional\b[^.\n]{0,80}"
+    r"\b(?:dereferenc\w*|access\w*|read\w*|unwrap\w*|get)\b|"
+    r"\b(?:dereferenc\w*|access\w*|read\w*|unwrap\w*|get)\b[^.\n]{0,80}"
+    r"\b(?:empty|absent|missing)\s+Optional\b|"
+    r"(?:空(?:的)?\s*Optional|Optional\s*(?:为空|不存在|缺失|未检查))[^\n。]{0,80}"
+    r"(?:取值|get|访问|解引用|抛出|异常|失败|崩溃)|"
+    r"(?:取值|get|访问|解引用|抛出)[^\n。]{0,80}"
+    r"(?:空(?:的)?\s*Optional|Optional\s*(?:为空|不存在|缺失|未检查))|"
+    r"(?:运行时|NoSuchElement)[^\n。]{0,40}(?:异常|失败)|(?:抛出|导致)[^\n。]{0,40}异常",
     re.IGNORECASE,
 )
 _MANUAL_COUNT_LANGUAGE = re.compile(
@@ -888,6 +920,13 @@ def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
     if kind == "style" and finding.category == "naming":
         if _NAMING_LANGUAGE.search(text) and not _OBSERVABLE_NAMING_FAILURE.search(text):
             return "该发现只描述名称可能误导或不一致，未给出可验证的运行时、框架或 API 调用失败"
+
+    if kind == "style" and finding.category == "optional-misuse" and finding.file.lower().endswith(".java"):
+        optional_parameter_preference = bool(_OPTIONAL_PARAMETER_LANGUAGE.search(text)) and bool(
+            _OPTIONAL_PARAMETER_STYLE_RATIONALE.search(text)
+        )
+        if optional_parameter_preference and not _OPTIONAL_CONCRETE_FAILURE.search(text):
+            return "该发现只将 Java Optional 参数描述为反模式或设计复杂性，未证明空值取用或运行时异常"
 
     if kind == "performance":
         count_scope = _nearby_added_code(code_diff, finding.file, finding.line, radius=6)

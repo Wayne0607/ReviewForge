@@ -83,6 +83,14 @@ _ADVISORY_ID = re.compile(
     r"(?:GO|PYSEC|RUSTSEC|MAL)-\d{4}-\d+|OSV-[A-Z0-9-]+|SNYK-[A-Z0-9-]+)\b",
     re.IGNORECASE,
 )
+_ADVISORY_CANONICAL_IDS = {
+    # Curated equivalences from the advisory records used by the deterministic
+    # dependency detector. Keep this explicit: unrelated advisories affecting
+    # the same package/version must remain independent findings.
+    "CVE-2019-16769": "GHSA-H9RV-JMMF-4PGX",
+    "CVE-2020-7660": "GHSA-HXCC-F52P-WC94",
+    "CVE-2021-44228": "GHSA-JFH8-C2JP-5V3Q",
+}
 _PACKAGE_COORDINATE_PATTERNS = (
     re.compile(
         r"^\s*(?P<name>@?[a-z0-9][a-z0-9_.-]*(?:[/:][a-z0-9_.-]+)*)\s+"
@@ -618,7 +626,8 @@ class Verifier:
     @staticmethod
     def _advisory_ids(finding: Finding) -> set[str]:
         text = f"{finding.message}\n{finding.suggestion}"
-        return {match.group(0).upper() for match in _ADVISORY_ID.finditer(text)}
+        advisory_ids = {match.group(0).upper() for match in _ADVISORY_ID.finditer(text)}
+        return {_ADVISORY_CANONICAL_IDS.get(advisory_id, advisory_id) for advisory_id in advisory_ids}
 
     @classmethod
     def _has_explicit_manifest_evidence(cls, finding: Finding) -> bool:

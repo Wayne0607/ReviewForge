@@ -92,6 +92,12 @@ def test_vocabulary_aliases_are_canonicalized_before_detector_precedence():
             "openssl * uses a mutable dependency version.",
         ),
         (
+            "unlocked-dependency",
+            "dependency-version-range",
+            "Gemfile",
+            "rack >= 2.0 uses a mutable dependency version.",
+        ),
+        (
             "missing-accessible-name",
             "missing-label",
             "LoginForm.tsx",
@@ -611,6 +617,82 @@ def test_manifest_same_advisory_id_for_same_package_is_merged():
 
     assert [finding.id for finding in survivors] == ["detector"]
     assert dropped == ["duplicate"]
+
+
+def test_manifest_equivalent_cve_and_ghsa_ids_are_merged():
+    cases = [
+        ("package.json", "serialize-javascript 1.7.0", "CVE-2019-16769", "GHSA-h9rv-jmmf-4pgx"),
+        ("package.json", "serialize-javascript 1.7.0", "CVE-2020-7660", "GHSA-hxcc-f52p-wc94"),
+        ("pom.xml", "log4j-core 2.14.1", "CVE-2021-44228", "GHSA-jfh8-c2jp-5v3q"),
+    ]
+
+    for index, (file_path, coordinate, cve_id, ghsa_id) in enumerate(cases):
+        detector = _finding(
+            f"detector-{index}",
+            file=file_path,
+            line=10,
+            category="dependency-vulnerability",
+            message=f"{coordinate} matches {ghsa_id}.",
+            verified_by="detector-auto",
+        )
+        duplicate = _finding(
+            f"duplicate-{index}",
+            file=file_path,
+            line=8,
+            category="dependency-vulnerability",
+            message=f"Dependency {coordinate} is affected by {cve_id}.",
+        )
+
+        survivors, dropped = Verifier().verify([duplicate, detector])
+
+        assert [finding.id for finding in survivors] == [detector.id]
+        assert dropped == [duplicate.id]
+
+
+def test_manifest_equivalent_cve_is_absorbed_by_composite_ghsa_detector():
+    detector = _finding(
+        "detector",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message=("serialize-javascript 1.7.0 matches GHSA-h9rv-jmmf-4pgx and GHSA-hxcc-f52p-wc94."),
+        verified_by="detector-auto",
+    )
+    duplicate = _finding(
+        "duplicate",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="serialize-javascript 1.7.0 is affected by CVE-2020-7660.",
+    )
+
+    survivors, dropped = Verifier().verify([duplicate, detector])
+
+    assert [finding.id for finding in survivors] == ["detector"]
+    assert dropped == ["duplicate"]
+
+
+def test_manifest_equivalence_does_not_merge_distinct_known_advisories():
+    detector = _finding(
+        "detector",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="serialize-javascript 1.7.0 matches GHSA-h9rv-jmmf-4pgx.",
+        verified_by="detector-auto",
+    )
+    independent = _finding(
+        "independent",
+        file="package.json",
+        line=10,
+        category="dependency-vulnerability",
+        message="serialize-javascript 1.7.0 is affected by CVE-2020-7660.",
+    )
+
+    survivors, dropped = Verifier().verify([detector, independent])
+
+    assert {finding.id for finding in survivors} == {"detector", "independent"}
+    assert dropped == []
 
 
 def test_manifest_generic_vulnerability_is_not_absorbed_without_shared_version_evidence():

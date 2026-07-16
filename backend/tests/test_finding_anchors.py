@@ -430,6 +430,183 @@ end""",
     assert findings[-1].line == 4
 
 
+def test_reanchors_insecure_hash_alias_to_unique_crypto_detector():
+    file_path = "src/passwords.py"
+    diff = _summary(
+        file_path,
+        """def verify_password(password: str, expected: str) -> bool:
+    digest = hashlib.md5(password.encode()).hexdigest()
+    return digest == expected
+
+
+def write_debug_dump(path, body):
+    path.write_text(body)""",
+    )
+    detector = _security_finding(
+        "detector", file_path, 2, "crypto", "MD5 is unsafe for password hashing.", detector=True
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        6,
+        "insecure-hash",
+        "verify_password uses MD5 for password hashing.",
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (2, "crypto")
+
+
+def test_dangerous_function_reanchors_only_to_explicit_eval_sink():
+    file_path = "src/hooks.ts"
+    diff = _summary(
+        file_path,
+        """export function runClientHook(script: string) {
+  return eval(script);
+}""",
+    )
+    detector = _security_finding(
+        "detector", file_path, 2, "code-injection", "Dynamic code execution via eval.", detector=True
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        1,
+        "dangerous-function",
+        "runClientHook uses eval to execute arbitrary JavaScript.",
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (2, "code-injection")
+
+
+def test_dangerous_function_reanchors_explicit_function_constructor():
+    file_path = "src/hooks.ts"
+    diff = _summary(
+        file_path,
+        """export function runDynamic(body: string, value: string) {
+  return new Function("value", body)(value);
+}""",
+    )
+    detector = _security_finding(
+        "detector", file_path, 2, "code-injection", "Dynamic code execution is possible.", detector=True
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        1,
+        "dangerous-function",
+        "runDynamic invokes the Function constructor with a dynamic body.",
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (2, "code-injection")
+
+
+def test_dangerous_function_does_not_reanchor_exec_sink():
+    file_path = "src/hooks.ts"
+    diff = _summary(
+        file_path,
+        """export function spawnReport(command: string) {
+  return exec(command);
+}""",
+    )
+    detector = _security_finding(
+        "detector", file_path, 2, "code-injection", "A dynamic process command is executed.", detector=True
+    )
+    reviewer = _security_finding("reviewer", file_path, 1, "dangerous-function", "spawnReport passes input to exec.")
+
+    assert reanchor_security_detector_duplicates([detector, reviewer], diff) == []
+    assert (reviewer.line, reviewer.category) == (1, "dangerous-function")
+
+
+def test_dangerous_function_does_not_cross_reanchor_eval_and_function_sinks():
+    file_path = "src/hooks.ts"
+    diff = _summary(
+        file_path,
+        """export function runBoth(script: string) {
+  const first = eval(script);
+  const second = new Function(script)();
+  return [first, second];
+}""",
+    )
+    eval_detector = _security_finding(
+        "eval-detector", file_path, 2, "code-injection", "Dynamic code execution via eval.", detector=True
+    )
+    function_reviewer = _security_finding(
+        "function-reviewer",
+        file_path,
+        1,
+        "dangerous-function",
+        "runBoth invokes the Function constructor with the dynamic script.",
+    )
+
+    assert reanchor_security_detector_duplicates([eval_detector, function_reviewer], diff) == []
+    assert (function_reviewer.line, function_reviewer.category) == (1, "dangerous-function")
+
+
+def test_reanchors_unique_java_jdbc_concatenation_to_raw_statement_detector():
+    file_path = "src/Directory.java"
+    diff = _summary(
+        file_path,
+        """public class Directory {
+    ResultSet directSearch(Connection conn, String email) throws Exception {
+        Statement stmt = conn.createStatement();
+        return stmt.executeQuery("SELECT * FROM users WHERE email = '" + email + "'");
+    }
+}""",
+    )
+    detector = _security_finding(
+        "detector", file_path, 3, "sql-injection", "Raw JDBC Statement is used.", detector=True
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        5,
+        "sql-injection",
+        "使用字符串拼接构造 SQL 查询，存在 SQL 注入漏洞。",
+    )
+
+    changed = reanchor_security_detector_duplicates([detector, reviewer], diff)
+
+    assert changed == [reviewer]
+    assert (reviewer.line, reviewer.category) == (3, "sql-injection")
+
+
+def test_java_jdbc_fallback_keeps_two_concatenated_sinks_separate():
+    file_path = "src/Directory.java"
+    diff = _summary(
+        file_path,
+        """public class Directory {
+    ResultSet byEmail(Connection conn, String email) throws Exception {
+        Statement first = conn.createStatement();
+        return first.executeQuery("SELECT * FROM users WHERE email = '" + email + "'");
+    }
+
+    int deleteByName(Connection conn, String name) throws Exception {
+        Statement second = conn.createStatement();
+        return second.executeUpdate("DELETE FROM users WHERE name = '" + name + "'");
+    }
+}""",
+    )
+    findings = [
+        _security_finding("first", file_path, 3, "sql-injection", "Raw JDBC Statement is used.", detector=True),
+        _security_finding("second", file_path, 8, "sql-injection", "Raw JDBC Statement is used.", detector=True),
+        _security_finding(
+            "reviewer", file_path, 6, "sql-injection", "SQL is constructed through string concatenation."
+        ),
+    ]
+
+    assert reanchor_security_detector_duplicates(findings, diff) == []
+    assert findings[-1].line == 6
+
+
 def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicates():
     findings = [
         _security_finding(

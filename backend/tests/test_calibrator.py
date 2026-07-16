@@ -1449,6 +1449,138 @@ pub fn count_items(items: &[String]) -> usize {
     assert {finding.verified_by for finding in rejected} == {"actionability-gate"}
 
 
+def test_actionability_gate_rejects_go_package_naming_conventions_without_observable_failure():
+    findings = [
+        Finding(
+            id="go_package_name_cn",
+            file="gauntlet_decoys/account_store.go",
+            line=1,
+            category="naming",
+            message="包名 gauntlet_decoys 使用了下划线，不符合 Go 惯例。",
+            suggestion="改为 gauntletdecoys。",
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="go_package_name_en",
+            file="gauntlet_decoys/account_store.go",
+            line=1,
+            category="naming",
+            message="Package name gauntlet_decoys uses an underscore and violates the Go naming convention.",
+            suggestion="Rename the package to gauntletdecoys.",
+            reviewer="style_reviewer",
+        ),
+    ]
+
+    actionable, rejected = apply_actionability_gate(
+        findings,
+        _summary("gauntlet_decoys/account_store.go", "package gauntlet_decoys"),
+    )
+
+    assert actionable == []
+    assert rejected == findings
+
+
+def test_actionability_gate_preserves_go_package_name_with_concrete_compile_failure():
+    finding = Finding(
+        id="go_package_compile_failure",
+        file="client.go",
+        line=1,
+        category="naming",
+        message="包名与生成代码不匹配，导致 API 调用者编译错误。",
+        reviewer="style_reviewer",
+    )
+
+    actionable, rejected = apply_actionability_gate(
+        [finding],
+        _summary("client.go", "package generated_client"),
+    )
+
+    assert actionable == [finding]
+    assert rejected == []
+
+
+def test_actionability_gate_rejects_optional_parameter_style_advice_but_preserves_unsafe_get():
+    source = """import java.util.Optional;
+class UserController {
+    String getUserName(Optional<String> userId) {
+        return userId.get();
+    }
+}
+"""
+    chinese_preference = Finding(
+        id="optional_parameter_cn",
+        file="UserController.java",
+        line=3,
+        category="optional-misuse",
+        message="Optional 作为方法参数是反模式，强制调用方传入 Optional 会增加复杂性且设计意图是用于返回值。",
+        suggestion="将参数改为 String，并在方法内部处理空值检查。",
+        reviewer="style_reviewer",
+    )
+    english_preference = Finding(
+        id="optional_parameter_en",
+        file="UserController.java",
+        line=3,
+        category="optional-misuse",
+        message="Using Optional as a method parameter is an anti-pattern and adds design complexity.",
+        suggestion="Use Optional only as a return value.",
+        reviewer="style_reviewer",
+    )
+    unsafe_get = Finding(
+        id="optional_unsafe_get",
+        file="UserController.java",
+        line=4,
+        category="optional-misuse",
+        message=(
+            "Optional is used as a method parameter and userId.get() can throw "
+            "NoSuchElementException when the value is empty."
+        ),
+        reviewer="quality_reviewer",
+    )
+
+    actionable, rejected = apply_actionability_gate(
+        [chinese_preference, english_preference, unsafe_get],
+        _summary("UserController.java", source),
+    )
+
+    assert actionable == [unsafe_get]
+    assert rejected == [chinese_preference, english_preference]
+
+
+def test_actionability_gate_routes_unnecessary_linear_count_through_manual_count_gate():
+    source = """pub fn count_items(items: &[String]) -> usize {
+    let mut count = 0;
+    for _item in items { count += 1; }
+    count
+}
+"""
+    micro_optimization = Finding(
+        id="linear_count_preference",
+        file="config_loader.rs",
+        line=1,
+        category="unnecessary-linear-count",
+        message="The manual O(n) count loop can be replaced by Vec::len(), which provides O(1) access.",
+        reviewer="performance_reviewer",
+    )
+    meaningful_impact = Finding(
+        id="linear_count_hot_path",
+        file="config_loader.rs",
+        line=1,
+        category="unnecessary-linear-count",
+        message=(
+            "The manual O(n) count loop runs on every request over an unbounded collection, increasing request latency."
+        ),
+        reviewer="performance_reviewer",
+    )
+
+    actionable, rejected = apply_actionability_gate(
+        [micro_optimization, meaningful_impact],
+        _summary("config_loader.rs", source),
+    )
+
+    assert actionable == [meaningful_impact]
+    assert rejected == [micro_optimization]
+
+
 def test_actionability_gate_rejects_static_vue_and_svelte_raw_html_live_region_guesses():
     diff = "\n".join(
         [

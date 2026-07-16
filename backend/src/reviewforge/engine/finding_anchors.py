@@ -81,6 +81,26 @@ _WORKFLOW_INDEPENDENT_EXECUTION_SINK = re.compile(
     r"\beval\s+",
     re.IGNORECASE,
 )
+_DYNAMIC_CODE_EXECUTION_MESSAGE_APIS = {
+    "eval": re.compile(r"(?<![A-Za-z0-9_$])eval(?![A-Za-z0-9_$])", re.IGNORECASE),
+    # Keep ``Function`` case-sensitive so ordinary prose such as "this
+    # function uses eval" does not claim evidence for the JavaScript API.
+    "Function": re.compile(r"(?<![A-Za-z0-9_$])Function(?![A-Za-z0-9_$])"),
+}
+_DYNAMIC_CODE_EXECUTION_SINK_APIS = {
+    "eval": re.compile(r"(?<![A-Za-z0-9_$\.])eval\s*\(", re.IGNORECASE),
+    "Function": re.compile(r"(?<![A-Za-z0-9_$\.])(?:new\s+)?Function\s*\("),
+}
+_JAVA_JDBC_EXECUTE_CALL = re.compile(
+    r"(?P<receiver>[A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*execute(?:Query|Update)\s*\(",
+    re.IGNORECASE,
+)
+_JAVA_RAW_STATEMENT_DECLARATION = re.compile(
+    r"\b(?:java\s*\.\s*sql\s*\.\s*)?Statement\s+"
+    r"(?P<receiver>[A-Za-z_$][A-Za-z0-9_$]*)\s*=.*\.\s*createStatement\s*\(",
+    re.IGNORECASE,
+)
+_SQL_CONCATENATION_MESSAGE = re.compile(r"\bconcat(?:enat(?:e|ed|es|ing|ion))?\b|\u62fc\u63a5", re.IGNORECASE)
 _PYTHON_REDIRECT_CALLS = {
     "httpresponseredirect",
     "httpresponseredirectpermanent",
@@ -563,6 +583,83 @@ def _window_contains_identifier(patch_lines: list[tuple[int, str]], detector_lin
     )
 
 
+def _java_call_argument_has_concatenation(content: str, argument_start: int) -> bool:
+    """Prove a single-line Java call contains ``+`` outside a string literal."""
+
+    depth = 1
+    quote = ""
+    escaped = False
+    has_concatenation = False
+    for character in content[argument_start:]:
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return has_concatenation
+        elif character == "+":
+            has_concatenation = True
+    # Multiline or otherwise incomplete expressions are deliberately not
+    # treated as proven concatenation by this narrow duplicate repair.
+    return False
+
+
+def _java_jdbc_concatenated_sinks(patch_lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    sinks: list[tuple[int, str]] = []
+    for line, content in patch_lines:
+        for call in _JAVA_JDBC_EXECUTE_CALL.finditer(content):
+            if _java_call_argument_has_concatenation(content, call.end()):
+                sinks.append((line, call.group("receiver").lower()))
+    return sinks
+
+
+def _java_jdbc_sql_duplicate_detectors(
+    finding: Finding,
+    detectors: list[Finding],
+    patch: str,
+    patch_lines: list[tuple[int, str]],
+) -> list[Finding]:
+    """Return one detector only for one proven raw-JDBC concatenation sink."""
+
+    if (
+        not finding.file.lower().endswith(".java")
+        or normalize_category(finding.category) != "sql-injection"
+        or not _SQL_CONCATENATION_MESSAGE.search(finding.message)
+        or not _is_complete_new_file_patch(patch)
+    ):
+        return []
+
+    sinks = _java_jdbc_concatenated_sinks(patch_lines)
+    if len(sinks) != 1:
+        return []
+    sink_line, sink_receiver = sinks[0]
+    if abs(finding.line - sink_line) > 4:
+        return []
+
+    source_by_line = {line: content for line, content in patch_lines}
+    corresponding: list[Finding] = []
+    for detector in detectors:
+        if normalize_category(detector.category) != "sql-injection" or abs(detector.line - sink_line) > 3:
+            continue
+        if detector.line == sink_line:
+            corresponding.append(detector)
+            continue
+        declaration = _JAVA_RAW_STATEMENT_DECLARATION.search(source_by_line.get(detector.line, ""))
+        if declaration is not None and declaration.group("receiver").lower() == sink_receiver:
+            corresponding.append(detector)
+    return corresponding if len(corresponding) == 1 else []
+
+
 def _security_anchor_categories_compatible(
     detector_category: str,
     reviewer_category: str,
@@ -570,12 +667,27 @@ def _security_anchor_categories_compatible(
     detector_line: int,
     detector_message: str = "",
     file_path: str = "",
+    reviewer_message: str = "",
 ) -> bool:
     if detector_category == reviewer_category:
         return True
     if frozenset({detector_category, reviewer_category}) in _SECURITY_ANCHOR_CATEGORY_PAIRS:
         return True
     categories = {detector_category, reviewer_category}
+    if categories == {"code-injection", "dangerous-function"}:
+        reviewer_apis = {
+            api for api, pattern in _DYNAMIC_CODE_EXECUTION_MESSAGE_APIS.items() if pattern.search(reviewer_message)
+        }
+        if not reviewer_apis:
+            return False
+        detector_apis = {
+            api
+            for line, content in patch_lines
+            if line == detector_line
+            for api, pattern in _DYNAMIC_CODE_EXECUTION_SINK_APIS.items()
+            if pattern.search(content)
+        }
+        return bool(reviewer_apis & detector_apis)
     if detector_category == "code-injection" and reviewer_category in {
         "unsafe-dynamic-call",
         "unsafe-reflection",
@@ -621,7 +733,8 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
         reviewers = group["reviewers"]
         if not detectors or not reviewers:
             continue
-        patch_lines = iter_right_lines(_extract_file_patch(diff_summary, file_path))
+        patch = _extract_file_patch(diff_summary, file_path)
+        patch_lines = iter_right_lines(patch)
         if not patch_lines:
             continue
         for finding in reviewers:
@@ -636,6 +749,7 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
                     detector.line,
                     detector.message,
                     file_path,
+                    finding.message,
                 )
                 and identifiers
                 and _window_contains_identifier(patch_lines, detector.line, identifiers)
@@ -695,6 +809,9 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
                                 and normalize_category(finding.category)
                                 in {"code-injection", "command-injection", "unsafe-script"}
                             ]
+
+            if not matching:
+                matching = _java_jdbc_sql_duplicate_detectors(finding, detectors, patch, patch_lines)
 
             if not matching and re.search(r"\.ya?ml$", file_path, re.IGNORECASE):
                 message_is_secret_output = bool(

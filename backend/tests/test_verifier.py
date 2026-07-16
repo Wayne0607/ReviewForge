@@ -73,6 +73,36 @@ def test_vocabulary_aliases_are_canonicalized_before_detector_precedence():
             "requirements.txt",
             "Dependency legacy-lib==1.0.0 is deprecated.",
         ),
+        (
+            "empty-catch",
+            "exception-handling",
+            "UserController.java",
+            "The empty catch block silently swallows the exception.",
+        ),
+        (
+            "optional-unsafe-get",
+            "null-safety",
+            "UserController.java",
+            "Optional.get is called without a presence guard.",
+        ),
+        (
+            "unpinned-dependency",
+            "dependency-version-range",
+            "Cargo.toml",
+            "openssl * uses a mutable dependency version.",
+        ),
+        (
+            "missing-accessible-name",
+            "missing-label",
+            "LoginForm.tsx",
+            "The input has no accessible label.",
+        ),
+        (
+            "deserialization",
+            "insecure-deserialization",
+            "loader.rb",
+            "YAML.load may deserialize unsafe objects.",
+        ),
     ]
 
     for index, (alias, canonical, file_path, message) in enumerate(cases):

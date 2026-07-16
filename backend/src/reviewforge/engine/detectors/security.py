@@ -2140,6 +2140,10 @@ _RUBY_OPEN3_CALL = re.compile(
     r"\bOpen3\.(?:capture(?:2e?|3)|popen(?:2e?|3))\s*\((?P<arguments>.*)\)\s*$",
     re.IGNORECASE,
 )
+_RUBY_SYSTEM_CALL = re.compile(
+    r"(?:(?<![\w.:])system|(?<![\w:])Kernel\s*\.\s*system)\s*\((?P<arguments>.*)\)\s*$",
+    re.IGNORECASE,
+)
 _RUBY_STRONG_COMMAND_SOURCE = re.compile(
     r"\b(?:params|request|user_input|user_params|ARGV|STDIN|ENV)\b|\bgets\b",
     re.IGNORECASE,
@@ -2801,6 +2805,144 @@ def _ruby_parameter_has_command_guard(
     return False
 
 
+def _ruby_system_shellless_argv_is_safe(arguments: list[str]) -> bool:
+    """Prove only the ordinary fixed-program argv form of ``system`` safe.
+
+    Ruby does not invoke a shell for the multi-argument form, but an explicit
+    interpreter/launcher can still turn later operands into code.  Those
+    shapes remain contextual instead of being suppressed here.
+    """
+
+    if len(arguments) < 2:
+        return False
+    program = _ruby_static_string_value(arguments[0].strip())
+    if program is None:
+        return False
+    executable = re.split(r"[/\\]", program)[-1].lower()
+    if _ruby_command_interpreter(program) or executable in {
+        "busybox",
+        "doas",
+        "doas.exe",
+        "env",
+        "env.exe",
+        "nice",
+        "nice.exe",
+        "nohup",
+        "nohup.exe",
+        "setsid",
+        "setsid.exe",
+        "sudo",
+        "sudo.exe",
+        "timeout",
+        "timeout.exe",
+    }:
+        return False
+    return True
+
+
+def _ruby_system_single_command_risk(diff: str, line_no: int, source_line: str) -> bool | None:
+    """Classify a conservative Ruby ``system(command)`` source-to-sink flow.
+
+    Only the real Kernel API, exactly one simple command value, and a bounded
+    alias chain back to an unguarded enclosing-method parameter can produce a
+    deterministic ``True``.  Static commands and fixed non-interpreter argv
+    are proven safe; receivers, interpolation, splats, expressions, and
+    ambiguous control flow stay contextual.
+    """
+
+    call = _RUBY_SYSTEM_CALL.search(source_line)
+    if call is None:
+        return None
+    arguments = _ruby_top_level_arguments(call.group("arguments"))
+    if not arguments or arguments == [""]:
+        return None
+    if len(arguments) != 1:
+        return False if _ruby_system_shellless_argv_is_safe(arguments) else None
+
+    command = arguments[0].strip()
+    if command.startswith("*"):
+        return None
+    if _ruby_static_string(command):
+        return False if "#{" not in command else None
+
+    variable = re.fullmatch(r"(?P<name>[A-Za-z_]\w*)", command)
+    location = _hunk_lines_for_right_line(diff, line_no)
+    if variable is None or location is None:
+        return None
+    name = variable.group("name")
+    hunk, sink_index = location
+    sink_indent = len(source_line) - len(source_line.lstrip())
+
+    method_index: int | None = None
+    method_header = ""
+    parameters: set[str] = set()
+    for index in range(sink_index - 1, -1, -1):
+        content = hunk[index][1]
+        if not re.match(r"^\s*def\b", content):
+            continue
+        method_indent = len(content) - len(content.lstrip())
+        if method_indent >= sink_indent:
+            continue
+        if any(
+            re.match(r"^\s*end\b", nested[1]) and len(nested[1]) - len(nested[1].lstrip()) <= method_indent
+            for nested in hunk[index + 1 : sink_index]
+        ):
+            continue
+        method_index = index
+        method_header = content
+        parameters = _ruby_method_parameters(content)
+        break
+    if method_index is None:
+        return None
+
+    current = name
+    aliases = {name}
+    search_end = sink_index
+    assignment_indent: int | None = None
+    for _depth in range(5):
+        assignment = re.compile(rf"^\s*{re.escape(current)}\s*=\s*(?P<value>.+?)\s*$")
+        assigned_index: int | None = None
+        assigned_value = ""
+        for index in range(search_end - 1, method_index, -1):
+            matched = assignment.match(hunk[index][1])
+            if matched is None:
+                continue
+            assigned_index = index
+            assigned_value = matched.group("value").strip()
+            assignment_indent = len(hunk[index][1]) - len(hunk[index][1].lstrip())
+            break
+
+        if assigned_index is None:
+            if current not in parameters:
+                return None
+            if re.search(rf"[*&]\s*{re.escape(current)}\b", method_header):
+                return None
+            if any(
+                _ruby_parameter_has_command_guard(hunk, method_index, sink_index, guarded)
+                for guarded in aliases | {current}
+            ):
+                return None
+            return True
+
+        if _ruby_static_string(assigned_value):
+            if "#{" in assigned_value or assignment_indent != sink_indent:
+                return None
+            return False
+
+        alias = re.fullmatch(r"(?P<name>[A-Za-z_]\w*)", assigned_value)
+        if alias is None:
+            return None
+        if _ruby_parameter_has_command_guard(hunk, method_index, sink_index, current):
+            return None
+        current = alias.group("name")
+        if current in aliases:
+            return None
+        aliases.add(current)
+        search_end = assigned_index
+
+    return None
+
+
 def _ruby_open3_shell_argument_risk(diff: str, line_no: int, source_line: str) -> bool | None:
     """Classify whether Open3 receives one dynamic shell-command string.
 
@@ -3105,6 +3247,7 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
         for rule in rules:
             for line_no, match in match_lines(diff, rule.pattern):
                 ruby_open3_risk: bool | None = None
+                ruby_system_risk: bool | None = None
                 template_expression = language in {"javascript", "typescript", "vue", "svelte"} and (
                     _template_expression_match_is_code(match.string, match.start())
                 )
@@ -3126,6 +3269,14 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                 if language == "ruby" and rule.category == "command-injection" and "Open3." in match.group(0):
                     ruby_open3_risk = _ruby_open3_shell_argument_risk(diff, line_no, match.string)
                     if ruby_open3_risk is False:
+                        continue
+                if (
+                    language == "ruby"
+                    and rule.category == "command-injection"
+                    and re.search(r"\bsystem\s*\(", match.group(0), re.IGNORECASE)
+                ):
+                    ruby_system_risk = _ruby_system_single_command_risk(diff, line_no, match.string)
+                    if ruby_system_risk is False:
                         continue
                 svelte_raw_html_directive = (
                     language == "svelte" and rule.category == "xss" and match.group(0).lstrip().startswith("{@html")
@@ -3204,6 +3355,10 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                 if ruby_open3_risk is True:
                     message = "A method/request value is executed as a single Open3 shell-command string."
                     suggestion = "Use a fixed executable with separate argv elements and validate each argument."
+                    confidence = 0.97
+                elif ruby_system_risk is True:
+                    message = "An unguarded method parameter is executed as a single Ruby system command."
+                    suggestion = "Map allowed operations to fixed executables and pass validated arguments separately."
                     confidence = 0.97
                 if language == "rust" and rule.category == "unsafe-block":
                     if re.search(r"\bunsafe\s+fn\b", match.string):
@@ -3325,6 +3480,52 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
             and any(abs(finding.line - line) <= 1 for line in transmute_lines.get(finding.file, set()))
         )
     ]
+
+
+_BROWSER_SENSITIVE_STORAGE_DYNAMIC_VALUE = re.compile(
+    r"\b(?:localStorage|sessionStorage)\.setItem\s*\(\s*[\"'`]"
+    r"(?:access[-_]?token|refresh[-_]?token|auth[-_]?token|token|secret|password)"
+    r"[\"'`]\s*,\s*(?![\"'`]|null\b|undefined\b|true\b|false\b)"
+    r"[A-Za-z_$][\w$]*\s*\)",
+    re.IGNORECASE,
+)
+
+
+def is_auto_confirmable_security_finding(file_path: str, line: int, category: str, diff: str) -> bool:
+    """Replay one of the deliberately narrow, structure-backed security proofs.
+
+    This is intentionally stricter than :func:`is_deterministic_security_finding`.
+    It exists only for findings whose complete new-file patch proves the
+    relevant source/sink semantics without an LLM: a dynamic credential value
+    persisted under an explicit browser-storage credential key, or a Ruby
+    single-command API fed by the conservative parameter-flow classifiers.
+    """
+
+    if not _is_complete_new_file_patch(diff):
+        return False
+    normalized_category = normalize_category_for_detector(category)
+    source_line = dict(iter_right_lines(diff)).get(line, "")
+    if not source_line:
+        return False
+    replayed = [
+        finding
+        for finding in detect_security_findings({file_path: diff})
+        if finding.line == line and finding.category == normalized_category and finding.confidence >= 0.96
+    ]
+    if not replayed:
+        return False
+
+    language = normalize_language(file_path)
+    if normalized_category == "data-leak" and language in {"javascript", "typescript"}:
+        return bool(_BROWSER_SENSITIVE_STORAGE_DYNAMIC_VALUE.search(source_line)) and not (
+            _javascript_storage_value_is_static(diff, line, source_line)
+        )
+    if normalized_category == "command-injection" and language == "ruby":
+        return (
+            _ruby_open3_shell_argument_risk(diff, line, source_line) is True
+            or _ruby_system_single_command_risk(diff, line, source_line) is True
+        )
+    return False
 
 
 def is_deterministic_security_finding(file_path: str, line: int, category: str, diff: str) -> bool:

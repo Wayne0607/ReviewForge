@@ -569,13 +569,19 @@ def _security_anchor_categories_compatible(
     patch_lines: list[tuple[int, str]],
     detector_line: int,
     detector_message: str = "",
+    file_path: str = "",
 ) -> bool:
     if detector_category == reviewer_category:
         return True
     if frozenset({detector_category, reviewer_category}) in _SECURITY_ANCHOR_CATEGORY_PAIRS:
         return True
     categories = {detector_category, reviewer_category}
-    if categories == {"code-injection", "unsafe-dynamic-call"}:
+    if detector_category == "code-injection" and reviewer_category in {
+        "unsafe-dynamic-call",
+        "unsafe-reflection",
+    }:
+        if not file_path.lower().endswith(".rb"):
+            return False
         detector_text = detector_message.lower()
         if not re.search(r"dynamic\s+dispatch|\b(?:send|public_send|instance_eval|class_eval)\b", detector_text):
             return False
@@ -629,6 +635,7 @@ def reanchor_security_detector_duplicates(findings: list[Finding], diff_summary:
                     patch_lines,
                     detector.line,
                     detector.message,
+                    file_path,
                 )
                 and identifiers
                 and _window_contains_identifier(patch_lines, detector.line, identifiers)

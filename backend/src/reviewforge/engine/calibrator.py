@@ -24,7 +24,7 @@ from reviewforge.core.state import Finding
 from reviewforge.engine.detectors.accessibility import is_deterministic_accessibility_finding
 from reviewforge.engine.detectors.dependency import is_deterministic_dependency_version_range
 from reviewforge.engine.detectors.quality import is_deterministic_quality_finding
-from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks
+from reviewforge.engine.detectors.security import _rust_dynamic_path_sinks, is_auto_confirmable_security_finding
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 
@@ -35,12 +35,11 @@ class CalibrationResponseError(RuntimeError):
     """Raised when semantic calibration has no complete, trustworthy verdict."""
 
 
-# Security detector matches always require semantic calibration. Replaying the
-# same lexical/API rule is provenance, not independent proof of an attacker-
-# controlled source reaching the sink. The remaining local auto-confirm lanes
-# are deliberately limited to manifest, quality, and accessibility rules whose
-# helpers require a complete new-file patch and an exact file/line/category
-# match.
+# Most security detector matches require semantic calibration. Only the narrow
+# structure-backed proofs exposed by ``is_auto_confirmable_security_finding``
+# may bypass it; generic API/keyword replay remains provenance rather than
+# independent proof.
+_SECURITY_AUTO_CONFIRM_MIN_CONFIDENCE = 0.96
 _QUALITY_AUTO_CONFIRM_MIN_CONFIDENCE = 0.98
 _ACCESSIBILITY_AUTO_CONFIRM_MIN_CONFIDENCE = 0.90
 _DETECTOR_AUTO_CONFIRM_ENABLED = True
@@ -950,10 +949,9 @@ class DynamicCalibrator:
     2. Adversarial Verifier tries to refute each finding
     3. Judge rules on disputed findings (only if Round 2 disagrees with Round 1)
 
-    Reviewer and security-detector findings require semantic calibration.
-    Manifest, quality, and accessibility detectors bypass it only when a
-    complete new-file patch reproduces the exact anchor under one of the
-    explicitly enabled high-confidence local proofs.
+    Reviewer findings and contextual detector matches require semantic
+    calibration. A detector bypasses it only when a complete new-file patch
+    reproduces the exact anchor under an explicitly enabled local proof.
     """
 
     def __init__(
@@ -1028,6 +1026,19 @@ class DynamicCalibrator:
                     _extract_file_patch(code_diff, f.file),
                 )
             )
+            deterministic_security = (
+                _DETECTOR_AUTO_CONFIRM_ENABLED
+                and detector_backed
+                and f.confidence >= _SECURITY_AUTO_CONFIRM_MIN_CONFIDENCE
+                and is_security_category(f.category)
+                and f.category != "dependency-version-range"
+                and is_auto_confirmable_security_finding(
+                    f.file,
+                    f.line,
+                    f.category,
+                    _extract_file_patch(code_diff, f.file),
+                )
+            )
             deterministic_accessibility = (
                 _DETECTOR_AUTO_CONFIRM_ENABLED
                 and detector_backed
@@ -1040,7 +1051,12 @@ class DynamicCalibrator:
                     _extract_file_patch(code_diff, f.file),
                 )
             )
-            if deterministic_manifest_range or deterministic_quality or deterministic_accessibility:
+            if (
+                deterministic_manifest_range
+                or deterministic_quality
+                or deterministic_security
+                or deterministic_accessibility
+            ):
                 f.status = "confirmed"
                 f.verified_by = "detector-auto"
                 f.verify_reason = "Deterministic detector rule matched the changed source line."

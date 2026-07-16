@@ -27,6 +27,11 @@ def test_security_category_aliases_normalize():
     assert normalize_category("unsafe-html") == "xss"
     assert normalize_category("dangerous-html") == "xss"
     assert normalize_category("unsafe-yaml") == "insecure-deserialization"
+    assert normalize_category("deserialization") == "insecure-deserialization"
+    assert normalize_category("empty-catch") == "exception-handling"
+    assert normalize_category("optional-unsafe-get") == "null-safety"
+    assert normalize_category("unpinned-dependency") == "dependency-version-range"
+    assert normalize_category("missing-accessible-name") == "missing-label"
     assert normalize_category("unsafe-dynamic-call") == "unsafe-dynamic-call"
     assert normalize_category("weak-hash") == "crypto"
     assert normalize_category("side-effect-in-computed") == "computed-side-effect"
@@ -39,10 +44,15 @@ def test_security_category_aliases_normalize():
     assert is_security_category("dangerous-html")
     assert is_security_category("malicious-dependency")
     assert is_security_category("unsafe-yaml")
+    assert is_security_category("deserialization")
+    assert is_security_category("unpinned-dependency")
     assert not is_security_category("unsafe-dynamic-call")
     assert is_security_category("weak-hash")
     assert is_security_category("insecure-download")
     assert not is_security_category("missing-alt-text")
+    assert not is_security_category("empty-catch")
+    assert not is_security_category("optional-unsafe-get")
+    assert not is_security_category("missing-accessible-name")
     assert is_security_category("版本范围不安全")
 
 

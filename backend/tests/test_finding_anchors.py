@@ -444,7 +444,7 @@ def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicat
             "catch-review",
             "src/UserController.java",
             28,
-            "exception-handling",
+            "empty-catch",
             "The empty catch silently swallows the database exception.",
         ),
         _security_finding(
@@ -474,7 +474,7 @@ def test_quality_reanchor_normalizes_unique_deterministic_multilanguage_duplicat
             "optional-review",
             "src/Lookup.java",
             46,
-            "optional-misuse",
+            "optional-unsafe-get",
             "Optional.get is called without checking presence.",
         ),
         _security_finding(
@@ -1125,6 +1125,13 @@ def test_reanchors_normalized_security_aliases_with_exact_diff_symbols():
             "unsafe-dynamic-call",
             "send dynamically invokes a user-selected method.",
         ),
+        (
+            "src/reflection.rb",
+            "public_send(name, payload)",
+            "code-injection",
+            "unsafe-reflection",
+            "public_send dynamically invokes a user-selected method.",
+        ),
     ]
 
     for index, (file_path, source, detector_category, reviewer_category, message) in enumerate(cases):
@@ -1135,7 +1142,7 @@ def test_reanchors_normalized_security_aliases_with_exact_diff_symbols():
             1,
             detector_category,
             "Dynamic dispatch/runtime execution API used."
-            if reviewer_category == "unsafe-dynamic-call"
+            if reviewer_category in {"unsafe-dynamic-call", "unsafe-reflection"}
             else "Deterministic security sink detected.",
             detector=True,
         )
@@ -1174,6 +1181,52 @@ def test_dynamic_call_anchor_does_not_merge_into_same_line_eval_detector():
 
     assert reanchor_security_detector_duplicates([eval_detector, send_reviewer], diff) == []
     assert send_reviewer.category == "unsafe-dynamic-call"
+
+
+def test_unsafe_reflection_anchor_requires_ruby_dynamic_dispatch_detector_evidence():
+    file_path = "src/job.rb"
+    diff = _summary(file_path, "send(name, payload)")
+    unrelated_detector = _security_finding(
+        "eval-detector",
+        file_path,
+        1,
+        "code-injection",
+        "Ruby eval usage detected.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reflection-reviewer",
+        file_path,
+        1,
+        "unsafe-reflection",
+        "send(name, payload) dynamically invokes a user-selected method.",
+    )
+
+    assert reanchor_security_detector_duplicates([unrelated_detector, reviewer], diff) == []
+    assert reviewer.category == "unsafe-reflection"
+
+
+def test_unsafe_reflection_anchor_does_not_merge_non_ruby_reflection():
+    file_path = "src/Reflect.java"
+    diff = _summary(file_path, "send(name, payload);")
+    detector = _security_finding(
+        "detector",
+        file_path,
+        1,
+        "code-injection",
+        "Dynamic dispatch/runtime execution API used.",
+        detector=True,
+    )
+    reviewer = _security_finding(
+        "reviewer",
+        file_path,
+        1,
+        "unsafe-reflection",
+        "send(name, payload) performs reflective dispatch.",
+    )
+
+    assert reanchor_security_detector_duplicates([detector, reviewer], diff) == []
+    assert reviewer.category == "unsafe-reflection"
 
 
 def test_reanchors_generic_workflow_secret_output_to_the_only_print_sink():

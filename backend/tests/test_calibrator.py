@@ -331,6 +331,102 @@ async def test_api_only_pickle_detector_requires_adversarial_calibration():
     assert result[0].verified_by == "judge"
 
 
+async def test_narrow_structure_backed_security_proofs_auto_confirm_without_llm():
+    sources = {
+        "storage.tsx": ('export function storeToken(token: string) {\n  localStorage.setItem("token", token)\n}'),
+        "runtime.rb": (
+            "module Runtime\n"
+            "  def self.run_shell(command)\n"
+            "    system(command)\n"
+            "  end\n"
+            "  def self.capture(command)\n"
+            "    Open3.capture3(command)\n"
+            "  end\n"
+            "end"
+        ),
+    }
+    summary = "\n".join(_summary(file_path, source) for file_path, source in sources.items())
+    expected = {
+        ("storage.tsx", 2, "data-leak"),
+        ("runtime.rb", 3, "command-injection"),
+        ("runtime.rb", 6, "command-injection"),
+    }
+    detectors = []
+    for file_path, source in sources.items():
+        detectors.extend(detect_security_findings({file_path: _summary(file_path, source)}))
+    findings = [
+        Finding(
+            file=item.file,
+            line=item.line,
+            severity=item.severity,
+            category=item.category,
+            message=item.message,
+            suggestion=item.suggestion,
+            confidence=item.confidence,
+            reviewer="security_reviewer",
+            verified_by="detector",
+        )
+        for item in detectors
+        if (item.file, item.line, item.category) in expected
+    ]
+
+    result = await DynamicCalibrator(FailingLLM(), build_registry()).calibrate(findings, summary)
+
+    assert {(finding.file, finding.line, finding.category) for finding in result} == expected
+    assert {finding.status for finding in result} == {"confirmed"}
+    assert {finding.verified_by for finding in result} == {"detector-auto"}
+
+
+async def test_narrow_security_auto_confirm_requires_detector_reviewer_and_complete_file():
+    source = "export function store(token: string) {\n  localStorage.setItem('token', token)\n}"
+    detector = next(
+        finding
+        for finding in detect_security_findings({"storage.tsx": _summary("storage.tsx", source)})
+        if finding.category == "data-leak" and finding.confidence >= 0.96
+    )
+    wrong_reviewer = Finding(
+        id="wrong_security_reviewer",
+        file=detector.file,
+        line=detector.line,
+        severity=detector.severity,
+        category=detector.category,
+        message=detector.message,
+        suggestion=detector.suggestion,
+        confidence=detector.confidence,
+        reviewer="style_reviewer",
+        verified_by="detector",
+    )
+    llm = RejectingLLM(wrong_reviewer.id)
+
+    wrong_reviewer_result = await DynamicCalibrator(llm, build_registry()).calibrate(
+        [wrong_reviewer],
+        _summary("storage.tsx", source),
+    )
+
+    assert llm.calls == 2
+    assert wrong_reviewer_result[0].verified_by == "judge"
+
+    partial = Finding(
+        id="partial_security_detector",
+        file="storage.tsx",
+        line=2,
+        severity="error",
+        category="data-leak",
+        message=detector.message,
+        suggestion=detector.suggestion,
+        confidence=0.96,
+        reviewer="security_reviewer",
+        verified_by="detector",
+    )
+    partial_llm = RejectingLLM(partial.id)
+    partial_diff = "@@ -2,1 +2,1 @@\n-  localStorage.removeItem('token')\n+  localStorage.setItem('token', token)"
+
+    partial_result = await DynamicCalibrator(partial_llm, build_registry()).calibrate([partial], partial_diff)
+
+    assert partial_llm.calls == 2
+    assert partial_result[0].verified_by == "judge"
+
+
 async def test_security_alias_normalizes_before_semantic_calibration():
     finding = Finding(
         file="settings.py",

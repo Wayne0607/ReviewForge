@@ -5,7 +5,10 @@ import pytest
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import ReviewTask, StateStore
 from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
-from reviewforge.engine.detectors.security import is_deterministic_security_finding
+from reviewforge.engine.detectors.security import (
+    is_auto_confirmable_security_finding,
+    is_deterministic_security_finding,
+)
 from reviewforge.engine.reviewers import SecurityReviewer
 from reviewforge.tools.gateway import ToolGateway
 
@@ -229,6 +232,36 @@ def test_high_signal_browser_storage_raw_html_and_ruby_backticks_are_detector_au
     assert sanitized_html.confidence < 0.96
     assert dynamic_backtick.confidence >= 0.96
     assert constant_backtick.confidence < 0.96
+
+
+def test_security_auto_confirm_allows_only_dynamic_values_under_explicit_browser_credential_keys():
+    patch = _diff(
+        "export function storeToken(token: string) {\n"
+        '  localStorage.setItem("token", token)\n'
+        "}\n"
+        'const loggedOut = "logged-out"\n'
+        'localStorage.setItem("token", loggedOut)\n'
+        'localStorage.setItem("token", "cleared")\n'
+        'localStorage.setItem("last-token-check", token)\n'
+        'localStorage.setItem("token", response.data.token)'
+    )
+
+    findings = [
+        finding for finding in detect_security_findings({"storage.tsx": patch}) if finding.category == "data-leak"
+    ]
+
+    assert next(finding for finding in findings if finding.line == 2).confidence == 0.96
+    assert is_auto_confirmable_security_finding("storage.tsx", 2, "data-leak", patch)
+    assert all(
+        not is_auto_confirmable_security_finding("storage.tsx", line, "data-leak", patch) for line in (5, 6, 7, 8)
+    )
+    assert not is_auto_confirmable_security_finding("tests/storage.tsx", 2, "data-leak", patch)
+    assert not is_auto_confirmable_security_finding(
+        "storage.tsx",
+        2,
+        "data-leak",
+        '@@ -2,1 +2,1 @@\n-  localStorage.removeItem("token")\n+  localStorage.setItem("token", token)',
+    )
 
 
 def test_browser_storage_static_nullable_and_logout_values_are_contextual():
@@ -1181,6 +1214,92 @@ def test_security_detector_auto_confirms_ruby_open3_single_parameter_shell_comma
 
     assert [(finding.line, finding.confidence) for finding in commands] == [(5, 0.97)]
     assert is_deterministic_security_finding("job_runtime.rb", 5, "command-injection", patch)
+    assert is_auto_confirmable_security_finding("job_runtime.rb", 5, "command-injection", patch)
+
+
+def test_security_detector_auto_confirms_only_proven_ruby_system_parameter_flows():
+    patch = _diff(
+        "def direct(command)\n"
+        "  system(command)\n"
+        "end\n"
+        "def kernel(command)\n"
+        "  Kernel.system(command)\n"
+        "end\n"
+        "def aliased(input)\n"
+        "  command = input\n"
+        "  system(command)\n"
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"system_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert {(finding.line, finding.confidence) for finding in commands} == {
+        (2, 0.97),
+        (5, 0.97),
+        (9, 0.97),
+    }
+    assert all(
+        is_auto_confirmable_security_finding("system_runner.rb", line, "command-injection", patch) for line in (2, 5, 9)
+    )
+
+
+def test_security_detector_keeps_guarded_or_ambiguous_ruby_system_calls_contextual():
+    patch = _diff(
+        "ALLOWED_COMMANDS = ['git status'].freeze\n"
+        "def guarded(command)\n"
+        "  raise unless ALLOWED_COMMANDS.include?(command)\n"
+        "  system(command)\n"
+        "end\n"
+        "def guarded_alias(input)\n"
+        "  command = input\n"
+        "  return unless SAFE_COMMANDS.include?(command)\n"
+        "  system(command)\n"
+        "end\n"
+        "def reassigned(command)\n"
+        '  command = "git status"\n'
+        "  system(command)\n"
+        "end\n"
+        "def argv(revision)\n"
+        '  system("git", "show", revision)\n'
+        "end\n"
+        "def custom(command)\n"
+        "  runner.system(command)\n"
+        "end\n"
+        "def interpolated(command)\n"
+        '  system("echo #{command}")\n'
+        "end\n"
+        "def variadic(*command)\n"
+        "  system(command)\n"
+        "end"
+    )
+
+    commands = [
+        finding
+        for finding in detect_security_findings({"guarded_system_runner.rb": patch})
+        if finding.category == "command-injection"
+    ]
+
+    assert [(finding.line, finding.confidence) for finding in commands] == [
+        (4, 0.92),
+        (9, 0.92),
+        (19, 0.92),
+        (22, 0.92),
+        (25, 0.92),
+    ]
+    assert all(
+        not is_auto_confirmable_security_finding(
+            "guarded_system_runner.rb",
+            finding.line,
+            finding.category,
+            patch,
+        )
+        for finding in commands
+    )
+    assert not any(finding.line in {13, 16} for finding in commands)
 
 
 def test_security_detector_ignores_ruby_open3_static_and_shellless_argv_forms():
@@ -1489,6 +1608,15 @@ def test_security_detector_does_not_auto_confirm_guarded_ruby_open3_parameters()
     }
     assert all(
         not is_deterministic_security_finding(finding.file, finding.line, finding.category, patches[finding.file])
+        for finding in commands
+    )
+    assert all(
+        not is_auto_confirmable_security_finding(
+            finding.file,
+            finding.line,
+            finding.category,
+            patches[finding.file],
+        )
         for finding in commands
     )
 

@@ -57,7 +57,7 @@ def test_skill_attached_to_reviewer():
     assert len(r._skill_body) > 50
 
 
-def test_planner_keeps_semantic_review_when_security_is_forced():
+def test_planner_does_not_duplicate_correctness_when_security_is_forced():
     planner = Planner(MockChatLLM(), build_registry())
     tasks = planner._merge_tasks(
         {"security_reviewer"},
@@ -66,11 +66,7 @@ def test_planner_keeps_semantic_review_when_security_is_forced():
         first_round=True,
     )
 
-    assert [t.reviewer for t in tasks] == [
-        "security_reviewer",
-        "correctness_reviewer",
-        "style_reviewer",
-    ]
+    assert [t.reviewer for t in tasks] == ["security_reviewer"]
 
 
 def test_planner_defaults_production_source_to_correctness():
@@ -78,18 +74,8 @@ def test_planner_defaults_production_source_to_correctness():
 
     tasks = planner._merge_tasks(set(), [], ["src/service.py", "tests/test_service.py"], first_round=True)
 
-    assert [task.reviewer for task in tasks] == ["correctness_reviewer", "style_reviewer"]
+    assert [task.reviewer for task in tasks] == ["correctness_reviewer"]
     assert tasks[0].files == ["src/service.py"]
-    assert tasks[1].files == ["src/service.py", "tests/test_service.py"]
-
-
-def test_planner_defaults_test_only_change_to_semantic_style():
-    planner = Planner(MockChatLLM(), build_registry())
-
-    tasks = planner._merge_tasks(set(), [], ["tests/test_service.py"], first_round=True)
-
-    assert [task.reviewer for task in tasks] == ["style_reviewer"]
-    assert tasks[0].files == ["tests/test_service.py"]
 
 
 def test_planner_skips_low_signal_reviewers_for_fixtures():

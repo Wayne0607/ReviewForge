@@ -327,10 +327,9 @@ class Planner:
     ) -> list[ReviewTask]:
         """Merge forced reviewers with LLM decisions.
 
-        On the first round, correctness_reviewer covers production behavior and
-        style_reviewer performs a separate language-semantics pass that also
-        covers changed tests. On re-planning rounds an empty result is valid (it
-        signals convergence — nothing more to dispatch).
+        On the first round, correctness_reviewer is added as the source-change default and a
+        fallback guarantees at least one task. On re-planning rounds an empty
+        result is valid (it signals convergence — nothing more to dispatch).
         """
         normalized_tasks = [
             ReviewTask(
@@ -364,29 +363,13 @@ class Planner:
             and style_fallback
             and correctness_files
             and "correctness_reviewer" not in {task.reviewer for task in merged}
-            and len(merged) < 6
+            and "security_reviewer" not in {task.reviewer for task in merged}
         ):
             merged.append(
                 ReviewTask(
                     reviewer="correctness_reviewer",
                     files=correctness_files,
                     rationale="default observable-correctness review",
-                )
-            )
-
-        semantic_files = _semantic_style_files(files)
-        if (
-            first_round
-            and style_fallback
-            and semantic_files
-            and "style_reviewer" not in {task.reviewer for task in merged}
-            and len(merged) < 6
-        ):
-            merged.append(
-                ReviewTask(
-                    reviewer="style_reviewer",
-                    files=semantic_files,
-                    rationale="independent language-semantics and robustness review",
                 )
             )
 
@@ -452,10 +435,10 @@ class Planner:
                 "performance_reviewer": "performance_reviewer",
                 "correctness": "correctness_reviewer",
                 "correctness_reviewer": "correctness_reviewer",
-                "style": "style_reviewer",
-                "style_reviewer": "style_reviewer",
+                "style": "correctness_reviewer",
+                "style_reviewer": "correctness_reviewer",
                 "architecture": "correctness_reviewer",
-                "readability": "style_reviewer",
+                "readability": "correctness_reviewer",
                 "testing": "testing_reviewer",
                 "testing_reviewer": "testing_reviewer",
                 "test": "testing_reviewer",
@@ -637,43 +620,6 @@ def _correctness_files(files: list[str]) -> list[str]:
     for file_path in files:
         normalized = file_path.replace("\\", "/").lower()
         if not normalized.endswith(code_suffixes) or _is_test_file(normalized):
-            continue
-        if any(marker in f"/{normalized}" for marker in ("/examples/", "/fixtures/", "/generated/", "/vendor/")):
-            continue
-        selected.append(file_path)
-        if len(selected) >= 32:
-            break
-    return selected
-
-
-def _semantic_style_files(files: list[str]) -> list[str]:
-    """Select changed code, including tests, for the independent semantics pass."""
-
-    code_suffixes = (
-        ".c",
-        ".cc",
-        ".cpp",
-        ".cs",
-        ".go",
-        ".java",
-        ".js",
-        ".jsx",
-        ".kt",
-        ".kts",
-        ".php",
-        ".py",
-        ".rb",
-        ".rs",
-        ".scala",
-        ".swift",
-        ".ts",
-        ".tsx",
-        ".vue",
-    )
-    selected: list[str] = []
-    for file_path in files:
-        normalized = file_path.replace("\\", "/").lower()
-        if not normalized.endswith(code_suffixes):
             continue
         if any(marker in f"/{normalized}" for marker in ("/examples/", "/fixtures/", "/generated/", "/vendor/")):
             continue

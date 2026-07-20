@@ -845,6 +845,52 @@ async def test_repository_wiki_evidence_is_bounded_and_present_in_both_rounds():
         assert "x" * 3_001 not in prompt
 
 
+def test_actionability_gate_suppresses_in_memory_and_speculative_style_noise():
+    findings = [
+        Finding(
+            id="memory_wrapper",
+            file="Verifier.java",
+            line=2,
+            severity="error",
+            category="resource-leak",
+            message="BufferedReader wrapping StringReader is not closed.",
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="immutability_preference",
+            file="Verifier.java",
+            line=3,
+            severity="info",
+            category="immutability",
+            message="The policy field should be final.",
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="speculative_robustness",
+            file="Verifier.java",
+            line=4,
+            severity="warning",
+            category="robustness",
+            message="replaceAll may be brittle for a hypothetical directory name.",
+            reviewer="style_reviewer",
+        ),
+    ]
+    diff = _summary(
+        "Verifier.java",
+        "class Verifier {\n"
+        "  var reader = new BufferedReader(new StringReader(value));\n"
+        "  Policy policy = createPolicy();\n"
+        '  String path = source.replaceAll("messages_.*", "messages");\n'
+        "}",
+    )
+
+    actionable, rejected = apply_actionability_gate(findings, diff)
+
+    assert actionable == []
+    assert {finding.id for finding in rejected} == {finding.id for finding in findings}
+    assert all(finding.verified_by == "actionability-gate" for finding in rejected)
+
+
 async def test_dependency_and_duplicate_evidence_contract_is_present_in_both_rounds():
     finding = Finding(
         id="finding_dependency_contract",

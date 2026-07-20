@@ -259,6 +259,19 @@ _SPECIFIC_TEST_DEFECT = re.compile(
     re.IGNORECASE,
 )
 _TEST_REMOVAL = re.compile(r"\b(?:deleted|removed|dropped)\b|删除|移除|删掉", re.IGNORECASE)
+_IN_MEMORY_STREAM = re.compile(
+    r"\b(?:StringReader|StringWriter|ByteArrayInputStream|ByteArrayOutputStream|StringIO|BytesIO)\b"
+)
+_SPECULATIVE_LANGUAGE = re.compile(
+    r"\b(?:may|might|could|potential(?:ly)?|possibly|brittle)\b|可能|潜在|也许|意外|不够稳健",
+    re.IGNORECASE,
+)
+_CONCRETE_FAILURE_LANGUAGE = re.compile(
+    r"\b(?:crash|exception|throw|panic|incorrect|wrong|data\s+loss|corrupt|deadlock|race|"
+    r"security|vulnerab|bypass|fails?\s+(?:at|when|to))\b|"
+    r"崩溃|异常|抛出|错误结果|数据丢失|损坏|死锁|竞态|漏洞|绕过|必然失败|无法",
+    re.IGNORECASE,
+)
 _SECURITY_REGRESSION = re.compile(
     r"(?:security|authorization|authentication|permission|saniti[sz]|escape|allow.?list|"
     r"regression|安全|鉴权|认证|授权|权限|清理|转义|白名单|回归)",
@@ -984,6 +997,25 @@ def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
     return ""
 
 
+def _reject_low_value_local_noise(finding: Finding, code_diff: str) -> str:
+    """Suppress narrow best-practice claims disproven by local source facts."""
+
+    text = f"{finding.message}\n{finding.suggestion}"
+    nearby_code = _nearby_added_code(code_diff, finding.file, finding.line, radius=4)
+    evidence = f"{text}\n{nearby_code}"
+    if finding.category == "resource-leak" and _IN_MEMORY_STREAM.search(evidence):
+        return "该 AutoCloseable 仅包装内存流，不持有文件、套接字或进程资源，不能构成资源泄漏"
+    if finding.category == "immutability" and finding.severity == "info":
+        return "仅建议增加 final/const 等不可变修饰，未证明本次变更会发生状态错误"
+    if (
+        finding.category == "robustness"
+        and _SPECULATIVE_LANGUAGE.search(text)
+        and not _CONCRETE_FAILURE_LANGUAGE.search(text)
+    ):
+        return "仅描述假设性的稳健性场景，未给出当前输入、调用契约或可复现失败"
+    return ""
+
+
 def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[list[Finding], list[Finding]]:
     """Zero-token prefilter for generic test/documentation findings.
 
@@ -997,8 +1029,10 @@ def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[l
     rejected: list[Finding] = []
     for finding in findings:
         finding.category = normalize_category(finding.category)
-        reason = _reject_rust_direct_path_claim(finding, code_diff) or _reject_generic_quality_finding(
-            finding, code_diff
+        reason = (
+            _reject_rust_direct_path_claim(finding, code_diff)
+            or _reject_low_value_local_noise(finding, code_diff)
+            or _reject_generic_quality_finding(finding, code_diff)
         )
         if reason:
             finding.status = "false_positive"

@@ -164,8 +164,8 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - diff 中能复现的空值、边界值、集合顺序、异常传播和 API 误用
 
 先比较同一文件的 sibling 方法、成功/失败分支和同类调用；Impact Manifest 有调用方或契约事实时必须使用。
-声称参数、变量、callee 或 metric recorder 用错时，必须用 search_code 查到声明/签名，
-或找到至少两个独立且一致的 sibling 调用证明契约；
+声称参数、变量、callee 或 metric recorder 用错时，若检索工具可用，必须用 search_code 查到声明/签名；
+否则必须由 Impact Manifest 或至少两个独立且一致的 sibling 调用证明契约；
 不能只因一个对比分支写法不同就猜测哪一边正确，也不能把 finding 自己的断言当作证据。
 每个 finding 必须说明触发输入或执行路径、实际错误结果，以及支持结论的具体代码证据。
 
@@ -207,7 +207,8 @@ confinement guard 必须验证 sink 实际读取的同一 candidate，且位于 
 - 测试断言过于宽松（assertTrue(True)）
 - 修改了逻辑但现有测试仍断言旧行为
 
-声称编译失败或符号未定义时，必须先用 search_code 在同一包/模块中搜索该精确标识符；
+声称编译失败或符号未定义时，若检索工具可用，必须先用 search_code 在同一包/模块中搜索该精确标识符；
+工具不可用时，只有 diff 或 Impact Manifest 能排除其他声明来源才可报告；
 Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文件中的包级声明同样有效。
 
 不要仅因新增公共函数/类、当前 diff 没有测试文件、边界条件未穷举，就报告“缺少测试”。

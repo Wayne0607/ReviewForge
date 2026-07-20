@@ -161,10 +161,10 @@ def test_yaml_can_select_agentic_reviewers(tmp_path, monkeypatch):
     assert config.agentic_default is False
 
 
-def test_default_agentic_reviewers_are_context_dependent_dimensions():
+def test_default_agentic_reviewers_are_opt_in():
     config = ReviewForgeConfig()
 
-    assert config.agentic_reviewers == ["correctness_reviewer", "testing_reviewer"]
+    assert config.agentic_reviewers == []
     assert config.agentic_default is False
 
 

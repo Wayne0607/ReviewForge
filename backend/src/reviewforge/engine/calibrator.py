@@ -1110,6 +1110,20 @@ def _reject_ungrounded_specialist_finding(finding: Finding, code_diff: str) -> s
         if not lifecycle_failure:
             return "未证明 goroutine 无法退出、永久阻塞或缺少取消路径，不能据此判定泄漏"
 
+    if (
+        finding.reviewer == "performance_reviewer"
+        and category == "resource-leak"
+        and re.search(r"\bgoroutines?\b|协程", text, re.IGNORECASE)
+    ):
+        lifecycle_failure = re.search(
+            r"\b(?:cannot exit|never exits?|blocked forever|unbuffered channel|missing cancellation|"
+            r"no cancellation|waitgroup leak)\b|无法退出|永不退出|永久阻塞|无缓冲通道|缺少取消|没有取消",
+            text,
+            re.IGNORECASE,
+        )
+        if not lifecycle_failure or re.search(r"\b(?:WithTimeout|WithDeadline|cancel)\b|超时|取消", nearby):
+            return "并发 goroutine 已有超时/取消路径，且未证明永久阻塞或无界存活，不能据此判定资源泄漏"
+
     if finding.reviewer != "performance_reviewer":
         return ""
 

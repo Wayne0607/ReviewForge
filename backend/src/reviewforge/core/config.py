@@ -68,10 +68,9 @@ class ReviewForgeConfig:
     skills_dir: str = "skills"
     events_dir: str = ".reviewforge/events"
     confidence_threshold: float = 0.5
-    # Correctness and test claims often require declarations outside the diff
-    # (callee signatures, package-level symbols, sibling tests). Keep the more
-    # expensive tool loop selective instead of enabling it for every reviewer.
-    agentic_reviewers: list[str] = field(default_factory=lambda: ["correctness_reviewer", "testing_reviewer"])
+    # The versioned project config selects production tool loops. Keep the
+    # library default empty so embedding applications opt into their own cost.
+    agentic_reviewers: list[str] = field(default_factory=list)
     agentic_default: bool = False  # default OFF — escalate-on-uncertainty replaces full agentic
 
     # Escalation: auto-verify uncertain findings with agentic tools

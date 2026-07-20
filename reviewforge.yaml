@@ -94,12 +94,10 @@ events_dir: ".reviewforge/events"
 # 全局置信度阈值（低于此值的发现不发评论）
 confidence_threshold: 0.5
 
-# 对最依赖跨文件证据的维度启用工具循环；其他 Reviewer 直接消费预计算的 Impact Manifest。
-# security 追踪数据流，correctness 核对声明/调用契约，testing 核对同包符号与相关测试。
+# 仅安全审查启用证据工具循环；其他 Reviewer 直接消费预计算的 Impact Manifest。
+# 实测 correctness/testing 工具循环成本接近翻倍且总体召回不稳定，因此保持单次模式。
 agentic_reviewers:
   - security_reviewer
-  - correctness_reviewer
-  - testing_reviewer
 agentic_default: false
 
 # Escalation：对不确定的 finding 自动用工具核实

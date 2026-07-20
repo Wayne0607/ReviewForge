@@ -2392,3 +2392,28 @@ def test_actionability_gate_rejects_llm_test_compilation_claim_without_build_evi
 
     assert actionable == []
     assert rejected == [finding]
+
+
+def test_actionability_gate_rejects_bounded_goroutine_resource_leak_claim():
+    finding = Finding(
+        id="bounded_goroutine",
+        file="writer.go",
+        line=2,
+        category="resource-leak",
+        message="High concurrency may create many goroutines and exhaust resources.",
+        suggestion="Add a worker pool.",
+        reviewer="performance_reviewer",
+    )
+    diff = _summary(
+        "writer.go",
+        "go func() {\n"
+        "    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)\n"
+        "    defer cancel()\n"
+        "    write(ctx)\n"
+        "}()",
+    )
+
+    actionable, rejected = apply_actionability_gate([finding], diff)
+
+    assert actionable == []
+    assert rejected == [finding]

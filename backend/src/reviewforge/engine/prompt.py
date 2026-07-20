@@ -41,10 +41,32 @@ def _bounded_diff_sections(files: list[str], diffs: dict[str, str], max_chars: i
     marker = "\n...[file diff truncated to prompt budget]...\n"
     headers = sum(len(f"### {file_path}\n\n\n") for file_path, _patch in sections)
     body_budget = max(0, max_chars - headers - len(marker) * len(sections))
-    share = body_budget // len(sections)
+
+    # Water-fill the body budget: preserve small patches in full and recycle
+    # their unused share into the remaining large patches.  The old equal-share
+    # calculation could leave much of the prompt budget unused on mixed-size
+    # PRs, while truncating the one large production file that needed context.
+    allocations = [0] * len(sections)
+    pending = set(range(len(sections)))
+    remaining = body_budget
+    while pending:
+        share = remaining // len(pending)
+        complete = {index for index in pending if len(sections[index][1]) <= share}
+        if not complete:
+            for index in pending:
+                allocations[index] = share
+            for index in sorted(pending)[: remaining - share * len(pending)]:
+                allocations[index] += 1
+            break
+        for index in complete:
+            allocations[index] = len(sections[index][1])
+            remaining -= allocations[index]
+        pending -= complete
+
     parts: list[str] = []
-    for file_path, patch in sections:
-        bounded = patch if len(patch) <= share else _bounded_text(patch, share + len(marker))
+    for index, (file_path, patch) in enumerate(sections):
+        allocation = allocations[index]
+        bounded = patch if len(patch) <= allocation else _bounded_text(patch, allocation + len(marker))
         parts.append(f"### {file_path}\n{bounded}\n\n")
     return _bounded_text("".join(parts), max_chars)
 
@@ -162,10 +184,20 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - 调用方与被调方契约不一致，参数顺序/单位/ID 与 name 混用，或 sibling 分支使用不一致
 - 资源、并发和异步生命周期导致确定的崩溃、竞态、数据不一致或结果丢失
 - diff 中能复现的空值、边界值、集合顺序、异常传播和 API 误用
+- 语言/框架语义造成的真实故障：重复定义覆盖实现、抽象契约未实现、React 列表缺 key、
+  async/Promise 未等待、固定 sleep/未等待线程造成竞态、getter/computed 的写入副作用
+
+按语言重点检查：
+- Java/Kotlin：错误对象或参数的 null 检查、资源生命周期、接口/抽象方法契约
+- Go：错误 recorder/scope/argument、goroutine 同步与取消、错误返回值和竞态窗口
+- Python/Ruby：重复方法覆盖、缺失字典键/nil、回调副作用、异常与状态更新顺序
+- JavaScript/TypeScript：错误时间/ID/状态字段、Promise 生命周期、React key 与 stale state
 
 先比较同一文件的 sibling 方法、成功/失败分支和同类调用；Impact Manifest 有调用方或契约事实时必须使用。
-声称参数、变量、callee 或 metric recorder 用错时，若检索工具可用，必须用 search_code 查到声明/签名；
-否则必须由 Impact Manifest 或至少两个独立且一致的 sibling 调用证明契约；
+如果 diff 本身直接形成矛盾（例如检查 A 却随后使用 B、用 start 计算 end、判空后仍解引用、
+同一作用域的两个定义互相覆盖），该执行路径就是充分证据，不要求额外 sibling。
+只有声称 diff 外的参数、变量、callee、接口或 metric recorder 契约时，若检索工具可用，
+才必须用 search_code 查到声明/签名；否则必须由 Impact Manifest 或至少两个独立且一致的 sibling 调用证明契约；
 不能只因一个对比分支写法不同就猜测哪一边正确，也不能把 finding 自己的断言当作证据。
 每个 finding 必须说明触发输入或执行路径、实际错误结果，以及支持结论的具体代码证据。
 
@@ -179,6 +211,11 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - 缺少输入验证/清理
 - 不安全的加密、弱认证模式
 - 依赖漏洞
+
+边界校验重点：origin/referer/host 必须做解析后的精确 origin 或域名边界比较；
+`indexOf`/`contains`、未锚定的后缀正则或可伪造 referer 不能建立可信来源。
+`X-Frame-Options: ALLOWALL` 会关闭点击劫持保护，不能由 referer 检查替代。
+检查 nil/空内容进入 HTML 拼接、动态正则插值和对象多级索引时是否能绕过校验或触发安全路径崩溃。
 
 路径遍历必须有请求/攻击者来源或动态 join/format/拼接到文件 sink 的证据；
 Rust `fs::read(path)` 仅接收普通函数参数时不构成路径遍历；Axum `Path(...)` extractor 是请求来源证据。
@@ -206,6 +243,9 @@ confinement guard 必须验证 sink 实际读取的同一 candidate，且位于 
 - 测试命名不清晰，无法看出测试意图
 - 测试断言过于宽松（assertTrue(True)）
 - 修改了逻辑但现有测试仍断言旧行为
+- 测试使用固定 sleep、未 join/await 的线程或轮询，导致断言先于被测行为完成
+- monkeypatch/mock 覆盖了测试随后依赖的真实 API，或 mock 返回结构与生产契约不一致
+- 重复定义覆盖测试 helper/方法、异常被吞掉、断言了错误对象/字段/时间边界
 
 声称编译失败或符号未定义时，若检索工具可用，必须先用 search_code 在同一包/模块中搜索该精确标识符；
 工具不可用时，只有 diff 或 Impact Manifest 能排除其他声明来源才可报告；

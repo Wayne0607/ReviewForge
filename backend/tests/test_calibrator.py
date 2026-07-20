@@ -2265,6 +2265,46 @@ def test_prompt_diff_evidence_has_hard_fair_budgets():
     assert len(reviewer) < 42_000
 
 
+def test_prompt_diff_budget_recycles_unused_small_file_share():
+    registry = build_registry()
+    huge_a = "A" * 30_000
+    huge_b = "B" * 30_000
+    small = "small patch stays complete"
+    reviewer = build_reviewer_prompt(
+        {
+            "registry": registry,
+            "reviewer_type": "correctness",
+            "agent_name": "correctness_reviewer",
+            "files_to_review": ["small.py", "large_a.py", "large_b.py"],
+            "diffs": {"small.py": small, "large_a.py": huge_a, "large_b.py": huge_b},
+        }
+    )[1]["content"]
+
+    assert small in reviewer
+    # Equal sharing would allocate only about 12k to each large file.  Recycling
+    # the small file's unused share lets both large files retain substantially more.
+    assert reviewer.count("A") > 17_000
+    assert reviewer.count("B") > 17_000
+    assert len(reviewer) < 42_000
+
+
+def test_correctness_prompt_accepts_direct_diff_contradictions_as_evidence():
+    system = build_reviewer_prompt(
+        {
+            "registry": build_registry(),
+            "reviewer_type": "correctness",
+            "agent_name": "correctness_reviewer",
+            "files_to_review": ["service.ts"],
+            "diffs": {"service.ts": "+const end = start.add(duration)"},
+            "target_language": "typescript",
+        }
+    )[0]["content"]
+
+    assert "diff 本身直接形成矛盾" in system
+    assert "不要求额外 sibling" in system
+    assert "React 列表缺 key" in system
+
+
 def test_actionability_rejects_specialist_category_misuse_and_preferences():
     diff = "\n".join(
         [

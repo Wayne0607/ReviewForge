@@ -824,10 +824,20 @@ class Orchestrator:
             return True
         manifest = state.impact_manifest or {}
         task_files = set(task.files or state.files_changed)
+        sensitive_symbols = {
+            (str(signal.get("file", "")), str(signal.get("symbol", "")))
+            for signal in manifest.get("risk_signals", [])
+            if signal.get("type") == "security-sensitive-symbol"
+        }
         for signal in manifest.get("risk_signals", []):
             if signal.get("type") != "blast-radius":
                 continue
-            if not signal.get("file") or signal.get("file") in task_files:
+            key = (str(signal.get("file", "")), str(signal.get("symbol", "")))
+            if (
+                int(signal.get("reference_count", 0)) >= 2
+                and key in sensitive_symbols
+                and (not key[0] or key[0] in task_files)
+            ):
                 return True
         for row in manifest.get("historical_graph", []):
             paths = {row.get("file"), row.get("source_file"), row.get("target_file")}

@@ -219,6 +219,11 @@ def test_security_agentic_requires_retrieved_cross_file_evidence():
         ],
         "historical_graph": [],
     }
+    assert Orchestrator._has_agentic_context(task, state) is False
+
+    state.impact_manifest["risk_signals"].append(
+        {"type": "security-sensitive-symbol", "file": "src/service.py", "symbol": "authorize"}
+    )
     assert Orchestrator._has_agentic_context(task, state) is True
 
 

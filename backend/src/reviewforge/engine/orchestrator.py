@@ -436,6 +436,15 @@ class Orchestrator:
                                 run_id, task.reviewer, status="failed", error=f"unknown reviewer: {task.reviewer}"
                             )
                         return
+                    if reviewer._agentic and not self._has_agentic_context(task, state):
+                        reviewer._agentic = False
+                        self._events.emit(
+                            "reviewer.agentic_skipped",
+                            {
+                                "reviewer": task.reviewer,
+                                "reason": "impact manifest has no cross-file or historical graph evidence",
+                            },
+                        )
                     # 按 task 文件检测语言/框架，注入匹配的 skill
                     lang = self._detect_task_language(task)
                     fw = self._detect_task_framework(task)
@@ -781,6 +790,29 @@ class Orchestrator:
             reviewer._events = self._events
             return reviewer
         return None
+
+    @staticmethod
+    def _has_agentic_context(task: ReviewTask, state: StateStore) -> bool:
+        """Use the costly tool loop only when retrieval found evidence to inspect.
+
+        Non-security reviewers retain their configured behavior. Security is the
+        production allowlisted reviewer and needs cross-file/live-reference or
+        historical graph evidence before an agentic investigation is useful.
+        """
+        if task.reviewer != "security_reviewer":
+            return True
+        manifest = state.impact_manifest or {}
+        task_files = set(task.files or state.files_changed)
+        for signal in manifest.get("risk_signals", []):
+            if signal.get("type") != "blast-radius":
+                continue
+            if not signal.get("file") or signal.get("file") in task_files:
+                return True
+        for row in manifest.get("historical_graph", []):
+            paths = {row.get("file"), row.get("source_file"), row.get("target_file")}
+            if task_files.intersection(path for path in paths if path):
+                return True
+        return False
 
     def _attach_skill(
         self, reviewer: BaseReviewer, target_language: str | None = None, target_framework: str | None = None

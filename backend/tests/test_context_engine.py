@@ -9,6 +9,7 @@ from reviewforge.core.database import Database
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_engine import ContextEngine, render_impact_manifest
+from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.prompt import build_planner_prompt
 from reviewforge.tools.gateway import ToolGateway
 
@@ -151,3 +152,22 @@ def test_render_manifest_truncation_remains_valid_json():
     }
     rendered = render_impact_manifest(manifest, max_chars=200)
     assert json.loads(rendered)["truncated"] is True
+
+
+def test_security_agentic_requires_retrieved_cross_file_evidence():
+    task = type("Task", (), {"reviewer": "security_reviewer", "files": ["src/service.py"]})()
+    state = StateStore(files_changed=["src/service.py"])
+    assert Orchestrator._has_agentic_context(task, state) is False
+
+    state.impact_manifest = {
+        "risk_signals": [
+            {"type": "blast-radius", "file": "src/service.py", "symbol": "authorize", "reference_count": 2}
+        ],
+        "historical_graph": [],
+    }
+    assert Orchestrator._has_agentic_context(task, state) is True
+
+
+def test_non_security_agentic_configuration_is_not_context_gated():
+    task = type("Task", (), {"reviewer": "style_reviewer", "files": ["src/service.py"]})()
+    assert Orchestrator._has_agentic_context(task, StateStore()) is True

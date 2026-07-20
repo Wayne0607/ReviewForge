@@ -122,6 +122,7 @@ _GENERIC_DOC_CATEGORIES = {
 _GENERIC_A11Y_ABSENCE_CATEGORIES = {
     "aria-live",
     "dynamic-content-update",
+    "live-region-missing",
     "live-region",
     "missing-aria-live",
     "missing-live-region",
@@ -266,6 +267,32 @@ _SPECULATIVE_LANGUAGE = re.compile(
     r"\b(?:may|might|could|potential(?:ly)?|possibly|brittle)\b|可能|潜在|也许|意外|不够稳健",
     re.IGNORECASE,
 )
+_LLM_A11Y_ABSENCE_CATEGORIES = _GENERIC_A11Y_ABSENCE_CATEGORIES | {
+    "interactive-element",
+    "missing-aria-label",
+    "missing-label",
+    "missing-label-association",
+    "non-semantic-content",
+}
+_N_PLUS_ONE_LOOP = re.compile(
+    r"\b(?:for|foreach|forEach|map)\b|\.each\b|\bwhile\b",
+    re.IGNORECASE,
+)
+_N_PLUS_ONE_DATABASE_SINK = re.compile(
+    r"\b(?:prisma|repository|entityManager|session|db)\b[^\n]{0,100}"
+    r"\b(?:find|select|query|execute|count|where|get)\w*\b|"
+    r"\b[A-Z]\w*\.(?:where|find|find_by|find_each|objects)\b|"
+    r"\bSELECT\b[^\n]+\bFROM\b",
+    re.IGNORECASE,
+)
+_STRONG_PERFORMANCE_PROOF = re.compile(
+    r"\b(?:unbounded|quadratic|cubic|exponential|resource exhaustion|connection pool exhaustion|"
+    r"memory leak|file descriptor leak|every request|every frame)\b|"
+    r"O\s*\(\s*n\s*(?:\^\s*[2-9]|²|³)\s*\)|"
+    r"无界|二次复杂度|指数复杂度|资源耗尽|连接池耗尽|内存泄漏|句柄泄漏|每个请求|每一帧",
+    re.IGNORECASE,
+)
+_EVENT_LOOP_PROOF = re.compile(r"\b(?:event loop|async(?:hronous)? handler|request handler)\b|事件循环|异步处理器")
 _CONCRETE_FAILURE_LANGUAGE = re.compile(
     r"\b(?:crash|exception|throw|panic|incorrect|wrong|data\s+loss|corrupt|deadlock|race|"
     r"security|vulnerab|bypass|fails?\s+(?:at|when|to))\b|"
@@ -1016,6 +1043,75 @@ def _reject_low_value_local_noise(finding: Finding, code_diff: str) -> str:
     return ""
 
 
+def _reject_ungrounded_specialist_finding(finding: Finding, code_diff: str) -> str:
+    """Require specialist claims to carry evidence their configured tools can prove.
+
+    Dependency advisories cannot be established from model memory, obvious a11y
+    absence is handled by deterministic scanners, and performance findings need
+    a changed sink plus scale evidence. This keeps semantic reviewers focused on
+    the cases where repository context can actually change the verdict.
+    """
+
+    if finding.verified_by == "detector":
+        return ""
+
+    category = finding.category
+    text = f"{finding.message}\n{finding.suggestion}"
+    patch = _extract_file_patch(code_diff, finding.file)
+    nearby = _nearby_added_code(code_diff, finding.file, finding.line, radius=16)
+
+    if finding.reviewer == "dependency_reviewer" and category != "dependency-version-range":
+        return (
+            "依赖结论缺少确定性扫描器或外部公告/许可证数据源的证据；"
+            "不能用模型记忆确认版本漏洞、维护状态、兼容性或必要性"
+        )
+
+    if finding.reviewer == "accessibility_reviewer" and category in _LLM_A11Y_ABSENCE_CATEGORIES:
+        if _has_removed_notification_semantics(code_diff, finding.file):
+            return ""
+        dynamic_contract = (
+            _has_right_anchor(code_diff, finding.file, finding.line)
+            and bool(_A11Y_DYNAMIC_TRIGGER.search(patch))
+            and bool(_A11Y_DYNAMIC_UPDATE.search(patch))
+            and not bool(_A11Y_NOTIFICATION_SEMANTICS.search(patch))
+        )
+        if dynamic_contract:
+            return ""
+        return "可访问名称、标签、live region 或语义缺失未由确定性 DOM 证据证明"
+
+    if finding.reviewer != "performance_reviewer":
+        return ""
+
+    if category == "n-plus-one":
+        evidence = _nearby_added_code(code_diff, finding.file, finding.line, radius=2)
+        if not (_N_PLUS_ONE_LOOP.search(evidence) and _N_PLUS_ONE_DATABASE_SINK.search(evidence)):
+            return "N+1 结论未在同一变更窗口中证明循环与数据库查询 sink"
+        return ""
+
+    if category in {
+        "efficiency",
+        "memory-usage",
+        "micro-optimization",
+        "optimization",
+        "performance",
+        "resource-waste",
+        "unnecessary-computation",
+    } and not _STRONG_PERFORMANCE_PROOF.search(f"{text}\n{nearby}"):
+        return "性能结论缺少无界工作、超线性复杂度或可耗尽资源的证据"
+
+    if category == "blocking-io" and not _EVENT_LOOP_PROOF.search(f"{text}\n{nearby}"):
+        return "同步 I/O 未被证明运行在事件循环或异步请求处理器上"
+
+    if category == "goroutine-leak" and re.search(
+        r"(?:这是正确的|正确取消|日志记录不一致|not a performance issue|is correct)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "描述本身承认生命周期正确，实际内容只是日志或风格差异"
+
+    return ""
+
+
 def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[list[Finding], list[Finding]]:
     """Zero-token prefilter for generic test/documentation findings.
 
@@ -1032,6 +1128,7 @@ def apply_actionability_gate(findings: list[Finding], code_diff: str) -> tuple[l
         reason = (
             _reject_rust_direct_path_claim(finding, code_diff)
             or _reject_low_value_local_noise(finding, code_diff)
+            or _reject_ungrounded_specialist_finding(finding, code_diff)
             or _reject_generic_quality_finding(finding, code_diff)
         )
         if reason:

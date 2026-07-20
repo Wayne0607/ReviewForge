@@ -9,7 +9,7 @@ from reviewforge.core.state import Finding
 from reviewforge.engine.calibrator import CalibrationResponseError, DynamicCalibrator, apply_actionability_gate
 from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
 from reviewforge.engine.detectors.quality import detect_quality_findings
-from reviewforge.engine.prompt import build_reviewer_prompt
+from reviewforge.engine.prompt import build_planner_prompt, build_reviewer_prompt
 
 
 class FailingLLM:
@@ -2141,6 +2141,128 @@ async def test_persistent_poisoned_judgment_is_split_and_suppressed_without_fail
         for finding in findings[1:]
     )
     assert llm.round_counts == {"adversarial": 1, "judge": 6}
+
+
+def test_actionability_rejects_ungrounded_dependency_and_a11y_absence():
+    diff = _summary("view.tsx", '<Button icon="more" />')
+    findings = [
+        Finding(
+            id="dependency_memory",
+            file="package.json",
+            line=2,
+            category="dependency-security",
+            message="This version may have a known CVE.",
+            reviewer="dependency_reviewer",
+        ),
+        Finding(
+            id="custom_button_name",
+            file="view.tsx",
+            line=1,
+            category="missing-aria-label",
+            message="The custom Button may lack an accessible name.",
+            reviewer="accessibility_reviewer",
+        ),
+        Finding(
+            id="keyboard_contract",
+            file="view.tsx",
+            line=1,
+            category="keyboard-navigation",
+            message="The custom control handles click but not keyboard activation.",
+            reviewer="accessibility_reviewer",
+        ),
+    ]
+
+    actionable, rejected = apply_actionability_gate(findings, diff)
+
+    assert {finding.id for finding in actionable} == {"keyboard_contract"}
+    assert {finding.id for finding in rejected} == {"dependency_memory", "custom_button_name"}
+
+
+def test_actionability_requires_local_database_sink_for_n_plus_one():
+    diff = _summary(
+        "service.ts",
+        "for (const item of items) {\n"
+        "  await client.request(item);\n"
+        "}\n"
+        "for (const user of users) {\n"
+        "  await prisma.account.findFirst({ where: { userId: user.id } });\n"
+        "}",
+    )
+    network = Finding(
+        id="network_loop",
+        file="service.ts",
+        line=2,
+        category="n-plus-one",
+        message="The loop makes one network request per item.",
+        reviewer="performance_reviewer",
+    )
+    database = Finding(
+        id="database_loop",
+        file="service.ts",
+        line=5,
+        category="n-plus-one",
+        message="The loop makes one database query per user.",
+        reviewer="performance_reviewer",
+    )
+
+    actionable, rejected = apply_actionability_gate([network, database], diff)
+
+    assert actionable == [database]
+    assert rejected == [network]
+
+
+def test_actionability_rejects_performance_nit_without_scale_proof():
+    diff = _summary("slots.ts", "for (const slot of slots) {\n  dayjs(slot.start).hour();\n}")
+    nit = Finding(
+        id="small_allocation",
+        file="slots.ts",
+        line=2,
+        category="performance",
+        message="This creates a small object in each iteration.",
+        reviewer="performance_reviewer",
+    )
+    quadratic = Finding(
+        id="quadratic",
+        file="slots.ts",
+        line=2,
+        category="performance",
+        message="This nested scan is O(n^2) for an unbounded input.",
+        reviewer="performance_reviewer",
+    )
+
+    actionable, rejected = apply_actionability_gate([nit, quadratic], diff)
+
+    assert actionable == [quadratic]
+    assert rejected == [nit]
+
+
+def test_prompt_diff_evidence_has_hard_fair_budgets():
+    registry = build_registry()
+    huge = "x" * 50_000
+    planner = build_planner_prompt(
+        {
+            "registry": registry,
+            "repo": "owner/repo",
+            "pr_number": 1,
+            "files_changed": ["a.py"],
+            "diff_summary": huge,
+        }
+    )[1]["content"]
+    reviewer = build_reviewer_prompt(
+        {
+            "registry": registry,
+            "reviewer_type": "style",
+            "agent_name": "style_reviewer",
+            "files_to_review": ["a.py", "b.py", "c.py"],
+            "diffs": {"a.py": huge, "b.py": huge, "c.py": huge},
+        }
+    )[1]["content"]
+
+    assert "diff truncated to prompt budget" in planner
+    assert len(planner) < 30_000
+    assert all(f"### {path}" in reviewer for path in ("a.py", "b.py", "c.py"))
+    assert "diff truncated to prompt budget" in reviewer
+    assert len(reviewer) < 42_000
 
 
 def test_reviewer_prompts_require_concrete_test_and_documentation_evidence():

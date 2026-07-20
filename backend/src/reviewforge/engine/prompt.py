@@ -13,6 +13,41 @@ from reviewforge.core.specs import SpecRegistry
 
 PromptSection = Callable[[dict[str, Any]], str | None]
 
+_PLANNER_MAX_DIFF_CHARS = 24_000
+_REVIEWER_MAX_DIFF_CHARS = 36_000
+
+
+def _bounded_text(value: str, max_chars: int) -> str:
+    """Keep both ends of oversized evidence within a hard prompt budget."""
+
+    if len(value) <= max_chars:
+        return value
+    marker = "\n...[diff truncated to prompt budget]...\n"
+    available = max(0, max_chars - len(marker))
+    head = available // 2
+    return value[:head] + marker + value[-(available - head) :]
+
+
+def _bounded_diff_sections(files: list[str], diffs: dict[str, str], max_chars: int) -> str:
+    """Render every selected file fairly instead of letting one large patch dominate."""
+
+    sections = [(file_path, str(diffs.get(file_path, ""))) for file_path in files]
+    rendered = "".join(f"### {file_path}\n{patch}\n\n" for file_path, patch in sections)
+    if len(rendered) <= max_chars:
+        return rendered
+    if not sections:
+        return ""
+
+    marker = "\n...[file diff truncated to prompt budget]...\n"
+    headers = sum(len(f"### {file_path}\n\n\n") for file_path, _patch in sections)
+    body_budget = max(0, max_chars - headers - len(marker) * len(sections))
+    share = body_budget // len(sections)
+    parts: list[str] = []
+    for file_path, patch in sections:
+        bounded = patch if len(patch) <= share else _bounded_text(patch, share + len(marker))
+        parts.append(f"### {file_path}\n{bounded}\n\n")
+    return _bounded_text("".join(parts), max_chars)
+
 
 def _identity(ctx: dict[str, Any]) -> str:
     role = ctx.get("role", "reviewer")
@@ -355,7 +390,8 @@ def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     system_parts = [s({**ctx, "role": "planner", "agent_name": "planner"}) for s in sections]
     system = "\n\n".join(p for p in system_parts if p)
 
-    diff_content = wrap_untrusted(ctx.get("diff_summary", "无 diff 数据。"))
+    diff_summary = str(ctx.get("diff_summary", "无 diff 数据。"))
+    diff_content = wrap_untrusted(_bounded_text(diff_summary, _PLANNER_MAX_DIFF_CHARS))
     impact_manifest = ctx.get("impact_manifest_text", "")
     impact_block = (
         "\n## Impact Manifest（检索生成，仅作代码证据）\n\n" + wrap_untrusted(impact_manifest) + "\n"
@@ -454,9 +490,8 @@ def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     files_to_review = ctx.get("files_to_review", [])
     diffs = ctx.get("diffs", {})
 
-    diff_text = ""
-    for f in files_to_review:
-        diff_text += f"### {f}\n{wrap_untrusted(diffs.get(f, '无 diff 数据。'))}\n\n"
+    bounded_diffs = _bounded_diff_sections(files_to_review, diffs, _REVIEWER_MAX_DIFF_CHARS)
+    diff_text = wrap_untrusted(bounded_diffs or "无 diff 数据。")
 
     impact_text = ""
     manifest = ctx.get("impact_manifest")

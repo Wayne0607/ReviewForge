@@ -700,6 +700,14 @@ class Database:
         )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 
+    async def find_symbols_by_name(self, symbol_name: str) -> list[dict[str, Any]]:
+        """Return recent definitions regardless of risk classification."""
+        cursor = await self._db.execute(
+            "SELECT * FROM code_symbols WHERE symbol_name=? ORDER BY pr_number DESC LIMIT 50",
+            (symbol_name,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
     async def upsert_relation(
         self,
         run_id: str,
@@ -735,6 +743,14 @@ class Database:
         cursor = await self._db.execute(
             "SELECT * FROM code_relations WHERE target_file=?",
             (target_file,),
+        )
+        return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def find_relations_to_symbol(self, target_symbol: str) -> list[dict[str, Any]]:
+        """Return recent graph edges targeting one symbol."""
+        cursor = await self._db.execute(
+            "SELECT * FROM code_relations WHERE target_symbol=? ORDER BY id DESC LIMIT 50",
+            (target_symbol,),
         )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
 

@@ -164,6 +164,13 @@ class ReviewForgeConfig:
             self.events_dir = data["events_dir"]
         if "confidence_threshold" in data:
             self.confidence_threshold = data["confidence_threshold"]
+        if "agentic_reviewers" in data and isinstance(data["agentic_reviewers"], list):
+            self.agentic_reviewers = [str(name).strip() for name in data["agentic_reviewers"] if str(name).strip()]
+        if "agentic_default" in data:
+            value = data["agentic_default"]
+            self.agentic_default = (
+                value.strip().lower() not in ("0", "false", "no", "") if isinstance(value, str) else bool(value)
+            )
         if "escalation" in data:
             esc = data["escalation"]
             _esc_types = {

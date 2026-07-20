@@ -133,6 +133,24 @@ def build_registry() -> SpecRegistry:
 
     registry.register_tool(
         ToolSpec(
+            name="get_change_context",
+            description=(
+                "Read the precomputed Impact Manifest: changed symbols, calls, imports, "
+                "repository references, likely tests, and historical graph edges"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Optional changed-file filter"},
+                    "symbol": {"type": "string", "description": "Optional symbol filter"},
+                },
+            },
+            risk_level="low",
+        )
+    )
+
+    registry.register_tool(
+        ToolSpec(
             name="post_comment",
             description="Post a review comment on a specific line of the PR",
             input_schema={
@@ -212,7 +230,7 @@ def build_registry() -> SpecRegistry:
             name="security_reviewer",
             role="executor",
             description="Reviews code for security vulnerabilities",
-            allowed_tools=["read_diff", "read_file", "search_code"],
+            allowed_tools=["read_diff", "read_file", "search_code", "get_change_context"],
             model_profile="reviewer",
             max_steps=10,
             output_contract={
@@ -245,7 +263,7 @@ def build_registry() -> SpecRegistry:
             name="performance_reviewer",
             role="executor",
             description="Reviews code for performance issues",
-            allowed_tools=["read_diff", "read_file", "search_code"],
+            allowed_tools=["read_diff", "read_file", "search_code", "get_change_context"],
             model_profile="reviewer",
             max_steps=8,
             output_contract={
@@ -278,7 +296,7 @@ def build_registry() -> SpecRegistry:
             name="style_reviewer",
             role="executor",
             description="Reviews code for readability and style issues",
-            allowed_tools=["read_diff", "read_file"],
+            allowed_tools=["read_diff", "read_file", "get_change_context"],
             model_profile="reviewer",
             max_steps=6,
             output_contract={
@@ -352,7 +370,7 @@ def build_registry() -> SpecRegistry:
             name="testing_reviewer",
             role="executor",
             description="Reviews code for testing issues — missing tests, poor coverage, edge cases",
-            allowed_tools=["read_diff", "read_file", "search_code"],
+            allowed_tools=["read_diff", "read_file", "search_code", "get_change_context"],
             model_profile="reviewer",
             max_steps=6,
             output_contract={
@@ -385,7 +403,7 @@ def build_registry() -> SpecRegistry:
             name="doc_reviewer",
             role="executor",
             description="Reviews code for documentation gaps — missing docstrings, type hints, comments",
-            allowed_tools=["read_diff", "read_file"],
+            allowed_tools=["read_diff", "read_file", "get_change_context"],
             model_profile="reviewer",
             max_steps=5,
             output_contract={
@@ -418,7 +436,7 @@ def build_registry() -> SpecRegistry:
             name="dependency_reviewer",
             role="executor",
             description="Reviews code for dependency risks — new deps, version locks, vulnerabilities",
-            allowed_tools=["read_diff", "read_file", "search_code"],
+            allowed_tools=["read_diff", "read_file", "search_code", "get_change_context"],
             model_profile="reviewer",
             max_steps=6,
             output_contract={
@@ -451,7 +469,7 @@ def build_registry() -> SpecRegistry:
             name="accessibility_reviewer",
             role="executor",
             description="Reviews code for accessibility issues — missing alt, aria labels, keyboard nav",
-            allowed_tools=["read_diff", "read_file"],
+            allowed_tools=["read_diff", "read_file", "get_change_context"],
             model_profile="reviewer",
             max_steps=6,
             output_contract={

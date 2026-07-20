@@ -82,6 +82,12 @@ events_dir: ".reviewforge/events"
 # 全局置信度阈值（低于此值的发现不发评论）
 confidence_threshold: 0.5
 
+# 仅安全审查启用证据工具循环；其他 Reviewer 直接消费预计算的 Impact Manifest，
+# 在控制 token 成本的同时优先提升最需要跨文件数据流证据的维度。
+agentic_reviewers:
+  - security_reviewer
+agentic_default: false
+
 # Escalation：对不确定的 finding 自动用工具核实
 escalation:
   enabled: true

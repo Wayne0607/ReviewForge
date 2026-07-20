@@ -37,6 +37,7 @@ class ToolGateway:
             "read_diff": self._read_diff,
             "read_file": self._read_file,
             "search_code": self._search_code,
+            "get_change_context": self._get_change_context,
             "post_comment": self._post_comment,
             "post_review": self._post_review,
         }
@@ -142,6 +143,14 @@ class ToolGateway:
 
     async def _search_code(self, params: dict[str, Any], state: StateStore) -> str:
         return await self._github.search_code(state.repo, params["pattern"], params.get("file_glob", ""))
+
+    async def _get_change_context(self, params: dict[str, Any], state: StateStore) -> str:
+        """Return the precomputed Impact Manifest, optionally narrowed."""
+        # Local import keeps the gateway independent from engine initialization.
+        from reviewforge.engine.context_engine import render_impact_manifest
+
+        files = [params["file_path"]] if params.get("file_path") else None
+        return render_impact_manifest(state.impact_manifest, files=files, symbol=params.get("symbol", ""))
 
     async def _post_comment(self, params: dict[str, Any], state: StateStore) -> dict[str, Any]:
         return await self._github.post_review_comment(

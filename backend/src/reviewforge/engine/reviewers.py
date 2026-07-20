@@ -57,6 +57,11 @@ def build_reviewer_tools(
         """Read diff for a specific file in this PR."""
         return await gw.invoke("read_diff", {"file_path": file_path}, state, agent_name=agent_name) or ""
 
+    async def get_change_context(file_path: str = "", symbol: str = "") -> str:
+        """Read changed symbols, repository references and historical graph context."""
+        params = {"file_path": file_path, "symbol": symbol}
+        return await gw.invoke("get_change_context", params, state, agent_name=agent_name) or ""
+
     tools = [
         StructuredTool.from_function(
             coroutine=read_file,
@@ -69,6 +74,11 @@ def build_reviewer_tools(
             description="在仓库搜索代码，定位调用方/定义，判断输入是否在别处已被校验",
         ),
         StructuredTool.from_function(coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"),
+        StructuredTool.from_function(
+            coroutine=get_change_context,
+            name="get_change_context",
+            description="读取影响清单：变更符号、调用/导入、仓库引用、候选测试和历史图谱边",
+        ),
     ]
 
     # Level-3 progressive disclosure: pull deeper Skill reference files on demand.
@@ -168,6 +178,7 @@ class BaseReviewer:
             "skill_refs": self._skill_refs,
             "target_language": getattr(self, "_target_language", ""),
             "target_framework": getattr(self, "_target_framework", ""),
+            "impact_manifest": state.impact_manifest,
         }
         messages = build_reviewer_prompt(ctx)
 
@@ -202,6 +213,7 @@ class BaseReviewer:
             "skill_refs": self._skill_refs,
             "target_language": getattr(self, "_target_language", ""),
             "target_framework": getattr(self, "_target_framework", ""),
+            "impact_manifest": state.impact_manifest,
         }
         messages = build_reviewer_prompt(ctx)
         chat = [

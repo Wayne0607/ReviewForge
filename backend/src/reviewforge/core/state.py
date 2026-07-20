@@ -175,6 +175,9 @@ class StateStore:
     # Per-run patch cache. ``None`` means the PR file list has not been loaded;
     # an empty dict is a valid loaded result (for example binary-only patches).
     file_diffs: dict[str, str] | None = field(default=None, repr=False)
+    # Bounded repository context generated before planning. It is derived from
+    # the immutable PR head and is safe to share by deep-copy/read-only views.
+    impact_manifest: dict[str, Any] = field(default_factory=dict, repr=False)
 
     # Runtime state
     findings: dict[str, Finding] = field(default_factory=dict)
@@ -243,6 +246,7 @@ class StateStore:
             "repo": self.repo,
             "head_sha": self.head_sha,
             "files_changed": self.files_changed,
+            "impact_manifest": copy.deepcopy(self.impact_manifest),
             "findings": {k: v.to_dict() for k, v in self.findings.items()},
             "tasks": {k: v.to_dict() for k, v in self.tasks.items()},
             "notes_count": len(self.notes),

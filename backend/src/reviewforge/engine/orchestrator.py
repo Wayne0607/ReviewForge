@@ -23,6 +23,7 @@ from reviewforge.core.scheduler import Scheduler
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate, apply_code_evidence_gate
+from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
@@ -139,6 +140,7 @@ class Orchestrator:
             self._reviewer_llm = reviewer_llm
 
         self._cross_pr = CrossPRAnalyzer(db, cross_pr_llm, github_client) if db else None
+        self._context_engine = ContextEngine(gateway, db)
         self._verifier = Verifier()  # #5: 纯逻辑去重/合并阶段（在 LLM 校准之前）
         self._escalation_reviewer: EscalationReviewer | None = None
         # B4: LoopDetector 每 run 新建，避免跨 run 状态污染
@@ -370,6 +372,26 @@ class Orchestrator:
 
         planner_errors: list[str] = []
         try:
+            # Build repository-aware context before planning. Failure is
+            # non-fatal: the original diff-only pipeline remains available.
+            self._events.emit("context_engine.started", {"file_count": len(state.files_changed)})
+            try:
+                manifest = await self._context_engine.build(state)
+                self._events.emit(
+                    "context_engine.completed",
+                    {
+                        "indexed_files": manifest.get("coverage", {}).get("indexed_files", 0),
+                        "references": sum(len(item.get("paths", [])) for item in manifest.get("references", [])),
+                        "risk_signals": len(manifest.get("risk_signals", [])),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Context Engine failed; continuing with diff-only review: %s", exc, exc_info=True)
+                state.impact_manifest = {}
+                self._events.emit("context_engine.failed", {"error": str(exc)})
+
             # Phase 0: deterministic coverage is independent of Planner routing
             # and Reviewer health. Keep its keys so later reviewer overlap can be
             # merged at ingestion instead of becoming duplicate findings.

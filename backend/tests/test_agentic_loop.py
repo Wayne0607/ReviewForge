@@ -157,13 +157,14 @@ async def test_agentic_sets_reviewer_name(registry, gateway, state, task):
 
 @pytest.mark.asyncio
 async def test_reviewer_map_has_all_types():
-    """REVIEWER_MAP should contain all 7 reviewer types."""
+    """REVIEWER_MAP should contain every built-in reviewer type."""
     from reviewforge.engine.reviewers import REVIEWER_MAP
 
     expected = {
         "security_reviewer",
         "performance_reviewer",
         "style_reviewer",
+        "localization_reviewer",
         "testing_reviewer",
         "doc_reviewer",
         "dependency_reviewer",

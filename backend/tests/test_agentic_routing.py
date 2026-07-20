@@ -7,6 +7,7 @@ from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.planner import (
     Planner,
+    _localization_files,
     _looks_like_cross_pr_wrapper,
     _skip_reviewer_for_change,
     _skip_reviewer_for_files,
@@ -123,6 +124,37 @@ def test_planner_keeps_testing_review_for_an_actual_security_fix():
 """
 
     assert not _skip_reviewer_for_change("testing_reviewer", ["src/parser.py"], diff)
+
+
+def test_localization_routing_selects_production_resources_and_bounds_scope():
+    files = [
+        "src/test/resources/messages_de.properties",
+        "themes/messages/messages_lt.properties",
+        "web/locales/zh-CN.json",
+        "config/settings.json",
+        *[f"translations/messages_{index}.properties" for index in range(30)],
+    ]
+
+    selected = _localization_files(files)
+
+    assert selected[:2] == ["themes/messages/messages_lt.properties", "web/locales/zh-CN.json"]
+    assert len(selected) == 16
+    assert all("src/test" not in path for path in selected)
+
+
+async def test_planner_forces_localization_reviewer_for_locale_resources():
+    planner = Planner(MockChatLLM(), build_registry())
+    state = StateStore(
+        pr_number=1,
+        repo="o/r",
+        files_changed=["themes/messages/messages_lt.properties", "src/service.java"],
+        diff_summary="+totpStep1=Installa una delle seguenti applicazioni",
+    )
+
+    tasks = await planner.plan(state)
+    task = next(item for item in tasks if item.reviewer == "localization_reviewer")
+
+    assert task.files == ["themes/messages/messages_lt.properties"]
 
 
 def test_cross_pr_wrapper_changes_skip_style_fallback():

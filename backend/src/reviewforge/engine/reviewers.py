@@ -114,6 +114,7 @@ _MAX_FINDINGS_BY_TYPE = {
     "testing": 6,
     "documentation": 4,
     "style": 5,
+    "localization": 6,
 }
 _SEVERITY_RANK = {"error": 3, "warning": 2, "info": 1}
 
@@ -592,6 +593,29 @@ class StyleReviewer(BaseReviewer):
         )
 
 
+class LocalizationReviewer(BaseReviewer):
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        registry: SpecRegistry,
+        gateway: ToolGateway,
+        agentic: bool = False,
+        max_tokens: int = 20000,
+        event_bus: Any = None,
+    ) -> None:
+        super().__init__(
+            name="localization_reviewer",
+            reviewer_type="localization",
+            llm=llm,
+            registry=registry,
+            gateway=gateway,
+            max_steps=registry.get_agent("localization_reviewer").max_steps,
+            agentic=agentic,
+            max_tokens=max_tokens,
+            event_bus=event_bus,
+        )
+
+
 class TestingReviewer(BaseReviewer):
     def __init__(
         self,
@@ -688,6 +712,7 @@ REVIEWER_MAP: dict[str, type[BaseReviewer]] = {
     "security_reviewer": SecurityReviewer,
     "performance_reviewer": PerformanceReviewer,
     "style_reviewer": StyleReviewer,
+    "localization_reviewer": LocalizationReviewer,
     "testing_reviewer": TestingReviewer,
     "doc_reviewer": DocumentationReviewer,
     "dependency_reviewer": DependencyReviewer,

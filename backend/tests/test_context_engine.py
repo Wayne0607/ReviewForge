@@ -75,6 +75,32 @@ async def test_context_engine_builds_symbol_references_tests_and_graph(tmp_path)
         await db.close()
 
 
+async def test_context_engine_represents_localization_resources_without_symbols():
+    state = StateStore(
+        repo="owner/repo",
+        pr_number=10,
+        head_sha="head",
+        files_changed=["themes/messages/messages_zh_CN.properties"],
+        file_diffs={
+            "themes/messages/messages_zh_CN.properties": "@@ -1 +1 @@\n-old=phone\n+totpStep1=手機應用程式\n"
+        },
+    )
+
+    manifest = await ContextEngine(ToolGateway(build_registry(), _ContextGitHub())).build(state)
+
+    assert manifest["files"] == []
+    assert manifest["coverage"]["indexed_resource_files"] == 1
+    assert manifest["resource_files"] == [
+        {
+            "path": "themes/messages/messages_zh_CN.properties",
+            "kind": "localization",
+            "locale": "zh_CN",
+            "added_lines": [1],
+            "added_entries": 1,
+        }
+    ]
+
+
 async def test_context_tool_is_permission_checked_and_filterable():
     registry = build_registry()
     gateway = ToolGateway(registry, _ContextGitHub())

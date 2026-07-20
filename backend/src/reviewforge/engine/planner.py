@@ -27,6 +27,7 @@ _MAX_LLM_TASKS = 6
 _MAX_REVIEWER_NAME_LENGTH = 100
 _MAX_FILE_PATH_LENGTH = 1024
 _MAX_RATIONALE_INPUT_LENGTH = TASK_RATIONALE_MAX_LENGTH * 10
+_MAX_LOCALIZATION_FILES = 16
 
 # ── 通用安全模式（不限语言）────────────────────────────────────────────
 _UNIVERSAL_SECURITY = [
@@ -184,6 +185,8 @@ class Planner:
             for r in (self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers)
             if not _skip_reviewer_for_change(r, state.files_changed, state.diff_summary)
         }
+        if _localization_files(state.files_changed) and "localization_reviewer" not in done_reviewers:
+            forced_reviewers.add("localization_reviewer")
 
         # Detect language summary for the planner prompt
         file_langs = self._detect_file_languages(state.files_changed)
@@ -319,10 +322,11 @@ class Planner:
 
         for reviewer in forced:
             if reviewer not in llm_reviewers:
+                task_files = _localization_files(files) if reviewer == "localization_reviewer" else files
                 merged.append(
                     ReviewTask(
                         reviewer=reviewer,
-                        files=files,
+                        files=task_files,
                         rationale="自动检测到安全/性能模式",
                     )
                 )
@@ -414,6 +418,11 @@ class Planner:
                 "accessibility": "accessibility_reviewer",
                 "accessibility_reviewer": "accessibility_reviewer",
                 "a11y": "accessibility_reviewer",
+                "localization": "localization_reviewer",
+                "localisation": "localization_reviewer",
+                "i18n": "localization_reviewer",
+                "l10n": "localization_reviewer",
+                "localization_reviewer": "localization_reviewer",
             }
             reviewer = reviewer_map.get(reviewer, reviewer)
 
@@ -509,6 +518,29 @@ def _is_test_file(file_path: str) -> bool:
             "spec.jsx",
         )
     ) or name.startswith(("test_", "spec/", "tests/", "__tests__/", "test/"))
+
+
+def _localization_files(files: list[str]) -> list[str]:
+    """Select bounded production locale resources for dedicated semantic review."""
+
+    selected: list[str] = []
+    locale_suffixes = (".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl")
+    locale_directories = ("/i18n/", "/l10n/", "/locale/", "/locales/", "/translations/")
+    excluded_directories = ("/src/test/", "/test/", "/tests/", "/testdata/", "/fixtures/")
+    for file_path in files:
+        normalized = "/" + file_path.replace("\\", "/").lower().lstrip("/")
+        if any(marker in normalized for marker in excluded_directories):
+            continue
+        is_locale_resource = normalized.endswith(locale_suffixes) or (
+            normalized.endswith((".json", ".yaml", ".yml"))
+            and any(marker in normalized for marker in locale_directories)
+        )
+        if not is_locale_resource:
+            continue
+        selected.append(file_path)
+        if len(selected) >= _MAX_LOCALIZATION_FILES:
+            break
+    return selected
 
 
 def _skip_reviewer_for_files(reviewer: str, files: list[str]) -> bool:

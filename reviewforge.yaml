@@ -49,6 +49,12 @@ reviewers:
     max_steps: 6
     confidence_threshold: 0.5
 
+  - name: localization_reviewer
+    type: localization
+    enabled: true
+    max_steps: 4
+    confidence_threshold: 0.5
+
   - name: testing_reviewer
     type: testing
     enabled: true

@@ -41,6 +41,7 @@ _MAX_REFERENCE_READS = 4
 _MAX_GRAPH_ROWS = 12
 _MAX_FILE_CHARS = 300_000
 _MAX_WIKI_PAGES = 8
+_MAX_RESOURCE_FILES = 32
 _SUPPORTED_LANGUAGES = {"python", "go", "java", "rust", "ruby", "javascript", "typescript"}
 _LOW_SIGNAL_NAMES = {
     "append",
@@ -104,6 +105,7 @@ class ContextEngine:
         }
         graph_context = await self._load_graph_context(symbols, known_paths)
         wiki_context = await self._load_wiki_context(files, references, state)
+        resource_context = _resource_context(state.files_changed, state.file_diffs or {})
 
         test_paths = sorted({path for item in references for path in item["paths"] if _is_test_path(path)})[
             :_MAX_REFERENCE_PATHS
@@ -122,10 +124,12 @@ class ContextEngine:
             "candidate_tests": test_paths,
             "historical_graph": graph_context,
             "wiki_pages": wiki_context,
+            "resource_files": resource_context,
             "risk_signals": risk_signals,
             "coverage": {
                 "changed_files": len(state.files_changed),
                 "indexed_files": len(files),
+                "indexed_resource_files": len(resource_context),
                 "truncated": len(selected)
                 < len([path for path in state.files_changed if detect_language(path) in _SUPPORTED_LANGUAGES]),
             },
@@ -452,6 +456,11 @@ def render_impact_manifest(
         for item in manifest.get("files", [])
         if not selected_files or str(item.get("path", "")) in selected_files
     ]
+    payload["resource_files"] = [
+        item
+        for item in manifest.get("resource_files", [])
+        if not selected_files or str(item.get("path", "")) in selected_files
+    ]
     if needle:
         payload["files"] = [item for item in payload["files"] if needle in json.dumps(item, ensure_ascii=False).lower()]
         payload["references"] = [
@@ -464,6 +473,11 @@ def render_impact_manifest(
         ]
         payload["wiki_pages"] = [
             item for item in manifest.get("wiki_pages", []) if needle in json.dumps(item, ensure_ascii=False).lower()
+        ]
+        payload["resource_files"] = [
+            item
+            for item in manifest.get("resource_files", [])
+            if needle in json.dumps(item, ensure_ascii=False).lower()
         ]
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     if len(text) <= max_chars:
@@ -490,6 +504,33 @@ def _touches_changed_line(symbol: SymbolInfo, added_lines: list[int]) -> bool:
     start = symbol.start_line or symbol.line
     end = symbol.end_line or symbol.line
     return any(start <= line <= end for line in added_lines)
+
+
+def _resource_context(paths: list[str], diffs: dict[str, str]) -> list[dict[str, Any]]:
+    """Represent non-code locale/config resources without pretending they have symbols."""
+
+    resources: list[dict[str, Any]] = []
+    locale_name = re.compile(r"(?:messages|strings|locale)[_-]([a-z]{2,3}(?:[_-][A-Z]{2})?)", re.IGNORECASE)
+    resource_suffixes = {".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl"}
+    for path in paths:
+        normalized = str(PurePosixPath(path))
+        suffix = PurePosixPath(normalized).suffix.lower()
+        if suffix not in resource_suffixes:
+            continue
+        match = locale_name.search(PurePosixPath(normalized).name)
+        added = list(iter_added_lines(diffs.get(path, "")))
+        resources.append(
+            {
+                "path": path,
+                "kind": "localization",
+                "locale": match.group(1).replace("-", "_") if match else "unknown",
+                "added_lines": [line for line, _content in added[:24]],
+                "added_entries": len(added),
+            }
+        )
+        if len(resources) >= _MAX_RESOURCE_FILES:
+            break
+    return resources
 
 
 def _parse_search_paths(output: str, changed_files: list[str]) -> list[str]:

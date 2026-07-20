@@ -206,9 +206,23 @@ class Planner:
         }
         messages = build_planner_prompt(ctx)
 
-        response = await self._llm.ainvoke(
-            [SystemMessage(content=messages[0]["content"]), HumanMessage(content=messages[1]["content"])]
-        )
+        chat_messages = [SystemMessage(content=messages[0]["content"]), HumanMessage(content=messages[1]["content"])]
+        response = await self._llm.ainvoke(chat_messages)
+        if not self._has_valid_task_envelope(response.content):
+            logger.warning("Planner returned invalid JSON; retrying once with the task envelope contract")
+            response = await self._llm.ainvoke(
+                [
+                    *chat_messages,
+                    response,
+                    HumanMessage(
+                        content=(
+                            "Your previous response was not valid planner JSON. "
+                            'Return only one JSON object with a "tasks" array; '
+                            "use an empty array when no task is needed."
+                        )
+                    ),
+                ]
+            )
 
         llm_tasks = [
             t
@@ -485,6 +499,21 @@ class Planner:
                 logger.warning("Planner task %d failed schema validation; skipping", index)
 
         return tasks
+
+    @staticmethod
+    def _has_valid_task_envelope(content: object) -> bool:
+        if not isinstance(content, str):
+            return False
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        try:
+            data = json.loads(stripped.strip())
+        except json.JSONDecodeError:
+            return False
+        return isinstance(data, dict) and isinstance(data.get("tasks"), list)
 
 
 def _normalize_rationale(value: object) -> str:

@@ -2374,3 +2374,21 @@ def test_actionability_gate_rejects_missing_mock_verification_advice():
 
     assert actionable == []
     assert rejected == [finding]
+
+
+def test_actionability_gate_rejects_llm_test_compilation_claim_without_build_evidence():
+    finding = Finding(
+        id="test_compile",
+        file="pkg/service_test.go",
+        line=18,
+        category="compilation-error",
+        message="变量 p 未定义，测试无法编译。",
+        suggestion="重新声明 p。",
+        reviewer="testing_reviewer",
+    )
+    diff = _summary("pkg/service_test.go", "func TestService(t *testing.T) { use(p) }")
+
+    actionable, rejected = apply_actionability_gate([finding], diff)
+
+    assert actionable == []
+    assert rejected == [finding]

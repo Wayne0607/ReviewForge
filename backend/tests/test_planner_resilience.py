@@ -17,6 +17,21 @@ class _StaticPlannerLLM:
         return AIMessage(content=self._content)
 
 
+class _InvalidThenValidPlannerLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke(self, _messages: list[object]) -> AIMessage:
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(content="analysis without JSON")
+        return AIMessage(
+            content=json.dumps(
+                {"tasks": [{"reviewer": "style", "files": ["app.py"], "rationale": "observable behavior"}]}
+            )
+        )
+
+
 async def test_overlong_rationale_is_truncated_without_failing_plan() -> None:
     content = json.dumps(
         {
@@ -56,6 +71,17 @@ async def test_plan_filters_absence_only_test_and_doc_tasks_for_source_only_chan
     tasks = await planner.plan(state)
 
     assert [task.reviewer for task in tasks] == ["security_reviewer"]
+
+
+async def test_planner_retries_invalid_json_once() -> None:
+    llm = _InvalidThenValidPlannerLLM()
+    planner = Planner(llm, build_registry())  # type: ignore[arg-type]
+    state = StateStore(repo="owner/repo", pr_number=76, files_changed=["app.py"], diff_summary="+value = 1")
+
+    tasks = await planner.plan(state)
+
+    assert llm.calls == 2
+    assert [task.reviewer for task in tasks] == ["correctness_reviewer"]
 
 
 def test_malformed_task_is_skipped_without_losing_valid_siblings() -> None:

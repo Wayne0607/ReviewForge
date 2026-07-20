@@ -1074,6 +1074,13 @@ def _reject_ungrounded_specialist_finding(finding: Finding, code_diff: str) -> s
     patch = _extract_file_patch(code_diff, finding.file)
     nearby = _nearby_added_code(code_diff, finding.file, finding.line, radius=16)
 
+    if (
+        finding.reviewer == "testing_reviewer"
+        and bool(_TEST_FILE.search(finding.file.replace("\\", "/")))
+        and category in {"compilation", "compilation-error", "compile-error", "undefined-symbol"}
+    ):
+        return "测试代码的编译/未定义符号结论没有确定性构建证据；此类问题交由编译器和 CI 判定"
+
     if finding.reviewer == "dependency_reviewer" and category != "dependency-version-range":
         return (
             "依赖结论缺少确定性扫描器或外部公告/许可证数据源的证据；"

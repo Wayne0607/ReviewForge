@@ -727,6 +727,35 @@ def _reject_by_code_evidence(finding: Finding, evidence: _PythonCodeEvidence | N
     return ""
 
 
+def apply_code_evidence_gate(
+    findings: list[Finding],
+    code_diff: str,
+) -> tuple[list[Finding], list[Finding]]:
+    """Reject provably safe Python findings before any LLM verification path.
+
+    Escalation and calibration are mutually exclusive, so keeping this proof
+    only inside ``DynamicCalibrator`` allowed ambiguous trace findings to bypass
+    it. This shared zero-token gate makes routing order irrelevant.
+    """
+
+    kept: list[Finding] = []
+    rejected: list[Finding] = []
+    evidence_cache: dict[str, _PythonCodeEvidence | None] = {}
+    for finding in findings:
+        finding.category = normalize_category(finding.category)
+        if finding.file not in evidence_cache:
+            evidence_cache[finding.file] = _python_code_evidence(code_diff, finding.file)
+        rejection_reason = _reject_by_code_evidence(finding, evidence_cache[finding.file])
+        if not rejection_reason:
+            kept.append(finding)
+            continue
+        finding.status = "false_positive"
+        finding.verified_by = "code-evidence"
+        finding.verify_reason = rejection_reason
+        rejected.append(finding)
+    return kept, rejected
+
+
 def _rust_line_for_braces(line: str) -> str:
     """Remove comments/string bodies so Rust format strings do not change brace depth."""
 
@@ -1020,19 +1049,11 @@ class DynamicCalibrator:
             raise CalibrationResponseError("Calibration input contains duplicate finding ids")
 
         need_actionability, evidence_rejected = apply_actionability_gate(findings, code_diff)
+        need_actionability, code_evidence_rejected = apply_code_evidence_gate(need_actionability, code_diff)
+        evidence_rejected.extend(code_evidence_rejected)
         auto_confirmed = []
         need_calibration = []
-        evidence_cache: dict[str, _PythonCodeEvidence | None] = {}
         for f in need_actionability:
-            if f.file not in evidence_cache:
-                evidence_cache[f.file] = _python_code_evidence(code_diff, f.file)
-            rejection_reason = _reject_by_code_evidence(f, evidence_cache[f.file])
-            if rejection_reason:
-                f.status = "false_positive"
-                f.verified_by = "code-evidence"
-                f.verify_reason = rejection_reason
-                evidence_rejected.append(f)
-                continue
             expected_detector_reviewer = {
                 "dependency-version-range": "dependency_reviewer",
                 "missing-alt": "accessibility_reviewer",

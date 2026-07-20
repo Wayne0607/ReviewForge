@@ -108,6 +108,10 @@ _MAX_FINDINGS_BY_TYPE = {
 _SEVERITY_RANK = {"error": 3, "warning": 2, "info": 1}
 
 
+class ReviewerOutputError(RuntimeError):
+    """Raised when a reviewer cannot return recoverable findings JSON."""
+
+
 class BaseReviewer:
     """Base class for all reviewers.
 
@@ -173,7 +177,9 @@ class BaseReviewer:
         ]
 
         response = await self._llm.ainvoke(chat_messages)
-        findings = self._parse_findings(response.content)
+        findings, valid = self._parse_findings_result(response.content)
+        if not valid:
+            raise ReviewerOutputError(f"{self.name}: invalid JSON output")
         for f in findings:
             f.reviewer = self.name
         return self._merge_detector_findings(findings, diffs)
@@ -224,8 +230,8 @@ class BaseReviewer:
 
             tool_calls = getattr(resp, "tool_calls", None) or []
             if not tool_calls:
-                findings = self._parse_findings(resp.content)
-                if findings:
+                findings, valid = self._parse_findings_result(resp.content)
+                if valid:
                     for fd in findings:
                         fd.reviewer = self.name
                     return self._merge_detector_findings(findings, diffs)
@@ -270,7 +276,11 @@ class BaseReviewer:
         try:
             final = await llm.ainvoke(chat)
             budget.add(final)
-            findings = self._parse_findings(final.content)
+            findings, valid = self._parse_findings_result(final.content)
+            if not valid:
+                raise ReviewerOutputError(f"{self.name}: invalid JSON output after force-finish")
+        except ReviewerOutputError:
+            raise
         except Exception as e:
             logger.error(f"{self.name}: force-finish failed: {e}")
             findings = []
@@ -341,22 +351,77 @@ class BaseReviewer:
 
         return None
 
-    def _parse_findings(self, content: str) -> list[Finding]:
-        """Parse LLM JSON output into Finding objects."""
+    @staticmethod
+    def _recover_truncated_findings(content: str) -> dict[str, list[dict[str, Any]]] | None:
+        """Recover complete objects from a findings array cut off at the model limit.
+
+        Recovery is deliberately narrow: only complete JSON objects already
+        present inside a top-level list or a ``findings`` array are accepted.
+        The unfinished tail is discarded, and prose JSON snippets are ignored.
+        """
+
+        stripped = str(content or "").strip()
+        if stripped.startswith("```"):
+            stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
+        stripped = stripped.removesuffix("```").strip()
+
+        findings_match = re.search(r'"findings"\s*:\s*\[', stripped)
+        if findings_match is not None:
+            index = findings_match.end()
+        elif stripped.startswith("["):
+            index = 1
+        else:
+            return None
+
+        decoder = json.JSONDecoder()
+        recovered: list[dict[str, Any]] = []
+        while index < len(stripped):
+            while index < len(stripped) and (stripped[index].isspace() or stripped[index] == ","):
+                index += 1
+            if index >= len(stripped) or stripped[index] == "]":
+                break
+            try:
+                item, end = decoder.raw_decode(stripped, index)
+            except json.JSONDecodeError:
+                break
+            if not isinstance(item, dict):
+                return None
+            recovered.append(item)
+            index = end
+        return {"findings": recovered} if recovered else None
+
+    def _parse_findings_result(self, content: str) -> tuple[list[Finding], bool]:
+        """Parse findings and distinguish valid emptiness from malformed output."""
+
         data = self._extract_json(content)
+        recovered = False
+        if data is None:
+            data = self._recover_truncated_findings(content)
+            recovered = data is not None
         if data is None:
             logger.warning(f"{self.name}: invalid JSON output")
-            return []
+            return [], False
 
-        findings = []
+        if recovered:
+            logger.warning(f"{self.name}: recovered complete findings from truncated JSON output")
+            if self._events:
+                self._events.emit(
+                    "reviewer.output_recovered",
+                    {"reviewer": self.name, "findings_count": len(data.get("findings", []))},
+                )
+
         if isinstance(data, list):
             raw_findings = data
         elif isinstance(data, dict):
             raw_findings = data.get("findings", [])
         else:
             logger.warning(f"{self.name}: JSON output was {type(data).__name__}, expected object or list")
-            return []
+            return [], False
+        if not isinstance(raw_findings, list):
+            logger.warning(f"{self.name}: findings field was {type(raw_findings).__name__}, expected list")
+            return [], False
 
+        findings = []
         for item in raw_findings:
             if not isinstance(item, dict):
                 continue
@@ -377,7 +442,12 @@ class BaseReviewer:
                 )
             except Exception as e:
                 logger.warning(f"{self.name}: skipped invalid finding {item!r}: {e}")
-        return self._cap_findings(findings)
+        return self._cap_findings(findings), True
+
+    def _parse_findings(self, content: str) -> list[Finding]:
+        """Parse LLM JSON output into Finding objects."""
+        findings, _valid = self._parse_findings_result(content)
+        return findings
 
     def _merge_detector_findings(self, findings: list[Finding], diffs: dict[str, str]) -> list[Finding]:
         """Merge zero-token deterministic findings into reviewer output.

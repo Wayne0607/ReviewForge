@@ -11,6 +11,7 @@ Uses MockChatLLM with bind_tools to verify:
 from __future__ import annotations
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import ReviewTask, StateStore
@@ -18,6 +19,18 @@ from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.reviewers import SecurityReviewer
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.mock_github import MockGitHubClient
+
+
+class _EmptyFindingsLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        return AIMessage(content='{"findings": []}')
 
 
 @pytest.fixture
@@ -120,6 +133,17 @@ async def test_agentic_fallback_on_empty_tool_calls(registry, gateway, state, ta
 
 
 @pytest.mark.asyncio
+async def test_agentic_valid_empty_result_finishes_without_nudge(registry, gateway, state, task):
+    llm = _EmptyFindingsLLM()
+    reviewer = SecurityReviewer(llm, registry, gateway, agentic=True, max_tokens=500)
+
+    findings = await reviewer.execute(task, state)
+
+    assert isinstance(findings, list)
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_agentic_sets_reviewer_name(registry, gateway, state, task):
     """All findings from agentic mode should have the reviewer name set."""
     llm = MockChatLLM()
@@ -203,6 +227,61 @@ async def test_singleshot_parse_valid_findings(registry, gateway):
     assert findings[0].severity == "error"
     assert findings[0].category == "readability"
     assert findings[0].confidence == 0.95
+
+
+def test_parse_findings_distinguishes_valid_empty_from_invalid(registry, gateway):
+    from reviewforge.engine.reviewers import BaseReviewer
+
+    reviewer = BaseReviewer(
+        name="test",
+        reviewer_type="test",
+        llm=MockChatLLM(),
+        registry=registry,
+        gateway=gateway,
+    )
+
+    assert reviewer._parse_findings_result('{"findings": []}') == ([], True)
+    assert reviewer._parse_findings_result("not json") == ([], False)
+
+
+def test_parse_findings_recovers_complete_objects_from_truncated_output(registry, gateway):
+    from reviewforge.engine.reviewers import BaseReviewer
+
+    reviewer = BaseReviewer(
+        name="test",
+        reviewer_type="test",
+        llm=MockChatLLM(),
+        registry=registry,
+        gateway=gateway,
+    )
+    content = """
+    {"findings": [
+      {
+        "file": "app.py",
+        "line": 5,
+        "severity": "warning",
+        "category": "readability",
+        "message": "First complete finding",
+        "confidence": 0.8
+      },
+      {
+        "file": "app.py",
+        "line": 9,
+        "severity": "warning",
+        "category": "dead-code",
+        "message": "Second complete finding",
+        "confidence": 0.7
+      },
+      {"file": "app.py", "line": 12, "message": "cut
+    """
+
+    findings, valid = reviewer._parse_findings_result(content)
+
+    assert valid is True
+    assert [(finding.line, finding.category) for finding in findings] == [
+        (5, "readability"),
+        (9, "dead-code"),
+    ]
 
 
 @pytest.mark.asyncio

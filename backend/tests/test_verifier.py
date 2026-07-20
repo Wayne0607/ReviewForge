@@ -109,6 +109,18 @@ def test_vocabulary_aliases_are_canonicalized_before_detector_precedence():
             "loader.rb",
             "YAML.load may deserialize unsafe objects.",
         ),
+        (
+            "unsafe-deserialization",
+            "insecure-deserialization",
+            "seed.py",
+            "pickle.loads may deserialize attacker-controlled objects.",
+        ),
+        (
+            "dependency-locked",
+            "dependency-version-range",
+            "Cargo.toml",
+            "openssl * uses a mutable dependency version.",
+        ),
     ]
 
     for index, (alias, canonical, file_path, message) in enumerate(cases):

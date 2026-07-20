@@ -28,10 +28,13 @@ def test_security_category_aliases_normalize():
     assert normalize_category("dangerous-html") == "xss"
     assert normalize_category("unsafe-yaml") == "insecure-deserialization"
     assert normalize_category("deserialization") == "insecure-deserialization"
+    assert normalize_category("unsafe-deserialization") == "insecure-deserialization"
+    assert normalize_category("cross-pr-unsafe-deserialization") == "cross-pr-insecure-deserialization"
     assert normalize_category("empty-catch") == "exception-handling"
     assert normalize_category("optional-unsafe-get") == "null-safety"
     assert normalize_category("unlocked-dependency") == "dependency-version-range"
     assert normalize_category("unpinned-dependency") == "dependency-version-range"
+    assert normalize_category("dependency-locked") == "dependency-version-range"
     assert normalize_category("missing-accessible-name") == "missing-label"
     assert normalize_category("unsafe-dynamic-call") == "unsafe-dynamic-call"
     assert normalize_category("insecure-hash") == "crypto"
@@ -47,6 +50,7 @@ def test_security_category_aliases_normalize():
     assert is_security_category("malicious-dependency")
     assert is_security_category("unsafe-yaml")
     assert is_security_category("deserialization")
+    assert is_security_category("unsafe-deserialization")
     assert is_security_category("unlocked-dependency")
     assert is_security_category("unpinned-dependency")
     assert not is_security_category("unsafe-dynamic-call")

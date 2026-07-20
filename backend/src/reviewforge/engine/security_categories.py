@@ -44,6 +44,7 @@ _ALIASES = {
     "code-execution": "code-injection",
     "critical-security-vulnerability": "rce",
     "deserialization": "insecure-deserialization",
+    "unsafe-deserialization": "insecure-deserialization",
     "directory-traversal": "path-traversal",
     "empty-catch": "exception-handling",
     "eval": "code-injection",
@@ -96,6 +97,7 @@ _ALIASES = {
     "deprecated-dependency": "dependency-deprecated",
     "unbounded-dependency-version": "dependency-version-range",
     "unlocked-dependency": "dependency-version-range",
+    "dependency-locked": "dependency-version-range",
     "unpinned-dependency": "dependency-version-range",
     "unsafe-html": "xss",
     "version-unpinned": "dependency-version-range",
@@ -121,6 +123,9 @@ def normalize_category(category: str) -> str:
     """Return a stable finding category while preserving non-security labels."""
     raw = str(category or "").strip().lower().replace("_", "-").replace(" ", "-")
     normalized = re.sub(r"-+", "-", raw).strip("-")
+    if normalized.startswith("cross-pr-"):
+        inner = normalized.removeprefix("cross-pr-")
+        return f"cross-pr-{_ALIASES.get(inner, inner)}"
     return _ALIASES.get(normalized, normalized)
 
 

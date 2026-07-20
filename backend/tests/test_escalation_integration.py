@@ -109,6 +109,51 @@ class _MissingTestLLM(BaseChatModel):
         return self
 
 
+class _SafeCommandLLM(BaseChatModel):
+    """Emit a fuzzy command-injection claim that static code evidence can disprove."""
+
+    calls: int = 0
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        self.calls += 1
+        sysmsg = messages[0].content if messages else ""
+        if "planner" in sysmsg.lower():
+            content = json.dumps({"tasks": [{"reviewer": "security_reviewer", "files": ["helpers.py"]}]})
+        elif self.calls == 2:
+            content = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "file": "helpers.py",
+                            "line": 5,
+                            "severity": "warning",
+                            "category": "command-injection",
+                            "message": "The host argument can inject shell commands.",
+                            "suggestion": "Validate the host before invoking ping.",
+                            "confidence": 0.6,
+                        }
+                    ]
+                }
+            )
+        else:
+            raise AssertionError("provably safe command finding reached an LLM verification path")
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
+
+    @property
+    def _llm_type(self):
+        return "safe-command"
+
+    @property
+    def _identifying_params(self):
+        return {}
+
+    def bind_tools(self, tools, **kw):
+        return self
+
+
 def test_high_confidence_security_skips_agentic_escalation():
     high_confidence = Finding(
         file="a.py",
@@ -197,6 +242,51 @@ async def test_actionability_gate_runs_before_escalation_split():
     assert findings[0].verified_by == "actionability-gate"
     event_types = [event.event_type for event in events]
     assert "actionability.completed" in event_types
+    assert "escalation.started" not in event_types
+    assert "calibration.started" not in event_types
+    assert llm.calls == 2
+
+
+async def test_code_evidence_gate_runs_before_escalation_split():
+    reg = build_registry()
+    llm = _SafeCommandLLM()
+    events = []
+    event_bus = EventBus()
+    event_bus.subscribe(events.append)
+    orch = Orchestrator(
+        registry=reg,
+        gateway=ToolGateway(reg, MockGitHubClient()),
+        event_bus=event_bus,
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        db=None,
+        agentic_default=False,
+        escalation_enabled=True,
+    )
+    state = StateStore(
+        pr_number=3,
+        repo="o/r",
+        head_sha="h3",
+        files_changed=["helpers.py"],
+        diff_summary=(
+            "--- /dev/null\n"
+            "+++ b/helpers.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+def ping_host(host: str = \"localhost\") -> str:\n"
+            "+    return subprocess.check_output(\n"
+            "+        [\"ping\", \"-c\", \"1\", host]).decode()"
+        ),
+    )
+
+    await orch.run(state)
+
+    findings = state.list_findings()
+    assert len(findings) == 1
+    assert findings[0].status == "false_positive"
+    assert findings[0].verified_by == "code-evidence"
+    event_types = [event.event_type for event in events]
+    assert "code_evidence.completed" in event_types
     assert "escalation.started" not in event_types
     assert "calibration.started" not in event_types
     assert llm.calls == 2

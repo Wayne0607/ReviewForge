@@ -22,7 +22,7 @@ from reviewforge.core.loop_detector import LoopDetector
 from reviewforge.core.scheduler import Scheduler
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
-from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate
+from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate, apply_code_evidence_gate
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
@@ -556,6 +556,26 @@ class Orchestrator:
                 self._events.emit(
                     "actionability.completed",
                     {"kept": len(candidates), "filtered": len(actionability_rejected)},
+                )
+
+            # Apply zero-token static proofs before fuzzy findings reach escalation.
+            # Escalation and calibration are exclusive paths, so leaving this gate
+            # inside the calibrator lets provably-safe findings bypass it.
+            candidates, code_evidence_rejected = apply_code_evidence_gate(
+                candidates,
+                state.diff_summary,
+            )
+            for finding in code_evidence_rejected:
+                state.update_finding(
+                    finding.id,
+                    status="false_positive",
+                    verified_by=finding.verified_by,
+                    verify_reason=finding.verify_reason,
+                )
+            if code_evidence_rejected:
+                self._events.emit(
+                    "code_evidence.completed",
+                    {"kept": len(candidates), "filtered": len(code_evidence_rejected)},
                 )
 
             # Phase 3.5/4: split candidates — trace/uncertain findings → Escalation

@@ -35,7 +35,7 @@ async def test_overlong_rationale_is_truncated_without_failing_plan() -> None:
 
     tasks = await planner.plan(state)
 
-    assert [task.reviewer for task in tasks] == ["security_reviewer", "style_reviewer"]
+    assert [task.reviewer for task in tasks] == ["security_reviewer", "correctness_reviewer"]
     assert len(tasks[0].rationale) == TASK_RATIONALE_MAX_LENGTH
     assert tasks[0].rationale.startswith("security context")
 

@@ -2265,6 +2265,80 @@ def test_prompt_diff_evidence_has_hard_fair_budgets():
     assert len(reviewer) < 42_000
 
 
+def test_actionability_rejects_specialist_category_misuse_and_preferences():
+    diff = "\n".join(
+        [
+            _summary(
+                "service.java",
+                'private final Pattern HTML_TAGS = Pattern.compile("<[^>]+>");\n'
+                "try (BufferedReader reader = new BufferedReader(new StringReader(content))) {\n"
+                "  return reader.readLine();\n"
+                "}",
+            ),
+            _summary(
+                "view.tsx",
+                'return <div className="grid">{codes.map(code => <div>{code}</div>)}</div>;',
+            ),
+            _summary(
+                "writer.go",
+                "go func() {\n  legacy.Update(ctx, value)\n}()",
+            ),
+        ]
+    )
+    findings = [
+        Finding(
+            id="static_preference",
+            file="service.java",
+            line=1,
+            category="naming",
+            message="The constant should be static.",
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="memory_reader",
+            file="service.java",
+            line=2,
+            category="resource-management",
+            message="BufferedReader is not explicitly closed.",
+            reviewer="style_reviewer",
+        ),
+        Finding(
+            id="semantic_preference",
+            file="view.tsx",
+            line=1,
+            category="semantic-html",
+            message="Use a list instead of div elements.",
+            reviewer="accessibility_reviewer",
+        ),
+        Finding(
+            id="async_consistency",
+            file="writer.go",
+            line=1,
+            category="goroutine-leak",
+            message="The caller cannot observe whether the asynchronous update succeeds.",
+            reviewer="performance_reviewer",
+        ),
+        Finding(
+            id="real_leak",
+            file="writer.go",
+            line=1,
+            category="goroutine-leak",
+            message="The goroutine waits forever and has no cancellation path.",
+            reviewer="performance_reviewer",
+        ),
+    ]
+
+    actionable, rejected = apply_actionability_gate(findings, diff)
+
+    assert actionable == [findings[-1]]
+    assert {finding.id for finding in rejected} == {
+        "static_preference",
+        "memory_reader",
+        "semantic_preference",
+        "async_consistency",
+    }
+
+
 def test_reviewer_prompts_require_concrete_test_and_documentation_evidence():
     base_ctx = {
         "files_to_review": ["src/service.py"],

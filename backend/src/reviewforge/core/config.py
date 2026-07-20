@@ -104,6 +104,7 @@ class ReviewForgeConfig:
             cfg.reviewers = [
                 ReviewerConfig(name="security_reviewer", type="security", max_steps=10),
                 ReviewerConfig(name="performance_reviewer", type="performance", max_steps=8),
+                ReviewerConfig(name="correctness_reviewer", type="correctness", max_steps=6),
                 ReviewerConfig(name="style_reviewer", type="style", max_steps=6),
                 ReviewerConfig(name="testing_reviewer", type="testing", max_steps=6),
                 ReviewerConfig(name="doc_reviewer", type="documentation", max_steps=5),

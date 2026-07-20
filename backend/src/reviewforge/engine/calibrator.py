@@ -100,6 +100,7 @@ _PATH_CALLS = {
     "Path",
 }
 _GENERIC_TEST_CATEGORIES = {
+    "incomplete-coverage",
     "missing-integration-test",
     "missing-test",
     "missing-tests",
@@ -273,6 +274,7 @@ _LLM_A11Y_ABSENCE_CATEGORIES = _GENERIC_A11Y_ABSENCE_CATEGORIES | {
     "missing-label",
     "missing-label-association",
     "non-semantic-content",
+    "semantic-html",
 }
 _N_PLUS_ONE_LOOP = re.compile(
     r"\b(?:for|foreach|forEach|map)\b|\.each\b|\bwhile\b",
@@ -988,7 +990,7 @@ def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
         return "仅指出缺少测试/覆盖率，没有在可评论的变更行上证明具体错误断言、测试删除或安全回归契约"
 
     if kind == "style" and finding.category == "naming":
-        if _NAMING_LANGUAGE.search(text) and not _OBSERVABLE_NAMING_FAILURE.search(text):
+        if not _OBSERVABLE_NAMING_FAILURE.search(text):
             return "该发现只描述名称可能误导或不一致，未给出可验证的运行时、框架或 API 调用失败"
 
     if kind == "style" and finding.category == "optional-misuse" and finding.file.lower().endswith(".java"):
@@ -1030,7 +1032,7 @@ def _reject_low_value_local_noise(finding: Finding, code_diff: str) -> str:
     text = f"{finding.message}\n{finding.suggestion}"
     nearby_code = _nearby_added_code(code_diff, finding.file, finding.line, radius=4)
     evidence = f"{text}\n{nearby_code}"
-    if finding.category == "resource-leak" and _IN_MEMORY_STREAM.search(evidence):
+    if finding.category in {"resource-leak", "resource-management"} and _IN_MEMORY_STREAM.search(evidence):
         return "该 AutoCloseable 仅包装内存流，不持有文件、套接字或进程资源，不能构成资源泄漏"
     if finding.category == "immutability" and finding.severity == "info":
         return "仅建议增加 final/const 等不可变修饰，未证明本次变更会发生状态错误"
@@ -1069,7 +1071,7 @@ def _reject_ungrounded_specialist_finding(finding: Finding, code_diff: str) -> s
     if finding.reviewer == "accessibility_reviewer" and category in _LLM_A11Y_ABSENCE_CATEGORIES:
         if _has_removed_notification_semantics(code_diff, finding.file):
             return ""
-        dynamic_contract = (
+        dynamic_contract = category in _GENERIC_A11Y_ABSENCE_CATEGORIES and (
             _has_right_anchor(code_diff, finding.file, finding.line)
             and bool(_A11Y_DYNAMIC_TRIGGER.search(patch))
             and bool(_A11Y_DYNAMIC_UPDATE.search(patch))
@@ -1078,6 +1080,16 @@ def _reject_ungrounded_specialist_finding(finding: Finding, code_diff: str) -> s
         if dynamic_contract:
             return ""
         return "可访问名称、标签、live region 或语义缺失未由确定性 DOM 证据证明"
+
+    if category == "goroutine-leak":
+        lifecycle_failure = re.search(
+            r"\b(?:cannot exit|never exits?|blocked forever|unbuffered channel|missing cancellation|"
+            r"no cancellation|waitgroup leak)\b|无法退出|永不退出|永久阻塞|无缓冲通道|缺少取消|没有取消",
+            text,
+            re.IGNORECASE,
+        )
+        if not lifecycle_failure:
+            return "未证明 goroutine 无法退出、永久阻塞或缺少取消路径，不能据此判定泄漏"
 
     if finding.reviewer != "performance_reviewer":
         return ""
@@ -1101,13 +1113,6 @@ def _reject_ungrounded_specialist_finding(finding: Finding, code_diff: str) -> s
 
     if category == "blocking-io" and not _EVENT_LOOP_PROOF.search(f"{text}\n{nearby}"):
         return "同步 I/O 未被证明运行在事件循环或异步请求处理器上"
-
-    if category == "goroutine-leak" and re.search(
-        r"(?:这是正确的|正确取消|日志记录不一致|not a performance issue|is correct)",
-        text,
-        re.IGNORECASE,
-    ):
-        return "描述本身承认生命周期正确，实际内容只是日志或风格差异"
 
     return ""
 

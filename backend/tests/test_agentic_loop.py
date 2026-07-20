@@ -164,6 +164,7 @@ async def test_reviewer_map_has_all_types():
         "security_reviewer",
         "performance_reviewer",
         "style_reviewer",
+        "correctness_reviewer",
         "localization_reviewer",
         "testing_reviewer",
         "doc_reviewer",

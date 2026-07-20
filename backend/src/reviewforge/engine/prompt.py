@@ -137,8 +137,9 @@ def _planner_mission(ctx: dict[str, Any]) -> str:
   - 网络请求、加密操作
 - Performance Reviewer：diff 显示无界工作、泄漏、N+1、高阶热路径、事件循环阻塞，
   或在重复路径上用线性遍历替代常数时间操作时派发；仅局部少一次分配不必派发
-- Style Reviewer：对源代码变更默认派发，覆盖语言级 anti-pattern、误导性 API/命名、
-  computed/getter 副作用、Optional 误用、Rust unwrap/panic/clone 和资源生命周期错误；只排除纯排版偏好
+- Correctness Reviewer：对源代码变更默认派发，只查错误变量/调用、分支、状态、返回值、契约、
+  并发和生命周期导致的可观察错误；不查命名、可读性、重构偏好或微优化
+- Style Reviewer：仅在已有仓库/框架规则能证明写法会导致实际 API 或运行时失败时派发
 - Testing Reviewer：只有测试断言/测试文件被修改或安全修复删除了既有保护时派发
 - Documentation Reviewer：只有文档文件被修改且可能与行为契约矛盾时派发
 - Dependency Reviewer：修改了依赖文件（requirements.txt, pyproject.toml 等）
@@ -153,6 +154,20 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
     language = ctx.get("target_language", "")
 
     missions: dict[str, str] = {
+        "correctness": """## 任务
+
+只审查会改变程序可观察行为的正确性缺陷：
+- 错误的变量、函数、provider、metric recorder、枚举值、默认值或返回对象
+- 分支条件不可达、方向颠倒、遗漏必要状态，或错误路径记录/返回了成功路径的数据
+- 调用方与被调方契约不一致，参数顺序/单位/ID 与 name 混用，或 sibling 分支使用不一致
+- 资源、并发和异步生命周期导致确定的崩溃、竞态、数据不一致或结果丢失
+- diff 中能复现的空值、边界值、集合顺序、异常传播和 API 误用
+
+先比较同一文件的 sibling 方法、成功/失败分支和同类调用；Impact Manifest 有调用方或契约事实时必须使用。
+每个 finding 必须说明触发输入或执行路径、实际错误结果，以及支持结论的具体代码证据。
+
+不要报告命名、static/final 偏好、可读性、重构建议、复杂度、缺少注释/测试、微优化或“可能更好”的写法。
+如果无法指出可复现的错误结果，输出空 findings。""",
         "security": """## 任务
 
 审查代码中的安全漏洞：

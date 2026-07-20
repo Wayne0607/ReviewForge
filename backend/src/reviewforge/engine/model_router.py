@@ -21,6 +21,7 @@ DEFAULT_PROFILE_MAP = {
     "security_reviewer": "accurate",
     "performance_reviewer": "fast",
     "style_reviewer": "fast",
+    "correctness_reviewer": "fast",
     "localization_reviewer": "fast",
     "testing_reviewer": "fast",
     "doc_reviewer": "fast",

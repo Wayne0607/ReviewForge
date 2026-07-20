@@ -7,6 +7,7 @@ from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.planner import (
     Planner,
+    _correctness_files,
     _localization_files,
     _looks_like_cross_pr_wrapper,
     _skip_reviewer_for_change,
@@ -56,7 +57,7 @@ def test_skill_attached_to_reviewer():
     assert len(r._skill_body) > 50
 
 
-def test_planner_does_not_default_style_when_security_is_forced():
+def test_planner_does_not_duplicate_correctness_when_security_is_forced():
     planner = Planner(MockChatLLM(), build_registry())
     tasks = planner._merge_tasks(
         {"security_reviewer"},
@@ -66,6 +67,15 @@ def test_planner_does_not_default_style_when_security_is_forced():
     )
 
     assert [t.reviewer for t in tasks] == ["security_reviewer"]
+
+
+def test_planner_defaults_production_source_to_correctness():
+    planner = Planner(MockChatLLM(), build_registry())
+
+    tasks = planner._merge_tasks(set(), [], ["src/service.py", "tests/test_service.py"], first_round=True)
+
+    assert [task.reviewer for task in tasks] == ["correctness_reviewer"]
+    assert tasks[0].files == ["src/service.py"]
 
 
 def test_planner_skips_low_signal_reviewers_for_fixtures():
@@ -140,6 +150,20 @@ def test_localization_routing_selects_production_resources_and_bounds_scope():
     assert selected[:2] == ["themes/messages/messages_lt.properties", "web/locales/zh-CN.json"]
     assert len(selected) == 16
     assert all("src/test" not in path for path in selected)
+
+
+def test_correctness_routing_keeps_only_production_source_files():
+    files = [
+        "src/service.java",
+        "src/service_test.py",
+        "tests/view.spec.tsx",
+        "themes/messages_lt.properties",
+        "go.work.sum",
+        "vendor/generated.go",
+        "web/controller.ts",
+    ]
+
+    assert _correctness_files(files) == ["src/service.java", "web/controller.ts"]
 
 
 async def test_planner_forces_localization_reviewer_for_locale_resources():

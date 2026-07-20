@@ -313,12 +313,23 @@ class Planner:
     ) -> list[ReviewTask]:
         """Merge forced reviewers with LLM decisions.
 
-        On the first round, style_reviewer is always added as a default and a
+        On the first round, correctness_reviewer is added as the source-change default and a
         fallback guarantees at least one task. On re-planning rounds an empty
         result is valid (it signals convergence — nothing more to dispatch).
         """
-        llm_reviewers = {t.reviewer for t in llm_tasks}
-        merged = list(llm_tasks)
+        normalized_tasks = [
+            ReviewTask(
+                reviewer=task.reviewer,
+                files=_correctness_files(task.files or files),
+                rationale=task.rationale,
+            )
+            if task.reviewer == "correctness_reviewer"
+            else task
+            for task in llm_tasks
+        ]
+        normalized_tasks = [task for task in normalized_tasks if task.files]
+        llm_reviewers = {t.reviewer for t in normalized_tasks}
+        merged = list(normalized_tasks)
 
         for reviewer in forced:
             if reviewer not in llm_reviewers:
@@ -332,17 +343,24 @@ class Planner:
                 )
                 logger.info(f"Forced reviewer added: {reviewer}")
 
-        if first_round and style_fallback and not merged:
+        correctness_files = _correctness_files(files)
+        if (
+            first_round
+            and style_fallback
+            and correctness_files
+            and "correctness_reviewer" not in {task.reviewer for task in merged}
+            and "security_reviewer" not in {task.reviewer for task in merged}
+        ):
             merged.append(
                 ReviewTask(
-                    reviewer="style_reviewer",
-                    files=files,
-                    rationale="fallback style review",
+                    reviewer="correctness_reviewer",
+                    files=correctness_files,
+                    rationale="default observable-correctness review",
                 )
             )
 
         if first_round and style_fallback:
-            return merged or [ReviewTask(reviewer="style_reviewer", files=files, rationale="fallback")]
+            return merged
         return merged
 
     def _parse_response(self, content: str, allowed_files: list[str] | None = None) -> list[ReviewTask]:
@@ -401,10 +419,12 @@ class Planner:
                 "security_reviewer": "security_reviewer",
                 "performance": "performance_reviewer",
                 "performance_reviewer": "performance_reviewer",
-                "style": "style_reviewer",
-                "style_reviewer": "style_reviewer",
-                "architecture": "style_reviewer",
-                "readability": "style_reviewer",
+                "correctness": "correctness_reviewer",
+                "correctness_reviewer": "correctness_reviewer",
+                "style": "correctness_reviewer",
+                "style_reviewer": "correctness_reviewer",
+                "architecture": "correctness_reviewer",
+                "readability": "correctness_reviewer",
                 "testing": "testing_reviewer",
                 "testing_reviewer": "testing_reviewer",
                 "test": "testing_reviewer",
@@ -539,6 +559,43 @@ def _localization_files(files: list[str]) -> list[str]:
             continue
         selected.append(file_path)
         if len(selected) >= _MAX_LOCALIZATION_FILES:
+            break
+    return selected
+
+
+def _correctness_files(files: list[str]) -> list[str]:
+    """Select production source files where observable behavior can change."""
+
+    code_suffixes = (
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".go",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".swift",
+        ".ts",
+        ".tsx",
+        ".vue",
+    )
+    selected: list[str] = []
+    for file_path in files:
+        normalized = file_path.replace("\\", "/").lower()
+        if not normalized.endswith(code_suffixes) or _is_test_file(normalized):
+            continue
+        if any(marker in f"/{normalized}" for marker in ("/examples/", "/fixtures/", "/generated/", "/vendor/")):
+            continue
+        selected.append(file_path)
+        if len(selected) >= 32:
             break
     return selected
 

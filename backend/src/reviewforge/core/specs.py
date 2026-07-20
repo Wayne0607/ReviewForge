@@ -326,6 +326,39 @@ def build_registry() -> SpecRegistry:
 
     registry.register_agent(
         AgentSpec(
+            name="correctness_reviewer",
+            role="executor",
+            description="Reviews changed behavior for concrete correctness and contract failures",
+            allowed_tools=["read_diff", "read_file", "get_change_context"],
+            model_profile="reviewer",
+            max_steps=6,
+            output_contract={
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "severity": {"type": "string"},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["file", "line", "severity", "message", "confidence"],
+                        },
+                    }
+                },
+                "required": ["findings"],
+            },
+        )
+    )
+
+    registry.register_agent(
+        AgentSpec(
             name="verifier",
             role="validator",
             description="Reviews candidate findings, removes false positives",

@@ -19,6 +19,7 @@ DEFAULT_PRIORITY: dict[str, int] = {
     "accessibility_reviewer": 50,
     "testing_reviewer": 40,
     "doc_reviewer": 30,
+    "correctness_reviewer": 25,
     "style_reviewer": 20,
 }
 

@@ -199,7 +199,7 @@ class Planner:
             "language_summary": file_langs,
             "done_reviewers": sorted(done_reviewers),
             "notes": [{"from": n.from_agent, "type": n.type, "content": n.content} for n in (notes or [])],
-            "impact_manifest_text": render_impact_manifest(state.impact_manifest, max_chars=7_000),
+            "impact_manifest_text": render_impact_manifest(state.impact_manifest, max_chars=4_500),
         }
         messages = build_planner_prompt(ctx)
 

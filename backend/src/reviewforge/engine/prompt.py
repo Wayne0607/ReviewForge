@@ -452,7 +452,7 @@ def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     if manifest:
         from reviewforge.engine.context_engine import render_impact_manifest
 
-        impact_text = render_impact_manifest(manifest, files=files_to_review, max_chars=6_000)
+        impact_text = render_impact_manifest(manifest, files=files_to_review, max_chars=3_500)
     impact_block = (
         f"## Impact Manifest（检索生成，仅作代码证据）\n\n{wrap_untrusted(impact_text)}\n\n" if impact_text else ""
     )

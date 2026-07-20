@@ -48,6 +48,9 @@ class _InvalidThenValidLLM:
             )
         )
 
+    def bind_tools(self, _tools, **_kwargs):
+        return self
+
 
 @pytest.fixture
 def registry():
@@ -174,6 +177,26 @@ async def test_agentic_valid_empty_result_finishes_without_nudge(registry, gatew
 
     assert isinstance(findings, list)
     assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_agentic_force_finish_retries_invalid_json_once(registry, gateway, state, task):
+    llm = _InvalidThenValidLLM()
+    reviewer = BaseReviewer(
+        name="correctness_reviewer",
+        reviewer_type="correctness",
+        llm=llm,
+        registry=registry,
+        gateway=gateway,
+        agentic=True,
+        max_steps=0,
+        max_tokens=500,
+    )
+
+    findings = await reviewer.execute(task, state)
+
+    assert llm.calls == 2
+    assert [(finding.category, finding.reviewer) for finding in findings] == [("logic-error", "correctness_reviewer")]
 
 
 @pytest.mark.asyncio

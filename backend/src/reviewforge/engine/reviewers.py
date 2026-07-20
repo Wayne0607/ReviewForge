@@ -306,7 +306,25 @@ class BaseReviewer:
             budget.add(final)
             findings, valid = self._parse_findings_result(final.content)
             if not valid:
-                raise ReviewerOutputError(f"{self.name}: invalid JSON output after force-finish")
+                logger.warning(
+                    "%s: invalid JSON output after force-finish; retrying once with the output contract",
+                    self.name,
+                )
+                repair_messages = [
+                    *chat,
+                    final,
+                    HumanMessage(
+                        content=(
+                            "Your previous response was not valid findings JSON. "
+                            'Return only JSON with a "findings" array; use an empty array when no issue exists.'
+                        )
+                    ),
+                ]
+                repaired = await llm.ainvoke(repair_messages)
+                budget.add(repaired)
+                findings, valid = self._parse_findings_result(repaired.content)
+                if not valid:
+                    raise ReviewerOutputError(f"{self.name}: invalid JSON output after bounded retry")
         except ReviewerOutputError:
             raise
         except Exception as e:

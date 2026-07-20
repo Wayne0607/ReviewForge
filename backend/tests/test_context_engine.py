@@ -66,6 +66,11 @@ async def test_context_engine_builds_symbol_references_tests_and_graph(tmp_path)
         assert any(item["kind"] == "call" for item in manifest["historical_graph"])
         assert all(item.get("file") != "unrelated/other.py" for item in manifest["historical_graph"])
         assert any(item["type"] == "blast-radius" for item in manifest["risk_signals"])
+        assert any(page["title"] == "process" for page in manifest["wiki_pages"])
+        process_page = next(page for page in manifest["wiki_pages"] if page["title"] == "process")
+        assert process_page["source"]["sha"] == "head"
+        assert any(fact["kind"] == "return-or-error" for fact in process_page["facts"])
+        assert any(page["source"]["path"] == "src/caller.py" for page in manifest["wiki_pages"])
     finally:
         await db.close()
 
@@ -82,6 +87,10 @@ async def test_context_tool_is_permission_checked_and_filterable():
             ],
             "references": [{"symbol": "alpha", "paths": ["tests/test_a.py"]}],
             "historical_graph": [],
+            "wiki_pages": [
+                {"title": "alpha", "facts": []},
+                {"title": "beta", "facts": []},
+            ],
         }
     )
 
@@ -94,6 +103,7 @@ async def test_context_tool_is_permission_checked_and_filterable():
     parsed = json.loads(output)
     assert [item["path"] for item in parsed["files"]] == ["a.py"]
     assert parsed["references"][0]["symbol"] == "alpha"
+    assert [item["title"] for item in parsed["wiki_pages"]] == ["alpha"]
 
 
 def test_planner_prompt_includes_bounded_impact_manifest():
@@ -142,6 +152,32 @@ def test_render_manifest_can_filter_without_mutating_original():
     assert len(manifest["files"]) == 2
 
 
+def test_render_manifest_compacts_low_value_file_details():
+    manifest = {
+        "version": 2,
+        "files": [
+            {
+                "path": "a.py",
+                "language": "python",
+                "added_lines": list(range(30)),
+                "changed_symbols": [],
+                "imports": [],
+                "calls": [],
+                "content_available": True,
+            }
+        ],
+        "references": [],
+        "historical_graph": [],
+        "wiki_pages": [],
+    }
+
+    rendered = json.loads(render_impact_manifest(manifest))
+
+    assert rendered["files"][0]["added_lines"] == list(range(12))
+    assert "content_available" not in rendered["files"][0]
+    assert len(manifest["files"][0]["added_lines"]) == 30
+
+
 def test_render_manifest_truncation_remains_valid_json():
     manifest = {
         "version": 1,
@@ -152,6 +188,24 @@ def test_render_manifest_truncation_remains_valid_json():
     }
     rendered = render_impact_manifest(manifest, max_chars=200)
     assert json.loads(rendered)["truncated"] is True
+
+
+def test_render_manifest_truncation_does_not_erase_shared_evidence():
+    manifest = {
+        "version": 2,
+        "files": [{"path": "src/a.py", "calls": ["x" * 200]}],
+        "references": [{"symbol": f"symbol_{index}", "paths": [f"src/{index}.py"]} for index in range(8)],
+        "historical_graph": [{"kind": "call", "symbol": "authorize"}],
+        "wiki_pages": [{"title": "authorize", "facts": [{"evidence": "x" * 200}]}],
+        "risk_signals": [{"type": "blast-radius", "symbol": "authorize"}],
+    }
+
+    render_impact_manifest(manifest, max_chars=200)
+
+    assert len(manifest["references"]) == 8
+    assert len(manifest["historical_graph"]) == 1
+    assert len(manifest["wiki_pages"]) == 1
+    assert len(manifest["risk_signals"]) == 1
 
 
 def test_security_agentic_requires_retrieved_cross_file_evidence():

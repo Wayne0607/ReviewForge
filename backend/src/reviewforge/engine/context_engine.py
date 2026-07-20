@@ -9,6 +9,7 @@ changed symbols, callers, imports and likely tests while decisions are made.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -29,14 +30,17 @@ from reviewforge.engine.symbol_extractor import (
     extract_diff_symbols,
     extract_imports,
 )
+from reviewforge.engine.wiki_compiler import compile_symbol_pages, render_wiki_pages
 from reviewforge.tools.gateway import ToolGateway
 
 _MAX_FILES = 16
 _MAX_SYMBOLS_PER_FILE = 12
 _MAX_SEARCH_SYMBOLS = 4
 _MAX_REFERENCE_PATHS = 8
+_MAX_REFERENCE_READS = 4
 _MAX_GRAPH_ROWS = 12
 _MAX_FILE_CHARS = 300_000
+_MAX_WIKI_PAGES = 8
 _SUPPORTED_LANGUAGES = {"python", "go", "java", "rust", "ruby", "javascript", "typescript"}
 _LOW_SIGNAL_NAMES = {
     "append",
@@ -71,6 +75,7 @@ class ImpactFile:
     imports: list[dict[str, Any]] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
     content_available: bool = False
+    wiki_pages: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
 
 class ContextEngine:
@@ -98,18 +103,25 @@ class ContextEngine:
             *(path for item in references for path in item["paths"]),
         }
         graph_context = await self._load_graph_context(symbols, known_paths)
+        wiki_context = await self._load_wiki_context(files, references, state)
 
         test_paths = sorted({path for item in references for path in item["paths"] if _is_test_path(path)})[
             :_MAX_REFERENCE_PATHS
         ]
         risk_signals = self._risk_signals(files, references, test_paths)
 
+        file_payloads: list[dict[str, Any]] = []
+        for item in files:
+            payload = asdict(item)
+            payload.pop("wiki_pages", None)
+            file_payloads.append(payload)
         manifest: dict[str, Any] = {
-            "version": 1,
-            "files": [asdict(item) for item in files],
+            "version": 2,
+            "files": file_payloads,
             "references": references,
             "candidate_tests": test_paths,
             "historical_graph": graph_context,
+            "wiki_pages": wiki_context,
             "risk_signals": risk_signals,
             "coverage": {
                 "changed_files": len(state.files_changed),
@@ -156,20 +168,31 @@ class ContextEngine:
             for call in calls
             if call.caller in changed_names or call.line in added_lines or call.caller == "<module>"
         ]
+        changed_payload = [
+            {
+                "name": item.name,
+                "type": item.symbol_type,
+                "line": item.line,
+                "start_line": item.start_line or item.line,
+                "end_line": item.end_line,
+            }
+            for item in changed[:_MAX_SYMBOLS_PER_FILE]
+        ]
+        wiki_pages = [
+            page.to_dict()
+            for page in compile_symbol_pages(
+                path=path,
+                language=detect_language(path),
+                content=content,
+                changed_symbols=changed_payload,
+                source_sha=state.head_sha,
+            )
+        ]
         return ImpactFile(
             path=path,
             language=detect_language(path),
             added_lines=added_lines[:40],
-            changed_symbols=[
-                {
-                    "name": item.name,
-                    "type": item.symbol_type,
-                    "line": item.line,
-                    "start_line": item.start_line or item.line,
-                    "end_line": item.end_line,
-                }
-                for item in changed[:_MAX_SYMBOLS_PER_FILE]
-            ],
+            changed_symbols=changed_payload,
             imports=[
                 {"source": item.source, "name": item.name, "local_name": item.local_name, "line": item.line}
                 for item in imports[:_MAX_SYMBOLS_PER_FILE]
@@ -179,6 +202,7 @@ class ContextEngine:
                 for item in relevant_calls[:_MAX_SYMBOLS_PER_FILE]
             ],
             content_available=bool(content),
+            wiki_pages=wiki_pages,
         )
 
     @staticmethod
@@ -258,6 +282,112 @@ class ContextEngine:
                 break
         return rows[:_MAX_GRAPH_ROWS]
 
+    async def _load_wiki_context(
+        self,
+        files: list[ImpactFile],
+        references: list[dict[str, Any]],
+        state: StateStore,
+    ) -> list[dict[str, Any]]:
+        reference_pages = await self._compile_reference_pages(references, state)
+        current = ([page for item in files for page in item.wiki_pages] + reference_pages)[:_MAX_WIKI_PAGES]
+        if not current:
+            return []
+        terms = list(
+            dict.fromkeys(
+                [str(symbol.get("name", "")) for item in files for symbol in item.changed_symbols]
+                + [str(call.get("callee", "")) for item in files for call in item.calls]
+                + [str(imported.get("name", "")) for item in files for imported in item.imports]
+            )
+        )
+        pages = current
+        if self._db is not None and state.repo:
+            try:
+                for page in current:
+                    await self._db.upsert_wiki_page(
+                        repo=state.repo,
+                        page_key=str(page["page_key"]),
+                        kind=str(page["kind"]),
+                        title=str(page["title"]),
+                        content=dict(page["content"]),
+                        search_terms=list(page["search_terms"]),
+                        source_path=str(page["source_path"]),
+                        source_sha=str(page["source_sha"]),
+                        source_start=int(page["source_start"]),
+                        source_end=int(page["source_end"]),
+                        content_hash=str(page["content_hash"]),
+                    )
+                pages = await self._db.search_wiki_pages(
+                    state.repo,
+                    terms,
+                    limit=_MAX_WIKI_PAGES,
+                    source_sha=state.head_sha,
+                )
+            except Exception:
+                # Persistence/retrieval is an optimization. Current revision
+                # facts remain usable if the wiki database is unavailable.
+                pages = current
+        for page in pages:
+            page.setdefault("retrieval_score", 4 if page in current else 0)
+        return render_wiki_pages(pages, max_chars=2_200)
+
+    async def _compile_reference_pages(
+        self,
+        references: list[dict[str, Any]],
+        state: StateStore,
+    ) -> list[dict[str, Any]]:
+        requests: list[tuple[str, str]] = []
+        for reference in references:
+            symbol = str(reference.get("symbol", ""))
+            for path in reference.get("paths", []):
+                pair = (symbol, str(path))
+                if pair in requests or detect_language(pair[1]) not in _SUPPORTED_LANGUAGES:
+                    continue
+                requests.append(pair)
+                if len(requests) >= _MAX_REFERENCE_READS:
+                    break
+            if len(requests) >= _MAX_REFERENCE_READS:
+                break
+
+        semaphore = asyncio.Semaphore(2)
+
+        async def compile_one(symbol: str, path: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                try:
+                    content = await self._gateway.invoke("read_file", {"file_path": path}, state)
+                except Exception:
+                    return []
+            if len(content) > _MAX_FILE_CHARS:
+                return []
+            calls = extract_calls(content, path)
+            caller_names = {call.caller for call in calls if call.callee == symbol and call.caller != "<module>"}
+            definitions = [
+                item for item in extract_definitions(content, path) if item.name == symbol or item.name in caller_names
+            ]
+            changed_symbols = [
+                {
+                    "name": item.name,
+                    "type": item.symbol_type,
+                    "line": item.line,
+                    "start_line": item.start_line or item.line,
+                    "end_line": item.end_line,
+                }
+                for item in definitions[:2]
+            ]
+            return [
+                page.to_dict()
+                for page in compile_symbol_pages(
+                    path=path,
+                    language=detect_language(path),
+                    content=content,
+                    changed_symbols=changed_symbols,
+                    source_sha=state.head_sha,
+                    focus_terms=[symbol],
+                )
+            ]
+
+        groups = await asyncio.gather(*(compile_one(symbol, path) for symbol, path in requests))
+        return [page for group in groups for page in group]
+
     @staticmethod
     def _risk_signals(
         files: list[ImpactFile], references: list[dict[str, Any]], test_paths: list[str]
@@ -305,9 +435,22 @@ def render_impact_manifest(
         return "No impact context is available."
     selected_files = set(files or [])
     needle = symbol.strip().lower()
-    payload = dict(manifest)
+    # Rendering is called repeatedly by Planner, Reviewers, tools and the
+    # Calibrator.  Truncation below is destructive to the working payload, so a
+    # shallow copy would silently erase shared StateStore evidence after the
+    # first prompt.
+    payload = copy.deepcopy(manifest)
     payload["files"] = [
-        item for item in manifest.get("files", []) if not selected_files or str(item.get("path", "")) in selected_files
+        {
+            "path": item.get("path", ""),
+            "language": item.get("language", ""),
+            "added_lines": item.get("added_lines", [])[:12],
+            "changed_symbols": item.get("changed_symbols", [])[:8],
+            "imports": item.get("imports", [])[:6],
+            "calls": item.get("calls", [])[:8],
+        }
+        for item in manifest.get("files", [])
+        if not selected_files or str(item.get("path", "")) in selected_files
     ]
     if needle:
         payload["files"] = [item for item in payload["files"] if needle in json.dumps(item, ensure_ascii=False).lower()]
@@ -319,6 +462,9 @@ def render_impact_manifest(
             for item in manifest.get("historical_graph", [])
             if needle in json.dumps(item, ensure_ascii=False).lower()
         ]
+        payload["wiki_pages"] = [
+            item for item in manifest.get("wiki_pages", []) if needle in json.dumps(item, ensure_ascii=False).lower()
+        ]
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     if len(text) <= max_chars:
         return text
@@ -326,7 +472,7 @@ def render_impact_manifest(
     # Keep tool output valid JSON while progressively dropping lowest-value
     # tail data. A raw string slice can leave the model with malformed evidence.
     payload["truncated"] = True
-    for key in ("historical_graph", "risk_signals", "references", "files"):
+    for key in ("historical_graph", "wiki_pages", "risk_signals", "references", "files"):
         items = payload.get(key)
         while (
             isinstance(items, list)

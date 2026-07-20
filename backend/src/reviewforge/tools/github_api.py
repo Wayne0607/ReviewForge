@@ -58,6 +58,7 @@ class GitHubClient:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=30.0,
+            follow_redirects=True,
         )
         self._sleep = asyncio.sleep
 

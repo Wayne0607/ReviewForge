@@ -13,6 +13,14 @@ import pytest
 from reviewforge.tools.github_api import GitHubAPIError, GitHubClient
 
 
+async def test_github_client_follows_repository_rename_redirects():
+    client = GitHubClient("test-token")
+    try:
+        assert client._client.follow_redirects is True
+    finally:
+        await client.close()
+
+
 async def _client_with_transport(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> GitHubClient:

@@ -817,6 +817,34 @@ async def test_quality_evidence_contract_is_present_in_both_calibration_rounds()
         assert "alt" in prompt and "label" in prompt
 
 
+async def test_repository_wiki_evidence_is_bounded_and_present_in_both_rounds():
+    finding = Finding(
+        id="finding_wiki_context",
+        file="component.tsx",
+        line=8,
+        severity="warning",
+        category="architecture",
+        message="a concrete dependency boundary is violated",
+        confidence=0.8,
+        reviewer="style_reviewer",
+    )
+    llm = PromptCaptureLLM(finding.id)
+    evidence = '{"title":"authorize","source":{"path":"policy.ts","sha":"head"}}' + "x" * 4_000
+
+    await DynamicCalibrator(llm, build_registry()).calibrate(
+        [finding],
+        "+return authorize(user)",
+        context_evidence=evidence,
+    )
+
+    assert len(llm.human_prompts) == 2
+    for prompt in llm.human_prompts:
+        assert "Repository Wiki" in prompt
+        assert "policy.ts" in prompt
+        assert "<<UNTRUSTED_CONTEXT>>" in prompt
+        assert "x" * 3_001 not in prompt
+
+
 async def test_dependency_and_duplicate_evidence_contract_is_present_in_both_rounds():
     finding = Finding(
         id="finding_dependency_contract",

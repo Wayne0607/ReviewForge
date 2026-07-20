@@ -23,7 +23,7 @@ from reviewforge.core.scheduler import Scheduler
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate, apply_code_evidence_gate
-from reviewforge.engine.context_engine import ContextEngine
+from reviewforge.engine.context_engine import ContextEngine, render_impact_manifest
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
@@ -382,6 +382,7 @@ class Orchestrator:
                     {
                         "indexed_files": manifest.get("coverage", {}).get("indexed_files", 0),
                         "references": sum(len(item.get("paths", [])) for item in manifest.get("references", [])),
+                        "wiki_pages": len(manifest.get("wiki_pages", [])),
                         "risk_signals": len(manifest.get("risk_signals", [])),
                     },
                 )
@@ -657,7 +658,27 @@ class Orchestrator:
 
             if calib_set:
                 self._events.emit("calibration.started", {"candidate_count": len(calib_set)})
-                calibrated = await self._calibrator.calibrate(calib_set, state.diff_summary)
+                wiki_pages = state.impact_manifest.get("wiki_pages", [])
+                calibration_context = (
+                    render_impact_manifest(
+                        {
+                            "version": state.impact_manifest.get("version", 1),
+                            "files": [],
+                            "references": [],
+                            "historical_graph": [],
+                            "risk_signals": [],
+                            "wiki_pages": wiki_pages,
+                        },
+                        max_chars=3_000,
+                    )
+                    if wiki_pages
+                    else ""
+                )
+                calibrated = await self._calibrator.calibrate(
+                    calib_set,
+                    state.diff_summary,
+                    context_evidence=calibration_context,
+                )
                 for f in calibrated:
                     if f.status == "confirmed":
                         state.update_finding(

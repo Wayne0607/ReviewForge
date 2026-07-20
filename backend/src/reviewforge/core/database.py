@@ -109,6 +109,25 @@ CREATE TABLE IF NOT EXISTS file_risk_summary (
     last_updated    TEXT
 );
 
+-- Source-grounded repository wiki pages.  Pages are compact, deterministic
+-- code facts rather than model-authored prose, so every statement remains
+-- traceable to an immutable repository revision and line range.
+CREATE TABLE IF NOT EXISTS wiki_pages (
+    repo          TEXT NOT NULL,
+    page_key      TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    content_json  TEXT NOT NULL DEFAULT '{}',
+    search_terms  TEXT NOT NULL DEFAULT '',
+    source_path   TEXT NOT NULL,
+    source_sha    TEXT NOT NULL DEFAULT '',
+    source_start  INTEGER NOT NULL DEFAULT 0,
+    source_end    INTEGER NOT NULL DEFAULT 0,
+    content_hash  TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (repo, page_key, source_sha)
+);
+
 CREATE INDEX IF NOT EXISTS idx_findings_run ON review_findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_file ON review_findings(file);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON review_findings(category);
@@ -121,6 +140,8 @@ CREATE INDEX IF NOT EXISTS idx_relations_source ON code_relations(source_file);
 CREATE INDEX IF NOT EXISTS idx_relations_target ON code_relations(target_file, target_symbol);
 CREATE INDEX IF NOT EXISTS idx_risk_max ON file_risk_summary(max_risk);
 CREATE INDEX IF NOT EXISTS idx_token_run ON token_usage(run_id);
+CREATE INDEX IF NOT EXISTS idx_wiki_repo_path ON wiki_pages(repo, source_path);
+CREATE INDEX IF NOT EXISTS idx_wiki_repo_title ON wiki_pages(repo, title);
 """
 
 
@@ -557,6 +578,101 @@ class Database:
             (*params, limit),
         )
         return [self._row_to_dict(r) for r in await cursor.fetchall()]
+
+    # ── Repository Wiki ──────────────────────────────────────────
+
+    async def upsert_wiki_page(
+        self,
+        *,
+        repo: str,
+        page_key: str,
+        kind: str,
+        title: str,
+        content: dict[str, Any],
+        search_terms: list[str],
+        source_path: str,
+        source_sha: str,
+        source_start: int,
+        source_end: int,
+        content_hash: str,
+    ) -> None:
+        """Store one revision-anchored wiki page."""
+
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "INSERT INTO wiki_pages "
+            "(repo, page_key, kind, title, content_json, search_terms, source_path, source_sha, "
+            "source_start, source_end, content_hash, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(repo, page_key, source_sha) DO UPDATE SET "
+            "kind=excluded.kind, title=excluded.title, content_json=excluded.content_json, "
+            "search_terms=excluded.search_terms, source_path=excluded.source_path, "
+            "source_sha=excluded.source_sha, source_start=excluded.source_start, "
+            "source_end=excluded.source_end, content_hash=excluded.content_hash, "
+            "updated_at=excluded.updated_at",
+            (
+                repo,
+                page_key,
+                kind,
+                title,
+                json.dumps(content, ensure_ascii=False),
+                " ".join(dict.fromkeys(term.lower() for term in search_terms if term)),
+                source_path,
+                source_sha,
+                source_start,
+                source_end,
+                content_hash,
+                now,
+            ),
+        )
+        await self._db.commit()
+
+    async def search_wiki_pages(
+        self,
+        repo: str,
+        terms: list[str],
+        *,
+        limit: int = 12,
+        source_sha: str = "",
+    ) -> list[dict[str, Any]]:
+        """Retrieve wiki pages using bounded exact/lexical hybrid scoring."""
+
+        needles = list(dict.fromkeys(term.strip().lower() for term in terms if len(term.strip()) >= 3))[:12]
+        if not repo or not needles:
+            return []
+        clauses = " OR ".join("lower(title) LIKE ? OR search_terms LIKE ?" for _ in needles)
+        params: list[Any] = [repo]
+        for needle in needles:
+            pattern = f"%{needle}%"
+            params.extend((pattern, pattern))
+        params.append(max(limit * 4, limit))
+        cursor = await self._db.execute(
+            f"SELECT * FROM wiki_pages WHERE repo=? AND ({clauses}) ORDER BY updated_at DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = [self._row_to_dict(row) for row in await cursor.fetchall()]
+        for row in rows:
+            title = str(row.get("title", "")).lower()
+            haystack = f"{title} {row.get('search_terms', '')}"
+            row["retrieval_score"] = (8 if source_sha and row.get("source_sha") == source_sha else 0) + sum(
+                4 if needle == title else 2 if needle in title else 1 if needle in haystack else 0 for needle in needles
+            )
+            try:
+                row["content"] = json.loads(str(row.pop("content_json", "{}")))
+            except json.JSONDecodeError:
+                row["content"] = {}
+        rows.sort(key=lambda row: (-int(row.get("retrieval_score", 0)), str(row.get("title", ""))))
+        deduplicated: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        for row in rows:
+            page_key = str(row.get("page_key", ""))
+            if page_key in seen_pages:
+                continue
+            seen_pages.add(page_key)
+            deduplicated.append(row)
+            if len(deduplicated) >= limit:
+                break
+        return deduplicated
 
     # ── Helpers ──────────────────────────────────────────────────
 

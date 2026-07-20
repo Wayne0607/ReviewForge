@@ -2353,3 +2353,24 @@ def test_reviewer_prompts_require_concrete_test_and_documentation_evidence():
     assert "具体错误测试行" in testing
     assert "不要仅因公共函数/类缺少 docstring" in documentation
     assert "应直接报告可修复的漏洞" in documentation
+
+
+def test_actionability_gate_rejects_missing_mock_verification_advice():
+    finding = Finding(
+        id="mock_verification",
+        file="pkg/service_test.go",
+        line=12,
+        category="mock-validation",
+        message="mock 预期调用缺少验证，即使实现没有调用也可能通过。",
+        suggestion="在测试末尾调用 AssertExpectations(t)。",
+        reviewer="testing_reviewer",
+    )
+    diff = _summary(
+        "pkg/service_test.go",
+        'func TestService(t *testing.T) {\n    mock.On("Save").Return(nil)\n}',
+    )
+
+    actionable, rejected = apply_actionability_gate([finding], diff)
+
+    assert actionable == []
+    assert rejected == [finding]

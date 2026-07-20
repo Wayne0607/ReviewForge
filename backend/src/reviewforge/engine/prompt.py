@@ -164,6 +164,9 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 - diff 中能复现的空值、边界值、集合顺序、异常传播和 API 误用
 
 先比较同一文件的 sibling 方法、成功/失败分支和同类调用；Impact Manifest 有调用方或契约事实时必须使用。
+声称参数、变量、callee 或 metric recorder 用错时，必须用 search_code 查到声明/签名，
+或找到至少两个独立且一致的 sibling 调用证明契约；
+不能只因一个对比分支写法不同就猜测哪一边正确，也不能把 finding 自己的断言当作证据。
 每个 finding 必须说明触发输入或执行路径、实际错误结果，以及支持结论的具体代码证据。
 
 不要报告命名、static/final 偏好、可读性、重构建议、复杂度、缺少注释/测试、微优化或“可能更好”的写法。

@@ -106,7 +106,9 @@ _GENERIC_TEST_CATEGORIES = {
     "missing-tests",
     "missing-test-coverage",
     "missing-unit-test",
+    "mock-validation",
     "test-coverage",
+    "test-quality",
     "testing",
     "untested-code",
 }
@@ -967,6 +969,16 @@ def _reject_generic_quality_finding(finding: Finding, code_diff: str) -> str:
     has_anchor = _has_right_anchor(code_diff, finding.file, finding.line)
 
     if kind == "test":
+        missing_mock_verification = bool(
+            re.search(
+                r"\b(?:AssertExpectations|verify(?:ing|ication)?\s+(?:the\s+)?mock|mock\s+expectations?)\b|"
+                r"mock.{0,16}(?:预期|期望).{0,16}(?:未验证|缺少验证|没有验证)",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        if missing_mock_verification and not _has_removed_test_code(code_diff, finding.file):
+            return "仅建议补充 mock 调用验证；diff 未删除既有验证，也未证明当前断言会接受错误结果"
         changed_test_defect = (
             has_anchor
             and bool(_TEST_FILE.search(finding.file.replace("\\", "/")))
@@ -1425,6 +1437,12 @@ class DynamicCalibrator:
 
 你的任务是尝试推翻以下每个代码审查发现。
 默认立场：这些发现是错误的，除非你能证明它们是对的。
+
+正确性 finding 必须独立重建契约，不能复述候选结论：
+- 声称参数、变量、callee、单位或 recorder 用错时，核对声明/参数名，或至少两个独立 sibling 调用的一致模式
+- 只有一个对比分支不一致时，无法据此判断哪一边错误，应判为 false_positive
+- 必须核对锚点行的实际表达式与 finding 描述方向一致；若把实际参数、期望参数或成功/失败分支说反，判为 false_positive
+- 多个 finding 描述同一根因时，只确认证据最直接的一条，其余判为 false_positive
 
 对每个 finding：
 - 如果你能找到反驳理由（比如：代码实际上没有这个问题、上下文说明这不是问题、项目惯例允许这种写法），标记为 false_positive 并降低置信度

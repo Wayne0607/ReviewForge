@@ -329,7 +329,7 @@ def build_registry() -> SpecRegistry:
             name="correctness_reviewer",
             role="executor",
             description="Reviews changed behavior for concrete correctness and contract failures",
-            allowed_tools=["read_diff", "read_file", "get_change_context"],
+            allowed_tools=["read_diff", "read_file", "search_code", "get_change_context"],
             model_profile="reviewer",
             max_steps=6,
             output_contract={

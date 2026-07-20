@@ -81,9 +81,7 @@ async def test_context_engine_represents_localization_resources_without_symbols(
         pr_number=10,
         head_sha="head",
         files_changed=["themes/messages/messages_zh_CN.properties"],
-        file_diffs={
-            "themes/messages/messages_zh_CN.properties": "@@ -1 +1 @@\n-old=phone\n+totpStep1=手機應用程式\n"
-        },
+        file_diffs={"themes/messages/messages_zh_CN.properties": "@@ -1 +1 @@\n-old=phone\n+totpStep1=手機應用程式\n"},
     )
 
     manifest = await ContextEngine(ToolGateway(build_registry(), _ContextGitHub())).build(state)

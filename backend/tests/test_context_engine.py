@@ -161,6 +161,13 @@ def test_yaml_can_select_agentic_reviewers(tmp_path, monkeypatch):
     assert config.agentic_default is False
 
 
+def test_default_agentic_reviewers_are_context_dependent_dimensions():
+    config = ReviewForgeConfig()
+
+    assert config.agentic_reviewers == ["correctness_reviewer", "testing_reviewer"]
+    assert config.agentic_default is False
+
+
 def test_render_manifest_can_filter_without_mutating_original():
     manifest = {
         "version": 1,

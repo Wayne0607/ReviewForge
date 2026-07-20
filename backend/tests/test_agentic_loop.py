@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessage
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import ReviewTask, StateStore
 from reviewforge.engine.mock_llm import MockChatLLM
-from reviewforge.engine.reviewers import SecurityReviewer
+from reviewforge.engine.reviewers import BaseReviewer, SecurityReviewer
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.mock_github import MockGitHubClient
 
@@ -31,6 +31,22 @@ class _EmptyFindingsLLM:
     async def ainvoke(self, messages):
         self.calls += 1
         return AIMessage(content='{"findings": []}')
+
+
+class _InvalidThenValidLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(content="analysis without JSON")
+        return AIMessage(
+            content=(
+                '{"findings":[{"file":"test.py","line":1,"severity":"error",'
+                '"category":"logic-error","message":"wrong result","confidence":0.9}]}'
+            )
+        )
 
 
 @pytest.fixture
@@ -75,6 +91,23 @@ async def test_singleshot_returns_findings(registry, gateway, state, task):
     assert all(f.file for f in findings)
     assert all(f.severity in ("info", "warning", "error") for f in findings)
     assert all(0.0 <= f.confidence <= 1.0 for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_singleshot_retries_invalid_json_once(registry, gateway, state, task):
+    llm = _InvalidThenValidLLM()
+    reviewer = BaseReviewer(
+        name="correctness_reviewer",
+        reviewer_type="correctness",
+        llm=llm,
+        registry=registry,
+        gateway=gateway,
+    )
+
+    findings = await reviewer.execute(task, state)
+
+    assert llm.calls == 2
+    assert [(finding.category, finding.reviewer) for finding in findings] == [("logic-error", "correctness_reviewer")]
 
 
 @pytest.mark.asyncio

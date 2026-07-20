@@ -192,7 +192,21 @@ class BaseReviewer:
         response = await self._llm.ainvoke(chat_messages)
         findings, valid = self._parse_findings_result(response.content)
         if not valid:
-            raise ReviewerOutputError(f"{self.name}: invalid JSON output")
+            logger.warning("%s: invalid JSON output; retrying once with the output contract", self.name)
+            repair_messages = [
+                *chat_messages,
+                response,
+                HumanMessage(
+                    content=(
+                        "Your previous response was not valid findings JSON. "
+                        'Return only JSON with a "findings" array; use an empty array when no issue exists.'
+                    )
+                ),
+            ]
+            repaired = await self._llm.ainvoke(repair_messages)
+            findings, valid = self._parse_findings_result(repaired.content)
+            if not valid:
+                raise ReviewerOutputError(f"{self.name}: invalid JSON output after bounded retry")
         for f in findings:
             f.reviewer = self.name
         return self._merge_detector_findings(findings, diffs)

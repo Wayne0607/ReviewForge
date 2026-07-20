@@ -273,9 +273,9 @@ async def test_code_evidence_gate_runs_before_escalation_split():
             "--- /dev/null\n"
             "+++ b/helpers.py\n"
             "@@ -0,0 +1,3 @@\n"
-            "+def ping_host(host: str = \"localhost\") -> str:\n"
+            '+def ping_host(host: str = "localhost") -> str:\n'
             "+    return subprocess.check_output(\n"
-            "+        [\"ping\", \"-c\", \"1\", host]).decode()"
+            '+        ["ping", "-c", "1", host]).decode()'
         ),
     )
 

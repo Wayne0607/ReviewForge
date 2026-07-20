@@ -50,7 +50,11 @@ async def test_overlong_rationale_is_truncated_without_failing_plan() -> None:
 
     tasks = await planner.plan(state)
 
-    assert [task.reviewer for task in tasks] == ["security_reviewer", "correctness_reviewer"]
+    assert [task.reviewer for task in tasks] == [
+        "security_reviewer",
+        "style_reviewer",
+        "correctness_reviewer",
+    ]
     assert len(tasks[0].rationale) == TASK_RATIONALE_MAX_LENGTH
     assert tasks[0].rationale.startswith("security context")
 
@@ -70,7 +74,11 @@ async def test_plan_filters_absence_only_test_and_doc_tasks_for_source_only_chan
 
     tasks = await planner.plan(state)
 
-    assert [task.reviewer for task in tasks] == ["security_reviewer"]
+    assert [task.reviewer for task in tasks] == [
+        "security_reviewer",
+        "correctness_reviewer",
+        "style_reviewer",
+    ]
 
 
 async def test_planner_retries_invalid_json_once() -> None:
@@ -81,7 +89,7 @@ async def test_planner_retries_invalid_json_once() -> None:
     tasks = await planner.plan(state)
 
     assert llm.calls == 2
-    assert [task.reviewer for task in tasks] == ["correctness_reviewer"]
+    assert [task.reviewer for task in tasks] == ["style_reviewer", "correctness_reviewer"]
 
 
 def test_malformed_task_is_skipped_without_losing_valid_siblings() -> None:

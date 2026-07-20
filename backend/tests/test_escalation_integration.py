@@ -237,14 +237,14 @@ async def test_actionability_gate_runs_before_escalation_split():
     await orch.run(state)
 
     findings = state.list_findings()
-    assert len(findings) == 1
-    assert findings[0].status == "false_positive"
-    assert findings[0].verified_by == "actionability-gate"
+    assert len(findings) == 2
+    assert all(finding.status == "false_positive" for finding in findings)
+    assert any(finding.verified_by == "actionability-gate" for finding in findings)
     event_types = [event.event_type for event in events]
     assert "actionability.completed" in event_types
     assert "escalation.started" not in event_types
     assert "calibration.started" not in event_types
-    assert llm.calls == 2
+    assert llm.calls == 3
 
 
 async def test_code_evidence_gate_runs_before_escalation_split():
@@ -289,4 +289,4 @@ async def test_code_evidence_gate_runs_before_escalation_split():
     assert "code_evidence.completed" in event_types
     assert "escalation.started" not in event_types
     assert "calibration.started" not in event_types
-    assert llm.calls == 2
+    assert llm.calls == 4

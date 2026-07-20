@@ -994,3 +994,42 @@ def test_nonduplicate_categories_are_still_canonicalized():
 
     assert survivors[0].category == "missing-alt"
     assert dropped == []
+
+
+def test_verifier_merges_repeated_metric_recorder_swaps_but_keeps_opposite_direction():
+    verifier = Verifier()
+    legacy_create = Finding(
+        id="legacy_create",
+        file="writer.go",
+        line=45,
+        category="metrics-recorder-mismatch",
+        message="Storage failure calls recordLegacyDuration instead of recordStorageDuration.",
+        suggestion="Call recordStorageDuration.",
+        confidence=0.9,
+        reviewer="correctness_reviewer",
+    )
+    legacy_update = Finding(
+        id="legacy_update",
+        file="writer.go",
+        line=128,
+        category="wrong-metric-recorder",
+        message="Storage update calls recordLegacyDuration; use recordStorageDuration.",
+        suggestion="Replace it with recordStorageDuration.",
+        confidence=0.8,
+        reviewer="performance_reviewer",
+    )
+    storage_delete = Finding(
+        id="storage_delete",
+        file="writer.go",
+        line=163,
+        category="metrics-recorder-mismatch",
+        message="Legacy deletion calls recordStorageDuration instead of recordLegacyDuration.",
+        suggestion="Call recordLegacyDuration.",
+        confidence=0.85,
+        reviewer="correctness_reviewer",
+    )
+
+    survivors, dropped = verifier.verify([legacy_create, legacy_update, storage_delete])
+
+    assert [finding.id for finding in survivors] == ["legacy_create", "storage_delete"]
+    assert dropped == ["legacy_update"]

@@ -180,6 +180,7 @@ _QUOTED_IDENTIFIER = re.compile(
     r"[`']([a-z_$][a-z0-9_$]*(?:[.:][a-z_$][a-z0-9_$]*)*)[`']",
     re.IGNORECASE,
 )
+_METRIC_RECORDER_CALL = re.compile(r"\b(record(?:Legacy|Storage)Duration)\b", re.IGNORECASE)
 _SINK_FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "family:sql-query",
@@ -348,6 +349,27 @@ class Verifier:
 
         if fuzzy_dropped:
             out = [finding for finding in out if finding.id not in fuzzy_dropped]
+
+        # Repeated copy/paste metric-recorder swaps are one root cause even when
+        # they occur in several sibling methods. Keep opposite swap directions
+        # independent (legacy->storage versus storage->legacy).
+        repeated_roots: dict[tuple[str, str, str], int] = {}
+        consolidated: list[Finding] = []
+        for finding in out:
+            root = self._repeated_root_fingerprint(finding)
+            if root is None:
+                consolidated.append(finding)
+                continue
+            key = (finding.file, *root)
+            existing_index = repeated_roots.get(key)
+            if existing_index is None:
+                repeated_roots[key] = len(consolidated)
+                consolidated.append(finding)
+                continue
+            winner, loser = self._merge(consolidated[existing_index], finding)
+            consolidated[existing_index] = winner
+            dropped.append(loser.id)
+        out = consolidated
         if dropped:
             logger.info(f"Verifier: {len(out)} kept, {len(dropped)} merged/dropped as duplicate/low-confidence")
         return out, dropped
@@ -397,6 +419,14 @@ class Verifier:
         first_advisories = cls._advisory_ids(first)
         second_advisories = cls._advisory_ids(second)
         return not (first_advisories and second_advisories and first_advisories != second_advisories)
+
+    @staticmethod
+    def _repeated_root_fingerprint(finding: Finding) -> tuple[str, str] | None:
+        text = f"{finding.message}\n{finding.suggestion}"
+        calls = [match.group(1).lower() for match in _METRIC_RECORDER_CALL.finditer(text)]
+        if len(set(calls)) < 2:
+            return None
+        return "metric-recorder-swap", calls[0]
 
     @classmethod
     def _is_nearby_duplicate(cls, detector: Finding, finding: Finding) -> bool:

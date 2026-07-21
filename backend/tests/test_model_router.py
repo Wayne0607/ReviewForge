@@ -22,9 +22,7 @@ class DummyLLM:
 def _patch_chat_openai(monkeypatch):
     """Replace ChatOpenAI with DummyLLM for every test."""
     DummyLLM.instances.clear()
-    monkeypatch.setattr(
-        "reviewforge.engine.model_router.ChatOpenAI", DummyLLM
-    )
+    monkeypatch.setattr("reviewforge.engine.model_router.ChatOpenAI", DummyLLM)
 
 
 def _make_config() -> LLMConfig:

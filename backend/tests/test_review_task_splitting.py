@@ -9,6 +9,7 @@ from reviewforge.engine.orchestrator import (
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
+
 def _task(reviewer: str = "correctness_reviewer", files: list[str] | None = None, rationale: str = "r") -> ReviewTask:
     return ReviewTask(reviewer=reviewer, files=files or [], rationale=rationale)
 
@@ -24,6 +25,7 @@ def _char_cost(file_path: str, patch: str) -> int:
 
 # ── identity: small correctness task unchanged ───────────────────────────
 
+
 def test_small_correctness_task_unchanged():
     """A correctness task within both budgets is returned as-is (same id)."""
     task = _task(files=["a.py", "b.py"])
@@ -34,6 +36,7 @@ def test_small_correctness_task_unchanged():
 
 
 # ── non-correctness never split ──────────────────────────────────────────
+
 
 def test_non_correctness_reviewer_unchanged():
     """A non-correctness reviewer is never split regardless of size."""
@@ -46,6 +49,7 @@ def test_non_correctness_reviewer_unchanged():
 
 
 # ── file-count split ─────────────────────────────────────────────────────
+
 
 def test_file_count_split():
     """More than _SLICE_MAX_FILES files triggers a file-count split."""
@@ -64,6 +68,7 @@ def test_file_count_split():
 
 
 # ── char-budget split ────────────────────────────────────────────────────
+
 
 def test_char_budget_split():
     """Files within file-count limit but over char budget split correctly."""
@@ -92,6 +97,7 @@ def test_oversized_single_file_stays_as_one_chunk():
 
 # ── preservation / no duplicates ─────────────────────────────────────────
 
+
 def test_all_files_preserved_no_duplicates():
     """Every original file appears exactly once across all chunks, in order."""
     files = [f"f{i}.py" for i in range(_SLICE_MAX_FILES * 3)]
@@ -104,6 +110,7 @@ def test_all_files_preserved_no_duplicates():
 
 
 # ── rationale and distinct IDs ───────────────────────────────────────────
+
 
 def test_rationale_preserved_and_ids_distinct():
     """Chunks carry the original rationale and have distinct IDs."""
@@ -122,6 +129,7 @@ def test_rationale_preserved_and_ids_distinct():
 
 # ── missing/empty patches count toward file-count limit ──────────────────
 
+
 def test_missing_patches_still_count_for_file_limit():
     """Files with no loaded patch (empty string) still trigger file-count split."""
     files = [f"f{i}.py" for i in range(_SLICE_MAX_FILES + 2)]
@@ -133,6 +141,7 @@ def test_missing_patches_still_count_for_file_limit():
 
 
 # ── mixed reviewers in same batch ────────────────────────────────────────
+
 
 def test_mixed_reviewers_only_correctness_splits():
     """Only correctness_reviewer tasks are split; others pass through."""
@@ -150,6 +159,7 @@ def test_mixed_reviewers_only_correctness_splits():
 
 
 # ── exact boundary: exactly at limits should NOT split ───────────────────
+
 
 def test_exact_file_limit_no_split():
     """Exactly _SLICE_MAX_FILES files with small patches does not split."""
@@ -177,6 +187,7 @@ def test_exact_char_limit_no_split():
 
 # ── empty input ──────────────────────────────────────────────────────────
 
+
 def test_empty_task_list():
     assert _split_oversized_correctness_tasks([], {}) == []
 
@@ -190,6 +201,7 @@ def test_empty_files_pass_through():
 
 
 # ── order preservation across multiple tasks ─────────────────────────────
+
 
 def test_task_order_preserved():
     """Split and unsplit tasks appear in their original relative order."""

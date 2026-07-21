@@ -80,6 +80,14 @@ class ReviewForgeConfig:
     escalation_max_steps: int = 3
     escalation_max_tokens: int = 5000
 
+    # Selective second pass for high-risk changed symbols that received no
+    # finding in the broad first pass. Disabled by default for embedders;
+    # production opts in through reviewforge.yaml.
+    coverage_gap_enabled: bool = False
+    coverage_gap_min_risk_score: int = 4
+    coverage_gap_max_cards: int = 3
+    coverage_gap_min_confidence: float = 0.65
+
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> ReviewForgeConfig:
         """Load config from YAML file, with env var overrides."""
@@ -193,6 +201,29 @@ class ReviewForgeConfig:
                         except (ValueError, TypeError):
                             pass
                     setattr(self, attr, v)
+        if "coverage_gap" in data:
+            gap = data["coverage_gap"] or {}
+            _gap_types = {
+                "enabled": bool,
+                "min_risk_score": int,
+                "max_cards": int,
+                "min_confidence": float,
+            }
+            for key, value in gap.items():
+                attr = f"coverage_gap_{key}"
+                if not hasattr(self, attr):
+                    continue
+                expected = _gap_types.get(key)
+                if expected:
+                    try:
+                        value = (
+                            value.strip().lower() not in ("0", "false", "no", "")
+                            if expected is bool and isinstance(value, str)
+                            else expected(value)
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                setattr(self, attr, value)
 
     def _apply_env(self) -> None:
         """Environment variables override config file."""
@@ -217,3 +248,6 @@ class ReviewForgeConfig:
         esc_flag = os.environ.get("REVIEWFORGE_ESCALATION_ENABLED")
         if esc_flag is not None:
             self.escalation_enabled = esc_flag.strip().lower() not in ("0", "false", "no", "")
+        gap_flag = os.environ.get("REVIEWFORGE_COVERAGE_GAP_ENABLED")
+        if gap_flag is not None:
+            self.coverage_gap_enabled = gap_flag.strip().lower() not in ("0", "false", "no", "")

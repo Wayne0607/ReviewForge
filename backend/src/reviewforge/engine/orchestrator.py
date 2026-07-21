@@ -24,6 +24,7 @@ from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate, apply_code_evidence_gate
 from reviewforge.engine.context_engine import ContextEngine, render_impact_manifest
+from reviewforge.engine.coverage_gap import build_evidence_cards, filter_gap_findings
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
@@ -104,6 +105,10 @@ class Orchestrator:
         escalation_confidence_max: float = 0.7,
         escalation_max_steps: int = 3,
         escalation_max_tokens: int = 5000,
+        coverage_gap_enabled: bool = False,
+        coverage_gap_min_risk_score: int = 4,
+        coverage_gap_max_cards: int = 3,
+        coverage_gap_min_confidence: float = 0.65,
         skills_dir: str | Path | None = None,
     ) -> None:
         self._registry = registry
@@ -120,6 +125,10 @@ class Orchestrator:
         self._escalation_confidence_max = escalation_confidence_max
         self._escalation_max_steps = escalation_max_steps
         self._escalation_max_tokens = escalation_max_tokens
+        self._coverage_gap_enabled = coverage_gap_enabled
+        self._coverage_gap_min_risk_score = max(0, coverage_gap_min_risk_score)
+        self._coverage_gap_max_cards = max(0, coverage_gap_max_cards)
+        self._coverage_gap_min_confidence = min(1.0, max(0.0, coverage_gap_min_confidence))
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
@@ -542,6 +551,12 @@ class Orchestrator:
                 if not state.notes:
                     break
 
+            # Phase 2.5: spend one bounded call only on high-risk changed
+            # symbols that the broad first pass did not cover. Its output still
+            # passes through every normal verifier/calibration gate below.
+            if self._coverage_gap_enabled:
+                await self._run_coverage_gap_pass(state, run_id, phase0_keys)
+
             # Phase 3: Verifier (#5, pure-logic de-dupe/merge) → Dynamic Calibration.
             raw_candidates = state.list_findings(status="candidate")
             unsupported_redirects = unsupported_python_open_redirect_findings(raw_candidates, state.diff_summary)
@@ -668,6 +683,7 @@ class Orchestrator:
                             "historical_graph": [],
                             "risk_signals": [],
                             "wiki_pages": wiki_pages,
+                            "coverage_gap": state.impact_manifest.get("coverage_gap", {}),
                         },
                         max_chars=3_000,
                     )
@@ -791,19 +807,144 @@ class Orchestrator:
                 await self._db.fail_run(run_id, str(e))
             raise
 
-    def _create_reviewer(self, name: str) -> BaseReviewer | None:
+    async def _run_coverage_gap_pass(
+        self,
+        state: StateStore,
+        run_id: str,
+        phase0_keys: set[tuple[Any, ...]],
+    ) -> None:
+        """Run one evidence-constrained correctness pass when coverage warrants it."""
+
+        if any(task.reviewer == "coverage_gap_reviewer" and task.status == "completed" for task in state.list_tasks()):
+            self._events.emit("coverage_gap.skipped", {"reason": "already completed in resumed run"})
+            return
+
+        cards = build_evidence_cards(
+            state.impact_manifest,
+            state.list_findings(),
+            min_risk_score=self._coverage_gap_min_risk_score,
+            max_cards=self._coverage_gap_max_cards,
+        )
+        state.impact_manifest["coverage_gap"] = {
+            "version": 1,
+            "selected": len(cards),
+            "cards": [card.to_dict() for card in cards],
+        }
+        self._events.emit(
+            "coverage_gap.analyzed",
+            {
+                "selected": len(cards),
+                "min_risk_score": self._coverage_gap_min_risk_score,
+                "max_cards": self._coverage_gap_max_cards,
+            },
+        )
+        if not cards:
+            return
+
+        files = list(dict.fromkeys(card.file for card in cards))
+        task = ReviewTask(
+            reviewer="coverage_gap_reviewer",
+            files=files,
+            rationale="selective high-risk uncovered-symbol correctness pass",
+            status="claimed",
+        )
+        state.add_task(task)
+        reviewer = self._create_reviewer(
+            "correctness_reviewer",
+            model_agent_name="coverage_gap_reviewer",
+            force_agentic=False,
+        )
+        if reviewer is None:
+            state.update_task(task.id, status="failed", error="correctness reviewer unavailable")
+            self._events.emit("coverage_gap.failed", {"error": "correctness reviewer unavailable"})
+            return
+
+        lang = self._detect_task_language(task)
+        fw = self._detect_task_framework(task)
+        self._attach_skill(reviewer, lang, fw)
+        reviewer._target_language = lang or ""
+        reviewer._target_framework = fw or ""
+        reviewer._review_focus = (
+            "This is a selective coverage-gap pass. Inspect only the symbols in "
+            "coverage_gap.cards. A coverage gap is not itself a defect. Report only a "
+            "concrete, observable correctness or security failure supported by the diff "
+            "and Evidence Card. Anchor every finding to one of the card's added_lines. "
+            "Do not report missing tests, documentation, style, speculative hardening, "
+            "or generic advice. Return an empty findings array when evidence is insufficient."
+        )
+
+        started = time.monotonic()
+        self._events.emit("coverage_gap.started", {"cards": len(cards), "files": files})
+        try:
+            findings = await reviewer.execute(task, state)
+            accepted, rejected = filter_gap_findings(
+                findings,
+                cards,
+                min_confidence=self._coverage_gap_min_confidence,
+            )
+            existing_keys = {finding_identity(finding) for finding in state.list_findings()}
+            added = 0
+            for finding in accepted:
+                key = finding_identity(finding)
+                if key in phase0_keys or key in existing_keys:
+                    continue
+                state.add_finding(finding)
+                existing_keys.add(key)
+                added += 1
+            state.update_task(task.id, status="completed")
+            duration_ms = int((time.monotonic() - started) * 1000)
+            self._events.emit(
+                "coverage_gap.completed",
+                {
+                    "cards": len(cards),
+                    "accepted": added,
+                    "rejected": len(rejected) + len(accepted) - added,
+                    "duration_ms": duration_ms,
+                },
+            )
+            if self._db:
+                await self._db.insert_metric(
+                    run_id,
+                    "coverage_gap_reviewer",
+                    findings_count=added,
+                    duration_ms=duration_ms,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state.update_task(task.id, status="failed", error=str(exc))
+            self._events.emit("coverage_gap.failed", {"error": str(exc)})
+            if self._db:
+                await self._db.insert_metric(
+                    run_id,
+                    "coverage_gap_reviewer",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    status="failed",
+                    error=str(exc),
+                )
+
+    def _create_reviewer(
+        self,
+        name: str,
+        *,
+        model_agent_name: str | None = None,
+        force_agentic: bool | None = None,
+    ) -> BaseReviewer | None:
         """D6+W2: 按 reviewer 名字解析 LLM + agentic 标志。"""
         cls = REVIEWER_MAP.get(name) or self._extra_reviewers.get(name)
         if cls:
             # D6: 如果有 ModelRouter，按 agent 名字取对应 LLM
+            route_name = model_agent_name or name
             if self._model_router:
-                llm = self._model_router.get_llm(name)
+                llm = self._model_router.get_llm(route_name)
                 if self._db:
-                    llm = TrackedChatLLM(inner=llm, ctx=self._token_ctx, agent_name=name)
+                    llm = TrackedChatLLM(inner=llm, ctx=self._token_ctx, agent_name=route_name)
             else:
                 llm = self._reviewer_llm
             # W2/#1: 有显式 allowlist 时按成员判定，否则用默认（默认全部 reviewer 走工具循环）
             agentic = name in self._agentic_reviewers if self._agentic_reviewers else self._agentic_default
+            if force_agentic is not None:
+                agentic = force_agentic
             # Construct with the base (llm, registry, gateway) signature so custom plugins
             # (which only accept those three) work too; set per-run flags as attributes.
             reviewer = cls(llm, self._registry, self._gateway)

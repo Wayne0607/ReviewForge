@@ -181,6 +181,7 @@ class BaseReviewer:
             "target_language": getattr(self, "_target_language", ""),
             "target_framework": getattr(self, "_target_framework", ""),
             "impact_manifest": state.impact_manifest,
+            "review_focus": getattr(self, "_review_focus", ""),
         }
         messages = build_reviewer_prompt(ctx)
 
@@ -230,6 +231,7 @@ class BaseReviewer:
             "target_language": getattr(self, "_target_language", ""),
             "target_framework": getattr(self, "_target_framework", ""),
             "impact_manifest": state.impact_manifest,
+            "review_focus": getattr(self, "_review_focus", ""),
         }
         messages = build_reviewer_prompt(ctx)
         chat = [

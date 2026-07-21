@@ -107,3 +107,11 @@ escalation:
   confidence_max: 0.7
   max_steps: 3
   max_tokens: 5000
+
+# 对首轮未覆盖的高风险变更符号做一次受限 correctness 二审。
+# 二审只接受锚定到 Evidence Card 新增行且有足够置信度的具体缺陷。
+coverage_gap:
+  enabled: true
+  min_risk_score: 4
+  max_cards: 3
+  min_confidence: 0.65

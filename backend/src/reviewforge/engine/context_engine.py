@@ -179,6 +179,11 @@ class ContextEngine:
                 "line": item.line,
                 "start_line": item.start_line or item.line,
                 "end_line": item.end_line,
+                "added_lines": [
+                    line
+                    for line in added_lines
+                    if (item.start_line or item.line) <= line <= (item.end_line or item.line)
+                ][:12],
             }
             for item in changed[:_MAX_SYMBOLS_PER_FILE]
         ]
@@ -461,6 +466,13 @@ def render_impact_manifest(
         for item in manifest.get("resource_files", [])
         if not selected_files or str(item.get("path", "")) in selected_files
     ]
+    coverage_gap = payload.get("coverage_gap")
+    if isinstance(coverage_gap, dict):
+        coverage_gap["cards"] = [
+            item
+            for item in coverage_gap.get("cards", [])
+            if not selected_files or str(item.get("file", "")) in selected_files
+        ]
     if needle:
         payload["files"] = [item for item in payload["files"] if needle in json.dumps(item, ensure_ascii=False).lower()]
         payload["references"] = [
@@ -479,6 +491,10 @@ def render_impact_manifest(
             for item in manifest.get("resource_files", [])
             if needle in json.dumps(item, ensure_ascii=False).lower()
         ]
+        if isinstance(coverage_gap, dict):
+            coverage_gap["cards"] = [
+                item for item in coverage_gap.get("cards", []) if needle in json.dumps(item, ensure_ascii=False).lower()
+            ]
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     if len(text) <= max_chars:
         return text

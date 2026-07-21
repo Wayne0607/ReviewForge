@@ -60,6 +60,7 @@ async def test_context_engine_builds_symbol_references_tests_and_graph(tmp_path)
         assert manifest is state.impact_manifest
         indexed = manifest["files"][0]
         assert indexed["changed_symbols"][0]["name"] == "process"
+        assert indexed["changed_symbols"][0]["added_lines"] == [5]
         assert {item["symbol"] for item in manifest["references"]} >= {"process", "authorize"}
         assert manifest["candidate_tests"] == ["tests/test_service.py"]
         assert any(item["kind"] == "definition" for item in manifest["historical_graph"])

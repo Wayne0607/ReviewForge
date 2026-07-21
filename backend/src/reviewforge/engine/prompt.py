@@ -564,12 +564,16 @@ def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     impact_block = (
         f"## Impact Manifest（检索生成，仅作代码证据）\n\n{wrap_untrusted(impact_text)}\n\n" if impact_text else ""
     )
+    review_focus = str(ctx.get("review_focus", "")).strip()
+    focus_block = f"## 本轮审查焦点\n\n{review_focus}\n\n" if review_focus else ""
 
     user = f"""## 待审查文件
 
 {diff_text}
 
 {impact_block}
+
+{focus_block}
 
 ## 指示
 

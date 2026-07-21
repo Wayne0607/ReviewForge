@@ -120,6 +120,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
             escalation_confidence_max=cfg.escalation_confidence_max,
             escalation_max_steps=cfg.escalation_max_steps,
             escalation_max_tokens=cfg.escalation_max_tokens,
+            coverage_gap_enabled=cfg.coverage_gap_enabled,
+            coverage_gap_min_risk_score=cfg.coverage_gap_min_risk_score,
+            coverage_gap_max_cards=cfg.coverage_gap_max_cards,
+            coverage_gap_min_confidence=cfg.coverage_gap_min_confidence,
             skills_dir=cfg.skills_dir,
         )
 

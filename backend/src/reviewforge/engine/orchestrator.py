@@ -46,6 +46,98 @@ from reviewforge.tools.github_api import MAX_REVIEW_COMMENTS_PER_REQUEST
 
 logger = logging.getLogger(__name__)
 
+# ── Correctness-task slicing budget ──────────────────────────────────────
+# The reviewer prompt has a 36k-char diff ceiling (_REVIEWER_MAX_DIFF_CHARS
+# in prompt.py).  System preamble, skill body, impact manifest, and
+# per-file "### path" headers all consume that budget, so a 24k-char
+# chunk target leaves ~12k for non-diff content and avoids the blanket
+# shallow truncation that defeats deep correctness review on large PRs.
+_SLICE_MAX_FILES = 8
+_SLICE_MAX_DIFF_CHARS = 24_000
+
+
+def _split_oversized_correctness_tasks(
+    tasks: list[ReviewTask],
+    file_diffs: dict[str, str],
+) -> list[ReviewTask]:
+    """Split oversized ``correctness_reviewer`` tasks into bounded chunks.
+
+    Only tasks whose ``reviewer`` is exactly ``correctness_reviewer`` are
+    candidates for splitting.  Non-correctness tasks and correctness tasks
+    already within both budgets are returned unchanged (same object / id).
+
+    Chunking uses deterministic sequential greedy packing in original file
+    order.  A single file whose rendered cost exceeds the character budget
+    becomes a one-file chunk and is never dropped or duplicated.
+
+    Args:
+        tasks: Planner-proposed tasks (may be empty).
+        file_diffs: Per-file patch cache from ``state.file_diffs``.
+
+    Returns:
+        A flat list of tasks ready for ``state.add_task``.
+    """
+    if not tasks:
+        return tasks
+
+    result: list[ReviewTask] = []
+    for task in tasks:
+        # Non-correctness tasks pass through regardless of size.
+        if task.reviewer != "correctness_reviewer":
+            result.append(task)
+            continue
+
+        files = task.files
+        # A single file (or empty list) cannot be split further — return unchanged.
+        if len(files) <= 1:
+            result.append(task)
+            continue
+
+        # Check whether splitting is needed: file-count *or* char budget.
+        needs_split = len(files) > _SLICE_MAX_FILES
+        if not needs_split:
+            total_cost = sum(len(f"### {fp}\n{file_diffs.get(fp, '')}\n\n") for fp in files)
+            needs_split = total_cost > _SLICE_MAX_DIFF_CHARS
+
+        if not needs_split:
+            result.append(task)
+            continue
+
+        # Sequential greedy packing — preserve original file order.
+        chunks: list[list[str]] = []
+        current: list[str] = []
+        current_cost = 0
+
+        for fp in files:
+            patch = str(file_diffs.get(fp, ""))
+            cost = len(f"### {fp}\n{patch}\n\n")
+
+            if current:
+                # Would adding this file exceed either budget?
+                if len(current) + 1 > _SLICE_MAX_FILES or current_cost + cost > _SLICE_MAX_DIFF_CHARS:
+                    chunks.append(current)
+                    current = []
+                    current_cost = 0
+
+            current.append(fp)
+            current_cost += cost
+
+        if current:
+            chunks.append(current)
+
+        # Emit fresh ReviewTask instances with distinct ids, preserving
+        # the original reviewer and rationale.
+        for chunk_files in chunks:
+            result.append(
+                ReviewTask(
+                    reviewer=task.reviewer,
+                    files=chunk_files,
+                    rationale=task.rationale,
+                )
+            )
+
+    return result
+
 
 @dataclass(frozen=True)
 class CommentDeliveryResult:
@@ -509,6 +601,10 @@ class Orchestrator:
                     planner_errors.append(f"round {round_no}: {e}")
                     planner_succeeded = False
                     proposed = []
+                # Slice oversized correctness tasks before they enter
+                # StateStore/Scheduler so each chunk fits the reviewer
+                # prompt's 36k-char diff budget.
+                proposed = _split_oversized_correctness_tasks(proposed, state.file_diffs or {})
                 for task in proposed:
                     state.add_task(task)
                 if planner_succeeded:

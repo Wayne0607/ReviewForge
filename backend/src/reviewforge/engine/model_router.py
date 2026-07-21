@@ -21,7 +21,9 @@ DEFAULT_PROFILE_MAP = {
     "security_reviewer": "accurate",
     "performance_reviewer": "fast",
     "style_reviewer": "fast",
-    "correctness_reviewer": "fast",
+    # correctness outputs 6 structured findings — needs accurate's 8192-token
+    # ceiling to avoid JSON truncation and costly full-prompt retries
+    "correctness_reviewer": "accurate",
     "coverage_gap_reviewer": "accurate",
     "localization_reviewer": "fast",
     "testing_reviewer": "fast",

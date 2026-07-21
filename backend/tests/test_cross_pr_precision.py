@@ -1359,6 +1359,50 @@ async def test_cross_pr_keeps_risk_when_source_and_base_file_contents_match(tmp_
     await db.close()
 
 
+async def test_same_content_history_can_structurally_confirm_direct_request_flow(tmp_path):
+    db = Database(tmp_path / "same_content_structural.db")
+    await db.connect()
+    repo = "o/r"
+    source_head = "historical-head"
+    base_sha = "current-base-with-unrelated-commit"
+    sink_path = "pkg/content_sink.py"
+    unchanged = "def danger(raw): return eval(raw)\n"
+    github = _FakeGitHub(
+        {
+            (repo, source_head, sink_path): unchanged,
+            (repo, base_sha, sink_path): unchanged,
+        }
+    )
+    llm = _RejectEveryChainLLM()
+    analyzer = CrossPRAnalyzer(db, llm=llm, github_client=github)
+    await _seed_completed_risk(
+        db,
+        analyzer,
+        run_id="historical-risk",
+        repo=repo,
+        pr_number=64,
+        head_sha=source_head,
+        file_path=sink_path,
+    )
+
+    consumer_path = "pkg/content_consumer.py"
+    body = "from pkg.content_sink import danger\ndef endpoint(request):\n    return danger(request.args['value'])\n"
+    state = StateStore(
+        pr_number=75,
+        repo=repo,
+        head_sha="consumer-head",
+        base_sha=base_sha,
+        files_changed=[consumer_path],
+        diff_summary=_diff(consumer_path, body),
+    )
+
+    findings = await analyzer.analyze("same-content-consumer", state, [])
+    await db.close()
+
+    assert {(finding.line, finding.verified_by) for finding in findings} == {(3, "cross-pr-structural")}
+    assert llm.invocations == 0
+
+
 async def test_cross_pr_caches_missing_file_and_skips_unverifiable_risk(tmp_path):
     db = Database(tmp_path / "missing_file.db")
     await db.connect()

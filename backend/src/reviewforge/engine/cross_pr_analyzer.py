@@ -115,7 +115,8 @@ class CrossPRChain:
     call_callee: str = ""
     # Deterministic publication is permitted only when both facts are proven:
     # the import resolves to one historical file, and that historical finding
-    # was produced by the exact commit used as this PR's base.
+    # was produced either by the exact base commit or by a commit whose target
+    # file is byte-identical to the target file at the current base.
     target_resolution_proven: bool = False
     history_base_proven: bool = False
     call_binding_proven: bool = False
@@ -971,7 +972,7 @@ class CrossPRAnalyzer:
                                     target_symbol,
                                     allow_file_risk=False,
                                 )
-                                == _APPLICABLE_BASE_HEAD
+                                >= _APPLICABLE_SAME_CONTENT
                             ),
                             call_binding_proven=call.binding_proven,
                         )

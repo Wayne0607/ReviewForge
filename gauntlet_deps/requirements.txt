@@ -1,0 +1,5 @@
+django==1.2
+pyyaml>=3.10
+requests>=2
+jinja2==2.10
+pickle5

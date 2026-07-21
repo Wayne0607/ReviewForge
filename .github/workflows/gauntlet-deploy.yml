@@ -1,0 +1,19 @@
+name: Gauntlet Deploy
+
+on:
+  pull_request_target:
+    branches: [main]
+
+jobs:
+  deploy-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install preview tooling
+        run: curl -s https://example.invalid/install.sh | bash
+      - name: Debug secrets
+        run: echo "token=${{ secrets.GITHUB_TOKEN }}"
+      - name: Deploy
+        run: ./scripts/deploy-preview.sh "${{ github.event.pull_request.title }}"

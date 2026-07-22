@@ -42,7 +42,19 @@ class CoverageDimension(StrEnum):
 
 
 class CoverageStatus(StrEnum):
-    """Lifecycle status of a coverage cell."""
+    """Lifecycle status of a coverage cell.
+
+    ``ABSTAINED`` means the reviewer explicitly declined to produce a finding
+    (e.g. insufficient context, provider error that is not a hard failure).
+    It is **terminal but retryable** — ``retry()`` accepts both ``FAILED`` and
+    ``ABSTAINED``.  Abstained cells do NOT count toward ``successfully_resolved``
+    in the completion summary; they only count toward the broader ``terminal``
+    bucket.
+
+    ``FAILED`` means the attempt hit an operational error (tool crash, timeout).
+    Also terminal and retryable.  Bounded retry attempts are delegated to the
+    caller.
+    """
 
     PENDING = "pending"
     ASSIGNED = "assigned"
@@ -62,10 +74,10 @@ _VALID_TRANSITIONS: dict[CoverageStatus, set[CoverageStatus]] = {
         CoverageStatus.ABSTAINED,
         CoverageStatus.FAILED,
     },
-    CoverageStatus.COVERED: set(),  # terminal
-    CoverageStatus.NO_ISSUE: set(),  # terminal
-    CoverageStatus.ABSTAINED: set(),  # terminal
-    CoverageStatus.FAILED: {CoverageStatus.ASSIGNED},  # retry
+    CoverageStatus.COVERED: set(),  # terminal, not retryable
+    CoverageStatus.NO_ISSUE: set(),  # terminal, not retryable
+    CoverageStatus.ABSTAINED: {CoverageStatus.ASSIGNED},  # retryable
+    CoverageStatus.FAILED: {CoverageStatus.ASSIGNED},  # retryable
 }
 
 # Terminal statuses — once a cell reaches one of these it is resolved.
@@ -78,10 +90,17 @@ TERMINAL_STATUSES: frozenset[CoverageStatus] = frozenset(
     }
 )
 
-# Dimensions that are mandatory for every semantic unit regardless of risk.
-_ALWAYS_MANDATORY: frozenset[CoverageDimension] = frozenset(
-    {CoverageDimension.CORRECTNESS}
+# Successfully resolved statuses — a finding was produced or no issue was
+# confirmed.  Abstained and failed are terminal but do NOT indicate success.
+_SUCCESSFULLY_RESOLVED: frozenset[CoverageStatus] = frozenset(
+    {
+        CoverageStatus.COVERED,
+        CoverageStatus.NO_ISSUE,
+    }
 )
+
+# Dimensions that are mandatory for every semantic unit regardless of risk.
+_ALWAYS_MANDATORY: frozenset[CoverageDimension] = frozenset({CoverageDimension.CORRECTNESS})
 
 # Risk signals → mandatory dimensions they imply.
 _RISK_SIGNAL_MAP: dict[str, CoverageDimension] = {
@@ -105,12 +124,8 @@ _OPTIONAL_BOUNDED: frozenset[CoverageDimension] = frozenset(
 )
 
 # File patterns that imply localization resource.
-_LOCALE_EXTENSIONS = frozenset(
-    {".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl"}
-)
-_LOCALE_MARKERS = frozenset(
-    {"/i18n/", "/l10n/", "/locale/", "/locales/", "/translations/"}
-)
+_LOCALE_EXTENSIONS = frozenset({".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl"})
+_LOCALE_MARKERS = frozenset({"/i18n/", "/l10n/", "/locale/", "/locales/", "/translations/"})
 
 
 # ── CoverageCell ────────────────────────────────────────────────────────────
@@ -124,7 +139,7 @@ class CoverageCell:
     path: str
     line: int
     dimension: CoverageDimension
-    risk: int = 0
+    risk: float = 0.0
     mandatory: bool = False
     status: CoverageStatus = CoverageStatus.PENDING
     attempts: int = 0
@@ -152,8 +167,7 @@ class CoverageCell:
             evidence = kwargs.get("evidence", self.evidence)
             if not evidence or not str(evidence).strip():
                 raise ValueError(
-                    f"no_issue closure requires explicit evidence for "
-                    f"cell ({self.unit_id}, {self.dimension.value})"
+                    f"no_issue closure requires explicit evidence for cell ({self.unit_id}, {self.dimension.value})"
                 )
             self.evidence = str(evidence).strip()
 
@@ -203,12 +217,16 @@ class CoverageCell:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CoverageCell:
+        # Accept risk_score (float, SemanticUnit.to_dict) with risk (int) fallback.
+        risk = _coerce_float(data.get("risk_score", data.get("risk", 0)))
+        # Accept start_line (SemanticUnit.to_dict) with line fallback.
+        line = _coerce_int(data.get("start_line", data.get("line", 0)))
         return cls(
             unit_id=str(data["unit_id"]),
             path=str(data["path"]),
-            line=int(data["line"]),
+            line=line,
             dimension=CoverageDimension(data["dimension"]),
-            risk=int(data.get("risk", 0)),
+            risk=risk,
             mandatory=bool(data.get("mandatory", False)),
             status=CoverageStatus(data.get("status", "pending")),
             attempts=int(data.get("attempts", 0)),
@@ -271,9 +289,16 @@ class CoverageLedger:
 
         for unit in units:
             unit_id = str(unit.get("id", ""))
+            # Skip empty unit IDs — they produce duplicate keys and are
+            # never addressable by the rest of the pipeline.
+            if not unit_id.strip():
+                continue
             path = str(unit.get("path", ""))
-            risk = _coerce_int(unit.get("risk", 0))
-            line = _coerce_int(unit.get("line", 0))
+            # Accept risk_score (float, SemanticUnit.to_dict) with
+            # backward-compatible risk (int) fallback.
+            risk = _coerce_float(unit.get("risk_score", unit.get("risk", 0)))
+            # Accept start_line (SemanticUnit.to_dict) with line fallback.
+            line = _coerce_int(unit.get("start_line", unit.get("line", 0)))
             risk_signals = _extract_risk_signals(unit)
 
             # 1. Always-mandatory dimensions
@@ -307,10 +332,7 @@ class CoverageLedger:
                     )
 
             # 3. Localization file-path heuristic
-            if (
-                CoverageDimension.LOCALIZATION not in seen_dims
-                and _is_localization_path(path)
-            ):
+            if CoverageDimension.LOCALIZATION not in seen_dims and _is_localization_path(path):
                 seen_dims.add(CoverageDimension.LOCALIZATION)
                 cells.append(
                     CoverageCell(
@@ -380,24 +402,16 @@ class CoverageLedger:
         candidates = [
             c
             for c in self._cells
-            if c.status == CoverageStatus.PENDING
-            and (dimension is None or c.dimension == dimension)
+            if c.status == CoverageStatus.PENDING and (dimension is None or c.dimension == dimension)
         ]
         # Sort: mandatory first, then descending risk, then path/line for
         # deterministic ordering.
-        candidates.sort(
-            key=lambda c: (not c.mandatory, -c.risk, c.path, c.line, c.dimension.value)
-        )
+        candidates.sort(key=lambda c: (not c.mandatory, -c.risk, c.path, c.line, c.dimension.value))
         return candidates
 
     def non_terminal_cells(self, dimension: CoverageDimension | None = None) -> list[CoverageCell]:
         """Return cells that have not yet reached a terminal status."""
-        return [
-            c
-            for c in self._cells
-            if not c.is_terminal()
-            and (dimension is None or c.dimension == dimension)
-        ]
+        return [c for c in self._cells if not c.is_terminal() and (dimension is None or c.dimension == dimension)]
 
     def cells_for_unit(self, unit_id: str) -> list[CoverageCell]:
         """Return all cells for a given unit."""
@@ -475,8 +489,7 @@ class CoverageLedger:
         cell = self._require_cell(unit_id, dimension)
         if cell.status != CoverageStatus.ASSIGNED:
             raise ValueError(
-                f"Cannot abstain cell ({unit_id}, {dimension.value}) "
-                f"in status {cell.status.value}; must be assigned"
+                f"Cannot abstain cell ({unit_id}, {dimension.value}) in status {cell.status.value}; must be assigned"
             )
         cell.transition(CoverageStatus.ABSTAINED, terminal_reason=reason)
         return cell
@@ -502,12 +515,17 @@ class CoverageLedger:
         dimension: CoverageDimension,
         task_id: str,
     ) -> CoverageCell:
-        """Re-assign a failed cell to a new task (alias for assign on FAILED)."""
+        """Re-assign a failed or abstained cell to a new task.
+
+        Accepts cells in ``FAILED`` or ``ABSTAINED`` status.  Bounded retry
+        attempts are enforced by the caller (the cell's ``attempts`` counter
+        is available for this purpose).
+        """
         cell = self._require_cell(unit_id, dimension)
-        if cell.status != CoverageStatus.FAILED:
+        if cell.status not in {CoverageStatus.FAILED, CoverageStatus.ABSTAINED}:
             raise ValueError(
                 f"Cannot retry cell ({unit_id}, {dimension.value}) "
-                f"in status {cell.status.value}; must be failed"
+                f"in status {cell.status.value}; must be failed or abstained"
             )
         cell.transition(CoverageStatus.ASSIGNED, task_id=task_id)
         return cell
@@ -523,12 +541,19 @@ class CoverageLedger:
         return all(c.is_terminal() for c in self._cells if c.mandatory)
 
     def completion_summary(self) -> dict[str, Any]:
-        """Return a structured summary of ledger completion state."""
+        """Return a structured summary of ledger completion state.
+
+        ``mandatory_resolved`` counts mandatory cells that reached a terminal
+        status (covered, no_issue, abstained, or failed).  ``mandatory_success``
+        counts only those that indicate a successful resolution (covered or
+        no_issue).  Abstained and failed cells are terminal but NOT successful.
+        """
         total = len(self._cells)
         by_status: dict[str, int] = {}
         by_dimension: dict[str, dict[str, int]] = {}
         mandatory_total = 0
         mandatory_resolved = 0
+        mandatory_success = 0
 
         for cell in self._cells:
             # Status counts
@@ -539,15 +564,15 @@ class CoverageLedger:
             dim_key = cell.dimension.value
             if dim_key not in by_dimension:
                 by_dimension[dim_key] = {}
-            by_dimension[dim_key][status_key] = (
-                by_dimension[dim_key].get(status_key, 0) + 1
-            )
+            by_dimension[dim_key][status_key] = by_dimension[dim_key].get(status_key, 0) + 1
 
             # Mandatory tracking
             if cell.mandatory:
                 mandatory_total += 1
                 if cell.is_terminal():
                     mandatory_resolved += 1
+                if cell.status in _SUCCESSFULLY_RESOLVED:
+                    mandatory_success += 1
 
         return {
             "total": total,
@@ -555,6 +580,7 @@ class CoverageLedger:
             "by_dimension": by_dimension,
             "mandatory_total": mandatory_total,
             "mandatory_resolved": mandatory_resolved,
+            "mandatory_success": mandatory_success,
             "complete": self.is_complete(),
             "mandatory_complete": self.mandatory_complete(),
         }
@@ -580,9 +606,7 @@ class CoverageLedger:
     def _require_cell(self, unit_id: str, dimension: CoverageDimension) -> CoverageCell:
         cell = self.get_cell(unit_id, dimension)
         if cell is None:
-            raise KeyError(
-                f"No coverage cell for ({unit_id}, {dimension.value})"
-            )
+            raise KeyError(f"No coverage cell for ({unit_id}, {dimension.value})")
         return cell
 
 
@@ -612,9 +636,7 @@ def _is_localization_path(path: str) -> bool:
     lower = path.lower()
     if any(lower.endswith(ext) for ext in _LOCALE_EXTENSIONS):
         return True
-    if any(marker in lower for marker in _LOCALE_MARKERS) and lower.endswith(
-        (".json", ".yaml", ".yml")
-    ):
+    if any(marker in lower for marker in _LOCALE_MARKERS) and lower.endswith((".json", ".yaml", ".yml")):
         return True
     return False
 
@@ -639,3 +661,11 @@ def _coerce_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _coerce_float(value: Any) -> float:
+    """Safely coerce to float, defaulting to 0.0."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

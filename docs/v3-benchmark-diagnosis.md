@@ -26,7 +26,7 @@ This document reports results from the Martian 50 benchmark (50 PRs, 137 golden 
 
 ReviewForge achieves **38.89% precision / 25.55% recall / 30.84% F1** on the Martian 50 benchmark (137 golden findings, 50 PRs, 5 project families). Compared to Qodo-v2 (37.09% P / 57.66% R / 45.14% F1), ReviewForge has marginally higher precision (+1.8pp) but critically lower recall (−32.1pp) and F1 (−14.3pp). The v3 architecture acceptance gates (precision ≥ 35%, recall ≥ 45%, F1 ≥ 39%) are **not met** — recall and F1 fail.
 
-The dominant failure mode is **insufficient candidate generation**, not over-aggressive filtering. 10/50 PRs (20%) produce zero candidates at all (target: ≤ 10%), and 18/50 (36%) emit zero published comments. The pipeline consumes 2.4M tokens across 50 PRs (mean 48K/PR) yet produces only 35 true positives.
+A measurable failure mode is **insufficient candidate generation**: 10/50 PRs (20%) produce zero candidates at all (target: ≤ 10%), accounting for at least 20 of 102 false negatives. 18/50 (36%) emit zero published comments. The remaining 82 FNs on PRs with candidates cannot be attributed to generation vs. filtering without re-judging rejected text. The pipeline consumes 2.4M tokens across 50 PRs (mean 48K/PR) yet produces only 35 true positives.
 
 ---
 
@@ -40,13 +40,13 @@ The dominant failure mode is **insufficient candidate generation**, not over-agg
 | Reviewer tasks completed | 166 | `results-merged.json` (sum of per-PR tasks_completed) |
 | Reviewer tasks failed | 2 | `results-merged.json` (sum of per-PR tasks_failed) |
 | Pre-verification candidates | 211 | `results-merged.json` (sum of total_findings) |
-| Post-calibration confirmed | 101 | `results-merged.json` (sum of confirmed) |
+| Final verification/gating confirmed | 101 | `results-merged.json` (sum of confirmed) |
 | Published comments | 101 | `results-merged.json` (sum of review_comments; equals confirmed) |
 | Judge-matched true positives | 35 | `judge-merged.json` |
 | Judge false positives | 55 | `judge-merged.json` |
 | Judge false negatives | 102 | `judge-merged.json` |
 
-**Attrition**: 110 of 211 candidates (52.1%) are rejected as false positives by the calibrator. Of the 101 confirmed findings, 35 (34.7%) are true positives against the golden set. The bigger loss is upstream — 10 PRs generate zero candidates, missing golden findings outright.
+**Attrition**: 110 of 211 candidates (52.1%) are rejected as false positives across the verification and gating pipeline (Verifier, actionability gate, code-evidence gate, escalation, calibrator). Of the 101 confirmed findings, 35 are true positives (38.89% official precision from the martian_judge; the raw 35/101 = 34.7% TP density on published comments reflects judge deduplication and differing denominators). The bigger loss is upstream — 10 PRs generate zero candidates, missing golden findings outright.
 
 ### 1.2 Per-PR Candidate Generation
 
@@ -125,7 +125,7 @@ From the 31 missed High-severity findings:
 
 **Observations**:
 - The **planner** consumes 19.1% of tokens (460K) for 53 calls — this is the decision layer that assigns reviewers, not the review itself.
-- The **calibrator** consumes 19.5% (470K) for 75 calls — it rejects 52.1% of candidates, meaning ~245K tokens were spent generating candidates that were then discarded.
+- The **calibrator** consumes 19.5% (470K) for 75 calls — the verification/gating pipeline as a whole rejects 52.1% of candidates (110/211), meaning ~245K tokens were spent generating candidates that were then discarded. The calibrator is one stage among several; its individual rejection share is not measured.
 - **correctness_reviewer** is the most productive (54 of 101 published findings) but also the most expensive.
 - **security_reviewer** produces the most false positives despite consuming only 15.3% of tokens.
 
@@ -157,7 +157,7 @@ These PRs consumed significant tokens but produced no published output:
 
 ---
 
-## 4. False Positive Analysis — Calibrator Effectiveness
+## 4. False Positive Analysis — Verification/Gating Pipeline
 
 ### 4.1 Aggregate
 
@@ -168,8 +168,9 @@ These PRs consumed significant tokens but produced no published output:
 - Total confirmed (published): 101
 - Judge-matched true positives: 35
 - Judge-matched false positives: 55
-- **Calibrator precision on published findings**: 35/101 = 34.7% (i.e., 65.3% of published findings are FP per judge)
-- **Overall candidate rejection rate**: 110/211 = 52.1%
+- **Official precision**: 38.89% (from martian_judge with deduplication)
+- **Raw TP density on published comments**: 35/101 = 34.7% (judge deduplication and differing denominators account for the gap)
+- **Overall candidate rejection rate**: 110/211 = 52.1% (across all verification/gating stages, not calibrator alone)
 
 ### 4.2 FP by Reviewer Type
 
@@ -220,8 +221,8 @@ These PRs consumed significant tokens but produced no published output:
 
 | Source | Count | % of FNs |
 |---|---:|---:|
-| Zero-candidate PRs (no candidates generated) | 40 | 39.2% |
-| PRs with candidates (candidates exist but wrong/missing) | 62 | 60.8% |
+| Zero-candidate PRs (no candidates generated) | 20 | 19.6% |
+| PRs with candidates (candidates exist but wrong/missing) | 82 | 80.4% |
 
 ### 5.2 Missed Findings by Family
 
@@ -237,17 +238,16 @@ These PRs consumed significant tokens but produced no published output:
 
 ### 5.3 Root Cause Attribution by Pipeline Stage (Hypotheses)
 
-**These attributions are estimated from zero-candidate patterns and DB reviewer assignments, not directly measurable from the final merged results.** The counts below are ranges, not precise figures.
+**These are hypotheses, not measured counts.** Attribution requires tracing individual FNs through the pipeline via DB lineage and re-judging rejected candidates against golden FNs — neither is performed here. The only directly measurable lower bound is that at least 20 of 102 FNs occur on zero-candidate PRs where no reviewer generated any finding.
 
-| Root Cause | Estimated FN Range | Pipeline Stage | Basis |
-|---|---:|---|---|
-| Reviewer generates 0 findings for PR | ~40 | Reviewer (generation) | 10 zero-candidate PRs, each with golden FNs |
-| Reviewer generates findings but misses specific golden | ~30–40 | Reviewer (coverage) | PRs with TP>0 but also FN>0 |
-| Calibrator rejects valid finding | ~10–15 | Calibrator | DB false_positives that match golden patterns (not independently verified) |
-| Planner assigns wrong reviewers | ~5–10 | Planner | DB reviewer assignments vs golden finding types |
-| Actionability filter drops valid finding | ~0–5 | Actionability | Limited evidence; few cases identifiable |
+| Root Cause | Observable Evidence | Measurement Status |
+|---|---|---|
+| Reviewer generates 0 findings for PR | 10 zero-candidate PRs, accounting for 20 golden FNs | **Measured lower bound** (20/102) |
+| Remaining FNs (82) on PRs with candidates | 82 FNs across PRs that did produce some candidates | **Unmeasured** — cannot split between reviewer generation loss, filtering loss, and verifier/gating loss without re-judging rejected candidate text |
+| Planner assigns wrong reviewers | DB reviewer assignments vs golden finding types | Hypothesis only |
+| Verification/gating rejects valid finding | DB false_positives that may match golden patterns | Hypothesis, not independently verified |
 
-**The reviewer generation stage is the primary bottleneck** (~70–80 of 102 FNs). The calibrator and planner are secondary contributors. Precise counts require re-judging all rejected candidate texts against golden FNs, which is not performed here.
+**The only firm conclusion**: at least 20/102 FNs occur because no reviewer generated any finding for those PRs. The remaining 82 FNs cannot be attributed to generation vs. filtering without re-judging the rejected candidate text, which is not performed here.
 
 ### 5.4 Specific High-Impact Misses
 
@@ -311,19 +311,17 @@ PR Input
 
 ### 7.2 Where FNs Originate (Hypotheses)
 
-**These are estimated ranges, not measured counts.** Attribution requires tracing individual FNs through the pipeline via DB lineage and re-judging rejected candidates against golden FNs. The table below represents our best hypothesis based on observable patterns (zero-candidate PRs, PRs with mixed TP/FN, DB reviewer assignments).
+**These are hypotheses, not measured counts.** Attribution requires tracing individual FNs through the pipeline via DB lineage and re-judging rejected candidates against golden FNs — neither is performed here. The only directly measurable lower bound is that at least 20 of 102 FNs occur on zero-candidate PRs.
 
-| Stage | Mechanism | Estimated FN Range | Observable Evidence |
-|---|---|---:|---|
-| **Context Engine** | Files not selected for review | ~0–5 | PRs with many files where golden finding is in an unreviewed file |
-| **Planner** | Wrong reviewer assigned | ~5–10 | E.g., permission bug assigned to testing_reviewer instead of correctness_reviewer |
-| **Reviewer (generation)** | LLM doesn't detect issue | ~35–40 | Zero-candidate PRs; reviewer runs but outputs 0 findings |
-| **Reviewer (coverage)** | LLM detects some issues but misses others | ~30–40 | PRs with TP>0 but also FN>0 |
-| **Actionability** | Filter drops valid finding | ~0–5 | Limited evidence |
-| **Calibrator** | LLM incorrectly rejects valid finding | ~10–15 | DB false_positives that may match golden patterns |
-| **Commenter** | Delivery failure | ~0 | All confirmed findings were posted |
+| Stage | Mechanism | Observable Evidence | Measurement Status |
+|---|---|---|---|
+| **Reviewer (generation)** | LLM doesn't detect issue for any candidate | 10 zero-candidate PRs → 20 golden FNs | **Measured lower bound** (20/102) |
+| **Remaining FNs** | Unknown split between generation, filtering, gating | 82 FNs on PRs with candidates | **Unmeasured** — requires re-judging rejected candidate text |
+| **Planner** | Wrong reviewer assigned | DB reviewer assignments vs golden finding types | Hypothesis only |
+| **Verification/gating** | Valid finding rejected by any gate | DB false_positives that may match golden patterns | Hypothesis, not independently verified |
+| **Commenter** | Delivery failure | All confirmed findings were posted | ~0 (observed) |
 
-**The reviewer generation stage is the primary bottleneck.** The planner and calibrator are secondary.
+**The only firm conclusion**: at least 20/102 FNs occur because no reviewer generated any finding for those PRs. The remaining 82 FNs cannot be attributed to specific stages without re-judging.
 
 ---
 
@@ -331,7 +329,7 @@ PR Input
 
 ### 8.1 Security Reviewer Noise
 
-The security_reviewer produces 15 `code-injection` FPs and 11 `hardcoded-secrets` FPs. These are deterministic pattern matches that the calibrator should filter but often doesn't. The security reviewer's 78% FP rate suggests its prompts or skills are too aggressive for the benchmark's codebases.
+The security_reviewer produces 15 `code-injection` FPs and 11 `hardcoded-secrets` FPs. These are deterministic pattern matches that the verification/gating pipeline should filter but often doesn't. The security reviewer's 78% FP rate suggests its prompts or skills are too aggressive for the benchmark's codebases.
 
 ### 8.2 Testing Reviewer Compilation Errors
 
@@ -418,18 +416,18 @@ The precision gate is met. The recall and F1 gates fail. The zero-candidate PR t
 
 **How to falsify**: If precision doesn't improve, the FPs are coming from the LLM's reasoning, not from deterministic patterns.
 
-### Experiment 4: Calibrator Threshold Tuning (Expected: +3-5pp recall)
+### Experiment 4: Verification/Gate Threshold Tuning (Expected: +3-5pp recall)
 
-**Hypothesis**: The calibrator is too aggressive — it rejects 52.1% of candidates, including some valid findings. Adjusting the calibrator's prompt to be less aggressive on borderline findings would increase recall.
+**Hypothesis**: The verification and gating pipeline is too aggressive — it rejects 52.1% of candidates across all stages (Verifier, actionability gate, code-evidence gate, escalation, calibrator), possibly including valid findings. Adjusting gate thresholds to be less aggressive on borderline findings would increase recall.
 
 **Implementation**:
-- Analyze the FNs that were rejected by the calibrator
+- Analyze the FNs that were rejected at each gate stage
 - Adjust the calibrator prompt: "When in doubt, confirm rather than reject"
-- Add a confidence threshold: findings with reviewer confidence > 0.8 should not be rejected by the calibrator unless there's explicit counterevidence
+- Add a confidence threshold: findings with reviewer confidence > 0.8 should not be rejected unless there's explicit counterevidence
 
 **Expected metric movement**: Recall +3-5pp, Precision −2-3pp, F1 +1-3pp
 
-**How to falsify**: If precision drops >8pp, the calibrator is correctly filtering noise and relaxing it would harm the product.
+**How to falsify**: If precision drops >8pp, the gates are correctly filtering noise and relaxing them would harm the product.
 
 ### Experiment 5: Language-Specific Reviewer Skills (Expected: +5-8pp recall)
 
@@ -480,7 +478,7 @@ The precision gate is met. The recall and F1 gates fail. The zero-candidate PR t
 | P1 | Zero-candidate PR elimination | +3-5pp | +5-10% | Low |
 | P2 | Security reviewer precision fix | +2-3pp | −5% | Low |
 | P3 | Language-specific reviewer skills | +3-5pp | +5% | Low |
-| P4 | Calibrator threshold tuning | +1-3pp | 0% | Medium |
+| P4 | Verification/gate threshold tuning | +1-3pp | 0% | Medium |
 | P5 | Cross-file context enrichment | +2-3pp | +10-15% | Low |
 | P6 | Agentic reviewer loops | +3-7pp | +30-50% | Medium |
 

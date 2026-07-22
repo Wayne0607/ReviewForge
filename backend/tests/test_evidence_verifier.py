@@ -105,7 +105,7 @@ def _make_evidence(**overrides) -> EvidenceItem:
         "path": "src/auth.py",
         "sha": "abc123def456",
         "line": 42,
-        "snippet": "cursor.execute(f\"SELECT * FROM users WHERE id={user_id}\")",
+        "snippet": 'cursor.execute(f"SELECT * FROM users WHERE id={user_id}")',
         "trigger": "user_id from request.params",
         "violated_contract": "SQL queries must use parameterized statements",
     }
@@ -403,9 +403,9 @@ class TestVerifyProviderException:
 
         assert capsule.prover.verdict == EvidenceVerdict.ABSTAIN
         assert capsule.retry_metadata.get("prover_failed") is True
-        # Never false-positive suppression: even though refuter rejects,
-        # prover failure means we abstain through arbiter
-        assert capsule.final_verdict != EvidenceVerdict.REJECTED or capsule.arbiter is not None
+        # P0 fix: prover failure → final verdict forced to ABSTAIN
+        assert capsule.final_verdict == EvidenceVerdict.ABSTAIN
+        assert capsule.status == EvidenceStatus.ABSTAIN
 
     async def test_refuter_exception_produces_abstain(self):
         """Provider exception from refuter → abstain with metadata."""
@@ -576,7 +576,7 @@ class TestDeterministicShortcut:
         refuter = FakeLLM(raise_exc=AssertionError("should not be called"))
         arbiter = FakeLLM(raise_exc=AssertionError("should not be called"))
 
-        verifier = EvidenceVerifier(prover, refuter, arbiter)
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="abc123def456")
         finding = _make_finding(file="src/auth.py")
         evidence = [
             EvidenceItem(
@@ -584,7 +584,7 @@ class TestDeterministicShortcut:
                 path="src/auth.py",
                 sha="abc123def456",
                 line=42,
-                snippet="cursor.execute(f\"SELECT * FROM users WHERE id={user_id}\")",
+                snippet='cursor.execute(f"SELECT * FROM users WHERE id={user_id}")',
                 trigger="user_id from request.params",
                 violated_contract="SQL queries must use parameterized statements",
             )
@@ -604,7 +604,7 @@ class TestDeterministicShortcut:
         refuter = FakeLLM(raise_exc=AssertionError("should not be called"))
         arbiter = FakeLLM(raise_exc=AssertionError("should not be called"))
 
-        verifier = EvidenceVerifier(prover, refuter, arbiter)
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="abc123")
         finding = _make_finding(file="src/auth.py")
         evidence = [
             EvidenceItem(
@@ -681,8 +681,7 @@ class TestVerifyBatch:
         assert len(capsules) == 3
         # The finding where prover failed should have retry metadata
         failed_capsules = [
-            c for c in capsules
-            if c.retry_metadata.get("prover_failed") or c.retry_metadata.get("refuter_failed")
+            c for c in capsules if c.retry_metadata.get("prover_failed") or c.retry_metadata.get("refuter_failed")
         ]
         assert len(failed_capsules) >= 1
 
@@ -809,7 +808,7 @@ class TestEdgeCases:
         refuter = FakeLLM(raise_exc=AssertionError("should not be called"))
         arbiter = FakeLLM(raise_exc=AssertionError("should not be called"))
 
-        verifier = EvidenceVerifier(prover, refuter, arbiter)
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="abc123")
         finding = _make_finding(file="src\\auth.py")  # Windows path
         evidence = [
             EvidenceItem(
@@ -840,3 +839,347 @@ class TestEdgeCases:
         capsules = await verifier.verify_batch(findings, {}, "diff")
 
         assert len(capsules) == 2  # limited by max_candidates
+
+
+# ---------------------------------------------------------------------------
+# P0 fix — ANY operational failure forces ABSTAIN
+# ---------------------------------------------------------------------------
+
+
+class TestAnyFailureForcesAbstain:
+    """Regression tests for the P0 bug: provider failure suppressing findings.
+
+    When ANY prover/refuter/arbiter fails (exception or invalid output) and
+    retry_metadata is set, the effective final verdict/status MUST be ABSTAIN
+    regardless of what the other models returned.  apply_evidence_to_finding
+    must preserve candidate status in that case.
+    """
+
+    @pytest.mark.parametrize(
+        "prover_llm,refuter_llm,arbiter_llm,scenario",
+        [
+            # Scenario 1: prover fails, refuter rejects, arbiter rejects
+            pytest.param(
+                FakeLLM(raise_exc=RuntimeError("prover down")),
+                FakeLLM(_rejected_response()),
+                FakeLLM(_rejected_response()),
+                "prover_failure_refuter_reject_arbiter_reject",
+                id="prover-fail+refuter-reject+arbiter-reject",
+            ),
+            # Scenario 2: refuter fails, prover rejects, arbiter rejects
+            pytest.param(
+                FakeLLM(_rejected_response()),
+                FakeLLM(raise_exc=RuntimeError("refuter down")),
+                FakeLLM(_rejected_response()),
+                "refuter_failure_prover_reject_arbiter_reject",
+                id="refuter-fail+prover-reject+arbiter-reject",
+            ),
+            # Scenario 3: arbiter fails on disagreement
+            pytest.param(
+                FakeLLM(_confirmed_response()),
+                FakeLLM(_rejected_response()),
+                FakeLLM(raise_exc=TimeoutError("arbiter timeout")),
+                "arbiter_failure_on_disagreement",
+                id="arbiter-fail-on-disagreement",
+            ),
+        ],
+    )
+    async def test_failure_forces_abstain(self, prover_llm, refuter_llm, arbiter_llm, scenario):
+        """ANY operational failure → ABSTAIN, candidate preserved."""
+        verifier = EvidenceVerifier(prover_llm, refuter_llm, arbiter_llm)
+        finding = _make_finding(status="candidate")
+
+        capsule = await verifier.verify_candidate(finding, [], "diff")
+
+        # Core assertion: verdict and status must be ABSTAIN
+        assert capsule.final_verdict == EvidenceVerdict.ABSTAIN, (
+            f"[{scenario}] final_verdict should be ABSTAIN, got {capsule.final_verdict}"
+        )
+        assert capsule.status == EvidenceStatus.ABSTAIN, f"[{scenario}] status should be ABSTAIN, got {capsule.status}"
+        # retry_metadata must record the failure
+        assert len(capsule.retry_metadata) > 0, f"[{scenario}] retry_metadata must record the failure"
+
+    @pytest.mark.parametrize(
+        "prover_llm,refuter_llm,arbiter_llm,scenario",
+        [
+            pytest.param(
+                FakeLLM(raise_exc=RuntimeError("prover down")),
+                FakeLLM(_rejected_response()),
+                FakeLLM(_rejected_response()),
+                "prover_failure_refuter_reject_arbiter_reject",
+                id="prover-fail+refuter-reject+arbiter-reject",
+            ),
+            pytest.param(
+                FakeLLM(_rejected_response()),
+                FakeLLM(raise_exc=RuntimeError("refuter down")),
+                FakeLLM(_rejected_response()),
+                "refuter_failure_prover_reject_arbiter_reject",
+                id="refuter-fail+prover-reject+arbiter-reject",
+            ),
+            pytest.param(
+                FakeLLM(_confirmed_response()),
+                FakeLLM(_rejected_response()),
+                FakeLLM(raise_exc=TimeoutError("arbiter timeout")),
+                "arbiter_failure_on_disagreement",
+                id="arbiter-fail-on-disagreement",
+            ),
+        ],
+    )
+    async def test_apply_evidence_preserves_candidate_on_failure(self, prover_llm, refuter_llm, arbiter_llm, scenario):
+        """apply_evidence_to_finding must preserve candidate on ANY failure."""
+        verifier = EvidenceVerifier(prover_llm, refuter_llm, arbiter_llm)
+        finding = _make_finding(status="candidate")
+
+        capsule = await verifier.verify_candidate(finding, [], "diff")
+        updated = apply_evidence_to_finding(finding, capsule)
+
+        assert updated.status == "candidate", f"[{scenario}] finding status must stay candidate, got {updated.status}"
+        assert updated.verified_by == "evidence-verifier"
+
+
+class TestInvalidOutputForcesAbstain:
+    """Invalid JSON output (not exception) also counts as operational failure."""
+
+    async def test_prover_invalid_json_refuter_reject_arbiter_reject(self):
+        """Prover invalid JSON + refuter reject + arbiter reject → ABSTAIN."""
+        prover = InvalidJsonLLM()
+        refuter = FakeLLM(_rejected_response())
+        arbiter = FakeLLM(_rejected_response())
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter)
+        finding = _make_finding(status="candidate")
+
+        capsule = await verifier.verify_candidate(finding, [], "diff")
+
+        assert capsule.retry_metadata.get("prover_failed") is True
+        assert capsule.final_verdict == EvidenceVerdict.ABSTAIN
+        assert capsule.status == EvidenceStatus.ABSTAIN
+
+        updated = apply_evidence_to_finding(finding, capsule)
+        assert updated.status == "candidate"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic shortcut — expected_head_sha guard
+# ---------------------------------------------------------------------------
+
+
+class TestExpectedHeadSha:
+    """Strengthened deterministic shortcut: requires expected_head_sha match."""
+
+    async def test_no_shortcut_without_expected_sha(self):
+        """Without expected_head_sha, shortcut is disabled → LLM runs."""
+        prover = FakeLLM(_confirmed_response())
+        refuter = FakeLLM(_confirmed_response())
+        arbiter = FakeLLM(_confirmed_response())
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter)  # no expected_head_sha
+        finding = _make_finding(file="src/auth.py")
+        evidence = [
+            EvidenceItem(
+                kind="supporting",
+                path="src/auth.py",
+                sha="abc123",
+                line=42,
+                snippet="code",
+                trigger="trigger",
+                violated_contract="contract",
+            )
+        ]
+
+        capsule = await verifier.verify_candidate(finding, evidence, "diff")
+
+        # LLMs should be called (shortcut disabled)
+        assert len(prover.calls) == 1
+        assert capsule.final_verdict == EvidenceVerdict.CONFIRMED
+
+    async def test_no_shortcut_on_sha_mismatch(self):
+        """Evidence SHA != expected_head_sha → shortcut disabled."""
+        prover = FakeLLM(_confirmed_response())
+        refuter = FakeLLM(_confirmed_response())
+        arbiter = FakeLLM(_confirmed_response())
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="correct_sha")
+        finding = _make_finding(file="src/auth.py")
+        evidence = [
+            EvidenceItem(
+                kind="supporting",
+                path="src/auth.py",
+                sha="stale_sha",  # does NOT match expected
+                line=42,
+                snippet="code",
+                trigger="trigger",
+                violated_contract="contract",
+            )
+        ]
+
+        await verifier.verify_candidate(finding, evidence, "diff")
+
+        # LLMs should be called (SHA mismatch blocks shortcut)
+        assert len(prover.calls) == 1
+
+    async def test_shortcut_with_instance_expected_sha(self):
+        """Instance-level expected_head_sha enables shortcut."""
+        prover = FakeLLM(raise_exc=AssertionError("should not be called"))
+        refuter = FakeLLM(raise_exc=AssertionError("should not be called"))
+        arbiter = FakeLLM(raise_exc=AssertionError("should not be called"))
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="abc123")
+        finding = _make_finding(file="src/auth.py")
+        evidence = [
+            EvidenceItem(
+                kind="supporting",
+                path="src/auth.py",
+                sha="abc123",
+                line=42,
+                snippet="code",
+                trigger="trigger",
+                violated_contract="contract",
+            )
+        ]
+
+        capsule = await verifier.verify_candidate(finding, evidence, "diff")
+
+        assert capsule.final_verdict == EvidenceVerdict.CONFIRMED
+        assert len(prover.calls) == 0
+
+    async def test_method_sha_overrides_instance_sha(self):
+        """Method-level expected_head_sha overrides instance-level."""
+        prover = FakeLLM(raise_exc=AssertionError("should not be called"))
+        refuter = FakeLLM(raise_exc=AssertionError("should not be called"))
+        arbiter = FakeLLM(raise_exc=AssertionError("should not be called"))
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="wrong_sha")
+        finding = _make_finding(file="src/auth.py")
+        evidence = [
+            EvidenceItem(
+                kind="supporting",
+                path="src/auth.py",
+                sha="correct_sha",
+                line=42,
+                snippet="code",
+                trigger="trigger",
+                violated_contract="contract",
+            )
+        ]
+
+        # Method-level overrides instance → matches evidence SHA
+        capsule = await verifier.verify_candidate(finding, evidence, "diff", expected_head_sha="correct_sha")
+
+        assert capsule.final_verdict == EvidenceVerdict.CONFIRMED
+        assert len(prover.calls) == 0
+
+    async def test_method_sha_none_falls_back_to_instance(self):
+        """Method-level None (default) falls back to instance SHA."""
+        prover = FakeLLM(_confirmed_response())
+        refuter = FakeLLM(_confirmed_response())
+        arbiter = FakeLLM(_confirmed_response())
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter, expected_head_sha="abc123")
+        finding = _make_finding(file="src/auth.py")
+        evidence = [
+            EvidenceItem(
+                kind="supporting",
+                path="src/auth.py",
+                sha="abc123",
+                line=42,
+                snippet="code",
+                trigger="trigger",
+                violated_contract="contract",
+            )
+        ]
+
+        # No method-level → uses instance expected_head_sha → shortcut fires
+        capsule = await verifier.verify_candidate(finding, evidence, "diff")
+
+        assert capsule.final_verdict == EvidenceVerdict.CONFIRMED
+        assert len(prover.calls) == 0
+
+    async def test_batch_forwards_expected_sha(self):
+        """verify_batch forwards expected_head_sha to verify_candidate."""
+        prover = FakeLLM(raise_exc=AssertionError("should not be called"))
+        refuter = FakeLLM(raise_exc=AssertionError("should not be called"))
+        arbiter = FakeLLM(raise_exc=AssertionError("should not be called"))
+
+        verifier = EvidenceVerifier(prover, refuter, arbiter)
+        finding = _make_finding(id="f1", file="src/auth.py")
+        evidence_map = {
+            "f1": [
+                EvidenceItem(
+                    kind="supporting",
+                    path="src/auth.py",
+                    sha="abc123",
+                    line=42,
+                    snippet="code",
+                    trigger="trigger",
+                    violated_contract="contract",
+                )
+            ]
+        }
+
+        capsules = await verifier.verify_batch([finding], evidence_map, "diff", expected_head_sha="abc123")
+
+        assert len(capsules) == 1
+        assert capsules[0].final_verdict == EvidenceVerdict.CONFIRMED
+        assert len(prover.calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# has_failure property
+# ---------------------------------------------------------------------------
+
+
+class TestHasFailure:
+    def test_no_metadata_no_failure(self):
+        """Empty retry_metadata → has_failure is False."""
+        capsule = EvidenceCapsule(finding_id="f1")
+        assert capsule.has_failure is False
+
+    def test_prover_failed_true(self):
+        """prover_failed=True → has_failure is True."""
+        capsule = EvidenceCapsule(
+            finding_id="f1",
+            retry_metadata={"prover_failed": True},
+        )
+        assert capsule.has_failure is True
+
+    def test_arbiter_failed_true(self):
+        """arbiter_failed=True → has_failure is True."""
+        capsule = EvidenceCapsule(
+            finding_id="f1",
+            retry_metadata={"arbiter_failed": True},
+        )
+        assert capsule.has_failure is True
+
+    def test_non_failed_metadata_ignored(self):
+        """Metadata without _failed keys → has_failure is False."""
+        capsule = EvidenceCapsule(
+            finding_id="f1",
+            retry_metadata={"prover_reason": "invalid_output"},
+        )
+        assert capsule.has_failure is False
+
+    def test_failed_false_ignored(self):
+        """_failed=False → has_failure is False."""
+        capsule = EvidenceCapsule(
+            finding_id="f1",
+            retry_metadata={"prover_failed": False},
+        )
+        assert capsule.has_failure is False
+
+    def test_failure_forces_abstain_in_final_verdict(self):
+        """final_verdict returns ABSTAIN when has_failure is True."""
+        capsule = EvidenceCapsule(
+            finding_id="f1",
+            retry_metadata={"prover_failed": True},
+        )
+        capsule.prover = ProverVerdict(EvidenceVerdict.CONFIRMED, 0.9, "yes")
+        capsule.refuter = RefuterVerdict(EvidenceVerdict.CONFIRMED, 0.85, "yes")
+        capsule.arbiter = SimpleNamespace(
+            verdict=EvidenceVerdict.REJECTED,
+            confidence=0.7,
+            rationale="arbiter",
+        )
+        # Despite prover+refuter CONFIRMED and arbiter REJECTED,
+        # failure forces ABSTAIN
+        assert capsule.final_verdict == EvidenceVerdict.ABSTAIN

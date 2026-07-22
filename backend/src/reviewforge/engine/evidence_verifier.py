@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 # Contracts
 # ---------------------------------------------------------------------------
 
+
 class EvidenceVerdict(StrEnum):
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
@@ -54,6 +55,7 @@ _MAX_DIFF_CHARS = 24_000
 # ---------------------------------------------------------------------------
 # Data contracts
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class EvidenceItem:
@@ -144,8 +146,21 @@ class EvidenceCapsule:
     retry_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def has_failure(self) -> bool:
+        """True if any operational failure was recorded in retry_metadata."""
+        return any(k.endswith("_failed") and v is True for k, v in self.retry_metadata.items())
+
+    @property
     def final_verdict(self) -> EvidenceVerdict:
-        """Determine final verdict from independent prover/refuter + arbiter."""
+        """Determine final verdict from independent prover/refuter + arbiter.
+
+        Policy: ANY operational failure → ABSTAIN regardless of other verdicts.
+        A provider failure must never cause false-positive suppression.
+        """
+        # Policy: any operational failure forces ABSTAIN
+        if self.has_failure:
+            return EvidenceVerdict.ABSTAIN
+
         # If arbiter ruled, its verdict is final
         if self.arbiter is not None:
             return self.arbiter.verdict
@@ -250,6 +265,7 @@ class EvidenceCapsule:
 # ---------------------------------------------------------------------------
 # Chat model protocol
 # ---------------------------------------------------------------------------
+
 
 class ChatModel(Protocol):
     """Minimal chat model interface for dependency injection."""
@@ -428,6 +444,7 @@ rationale: {refuter.rationale[:_MAX_RATIONALE_CHARS]}
 # JSON parsing with bounded repair
 # ---------------------------------------------------------------------------
 
+
 def _strip_code_fences(content: str) -> str:
     content = content.strip()
     if content.startswith("```"):
@@ -487,16 +504,25 @@ def _parse_verdict_response(content: str) -> dict | None:
 # Deterministic evidence shortcut
 # ---------------------------------------------------------------------------
 
+
 def _deterministic_evidence_shortcut(
     finding: Finding,
     evidence: list[EvidenceItem],
+    *,
+    expected_head_sha: str | None = None,
 ) -> EvidenceCapsule | None:
     """When complete code evidence proves the fact deterministically.
 
     Only applies when ALL supporting evidence items have the same SHA as
     the finding's file AND the evidence is complete (no missing pieces).
     This bypasses LLM verification entirely.
+
+    Safety: requires ``expected_head_sha`` to be set AND all evidence SHAs
+    to match it exactly.  Without an expected SHA the shortcut is disabled
+    to prevent auto-confirming against stale or attacker-supplied evidence.
     """
+    if not expected_head_sha:
+        return None
     if not evidence:
         return None
 
@@ -519,6 +545,10 @@ def _deterministic_evidence_shortcut(
     # All evidence items must have the same SHA (complete, consistent source)
     shas = {e.sha for e in evidence}
     if len(shas) != 1:
+        return None
+
+    # Evidence SHA must equal the expected head SHA
+    if next(iter(shas)) != expected_head_sha:
         return None
 
     # The violated_contract field must be non-empty on at least one item
@@ -551,6 +581,7 @@ def _deterministic_evidence_shortcut(
 # ---------------------------------------------------------------------------
 # LLM interaction helpers
 # ---------------------------------------------------------------------------
+
 
 async def _call_llm_with_repair(
     chat_model: ChatModel,
@@ -606,6 +637,7 @@ async def _call_llm_with_repair(
 # Evidence Verifier
 # ---------------------------------------------------------------------------
 
+
 class EvidenceVerifier:
     """Candidate-by-candidate evidence verification with injectable models.
 
@@ -619,25 +651,37 @@ class EvidenceVerifier:
         refuter_model: ChatModel,
         arbiter_model: ChatModel,
         max_candidates: int = 50,
+        expected_head_sha: str | None = None,
     ) -> None:
         self._prover_model = prover_model
         self._refuter_model = refuter_model
         self._arbiter_model = arbiter_model
         self._max_candidates = max_candidates
+        self._expected_head_sha = expected_head_sha
 
     async def verify_candidate(
         self,
         finding: Finding,
         evidence: list[EvidenceItem],
         diff: str,
+        *,
+        expected_head_sha: str | None = None,
     ) -> EvidenceCapsule:
         """Verify a single candidate finding through prover/refuter/arbiter.
 
         Returns an EvidenceCapsule with verdicts and retry metadata.
         Failures always produce abstain, never false-positive suppression.
+
+        Args:
+            expected_head_sha: If provided, deterministic shortcut requires
+                evidence SHA to equal this value. Method-level param takes
+                precedence over instance-level ``_expected_head_sha``.
         """
+        # Resolve expected SHA: method param > instance default
+        sha = expected_head_sha if expected_head_sha is not None else self._expected_head_sha
+
         # Check deterministic evidence shortcut first
-        shortcut = _deterministic_evidence_shortcut(finding, evidence)
+        shortcut = _deterministic_evidence_shortcut(finding, evidence, expected_head_sha=sha)
         if shortcut is not None:
             return shortcut
 
@@ -645,12 +689,18 @@ class EvidenceVerifier:
 
         # Phase 1: Independent prover and refuter (parallel conceptually, sequential here)
         prover_result = await self._run_verdict_llm(
-            self._prover_model, _prover_system_prompt(),
-            _user_prompt(finding, diff, evidence), finding.id, "Prover",
+            self._prover_model,
+            _prover_system_prompt(),
+            _user_prompt(finding, diff, evidence),
+            finding.id,
+            "Prover",
         )
         refuter_result = await self._run_verdict_llm(
-            self._refuter_model, _refuter_system_prompt(),
-            _user_prompt(finding, diff, evidence), finding.id, "Refuter",
+            self._refuter_model,
+            _refuter_system_prompt(),
+            _user_prompt(finding, diff, evidence),
+            finding.id,
+            "Refuter",
         )
 
         # Handle prover failure
@@ -696,9 +746,11 @@ class EvidenceVerifier:
 
         if needs_arbiter:
             arbiter_result = await self._run_verdict_llm(
-                self._arbiter_model, _arbiter_system_prompt(),
+                self._arbiter_model,
+                _arbiter_system_prompt(),
                 _arbiter_user_prompt(finding, diff, evidence, prover_verdict, refuter_verdict),
-                finding.id, "Arbiter",
+                finding.id,
+                "Arbiter",
             )
             if arbiter_result is None:
                 capsule.retry_metadata["arbiter_failed"] = True
@@ -731,13 +783,20 @@ class EvidenceVerifier:
         findings: list[Finding],
         evidence_map: dict[str, list[EvidenceItem]],
         diff: str,
+        *,
+        expected_head_sha: str | None = None,
     ) -> list[EvidenceCapsule]:
         """Verify a batch of candidates. Returns capsules in same order."""
         capsules: list[EvidenceCapsule] = []
         for finding in findings[: self._max_candidates]:
             evidence = evidence_map.get(finding.id, [])
             try:
-                capsule = await self.verify_candidate(finding, evidence, diff)
+                capsule = await self.verify_candidate(
+                    finding,
+                    evidence,
+                    diff,
+                    expected_head_sha=expected_head_sha,
+                )
             except Exception as exc:
                 # Unexpected failure → abstain with retry metadata
                 logger.error(f"Unexpected error verifying {finding.id}: {exc}")
@@ -774,7 +833,19 @@ def apply_evidence_to_finding(
 
     Preserves Finding compatibility — only updates status, verified_by,
     verify_reason, and confidence fields.
+
+    Policy: any operational failure recorded in ``retry_metadata`` forces
+    the finding to remain ``candidate`` — never ``false_positive``.
     """
+    # Defense-in-depth: explicit failure guard before consulting final_verdict.
+    # final_verdict already returns ABSTAIN on failure, but this makes the
+    # policy impossible to miss during code review.
+    if capsule.has_failure:
+        finding.status = "candidate"
+        finding.verified_by = "evidence-verifier"
+        finding.verify_reason = capsule.rationale[:500]
+        return finding
+
     final = capsule.final_verdict
     if final == EvidenceVerdict.CONFIRMED:
         finding.status = "confirmed"

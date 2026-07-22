@@ -125,6 +125,12 @@ def create_app(config_path: str | None = None) -> FastAPI:
             coverage_gap_max_cards=cfg.coverage_gap_max_cards,
             coverage_gap_min_confidence=cfg.coverage_gap_min_confidence,
             skills_dir=cfg.skills_dir,
+            v3_enabled=cfg.v3.enabled,
+            v3_coverage_min_risk_score=cfg.v3.coverage_min_risk_score,
+            v3_coverage_max_cells_per_round=cfg.v3.coverage_max_cells_per_round,
+            v3_coverage_max_attempts=cfg.v3.coverage_max_attempts,
+            v3_evidence_mode=cfg.v3.evidence_mode,
+            v3_evidence_max_candidates=cfg.v3.evidence_max_candidates,
         )
 
         # S4: 插件默认关闭，靠显式 env 开启

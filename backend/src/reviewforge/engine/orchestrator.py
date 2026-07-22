@@ -25,6 +25,12 @@ from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
 from reviewforge.engine.calibrator import DynamicCalibrator, apply_actionability_gate, apply_code_evidence_gate
 from reviewforge.engine.context_engine import ContextEngine, render_impact_manifest
 from reviewforge.engine.coverage_gap import build_evidence_cards, filter_gap_findings
+from reviewforge.engine.coverage_ledger import (
+    CoverageCell,
+    CoverageDimension,
+    CoverageLedger,
+    CoverageStatus,
+)
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
@@ -39,6 +45,7 @@ from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.security_categories import is_security_category
+from reviewforge.engine.semantic_diff import SemanticUnit, compile_semantic_changeset
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 from reviewforge.engine.verifier import Verifier
 from reviewforge.tools.gateway import ToolGateway
@@ -202,6 +209,13 @@ class Orchestrator:
         coverage_gap_max_cards: int = 3,
         coverage_gap_min_confidence: float = 0.65,
         skills_dir: str | Path | None = None,
+        # V3 coverage-driven pipeline (all default off)
+        v3_enabled: bool = False,
+        v3_coverage_min_risk_score: float = 0.15,
+        v3_coverage_max_cells_per_round: int = 24,
+        v3_coverage_max_attempts: int = 2,
+        v3_evidence_mode: str = "shadow",
+        v3_evidence_max_candidates: int = 20,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -221,6 +235,19 @@ class Orchestrator:
         self._coverage_gap_min_risk_score = max(0, coverage_gap_min_risk_score)
         self._coverage_gap_max_cards = max(0, coverage_gap_max_cards)
         self._coverage_gap_min_confidence = min(1.0, max(0.0, coverage_gap_min_confidence))
+
+        # V3 coverage-driven pipeline config
+        self._v3_enabled = v3_enabled
+        self._v3_coverage_min_risk_score = max(0.0, v3_coverage_min_risk_score)
+        self._v3_coverage_max_cells_per_round = max(1, v3_coverage_max_cells_per_round)
+        self._v3_coverage_max_attempts = max(1, v3_coverage_max_attempts)
+        self._v3_evidence_mode = v3_evidence_mode
+        self._v3_evidence_max_candidates = max(1, v3_evidence_max_candidates)
+
+        # V3 runtime tracking (populated per-run)
+        self._v3_change_set = None
+        self._v3_ledger: CoverageLedger | None = None
+        self._v3_task_dimensions: dict[str, list[str]] = {}  # task_id → [dimension, ...]
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
@@ -519,6 +546,10 @@ class Orchestrator:
                 },
             )
 
+            # V3: compile SemanticChangeSet and build CoverageLedger
+            if self._v3_enabled:
+                await self._v3_compile_and_build_ledger(state)
+
             # Phase 1+2: iterative plan → schedule → execute (re-planning loop).
             # #4 Scheduler dispatches reviewers by priority with bounded concurrency.
             # #2/#3 bounded rounds; loop-detector rescue→stall guards repeats and writes
@@ -640,6 +671,19 @@ class Orchestrator:
                 if runnable:
                     await scheduler.dispatch(runnable, _run_one)  # #4: priority + concurrency
 
+                # V3: track broad-pass coverage for this round's completed tasks
+                if self._v3_enabled:
+                    for task in runnable:
+                        completed_task = state.get_task(task.id)
+                        if completed_task.status == "completed":
+                            findings = state.list_findings()
+                            self._track_broad_pass_coverage(
+                                task_id=task.id,
+                                reviewer=task.reviewer,
+                                task_files=task.files,
+                                findings=findings,
+                            )
+
                 if loop_detector.is_stalled:
                     self._events.emit("planner.stalled", {"round": round_no})
                     break
@@ -652,6 +696,11 @@ class Orchestrator:
             # passes through every normal verifier/calibration gate below.
             if self._coverage_gap_enabled:
                 await self._run_coverage_gap_pass(state, run_id, phase0_keys)
+
+            # V3: mark unresolved broad-pass cells as ABSTAINED, then run targeted closure
+            if self._v3_enabled:
+                self._v3_mark_unresolved_cells()
+                await self._v3_run_targeted_closure(state, run_id, phase0_keys)
 
             # Phase 3: Verifier (#5, pure-logic de-dupe/merge) → Dynamic Calibration.
             raw_candidates = state.list_findings(status="candidate")
@@ -868,6 +917,12 @@ class Orchestrator:
                 "tasks_failed": len(state.list_tasks(status="failed")),
                 "comment_delivery": comment_result.to_dict(),
             }
+
+            # V3: add coverage summary
+            if self._v3_enabled:
+                v3_cov = self._build_v3_coverage_summary()
+                if v3_cov:
+                    summary["v3_coverage"] = v3_cov
             retryable_errors = list(planner_errors)
             if comment_result.retryable:
                 retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
@@ -1018,6 +1073,438 @@ class Orchestrator:
                     status="failed",
                     error=str(exc),
                 )
+
+    # ── V3 integration helpers ─────────────────────────────────────────────
+
+    async def _v3_compile_and_build_ledger(self, state: StateStore) -> None:
+        """Compile SemanticChangeSet and build CoverageLedger from state."""
+        try:
+            cs = compile_semantic_changeset(state)
+            self._v3_change_set = cs
+
+            cs_dict = cs.to_dict()
+            self._v3_ledger = CoverageLedger.from_change_set(cs_dict)
+
+            # Store bounded summaries in impact_manifest (avoid exploding prompts)
+            unit_summaries = [
+                {
+                    "id": u.id,
+                    "path": u.path,
+                    "symbol": u.symbol,
+                    "start_line": u.start_line,
+                    "end_line": u.end_line,
+                    "risk_score": u.risk_score,
+                    "risk_reasons": list(u.risk_reasons),
+                }
+                for u in cs.units
+            ]
+            state.impact_manifest["v3"] = {
+                "semantic": {
+                    "repo": cs.repo,
+                    "pr_number": cs.pr_number,
+                    "head_sha": cs.head_sha,
+                    "unit_count": len(cs.units),
+                    "unresolved_count": len(cs.unresolved_files),
+                    "units": unit_summaries,
+                },
+                "coverage_summary": self._v3_ledger.completion_summary(),
+            }
+
+            self._events.emit(
+                "v3.semantic.compiled",
+                {
+                    "repo": cs.repo,
+                    "pr_number": cs.pr_number,
+                    "unit_count": len(cs.units),
+                    "unresolved_files": len(cs.unresolved_files),
+                },
+            )
+            self._events.emit(
+                "v3.coverage.created",
+                {
+                    "cell_count": len(self._v3_ledger.cells),
+                    "mandatory_total": self._v3_ledger.completion_summary()["mandatory_total"],
+                },
+            )
+        except Exception as exc:
+            logger.warning("V3 semantic compilation failed: %s", exc, exc_info=True)
+            self._v3_change_set = None
+            self._v3_ledger = None
+            self._events.emit("v3.semantic.failed", {"error": str(exc)})
+
+    def _track_broad_pass_coverage(
+        self,
+        task_id: str,
+        reviewer: str,
+        task_files: list[str],
+        findings: list[Finding],
+    ) -> None:
+        """Track which coverage cells were addressed by a broad-pass reviewer task."""
+        if not self._v3_ledger or not self._v3_change_set:
+            return
+
+        dimensions = self._reviewer_dimensions(reviewer)
+        self._v3_task_dimensions[task_id] = dimensions
+
+        task_files_set = set(task_files)
+
+        for dim_name in dimensions:
+            try:
+                dim = CoverageDimension(dim_name)
+            except ValueError:
+                continue
+            cells = self._v3_ledger.cells_by_dimension(dim)
+            for cell in cells:
+                if cell.status != CoverageStatus.PENDING:
+                    continue
+                if cell.path not in task_files_set:
+                    continue
+                unit = self._find_unit_by_id(cell.unit_id)
+                # Check if any finding is unit-specific
+                has_unit_specific = False
+                for f in findings:
+                    if self._finding_matches_unit(f, unit):
+                        has_unit_specific = True
+                        break
+                if has_unit_specific:
+                    # Find the matching finding to record
+                    for f in findings:
+                        if self._finding_matches_unit(f, unit):
+                            try:
+                                cell.transition(CoverageStatus.ASSIGNED, task_id=task_id)
+                                cell.transition(CoverageStatus.COVERED, terminal_reason=f"finding:{f.id}")
+                                cell.add_finding(f.id)
+                            except (ValueError, KeyError):
+                                pass
+                            break
+                else:
+                    # No unit-specific finding — mark as ABSTAINED
+                    try:
+                        cell.transition(CoverageStatus.ASSIGNED, task_id=task_id)
+                        cell.transition(
+                            CoverageStatus.ABSTAINED,
+                            terminal_reason="broad pass produced no unit-specific finding for this cell",
+                        )
+                    except (ValueError, KeyError):
+                        pass
+
+    def _v3_mark_unresolved_cells(self) -> None:
+        """Mark broad-pass cells that were not resolved as ABSTAINED."""
+        if not self._v3_ledger:
+            return
+        for cell in self._v3_ledger.cells:
+            if cell.status == CoverageStatus.PENDING:
+                if cell.assigned_task_ids:
+                    try:
+                        cell.transition(CoverageStatus.ASSIGNED, task_id=cell.assigned_task_ids[-1])
+                        cell.transition(
+                            CoverageStatus.ABSTAINED,
+                            terminal_reason="broad pass produced no unit-specific finding for this cell",
+                        )
+                    except (ValueError, KeyError):
+                        pass
+
+    async def _v3_run_targeted_closure(
+        self,
+        state: StateStore,
+        run_id: str,
+        phase0_keys: set[tuple[Any, ...]],
+    ) -> None:
+        """Run bounded targeted coverage closure for unresolved mandatory cells."""
+        if not self._v3_ledger or not self._v3_change_set:
+            return
+
+        self._events.emit("v3.coverage.started", {"cell_count": len(self._v3_ledger.cells)})
+
+        # Select cells: unresolved mandatory, prioritized by risk
+        selected = self._select_closure_cells(
+            state,
+            state.list_findings(),
+            self._v3_ledger,
+        )
+        if not selected:
+            self._events.emit(
+                "v3.coverage.completed",
+                {"total_cells": len(self._v3_ledger.cells), "selected": 0, "closure_findings": 0},
+            )
+            return
+
+        # Group by path for efficient task creation
+        cells_by_path: dict[str, list[CoverageCell]] = {}
+        for cell in selected:
+            cells_by_path.setdefault(cell.path, []).append(cell)
+
+        total_closure_findings = 0
+        existing_keys = {finding_identity(f) for f in state.list_findings()}
+
+        for path, path_cells in cells_by_path.items():
+            for cell in path_cells:
+                unit = self._find_unit_by_id(cell.unit_id)
+                dim = cell.dimension.value
+                reviewer = self._dimension_reviewer(dim)
+                is_retry = cell.attempts > 0
+
+                focus = self._build_review_focus(
+                    path=path,
+                    symbol=getattr(unit, "symbol", "") if unit else "",
+                    start_line=getattr(unit, "start_line", 0) if unit else 0,
+                    end_line=getattr(unit, "end_line", 0) if unit else 0,
+                    dimension=dim,
+                    risk_reasons=getattr(unit, "risk_reasons", []) if unit else [],
+                    is_retry=is_retry,
+                )
+
+                task = ReviewTask(
+                    reviewer=reviewer,
+                    files=[path],
+                    rationale=f"v3 targeted closure: {dim} for {cell.unit_id}",
+                    status="claimed",
+                )
+                state.add_task(task)
+
+                try:
+                    cell.transition(CoverageStatus.ASSIGNED, task_id=task.id)
+                except ValueError:
+                    self._events.emit(
+                        "v3.coverage.cell_failed",
+                        {"unit_id": cell.unit_id, "dimension": dim, "error": "invalid cell state"},
+                    )
+                    continue
+
+                reviewer_obj = self._create_reviewer(reviewer)
+                if not reviewer_obj:
+                    state.update_task(task.id, status="failed", error=f"unknown reviewer: {reviewer}")
+                    try:
+                        cell.transition(CoverageStatus.FAILED, terminal_reason=f"unknown reviewer: {reviewer}")
+                    except ValueError:
+                        pass
+                    self._events.emit(
+                        "v3.coverage.cell_failed",
+                        {"unit_id": cell.unit_id, "dimension": dim, "error": f"unknown reviewer: {reviewer}"},
+                    )
+                    continue
+
+                lang = self._detect_task_language(task)
+                fw = self._detect_task_framework(task)
+                self._attach_skill(reviewer_obj, lang, fw)
+                reviewer_obj._target_language = lang or ""
+                reviewer_obj._target_framework = fw or ""
+                reviewer_obj._review_focus = focus
+
+                started = time.monotonic()
+                try:
+                    findings = await reviewer_obj.execute(task, state)
+                    added = 0
+                    for f in findings:
+                        key = finding_identity(f)
+                        if key in phase0_keys or key in existing_keys:
+                            continue
+                        state.add_finding(f)
+                        existing_keys.add(key)
+                        added += 1
+                    total_closure_findings += added
+                    state.update_task(task.id, status="completed")
+
+                    if added > 0:
+                        for f in findings:
+                            key = finding_identity(f)
+                            if key not in phase0_keys:
+                                try:
+                                    cell.transition(CoverageStatus.COVERED, terminal_reason=f"closure finding:{f.id}")
+                                    cell.add_finding(f.id)
+                                except ValueError:
+                                    pass
+                                break
+                    else:
+                        try:
+                            cell.transition(
+                                CoverageStatus.ABSTAINED,
+                                terminal_reason="targeted closure produced no finding",
+                            )
+                        except ValueError:
+                            pass
+
+                    self._events.emit(
+                        "v3.coverage.cell_reviewed",
+                        {
+                            "unit_id": cell.unit_id,
+                            "dimension": dim,
+                            "findings": added,
+                            "duration_ms": int((time.monotonic() - started) * 1000),
+                        },
+                    )
+                    if self._db:
+                        await self._db.insert_metric(
+                            run_id,
+                            f"v3_closure_{reviewer}",
+                            findings_count=added,
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    state.update_task(task.id, status="failed", error=str(exc))
+                    try:
+                        cell.transition(CoverageStatus.FAILED, terminal_reason=str(exc)[:200])
+                    except ValueError:
+                        pass
+                    self._events.emit(
+                        "v3.coverage.cell_failed",
+                        {"unit_id": cell.unit_id, "dimension": dim, "error": str(exc)},
+                    )
+                    if self._db:
+                        await self._db.insert_metric(
+                            run_id,
+                            f"v3_closure_{reviewer}",
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                            status="failed",
+                            error=str(exc)[:200],
+                        )
+
+        self._events.emit(
+            "v3.coverage.completed",
+            {
+                "total_cells": len(self._v3_ledger.cells),
+                "selected": len(selected),
+                "closure_findings": total_closure_findings,
+            },
+        )
+
+    def _select_closure_cells(
+        self,
+        state: StateStore,
+        findings: list[Finding],
+        ledger: CoverageLedger,
+    ) -> list[CoverageCell]:
+        """Select unresolved cells for targeted closure, respecting risk and attempt limits."""
+        # Use assigned_task_ids count (number of dispatches) rather than
+        # raw attempts (which increments on both ASSIGNED and FAILED).
+        unresolved = [
+            c
+            for c in ledger.cells
+            if c.status == CoverageStatus.PENDING
+            or (
+                c.status in (CoverageStatus.ABSTAINED, CoverageStatus.FAILED)
+                and len(c.assigned_task_ids) < self._v3_coverage_max_attempts
+            )
+        ]
+        unresolved.sort(key=lambda c: (not c.mandatory, -c.risk, c.path, c.line, c.dimension.value))
+
+        # Normal selection: above risk threshold (mandatory status does not
+        # bypass the risk gate — only the zero-candidate fallback does).
+        selected = [
+            c for c in unresolved if c.risk >= self._v3_coverage_min_risk_score
+        ][: self._v3_coverage_max_cells_per_round]
+
+        # Zero-candidate fallback: if the PR has zero candidate findings,
+        # include correctness cells regardless of risk.
+        if not findings and not selected:
+            correctness_unresolved = [
+                c for c in unresolved if c.dimension == CoverageDimension.CORRECTNESS
+            ]
+            selected = correctness_unresolved[: self._v3_coverage_max_cells_per_round]
+
+        return selected
+
+    def _build_v3_coverage_summary(self) -> dict[str, Any]:
+        """Build bounded v3_coverage summary for the run result."""
+        if not self._v3_ledger:
+            return {}
+        cs = self._v3_ledger.completion_summary()
+        return {
+            "units": len(self._v3_change_set.units) if self._v3_change_set else 0,
+            "cells": cs["total"],
+            "mandatory_total": cs["mandatory_total"],
+            "mandatory_success": cs["mandatory_success"],
+            "abstained": cs["by_status"].get("abstained", 0),
+            "failed": cs["by_status"].get("failed", 0),
+            "attempts": sum(c.attempts for c in self._v3_ledger.cells),
+            "selected": len(
+                [
+                    c
+                    for c in self._v3_ledger.cells
+                    if c.status in (CoverageStatus.ASSIGNED, CoverageStatus.COVERED)
+                    and any("closure" in tid for tid in c.assigned_task_ids)
+                ]
+            ),
+            "closure_findings": sum(
+                len(c.finding_ids)
+                for c in self._v3_ledger.cells
+                if any("closure" in tid for tid in c.assigned_task_ids)
+            ),
+        }
+
+    @staticmethod
+    def _reviewer_dimensions(reviewer: str) -> list[str]:
+        """Map a reviewer name to the coverage dimensions it addresses."""
+        _reviewer_dim_map = {
+            "security_reviewer": ["security"],
+            "testing_reviewer": ["testing"],
+            "localization_reviewer": ["localization"],
+            "performance_reviewer": ["performance"],
+        }
+        return _reviewer_dim_map.get(
+            reviewer, ["correctness", "contract", "error-handling", "compatibility", "cross-PR"]
+        )
+
+    @staticmethod
+    def _dimension_reviewer(dimension: str) -> str:
+        """Map a coverage dimension to its reviewer."""
+        _dim_reviewer_map = {
+            "security": "security_reviewer",
+            "testing": "testing_reviewer",
+            "localization": "localization_reviewer",
+            "performance": "performance_reviewer",
+        }
+        return _dim_reviewer_map.get(dimension, "correctness_reviewer")
+
+    @staticmethod
+    def _finding_matches_unit(finding: Finding, unit: SemanticUnit | None) -> bool:
+        """Check if a finding is unit-specific (same file, line within range)."""
+        if unit is None:
+            return False
+        if finding.file != unit.path:
+            return False
+        if finding.line <= 0:
+            return False
+        if unit.start_line > 0 and unit.end_line > 0:
+            return unit.start_line <= finding.line <= unit.end_line
+        return True
+
+    def _find_unit_by_id(self, unit_id: str) -> SemanticUnit | None:
+        """Look up a SemanticUnit by ID from the current change set."""
+        if not self._v3_change_set:
+            return None
+        for u in self._v3_change_set.units:
+            if u.id == unit_id:
+                return u
+        return None
+
+    @staticmethod
+    def _build_review_focus(
+        *,
+        path: str,
+        symbol: str,
+        start_line: int,
+        end_line: int,
+        dimension: str,
+        risk_reasons: list[str],
+        is_retry: bool,
+    ) -> str:
+        """Build concise review_focus text for a targeted closure task."""
+        line_range = f"{start_line}-{end_line}" if start_line > 0 and end_line > 0 else "unknown"
+        focus = (
+            f"Targeted coverage closure. Focus on: "
+            f"path={path}, symbol={symbol or '<file>'}, "
+            f"lines={line_range}, dimension={dimension}."
+        )
+        if risk_reasons:
+            focus += f" Risk reasons: {', '.join(risk_reasons)}."
+        if is_retry:
+            focus += (
+                " This is an adversarial retry — the first attempt found no issue. Look harder for subtle problems."
+            )
+        return focus
 
     def _create_reviewer(
         self,

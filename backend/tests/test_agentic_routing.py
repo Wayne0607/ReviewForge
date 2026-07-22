@@ -2,7 +2,7 @@
 
 from reviewforge.core.events import EventBus
 from reviewforge.core.specs import build_registry
-from reviewforge.core.state import StateStore
+from reviewforge.core.state import ReviewTask, StateStore
 from reviewforge.engine.mock_llm import MockChatLLM
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.planner import (
@@ -57,7 +57,8 @@ def test_skill_attached_to_reviewer():
     assert len(r._skill_body) > 50
 
 
-def test_planner_does_not_duplicate_correctness_when_security_is_forced():
+def test_security_and_correctness_coexist_on_first_round():
+    """First-round correctness baseline is injected even when security_reviewer is forced."""
     planner = Planner(MockChatLLM(), build_registry())
     tasks = planner._merge_tasks(
         {"security_reviewer"},
@@ -66,7 +67,65 @@ def test_planner_does_not_duplicate_correctness_when_security_is_forced():
         first_round=True,
     )
 
-    assert [t.reviewer for t in tasks] == ["security_reviewer"]
+    assert [t.reviewer for t in tasks] == ["security_reviewer", "correctness_reviewer"]
+    assert tasks[-1].files == ["app.py"]
+
+
+def test_llm_correctness_subset_expands_to_all_eligible_production_files():
+    """LLM proposing a correctness task on a subset of files gets expanded to all production files."""
+    planner = Planner(MockChatLLM(), build_registry())
+    llm_tasks = [
+        ReviewTask(
+            reviewer="correctness_reviewer",
+            files=["src/a.py"],
+            rationale="subset rationale",
+        ),
+    ]
+    files = ["src/a.py", "src/b.py", "tests/test_b.py"]
+
+    tasks = planner._merge_tasks(set(), llm_tasks, files, first_round=True)
+
+    correctness = [t for t in tasks if t.reviewer == "correctness_reviewer"]
+    assert len(correctness) == 1
+    assert set(correctness[0].files) == {"src/a.py", "src/b.py"}
+    assert correctness[0].rationale == "subset rationale"
+
+
+def test_duplicate_llm_correctness_proposals_collapse_to_one_with_first_rationale():
+    """Multiple LLM correctness proposals collapse to exactly one; first rationale is kept."""
+    planner = Planner(MockChatLLM(), build_registry())
+    llm_tasks = [
+        ReviewTask(reviewer="correctness_reviewer", files=["src/a.py"], rationale="first rationale"),
+        ReviewTask(reviewer="security_reviewer", files=["src/a.py"], rationale="security finding"),
+        ReviewTask(reviewer="correctness_reviewer", files=["src/b.py"], rationale="second rationale"),
+    ]
+    files = ["src/a.py", "src/b.py"]
+
+    tasks = planner._merge_tasks(set(), llm_tasks, files, first_round=True)
+
+    correctness = [t for t in tasks if t.reviewer == "correctness_reviewer"]
+    assert len(correctness) == 1
+    assert set(correctness[0].files) == {"src/a.py", "src/b.py"}
+    assert correctness[0].rationale == "first rationale"
+    reviewers = [t.reviewer for t in tasks]
+    assert reviewers.count("correctness_reviewer") == 1
+    assert "security_reviewer" in reviewers
+
+
+def test_cross_pr_style_fallback_false_does_not_inject_correctness():
+    """When style_fallback=False (cross-PR wrapper), no correctness baseline is injected."""
+    planner = Planner(MockChatLLM(), build_registry())
+    tasks = planner._merge_tasks(set(), [], ["app.py"], first_round=True, style_fallback=False)
+
+    assert tasks == []
+
+
+def test_replan_does_not_inject_correctness_baseline():
+    """When first_round=False (replanning), no correctness baseline is injected."""
+    planner = Planner(MockChatLLM(), build_registry())
+    tasks = planner._merge_tasks(set(), [], ["app.py"], first_round=False, style_fallback=True)
+
+    assert tasks == []
 
 
 def test_planner_defaults_production_source_to_correctness():

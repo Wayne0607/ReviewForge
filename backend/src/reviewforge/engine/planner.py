@@ -327,25 +327,35 @@ class Planner:
     ) -> list[ReviewTask]:
         """Merge forced reviewers with LLM decisions.
 
-        On the first round, correctness_reviewer is added as the source-change default and a
-        fallback guarantees at least one task. On re-planning rounds an empty
+        On the first round, exactly one correctness_reviewer task covers all
+        production source files, even when security_reviewer or another
+        specialised reviewer exists.  Duplicate LLM correctness proposals are
+        collapsed (first rationale kept).  On re-planning rounds an empty
         result is valid (it signals convergence — nothing more to dispatch).
         """
-        normalized_tasks = [
-            ReviewTask(
-                reviewer=task.reviewer,
-                files=_correctness_files(task.files or files),
-                rationale=task.rationale,
-            )
-            if task.reviewer == "correctness_reviewer"
-            else task
-            for task in llm_tasks
-        ]
+        correctness_files = _correctness_files(files)
+        normalized_tasks: list[ReviewTask] = []
+        correctness_added = False
+        for task in llm_tasks:
+            if task.reviewer == "correctness_reviewer":
+                if correctness_added or not correctness_files:
+                    continue
+                normalized_tasks.append(
+                    ReviewTask(
+                        reviewer="correctness_reviewer",
+                        files=correctness_files,
+                        rationale=task.rationale,
+                    )
+                )
+                correctness_added = True
+                continue
+            normalized_tasks.append(task)
+
         normalized_tasks = [task for task in normalized_tasks if task.files]
         llm_reviewers = {t.reviewer for t in normalized_tasks}
         merged = list(normalized_tasks)
 
-        for reviewer in forced:
+        for reviewer in sorted(forced):
             if reviewer not in llm_reviewers:
                 task_files = _localization_files(files) if reviewer == "localization_reviewer" else files
                 merged.append(
@@ -357,13 +367,11 @@ class Planner:
                 )
                 logger.info(f"Forced reviewer added: {reviewer}")
 
-        correctness_files = _correctness_files(files)
         if (
             first_round
             and style_fallback
             and correctness_files
             and "correctness_reviewer" not in {task.reviewer for task in merged}
-            and "security_reviewer" not in {task.reviewer for task in merged}
         ):
             merged.append(
                 ReviewTask(
@@ -373,8 +381,6 @@ class Planner:
                 )
             )
 
-        if first_round and style_fallback:
-            return merged
         return merged
 
     def _parse_response(self, content: str, allowed_files: list[str] | None = None) -> list[ReviewTask]:

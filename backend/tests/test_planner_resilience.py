@@ -70,7 +70,7 @@ async def test_plan_filters_absence_only_test_and_doc_tasks_for_source_only_chan
 
     tasks = await planner.plan(state)
 
-    assert [task.reviewer for task in tasks] == ["security_reviewer"]
+    assert [task.reviewer for task in tasks] == ["security_reviewer", "correctness_reviewer"]
 
 
 async def test_planner_retries_invalid_json_once() -> None:

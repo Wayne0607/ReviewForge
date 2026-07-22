@@ -550,3 +550,106 @@ def test_context_dependent_quality_shapes_do_not_cross_auto_confirm_threshold():
         "src/ServerPanel.tsx",
     }
     assert all(finding.confidence < 0.98 for finding in contextual)
+
+
+def test_shell_detector_flags_bsd_sed_in_place_syntax():
+    findings = detect_quality_findings(
+        {
+            "scripts/update.sh": _patch(
+                "#!/bin/bash\nif grep -q '^KEY=' .env; then\n  sed -i '' -E 's|^KEY=.*|KEY=value|' .env\nfi"
+            ),
+            "scripts/update.bash": _patch("sed -E -i \"\" 's/old/new/' config.txt"),
+            "scripts/test-portability.sh": _patch("sed -i '' 's/old/new/' config.txt"),
+        }
+    )
+
+    shell_findings = [finding for finding in findings if finding.category == "correctness"]
+    assert {(finding.file, finding.line) for finding in shell_findings} == {
+        ("scripts/update.sh", 3),
+        ("scripts/update.bash", 1),
+        ("scripts/test-portability.sh", 1),
+    }
+    assert all(finding.confidence >= 0.98 for finding in shell_findings)
+
+
+def test_shell_detector_ignores_non_executed_and_portable_sed_forms():
+    findings = detect_quality_findings(
+        {
+            "scripts/update.sh": _patch(
+                "#!/bin/sh\n"
+                "# sed -i '' 's/old/new/' config.txt\n"
+                "echo \"sed -i '' 's/old/new/' config.txt\"\n"
+                "printf '%s\\n' \"sed -i '' 's/old/new/' config.txt\"\n"
+                "sed -i 's/old/new/' config.txt\n"
+                "sed -i.bak 's/old/new/' config.txt\n"
+                "sed 's/old/new/' config.txt > config.tmp && mv config.tmp config.txt"
+            ),
+            "tests/test-portability.sh": _patch("sed -i '' 's/old/new/' config.txt"),
+            "fixtures/example.sh": _patch("sed -i '' 's/old/new/' config.txt"),
+        }
+    )
+
+    assert not findings
+
+
+def test_ruby_detector_finds_unguarded_callback_and_one_sided_lower_lookup():
+    findings = detect_quality_findings(
+        {
+            "app/models/embeddable_host.rb": _patch(
+                "class EmbeddableHost < ActiveRecord::Base\n"
+                "  validates_format_of :host, with: /example/\n"
+                "  before_validation do\n"
+                "    self.host.sub!(/^https?:\\/\\//, '')\n"
+                "    self.host.strip!()\n"
+                "  end\n"
+                "\n"
+                "  def self.record_for_host(host)\n"
+                '    where("lower(host) = ?", host).first\n'
+                "  end\n"
+                "end"
+            )
+        }
+    )
+
+    assert _keys(findings) >= {
+        ("app/models/embeddable_host.rb", 4, "null-safety"),
+        ("app/models/embeddable_host.rb", 9, "correctness"),
+    }
+    assert ("app/models/embeddable_host.rb", 5, "null-safety") not in _keys(findings)
+    targeted = [finding for finding in findings if finding.line in {4, 9}]
+    assert all(finding.confidence >= 0.98 for finding in targeted)
+
+
+def test_ruby_detector_ignores_guarded_callbacks_and_normalized_lookups():
+    findings = detect_quality_findings(
+        {
+            "app/models/safe_host.rb": _patch(
+                "class SafeHost < ActiveRecord::Base\n"
+                "  before_validation do\n"
+                "    next if host.blank?\n"
+                "    self.host.sub!(/^https?:\\/\\//, '')\n"
+                "  end\n"
+                "  before_validation do\n"
+                "    self.name&.strip!\n"
+                "    self.label.to_s.strip!\n"
+                "  end\n"
+                "  def normalize_note\n"
+                "    self.note.gsub!(/x/, 'y')\n"
+                "  end\n"
+                "  def self.lookups(host)\n"
+                '    where("lower(host) = ?", host.downcase).first\n'
+                '    where("lower(host) = lower(?)", host).first\n'
+                '    where("host ILIKE ?", host).first\n'
+                "  end\n"
+                "end"
+            )
+        }
+    )
+
+    assert not [finding for finding in findings if finding.category in {"null-safety", "correctness"}]
+
+
+def test_ruby_context_rules_require_a_complete_new_file():
+    partial = "@@ -20,2 +20,2 @@\n+  self.host.sub!(/^https?:\\/\\//, '')\n+  where(\"lower(host) = ?\", host).first"
+
+    assert not detect_quality_findings({"app/models/host.rb": partial})

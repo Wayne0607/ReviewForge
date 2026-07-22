@@ -69,6 +69,21 @@ def _is_low_signal_path(file_path: str) -> bool:
     )
 
 
+def _is_shell_tool_path(file_path: str) -> bool:
+    """Keep executable tooling scripts even when their filename starts with test-."""
+
+    normalized = file_path.replace("\\", "/").lower()
+    path = PurePosixPath(normalized)
+    if path.suffix not in {".sh", ".bash"}:
+        return False
+    return not any(
+        part in _LOW_SIGNAL_PATH_PARTS
+        or part.strip("_-") in {"fixture", "fixtures", "testing"}
+        or re.fullmatch(r"(?:unit|integration|e2e|acceptance|contract)[_-]?tests?", part.strip("_-"))
+        for part in path.parts[:-1]
+    )
+
+
 def _is_complete_new_file_patch(patch: str) -> bool:
     """Return true only when one hunk contains the advertised whole new file."""
 
@@ -632,6 +647,7 @@ def _ruby_findings(
     patch: str,
     rows: list[tuple[int, str]],
     added: set[int],
+    original_rows: list[tuple[int, str]],
 ) -> list[DetectorFinding]:
     findings: list[DetectorFinding] = []
     for line_no, content in rows:
@@ -679,6 +695,81 @@ def _ruby_findings(
                     )
                 )
             break
+
+    if not _is_complete_new_file_patch(patch):
+        return findings
+
+    for index, (_callback_line, callback) in enumerate(rows):
+        if not re.search(r"\bbefore_validation\s+do\b", callback):
+            continue
+        callback_indent = len(callback) - len(callback.lstrip())
+        block: list[tuple[int, str]] = []
+        for line_no, content in rows[index + 1 :]:
+            stripped = content.strip()
+            indent = len(content) - len(content.lstrip())
+            if stripped == "end" and indent == callback_indent:
+                break
+            block.append((line_no, content))
+        else:
+            continue
+
+        prefix = ""
+        reported_attributes: set[str] = set()
+        for line_no, content in block:
+            match = re.search(r"\bself\.(?P<attribute>[A-Za-z_]\w*)\.(?P<method>sub!|gsub!|strip!)\s*\(", content)
+            if match and line_no in added:
+                attribute = match.group("attribute")
+                if attribute in reported_attributes:
+                    prefix += content + "\n"
+                    continue
+                receiver = rf"(?:self\.)?{re.escape(attribute)}"
+                guarded = bool(
+                    re.search(
+                        rf"\b(?:return|next)\b[^\n]*\bif\s+{receiver}\.(?:nil\?|blank\?)|"
+                        rf"\b(?:return|next)\b[^\n]*\bunless\s+{receiver}\.present\?|"
+                        rf"\bif\s+{receiver}\.present\?|"
+                        rf"\bunless\s+{receiver}\.(?:nil\?|blank\?)|"
+                        rf"\bself\.{re.escape(attribute)}\s*\|\|=",
+                        prefix,
+                    )
+                )
+                if not guarded:
+                    findings.append(
+                        _finding(
+                            file_path,
+                            line_no,
+                            "null-safety",
+                            f"The before_validation callback calls {match.group('method')} on "
+                            f"`{attribute}` before proving the attribute is non-nil.",
+                            "Guard the attribute before the destructive String call or normalize "
+                            "a safe copy with to_s.",
+                        )
+                    )
+                    reported_attributes.add(attribute)
+            prefix += content + "\n"
+
+    comment_masked_rows = _masked_rows(original_rows, "ruby", comments_only=True)
+    lower_lookup = re.compile(
+        r"\bwhere\s*\(\s*(?P<quote>['\"])\s*lower\(\s*[A-Za-z_]\w*\s*\)\s*=\s*\?\s*(?P=quote)\s*,\s*"
+        r"(?P<argument>(?:self\.)?[A-Za-z_]\w*)\s*\)"
+    )
+    for line_no, content in comment_masked_rows:
+        if line_no not in added:
+            continue
+        match = lower_lookup.search(content)
+        if match is None:
+            continue
+        argument = match.group("argument")
+        findings.append(
+            _finding(
+                file_path,
+                line_no,
+                "correctness",
+                f"The query lowercases the stored column but compares it with unnormalized `{argument}`.",
+                f"Bind `{argument}.downcase` or lowercase the placeholder in SQL so the comparison is "
+                "case-insensitive on both sides.",
+            )
+        )
     return findings
 
 
@@ -938,6 +1029,40 @@ def _rust_findings(
     return findings
 
 
+def _shell_findings(
+    file_path: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    findings: list[DetectorFinding] = []
+    masked = _masked_rows(rows, "shell", comments_only=True)
+    for (line_no, content), (_masked_line_no, masked_content) in zip(rows, masked, strict=False):
+        if line_no not in added:
+            continue
+        if content.lstrip().startswith("#"):
+            continue
+        if not _BSD_SED_I.search(content):
+            continue
+        # Echo/printf documentation is data, not an executed sed command.
+        if re.match(r"^\s*(?:echo|printf)\b", masked_content):
+            continue
+        # Entire line is a comment.
+        if not masked_content.lstrip():
+            continue
+        findings.append(
+            _finding(
+                file_path,
+                line_no,
+                "correctness",
+                "BSD `sed -i ''` treats the empty string as a separate argument for the backup suffix. "
+                "GNU sed interprets this differently, causing portability failures.",
+                "Use `sed -i.bak` and remove the `.bak` file afterward, or use a temp-file approach: "
+                '`tmp=$(mktemp) && sed \'s/old/new/\' file > "$tmp" && mv "$tmp" file`.',
+            )
+        )
+    return findings
+
+
 def _browser_import_findings(file_path: str, rows: list[tuple[int, str]], added: set[int]) -> list[DetectorFinding]:
     source = "\n".join(content for _line, content in rows)
     if re.search(r"^\s*['\"]use server['\"]\s*;?", source, re.MULTILINE):
@@ -961,6 +1086,15 @@ def _browser_import_findings(file_path: str, rows: list[tuple[int, str]], added:
             content,
         )
     ]
+
+
+_BSD_SED_I = re.compile(
+    r"(?<![\"'`])"  # not inside a documentation string
+    r"\bsed\b"
+    r"\s+(?:-[iA-Za-z]*\s+)*"  # preceding flags (if any)
+    r"-i\s+"  # -i followed by a separate empty-string arg
+    r"['\"]{2}"  # empty '' or ""
+)
 
 
 _REACT_RENDER_EFFECT_NAME = re.compile(
@@ -1118,10 +1252,10 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
 
     findings: list[DetectorFinding] = []
     for file_path, patch in diffs.items():
-        if _is_low_signal_path(file_path):
+        if _is_low_signal_path(file_path) and not _is_shell_tool_path(file_path):
             continue
         suffix = PurePosixPath(file_path.replace("\\", "/")).suffix.lower()
-        if suffix not in {".java", ".vue", ".py", ".rb", ".go", ".rs", ".tsx", ".jsx"}:
+        if suffix not in {".java", ".vue", ".py", ".rb", ".go", ".rs", ".tsx", ".jsx", ".sh", ".bash"}:
             continue
         added_rows = iter_added_lines(patch)
         if not added_rows:
@@ -1137,6 +1271,8 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
             ".rs": "rust",
             ".tsx": "typescript",
             ".jsx": "javascript",
+            ".sh": "shell",
+            ".bash": "shell",
         }[suffix]
         code_rows = _masked_rows(rows, language)
 
@@ -1147,11 +1283,13 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
         elif suffix == ".py":
             findings.extend(_python_findings(file_path, patch, rows, added))
         elif suffix == ".rb":
-            findings.extend(_ruby_findings(file_path, patch, code_rows, added))
+            findings.extend(_ruby_findings(file_path, patch, code_rows, added, rows))
         elif suffix == ".go":
             findings.extend(_go_findings(file_path, code_rows, added))
         elif suffix == ".rs":
             findings.extend(_rust_findings(file_path, code_rows, added, rows))
+        elif suffix in {".sh", ".bash"}:
+            findings.extend(_shell_findings(file_path, rows, added))
         else:
             findings.extend(
                 _browser_import_findings(

@@ -20,16 +20,14 @@ Policy
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
-
 
 # ── Enums ───────────────────────────────────────────────────────────────────
 
 
-class CoverageDimension(str, Enum):
+class CoverageDimension(StrEnum):
     """Review dimensions tracked by the coverage ledger."""
 
     CORRECTNESS = "correctness"
@@ -43,7 +41,7 @@ class CoverageDimension(str, Enum):
     CROSS_PR = "cross-PR"
 
 
-class CoverageStatus(str, Enum):
+class CoverageStatus(StrEnum):
     """Lifecycle status of a coverage cell."""
 
     PENDING = "pending"
@@ -632,12 +630,6 @@ def _has_cross_pr_signal(unit: dict[str, Any]) -> bool:
     meta = unit.get("metadata", {})
     if isinstance(meta, dict) and meta.get("cross_pr"):
         return True
-    # live_references with cross-PR hints
-    refs = unit.get("live_references", [])
-    if isinstance(refs, list) and len(refs) > 0:
-        # If there are references to other files, it could be cross-PR
-        # This is a weak signal — only use if explicitly flagged
-        pass
     return False
 
 

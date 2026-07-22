@@ -17,23 +17,21 @@ Tests are deterministic and cover:
 
 from __future__ import annotations
 
-import copy
 import json
 
 import pytest
 
 from reviewforge.engine.coverage_ledger import (
+    TERMINAL_STATUSES,
     CoverageCell,
     CoverageDimension,
     CoverageLedger,
     CoverageStatus,
-    TERMINAL_STATUSES,
     _coerce_int,
     _extract_risk_signals,
     _has_cross_pr_signal,
     _is_localization_path,
 )
-
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 

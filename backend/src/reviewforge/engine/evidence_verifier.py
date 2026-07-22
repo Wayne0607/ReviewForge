@@ -17,7 +17,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 # Contracts
 # ---------------------------------------------------------------------------
 
-class EvidenceVerdict(str, Enum):
+class EvidenceVerdict(StrEnum):
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     ABSTAIN = "abstain"
 
 
-class EvidenceStatus(str, Enum):
+class EvidenceStatus(StrEnum):
     CANDIDATE = "candidate"
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
@@ -49,7 +49,6 @@ _MAX_EVIDENCE_ITEMS = 32
 _MAX_RATIONALE_CHARS = 300
 _MAX_REPAIR_ATTEMPTS = 1
 _MAX_DIFF_CHARS = 24_000
-_MAX_CONTEXT_CHARS = 3_000
 
 
 # ---------------------------------------------------------------------------
@@ -102,51 +101,34 @@ class EvidenceItem:
 
 
 @dataclass
-class ProverVerdict:
+class _BaseVerdict:
+    """Shared fields for prover/refuter/arbiter verdicts."""
+
+    verdict: EvidenceVerdict
+    confidence: float
+    rationale: str  # concise, not chain-of-thought
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict.value,
+            "confidence": round(self.confidence, 3),
+            "rationale": self.rationale[:_MAX_RATIONALE_CHARS],
+        }
+
+
+@dataclass
+class ProverVerdict(_BaseVerdict):
     """Independent prover verdict (supports the finding)."""
 
-    verdict: EvidenceVerdict
-    confidence: float
-    rationale: str  # concise, not chain-of-thought
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "verdict": self.verdict.value,
-            "confidence": round(self.confidence, 3),
-            "rationale": self.rationale[:_MAX_RATIONALE_CHARS],
-        }
-
 
 @dataclass
-class RefuterVerdict:
+class RefuterVerdict(_BaseVerdict):
     """Independent refuter verdict (tries to disprove the finding)."""
 
-    verdict: EvidenceVerdict
-    confidence: float
-    rationale: str  # concise, not chain-of-thought
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "verdict": self.verdict.value,
-            "confidence": round(self.confidence, 3),
-            "rationale": self.rationale[:_MAX_RATIONALE_CHARS],
-        }
-
 
 @dataclass
-class ArbiterVerdict:
+class ArbiterVerdict(_BaseVerdict):
     """Final arbiter verdict after seeing evidence + both arguments."""
-
-    verdict: EvidenceVerdict
-    confidence: float
-    rationale: str  # concise, not chain-of-thought
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "verdict": self.verdict.value,
-            "confidence": round(self.confidence, 3),
-            "rationale": self.rationale[:_MAX_RATIONALE_CHARS],
-        }
 
 
 @dataclass
@@ -662,8 +644,14 @@ class EvidenceVerifier:
         capsule = EvidenceCapsule(finding_id=finding.id, evidence=evidence)
 
         # Phase 1: Independent prover and refuter (parallel conceptually, sequential here)
-        prover_result = await self._run_prover(finding, evidence, diff)
-        refuter_result = await self._run_refuter(finding, evidence, diff)
+        prover_result = await self._run_verdict_llm(
+            self._prover_model, _prover_system_prompt(),
+            _user_prompt(finding, diff, evidence), finding.id, "Prover",
+        )
+        refuter_result = await self._run_verdict_llm(
+            self._refuter_model, _refuter_system_prompt(),
+            _user_prompt(finding, diff, evidence), finding.id, "Refuter",
+        )
 
         # Handle prover failure
         if prover_result is None:
@@ -707,8 +695,10 @@ class EvidenceVerifier:
         )
 
         if needs_arbiter:
-            arbiter_result = await self._run_arbiter(
-                finding, evidence, diff, prover_verdict, refuter_verdict
+            arbiter_result = await self._run_verdict_llm(
+                self._arbiter_model, _arbiter_system_prompt(),
+                _arbiter_user_prompt(finding, diff, evidence, prover_verdict, refuter_verdict),
+                finding.id, "Arbiter",
             )
             if arbiter_result is None:
                 capsule.retry_metadata["arbiter_failed"] = True
@@ -760,57 +750,19 @@ class EvidenceVerifier:
             capsules.append(capsule)
         return capsules
 
-    async def _run_prover(
+    async def _run_verdict_llm(
         self,
-        finding: Finding,
-        evidence: list[EvidenceItem],
-        diff: str,
+        chat_model: ChatModel,
+        system_prompt: str,
+        user_prompt: str,
+        finding_id: str,
+        role: str,
     ) -> dict | None:
-        """Run the prover model. Returns parsed result or None on failure."""
+        """Run a verdict LLM with error handling. Returns parsed result or None."""
         try:
-            return await _call_llm_with_repair(
-                self._prover_model,
-                _prover_system_prompt(),
-                _user_prompt(finding, diff, evidence),
-            )
+            return await _call_llm_with_repair(chat_model, system_prompt, user_prompt)
         except Exception as exc:
-            logger.warning(f"Prover failed for {finding.id}: {exc}")
-            return None
-
-    async def _run_refuter(
-        self,
-        finding: Finding,
-        evidence: list[EvidenceItem],
-        diff: str,
-    ) -> dict | None:
-        """Run the refuter model. Returns parsed result or None on failure."""
-        try:
-            return await _call_llm_with_repair(
-                self._refuter_model,
-                _refuter_system_prompt(),
-                _user_prompt(finding, diff, evidence),
-            )
-        except Exception as exc:
-            logger.warning(f"Refuter failed for {finding.id}: {exc}")
-            return None
-
-    async def _run_arbiter(
-        self,
-        finding: Finding,
-        evidence: list[EvidenceItem],
-        diff: str,
-        prover: ProverVerdict,
-        refuter: RefuterVerdict,
-    ) -> dict | None:
-        """Run the arbiter model. Returns parsed result or None on failure."""
-        try:
-            return await _call_llm_with_repair(
-                self._arbiter_model,
-                _arbiter_system_prompt(),
-                _arbiter_user_prompt(finding, diff, evidence, prover, refuter),
-            )
-        except Exception as exc:
-            logger.warning(f"Arbiter failed for {finding.id}: {exc}")
+            logger.warning(f"{role} failed for {finding_id}: {exc}")
             return None
 
 

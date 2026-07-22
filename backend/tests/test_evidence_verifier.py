@@ -31,7 +31,6 @@ from reviewforge.engine.evidence_verifier import (
     apply_evidence_to_finding,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fake LLM helpers
 # ---------------------------------------------------------------------------
@@ -475,7 +474,7 @@ class TestProvenanceValidation:
             _make_evidence(sha="different_sha", trigger="other"),
         ]
 
-        capsule = await verifier.verify_candidate(finding, evidence, "diff")
+        await verifier.verify_candidate(finding, evidence, "diff")
 
         # Check that evidence was included in the prover prompt
         assert len(prover.calls) == 1
@@ -499,7 +498,7 @@ class TestProvenanceValidation:
             _make_evidence(sha="sha2"),
         ]
 
-        capsule = await verifier.verify_candidate(finding, evidence, "diff")
+        await verifier.verify_candidate(finding, evidence, "diff")
 
         # Should have called LLMs (no shortcut)
         assert len(prover.calls) == 1
@@ -681,7 +680,10 @@ class TestVerifyBatch:
 
         assert len(capsules) == 3
         # The finding where prover failed should have retry metadata
-        failed_capsules = [c for c in capsules if c.retry_metadata.get("prover_failed") or c.retry_metadata.get("refuter_failed")]
+        failed_capsules = [
+            c for c in capsules
+            if c.retry_metadata.get("prover_failed") or c.retry_metadata.get("refuter_failed")
+        ]
         assert len(failed_capsules) >= 1
 
 

@@ -12,6 +12,52 @@ from typing import Any
 
 import yaml
 
+_VALID_EVIDENCE_MODES = frozenset({"off", "shadow", "enforce"})
+
+
+def _normalize_int(value: Any, default: int, minimum: int = 1) -> int:
+    """Parse an int from *value*, clamping to *minimum*. Returns *default* on failure."""
+    try:
+        result = int(value)
+    except (ValueError, TypeError):
+        return default
+    return max(result, minimum)
+
+
+def _normalize_float(value: Any, default: float, minimum: float = 0.0) -> float:
+    """Parse a float from *value*, clamping to *minimum*. Returns *default* on failure."""
+    try:
+        result = float(value)
+    except (ValueError, TypeError):
+        return default
+    return max(result, minimum)
+
+
+def _normalize_evidence_mode(value: Any) -> str:
+    """Return a valid evidence mode, falling back to ``shadow``."""
+    if isinstance(value, str) and value.strip().lower() in _VALID_EVIDENCE_MODES:
+        return value.strip().lower()
+    return "shadow"
+
+
+def _parse_bool(value: Any) -> bool:
+    """Parse a bool from YAML or env, handling string representations."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "")
+    return bool(value)
+
+
+@dataclass
+class V3Config:
+    """V3 coverage-driven pipeline configuration."""
+
+    enabled: bool = False
+    coverage_min_risk_score: float = 0.15
+    coverage_max_cells_per_round: int = 24
+    coverage_max_attempts: int = 2
+    evidence_mode: str = "shadow"
+    evidence_max_candidates: int = 20
+
 
 @dataclass
 class ModelProfile:
@@ -57,6 +103,24 @@ class GitHubConfig:
     webhook_secret: str = ""
 
 
+def _v3_from_dict(data: dict[str, Any]) -> V3Config:
+    """Build a V3Config from a YAML dict, silently normalizing bad values."""
+    cfg = V3Config()
+    if "enabled" in data:
+        cfg.enabled = _parse_bool(data["enabled"])
+    if "coverage_min_risk_score" in data:
+        cfg.coverage_min_risk_score = _normalize_float(data["coverage_min_risk_score"], 0.15, 0.0)
+    if "coverage_max_cells_per_round" in data:
+        cfg.coverage_max_cells_per_round = _normalize_int(data["coverage_max_cells_per_round"], 24, 1)
+    if "coverage_max_attempts" in data:
+        cfg.coverage_max_attempts = _normalize_int(data["coverage_max_attempts"], 2, 1)
+    if "evidence_mode" in data:
+        cfg.evidence_mode = _normalize_evidence_mode(data["evidence_mode"])
+    if "evidence_max_candidates" in data:
+        cfg.evidence_max_candidates = _normalize_int(data["evidence_max_candidates"], 20, 1)
+    return cfg
+
+
 @dataclass
 class ReviewForgeConfig:
     """Top-level configuration."""
@@ -87,6 +151,9 @@ class ReviewForgeConfig:
     coverage_gap_min_risk_score: int = 4
     coverage_gap_max_cards: int = 3
     coverage_gap_min_confidence: float = 0.65
+
+    # V3 coverage-driven pipeline
+    v3: V3Config = field(default_factory=V3Config)
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> ReviewForgeConfig:
@@ -224,6 +291,10 @@ class ReviewForgeConfig:
                     except (ValueError, TypeError):
                         pass
                 setattr(self, attr, value)
+        if "v3" in data:
+            v3 = data["v3"]
+            if isinstance(v3, dict):
+                self.v3 = _v3_from_dict(v3)
 
     def _apply_env(self) -> None:
         """Environment variables override config file."""
@@ -251,3 +322,10 @@ class ReviewForgeConfig:
         gap_flag = os.environ.get("REVIEWFORGE_COVERAGE_GAP_ENABLED")
         if gap_flag is not None:
             self.coverage_gap_enabled = gap_flag.strip().lower() not in ("0", "false", "no", "")
+        # V3 env overrides
+        v3_enabled = os.environ.get("REVIEWFORGE_V3_ENABLED")
+        if v3_enabled is not None:
+            self.v3.enabled = _parse_bool(v3_enabled)
+        v3_mode = os.environ.get("REVIEWFORGE_V3_EVIDENCE_MODE")
+        if v3_mode is not None:
+            self.v3.evidence_mode = _normalize_evidence_mode(v3_mode)

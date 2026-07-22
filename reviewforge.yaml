@@ -118,3 +118,12 @@ coverage_gap:
   min_risk_score: 4
   max_cards: 3
   min_confidence: 0.65
+
+# V3 coverage-driven pipeline (disabled; enable after integration tests pass)
+v3:
+  enabled: false
+  coverage_min_risk_score: 0.15
+  coverage_max_cells_per_round: 24
+  coverage_max_attempts: 2
+  evidence_mode: shadow
+  evidence_max_candidates: 20

@@ -40,6 +40,32 @@ and closure reason. `CoverageLedger` is deterministic, serializable, and owns
 the completion rule. Planner output may prioritize or add work but cannot mark
 mandatory coverage complete.
 
+**Canonical field mapping.** `CoverageLedger.from_change_set` reads
+`risk_score` (float, [0.0, 1.0]) and `start_line` (int) from the
+`SemanticUnit.to_dict()` shape.  Legacy `risk` (int) and `line` (int) keys
+are accepted as fallback but `risk_score` and `start_line` always take
+precedence.
+
+**Signal vocabulary.** Risk signals drive mandatory dimension creation via
+`_RISK_SIGNAL_MAP`:
+
+| Signal                          | Dimension        |
+|---------------------------------|------------------|
+| `security-sensitive-symbol`     | security         |
+| `security-sensitive`            | security         |
+| `localization-resource`         | localization     |
+| `localization`                  | localization     |
+| `cross-PR` / `cross-pr`        | cross-PR         |
+| `error-handling` / `error_handling` | error-handling |
+| `contract-surface` / `contract` | contract         |
+| `testing-scope` / `testing`    | testing          |
+| `test-evidence-not-discovered`  | testing          |
+
+`test-evidence-not-discovered` is emitted by `SemanticChangeSet` compilation
+when no candidate test is found for a changed symbol.  It maps to the
+`testing` dimension so the reviewer explicitly verifies whether the gap is
+acceptable.
+
 ### Evidence
 
 An `EvidenceCapsule` is tied to one candidate finding and stores typed evidence

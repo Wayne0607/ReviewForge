@@ -72,9 +72,7 @@ def _sample_manifest(**overrides) -> dict:
                         "added_lines": [12],
                     },
                 ],
-                "imports": [
-                    {"source": "auth", "name": "authorize", "local_name": "authorize", "line": 1}
-                ],
+                "imports": [{"source": "auth", "name": "authorize", "local_name": "authorize", "line": 1}],
                 "calls": [
                     {"caller": "process", "callee": "authorize", "line": 5},
                     {"caller": "<module>", "callee": "setup", "line": 2},
@@ -537,9 +535,7 @@ class TestRiskScoring:
 
     def test_test_evidence_gap_increases_risk(self):
         manifest = _sample_manifest()
-        manifest["risk_signals"].append(
-            {"type": "test-evidence-not-discovered", "note": "no test file found"}
-        )
+        manifest["risk_signals"].append({"type": "test-evidence-not-discovered", "note": "no test file found"})
         state = _make_state(
             files_changed=["src/service.py"],
             impact_manifest=manifest,
@@ -795,9 +791,9 @@ class TestMixedFiles:
         ]
         state = _make_state(
             files_changed=[
-                "src/service.py",       # in manifest files
+                "src/service.py",  # in manifest files
                 "locales/en.properties",  # in manifest resource_files
-                "src/extra.py",          # not in manifest
+                "src/extra.py",  # not in manifest
                 "assets/strings_es.po",  # not in manifest, resource suffix
             ],
             file_diffs={

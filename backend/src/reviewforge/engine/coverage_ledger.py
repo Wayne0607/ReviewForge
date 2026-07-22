@@ -116,6 +116,7 @@ _RISK_SIGNAL_MAP: dict[str, CoverageDimension] = {
     "contract": CoverageDimension.CONTRACT,
     "testing-scope": CoverageDimension.TESTING,
     "testing": CoverageDimension.TESTING,
+    "test-evidence-not-discovered": CoverageDimension.TESTING,
 }
 
 # Dimensions that may be bounded by a global cap for low-risk units.

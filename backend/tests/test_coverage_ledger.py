@@ -365,6 +365,14 @@ class TestLedgerConstruction:
         assert t is not None
         assert t.mandatory is True
 
+    def test_test_evidence_not_discovered_creates_testing_cell(self):
+        """test-evidence-not-discovered (from SemanticChangeSet) → TESTING."""
+        cs = _make_change_set([_make_unit("u1", risk_signals=["test-evidence-not-discovered"])])
+        ledger = CoverageLedger.from_change_set(cs)
+        t = ledger.get_cell("u1", CoverageDimension.TESTING)
+        assert t is not None
+        assert t.mandatory is True
+
     def test_dict_risk_signals(self):
         cs = _make_change_set([_make_unit("u1", risk_signals=[{"type": "security-sensitive"}])])
         ledger = CoverageLedger.from_change_set(cs)
@@ -979,6 +987,14 @@ class TestEdgeCases:
             cell = ledger.get_cell("u1", dim)
             assert cell is not None, f"Missing cell for {dim.value} with signal {signal}"
             assert cell.mandatory is True
+
+    def test_test_evidence_not_discovered_signal(self):
+        """test-evidence-not-discovered creates TESTING, not a separate dimension."""
+        cs = _make_change_set([_make_unit("u1", risk_signals=["test-evidence-not-discovered"])])
+        ledger = CoverageLedger.from_change_set(cs)
+        t = ledger.get_cell("u1", CoverageDimension.TESTING)
+        assert t is not None
+        assert t.mandatory is True
 
 
 # ── SemanticUnit interoperability (risk_score / start_line) ────────────────

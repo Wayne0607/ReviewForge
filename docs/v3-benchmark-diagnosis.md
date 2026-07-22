@@ -1,10 +1,32 @@
 # ReviewForge v3 Benchmark Diagnosis — Martian 50 (commit 0823da6)
 
+## Methodology
+
+This document reports results from the Martian 50 benchmark (50 PRs, 137 golden findings, 5 project families). All pipeline and judge runs used MiMo v2.5 Pro.
+
+**Measured (from authoritative merged artifacts):**
+- Pipeline funnel counts (total_findings, confirmed, false_positives, review_comments) from `results-merged.json`
+- Judge outcomes (TP, FP, FN, precision, recall, F1) from `judge-merged.json`
+- Workload structure (PR count, golden count per PR) from `workload.json`
+- Execution summary (tokens, tasks_failed, by_family, by_severity) from `summary.json`
+- Per-PR token totals from `results-merged.json`
+
+**Inferred / supplemental (from SQLite shard DBs, clearly labeled):**
+- FP breakdown by reviewer type and category (Section 4.2–4.3): derived from `review_findings` table in `reviewforge-martian.db`; the DB contains per-shard lineage not present in the merged JSON
+- Token distribution by agent (Section 3.1): derived from `tokens_by_agent` arrays in `results-merged.json`, cross-referenced with DB `token_usage` table
+- Stage attribution for false negatives (Section 5.3, 7.2): **hypotheses** based on zero-candidate PR patterns and DB reviewer assignments; not directly measurable from final merged results alone. Ranges are estimated, not precise counts.
+
+**Qodo-v2 baseline:** Pre-recorded candidates from the benchmark dataset, re-judged with the same MiMo rubric. Same model used for execution and judging may introduce correlated biases. The benchmark is 50 PRs — confidence intervals are wide.
+
+**Canonical cross-check:** A validation script (`.reviewforge/v3-diagnostics/validate_counts.py`) asserts the expected counts from the authoritative artifacts.
+
+---
+
 ## Executive Summary
 
 ReviewForge achieves **38.89% precision / 25.55% recall / 30.84% F1** on the Martian 50 benchmark (137 golden findings, 50 PRs, 5 project families). Compared to Qodo-v2 (37.09% P / 57.66% R / 45.14% F1), ReviewForge has marginally higher precision (+1.8pp) but critically lower recall (−32.1pp) and F1 (−14.3pp). The v3 architecture acceptance gates (precision ≥ 35%, recall ≥ 45%, F1 ≥ 39%) are **not met** — recall and F1 fail.
 
-The dominant failure mode is **insufficient candidate generation**, not over-aggressive filtering. 10/50 PRs (20%) produce zero candidates at all (target: ≤ 10%), and 18/50 (36%) emit zero published comments. An additional 8 PRs generate candidates that are entirely rejected by the calibrator. The pipeline consumes 2.4M tokens across 50 PRs (mean 48K/PR) yet produces only 35 true positives — 68,836 tokens per true positive.
+The dominant failure mode is **insufficient candidate generation**, not over-aggressive filtering. 10/50 PRs (20%) produce zero candidates at all (target: ≤ 10%), and 18/50 (36%) emit zero published comments. The pipeline consumes 2.4M tokens across 50 PRs (mean 48K/PR) yet produces only 35 true positives.
 
 ---
 
@@ -12,32 +34,32 @@ The dominant failure mode is **insufficient candidate generation**, not over-agg
 
 ### 1.1 Aggregate Funnel
 
-| Stage | Count | Cumulative Yield |
-|---|---:|---:|
-| PRs processed | 50 | 100% |
-| Reviewer tasks completed | 248 (across all PRs) | — |
-| Pre-verification candidates | 211 | 100% |
-| Actionability filter kept | ~148 (est.) | 70% |
-| Post-calibration confirmed | 101 | 47.9% |
-| Published comments | 95 (4 confirmed but 0 reported in DB) | 45.0% |
-| Judge-matched true positives | 35 | 16.6% of candidates |
+| Stage | Count | Source |
+|---|---:|---|
+| PRs processed | 50 | `workload.json` |
+| Reviewer tasks completed | 166 | `results-merged.json` (sum of per-PR tasks_completed) |
+| Reviewer tasks failed | 2 | `results-merged.json` (sum of per-PR tasks_failed) |
+| Pre-verification candidates | 211 | `results-merged.json` (sum of total_findings) |
+| Post-calibration confirmed | 101 | `results-merged.json` (sum of confirmed) |
+| Published comments | 101 | `results-merged.json` (sum of review_comments; equals confirmed) |
+| Judge-matched true positives | 35 | `judge-merged.json` |
+| Judge false positives | 55 | `judge-merged.json` |
+| Judge false negatives | 102 | `judge-merged.json` |
 
-**Key figure**: 52.1% of generated candidates are rejected before publication. But the bigger loss is upstream — 10 PRs generate zero candidates, missing 40 golden findings outright.
+**Attrition**: 110 of 211 candidates (52.1%) are rejected as false positives by the calibrator. Of the 101 confirmed findings, 35 (34.7%) are true positives against the golden set. The bigger loss is upstream — 10 PRs generate zero candidates, missing golden findings outright.
 
 ### 1.2 Per-PR Candidate Generation
 
 | Metric | Value |
 |---|---:|
-| Mean candidates per PR | 4.22 |
-| Median candidates per PR | 3.0 |
+| Mean candidates per PR | 4.22 (211/50) |
 | PRs with 0 candidates | 10 (20%) |
 | PRs with 0 confirmed | 18 (36%) |
 | PRs with 0 true positives | 27 (54%) |
-| PRs with all candidates correct (FP=0, TP>0) | 11 (22%) |
 
 ### 1.3 Zero-Candidate PRs (complete blind spots)
 
-These 10 PRs produced no reviewer findings whatsoever, missing 40 golden findings:
+These 10 PRs produced no reviewer findings whatsoever:
 
 | PR | Family | Tokens | Changed Files | Golden Findings Missed |
 |---|---|---:|---:|---:|
@@ -85,6 +107,8 @@ From the 31 missed High-severity findings:
 
 ### 3.1 Token Distribution by Agent
 
+*Source: `tokens_by_agent` arrays in `results-merged.json`, cross-referenced with `token_usage` table in `reviewforge-martian.db`.*
+
 | Agent | Tokens | % of Total | Calls | Avg/Call |
 |---|---:|---:|---:|---:|
 | correctness_reviewer | 573,447 | 23.8% | 74 | 7,749 |
@@ -100,22 +124,20 @@ From the 31 missed High-severity findings:
 | doc_reviewer | 4,338 | 0.2% | 1 | 4,338 |
 
 **Observations**:
-- The **planner** consumes 19.1% of tokens (459K) for 53 calls — this is the decision layer that assigns reviewers, not the review itself.
-- The **calibrator** consumes 19.5% (470K) for 75 calls — it rejects 52% of candidates, meaning ~245K tokens were spent generating candidates that were then discarded.
-- **correctness_reviewer** is the most productive (54 of 95 published findings) but also the most expensive.
-- **security_reviewer** produces the most false positives (36 of 105 FP findings) despite consuming only 15.3% of tokens.
+- The **planner** consumes 19.1% of tokens (460K) for 53 calls — this is the decision layer that assigns reviewers, not the review itself.
+- The **calibrator** consumes 19.5% (470K) for 75 calls — it rejects 52.1% of candidates, meaning ~245K tokens were spent generating candidates that were then discarded.
+- **correctness_reviewer** is the most productive (54 of 101 published findings) but also the most expensive.
+- **security_reviewer** produces the most false positives despite consuming only 15.3% of tokens.
 
 ### 3.2 Token Efficiency
 
-| Metric | Value |
-|---|---:|
-| Total tokens | 2,409,261 |
-| Tokens per PR (mean) | 48,185 |
-| Tokens per PR (median) | 45,338 |
-| Tokens per emitted comment | 23,854 |
-| Tokens per true positive | 68,836 |
-
-**68,836 tokens per true positive is extremely expensive.** For context, a typical GPT-4 prompt is ~4K tokens. ReviewForge spends the equivalent of 17 full prompts per correct finding.
+| Metric | Value | Source |
+|---|---:|---|
+| Total tokens | 2,409,261 | `summary.json` |
+| Tokens per PR (mean) | 48,185 | `results-merged.json` |
+| Tokens per PR (median) | 45,338 | `results-merged.json` |
+| Tokens per emitted comment | 23,854 | 2,409,261 / 101 |
+| Tokens per true positive | 68,836 | 2,409,261 / 35 |
 
 ### 3.3 High-Token Zero-Comment PRs
 
@@ -139,13 +161,19 @@ These PRs consumed significant tokens but produced no published output:
 
 ### 4.1 Aggregate
 
+*Source: `results-merged.json` for counts; `judge-merged.json` for TP/FP/FN.*
+
 - Total pre-verification candidates: 211
-- Total rejected (false_positive in DB): 105
-- Total published (reported): 95 + 4 confirmed = 99
+- Total rejected (false_positive): 110
+- Total confirmed (published): 101
 - Judge-matched true positives: 35
-- **Calibrator precision on published findings**: 35/95 ≈ 36.8% (i.e., 63.2% of published findings are FP)
+- Judge-matched false positives: 55
+- **Calibrator precision on published findings**: 35/101 = 34.7% (i.e., 65.3% of published findings are FP per judge)
+- **Overall candidate rejection rate**: 110/211 = 52.1%
 
 ### 4.2 FP by Reviewer Type
+
+*Source: `review_findings` table in `reviewforge-martian.db` (supplemental lineage).*
 
 | Reviewer | FP Count | Published | FP Rate |
 |---|---:|---:|---:|
@@ -167,6 +195,8 @@ These PRs consumed significant tokens but produced no published output:
 
 ### 4.3 FP by Category (top 10)
 
+*Source: `review_findings` table in `reviewforge-martian.db` (supplemental lineage).*
+
 | Category | Count | Likely Cause |
 |---|---:|---|
 | code-injection | 15 | Over-sensitive pattern matching on JS `Function()` |
@@ -186,6 +216,8 @@ These PRs consumed significant tokens but produced no published output:
 
 ### 5.1 Total Missed: 102 of 137 golden findings
 
+*Source: `judge-merged.json` (sum of false_negatives list lengths).*
+
 | Source | Count | % of FNs |
 |---|---:|---:|
 | Zero-candidate PRs (no candidates generated) | 40 | 39.2% |
@@ -203,43 +235,47 @@ These PRs consumed significant tokens but produced no published output:
 
 **sentry** and **cal.com** together account for 50 of 102 FNs (49%). These are Python and TypeScript projects respectively.
 
-### 5.3 Root Cause Attribution by Pipeline Stage
+### 5.3 Root Cause Attribution by Pipeline Stage (Hypotheses)
 
-| Root Cause | Estimated FN Count | Pipeline Stage |
-|---|---:|---|
-| Reviewer generates 0 findings for PR | 40 | Reviewer (generation) |
-| Reviewer generates findings but misses specific golden | 35 | Reviewer (coverage) |
-| Calibrator rejects valid finding | 15 | Calibrator |
-| Planner assigns wrong reviewers | 8 | Planner |
-| Actionability filter drops valid finding | 4 | Actionability |
+**These attributions are estimated from zero-candidate patterns and DB reviewer assignments, not directly measurable from the final merged results.** The counts below are ranges, not precise figures.
 
-**The reviewer generation stage is responsible for ~75 FNs (73.5%).** The calibrator directly rejects ~15 valid findings. The planner mis-routing accounts for ~8.
+| Root Cause | Estimated FN Range | Pipeline Stage | Basis |
+|---|---:|---|---|
+| Reviewer generates 0 findings for PR | ~40 | Reviewer (generation) | 10 zero-candidate PRs, each with golden FNs |
+| Reviewer generates findings but misses specific golden | ~30–40 | Reviewer (coverage) | PRs with TP>0 but also FN>0 |
+| Calibrator rejects valid finding | ~10–15 | Calibrator | DB false_positives that match golden patterns (not independently verified) |
+| Planner assigns wrong reviewers | ~5–10 | Planner | DB reviewer assignments vs golden finding types |
+| Actionability filter drops valid finding | ~0–5 | Actionability | Limited evidence; few cases identifiable |
+
+**The reviewer generation stage is the primary bottleneck** (~70–80 of 102 FNs). The calibrator and planner are secondary contributors. Precise counts require re-judging all rejected candidate texts against golden FNs, which is not performed here.
 
 ### 5.4 Specific High-Impact Misses
 
 These are High/Critical severity findings that Qodo found but ReviewForge missed entirely:
 
 **Permission/Authz bugs (Java/Keycloak)**:
-- keycloak#36880: 3 High findings about AdminPermissions feature flag inconsistency and resource lookup bugs → all missed (0 candidates)
-- keycloak#37038: 2 High findings about incorrect canManage() permission check and group resource ID mismatch → both missed (FP candidates produced)
-- grafana#103633: 1 High finding about asymmetric cache trust in permission check → missed (FP candidates)
+- keycloak#36880: 3 High findings about AdminPermissions feature flag inconsistency and resource lookup bugs — all missed (0 candidates)
+- keycloak#37038: 2 High findings about incorrect canManage() permission check and group resource ID mismatch — both missed (FP candidates produced)
+- grafana#103633: 1 High finding about asymmetric cache trust in permission check — missed (FP candidates)
 
 **Race conditions (Go/Grafana)**:
-- grafana#97529: 2 High findings about BuildIndex race and TotalDocs concurrent access → both missed (0 candidates)
-- grafana#79265: 1 High finding about device count race condition → missed (0 candidates)
+- grafana#97529: 2 High findings about BuildIndex race and TotalDocs concurrent access — both missed (0 candidates)
+- grafana#79265: 1 High finding about device count race condition — missed (0 candidates)
 
 **Logic inversions (Java/Keycloak)**:
-- keycloak#37634: Critical finding about wrong null-check parameter → found ✓
-- keycloak#37634: High finding about inverted isAccessTokenId logic → found ✓
-- But keycloak#33832: High finding about wrong BouncyCastle provider → missed (0 candidates)
+- keycloak#37634: Critical finding about wrong null-check parameter — found
+- keycloak#37634: High finding about inverted isAccessTokenId logic — found
+- But keycloak#33832: High finding about wrong BouncyCastle provider — missed (0 candidates)
 
 **Contract violations (TypeScript/Cal.com)**:
-- cal.com#14943: 2 High findings about atomic increment race and incorrect SMS deletion logic → both missed (0 candidates)
-- cal.com#11059: 5 High findings about OAuth token refresh failures → none found
+- cal.com#14943: 2 High findings about atomic increment race and incorrect SMS deletion logic — both missed (0 candidates)
+- cal.com#11059: 5 High findings about OAuth token refresh failures — none found
 
 ---
 
 ## 6. Language/Project Performance
+
+*Source: `summary.json` by_family section.*
 
 | Family | Language | RF Precision | RF Recall | RF F1 | Qodo F1 | RF Worst |
 |---|---|---:|---:|---:|---:|---|
@@ -264,28 +300,30 @@ These are High/Critical severity findings that Qodo found but ReviewForge missed
 
 ```
 PR Input
-  → Context Engine (file selection, indexing)
-  → Deterministic Scan (pattern-based)
-  → Planner (LLM: assign reviewers to files)
-  → Reviewers (LLM: generate candidate findings)
-  → Actionability Filter (deterministic)
-  → Calibrator (LLM: confirm/reject candidates)
-  → Commenter (format + publish)
+  -> Context Engine (file selection, indexing)
+  -> Deterministic Scan (pattern-based)
+  -> Planner (LLM: assign reviewers to files)
+  -> Reviewers (LLM: generate candidate findings)
+  -> Actionability Filter (deterministic)
+  -> Calibrator (LLM: confirm/reject candidates)
+  -> Commenter (format + publish)
 ```
 
-### 7.2 Where FNs Originate
+### 7.2 Where FNs Originate (Hypotheses)
 
-| Stage | Mechanism | FN Count | Evidence |
+**These are estimated ranges, not measured counts.** Attribution requires tracing individual FNs through the pipeline via DB lineage and re-judging rejected candidates against golden FNs. The table below represents our best hypothesis based on observable patterns (zero-candidate PRs, PRs with mixed TP/FN, DB reviewer assignments).
+
+| Stage | Mechanism | Estimated FN Range | Observable Evidence |
 |---|---|---:|---|
-| **Context Engine** | Files not selected for review | ~5 | PRs with many files where golden finding is in an unreviewed file |
-| **Planner** | Wrong reviewer assigned | ~8 | E.g., permission bug assigned to testing_reviewer instead of correctness_reviewer |
-| **Reviewer (generation)** | LLM doesn't detect issue | ~40 | Zero-candidate PRs; reviewer runs but outputs 0 findings |
-| **Reviewer (coverage)** | LLM detects some issues but misses others | ~35 | PRs with TP>0 but also FN>0 |
-| **Actionability** | Filter drops valid finding | ~4 | Findings filtered as "not actionable" |
-| **Calibrator** | LLM incorrectly rejects valid finding | ~15 | FP in DB that match golden patterns |
+| **Context Engine** | Files not selected for review | ~0–5 | PRs with many files where golden finding is in an unreviewed file |
+| **Planner** | Wrong reviewer assigned | ~5–10 | E.g., permission bug assigned to testing_reviewer instead of correctness_reviewer |
+| **Reviewer (generation)** | LLM doesn't detect issue | ~35–40 | Zero-candidate PRs; reviewer runs but outputs 0 findings |
+| **Reviewer (coverage)** | LLM detects some issues but misses others | ~30–40 | PRs with TP>0 but also FN>0 |
+| **Actionability** | Filter drops valid finding | ~0–5 | Limited evidence |
+| **Calibrator** | LLM incorrectly rejects valid finding | ~10–15 | DB false_positives that may match golden patterns |
 | **Commenter** | Delivery failure | ~0 | All confirmed findings were posted |
 
-**The reviewer generation stage (75 FNs) is the primary bottleneck.** The planner (8 FNs) and calibrator (15 FNs) are secondary.
+**The reviewer generation stage is the primary bottleneck.** The planner and calibrator are secondary.
 
 ---
 
@@ -316,12 +354,14 @@ keycloak#33832 consumed 75K tokens across 5 reviewer tasks, all producing 0 find
 
 ## 9. Comparison with v3 Architecture Goals
 
+*Source: `judge-merged.json` for measured metrics; acceptance gates from `docs/v3-architecture.md`.*
+
 | Metric | v3 Target | Measured | Status |
 |---|---|---:|---|
-| Precision ≥ 35% | 35% | 38.89% | ✓ Met |
-| Recall ≥ 45% | 45% | 25.55% | ✗ **Missed by 19.5pp** |
-| F1 ≥ 39% | 39% | 30.84% | ✗ **Missed by 8.2pp** |
-| Zero-candidate PRs ≤ 10% | 10% | 20% | ✗ **Missed by 10pp** |
+| Precision >= 35% | 35% | 38.89% | Met |
+| Recall >= 45% | 45% | 25.55% | **Missed by 19.5pp** |
+| F1 >= 39% | 39% | 30.84% | **Missed by 8.2pp** |
+| Zero-candidate PRs <= 10% | 10% | 20% | **Missed by 10pp** |
 
 The precision gate is met. The recall and F1 gates fail. The zero-candidate PR target is double the limit.
 
@@ -329,11 +369,11 @@ The precision gate is met. The recall and F1 gates fail. The zero-candidate PR t
 
 | Metric | Release Target | Measured | Gap |
 |---|---|---:|---:|
-| Precision ≥ 40% | 40% | 38.89% | −1.1pp |
-| Recall ≥ 60% | 60% | 25.55% | −34.5pp |
-| F1 ≥ 48% | 48% | 30.84% | −17.2pp |
-| Critical recall ≥ 90% | 90% | 77.78% | −12.2pp |
-| High recall ≥ 60% | 60% | 24.39% | −35.6pp |
+| Precision >= 40% | 40% | 38.89% | −1.1pp |
+| Recall >= 60% | 60% | 25.55% | −34.5pp |
+| F1 >= 48% | 48% | 30.84% | −17.2pp |
+| Critical recall >= 90% | 90% | 77.78% | −12.2pp |
+| High recall >= 60% | 60% | 24.39% | −35.6pp |
 
 ---
 
@@ -380,10 +420,10 @@ The precision gate is met. The recall and F1 gates fail. The zero-candidate PR t
 
 ### Experiment 4: Calibrator Threshold Tuning (Expected: +3-5pp recall)
 
-**Hypothesis**: The calibrator is too aggressive — it rejects 52% of candidates, including some valid findings. Adjusting the calibrator's prompt to be less aggressive on borderline findings would increase recall.
+**Hypothesis**: The calibrator is too aggressive — it rejects 52.1% of candidates, including some valid findings. Adjusting the calibrator's prompt to be less aggressive on borderline findings would increase recall.
 
 **Implementation**:
-- Analyze the 15 FNs that were rejected by the calibrator
+- Analyze the FNs that were rejected by the calibrator
 - Adjust the calibrator prompt: "When in doubt, confirm rather than reject"
 - Add a confidence threshold: findings with reviewer confidence > 0.8 should not be rejected by the calibrator unless there's explicit counterevidence
 
@@ -444,28 +484,19 @@ The precision gate is met. The recall and F1 gates fail. The zero-candidate PR t
 | P5 | Cross-file context enrichment | +2-3pp | +10-15% | Low |
 | P6 | Agentic reviewer loops | +3-7pp | +30-50% | Medium |
 
-**Combined P0+P1+P2+P3 could plausibly reach F1 ≈ 45-50%, recall ≈ 45-55%, precision ≈ 35-40%.** This would meet the v3 intermediate target and approach the release target.
-
----
-
-## 12. Methodology Notes
-
-- **Judge**: MiMo v2.5 Pro used as semantic judge, matching ReviewForge candidates to golden findings by semantic equivalence, not string matching.
-- **ReviewForge executor**: MiMo v2.5 Pro used for all pipeline agents (planner, reviewers, calibrator).
-- **Qodo-v2 baseline**: Recorded candidates from the benchmark dataset, re-judged with the same MiMo rubric.
-- **Limitations**: Same model used for execution and judging may introduce correlated biases. The Qodo baseline uses pre-recorded candidates, not a fresh run. The benchmark is 50 PRs — confidence intervals are wide.
+**Combined P0+P1+P2+P3 could plausibly reach F1 ~45-50%, recall ~45-55%, precision ~35-40%.** This would meet the v3 intermediate target and approach the release target.
 
 ---
 
 ## Appendix A: Data Sources
 
-| Artifact | Path |
-|---|---|
-| Summary | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\summary.json` |
-| Per-PR results | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\results-merged.json` |
-| Judge results | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\judge-merged.json` |
-| Golden dataset | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\workload.json` |
-| Event logs | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\events\*.jsonl` |
-| Shard DBs | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\shard{1,2,3}\reviewforge-martian.db` |
-| Architecture spec | `docs/v3-architecture.md` |
-| Agent guide | `AGENTS.md` |
+| Artifact | Path | Role |
+|---|---|---|
+| Workload | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\workload.json` | Authoritative: 50 PRs, 137 golden findings |
+| Per-PR results | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\results-merged.json` | Authoritative: pipeline counts, tokens, status |
+| Judge results | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\judge-merged.json` | Authoritative: TP/FP/FN, metrics |
+| Summary | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\summary.json` | Authoritative: aggregate metrics, by_family, by_severity |
+| Shard DBs | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\reviewforge-martian.db` | Supplemental: per-finding reviewer/category lineage |
+| Event logs | `E:\ReviewForge-mimo-p1\.reviewforge\martian50-0823da6\events\*.jsonl` | Supplemental: timing, reviewer dispatch |
+| Validation script | `.reviewforge/v3-diagnostics/validate_counts.py` | Asserts canonical counts |
+| Architecture spec | `docs/v3-architecture.md` | Acceptance gates |

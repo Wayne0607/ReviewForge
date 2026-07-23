@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import Finding, StateStore
+from reviewforge.engine.budget import TokenBudget
 from reviewforge.engine.escalation import (
     TRACE_CATEGORIES,
     EscalationReviewer,
@@ -206,6 +208,24 @@ class TestPublicationGate:
         assert finding.message in user.content
 
     @pytest.mark.asyncio
+    async def test_forced_final_verdict_uses_raw_model_without_tools(self, gateway):
+        class _RawFinalLLM:
+            async def ainvoke(self, _messages):
+                return AIMessage(
+                    content='{"verdict":"confirmed","confidence":0.9,"reason":"grounded"}',
+                )
+
+        gate = PublicationGateReviewer(_RawFinalLLM(), gateway)
+
+        result = await gate._force_final_verdict([], TokenBudget(100))
+
+        assert result == {
+            "verdict": "confirmed",
+            "confidence": 0.9,
+            "reason": "grounded",
+        }
+
+    @pytest.mark.asyncio
     async def test_valid_verdict_is_attributed_to_publication_gate(
         self,
         gateway,
@@ -255,8 +275,6 @@ class TestPublicationGate:
     @pytest.mark.parametrize(
         ("reviewer", "category", "confidence"),
         [
-            ("security_reviewer", "ssrf", 0.75),
-            ("security_reviewer", "unsafe-postmessage", 0.85),
             ("localization_reviewer", "language-mismatch", 0.9),
             ("quality_reviewer", "null-safety", 0.9),
             ("correctness_reviewer", "nullish-vs-falsy-semantics", 0.85),
@@ -281,7 +299,8 @@ class TestPublicationGate:
         ("reviewer", "category", "confidence"),
         [
             ("security_reviewer", "input-validation", 0.99),
-            ("security_reviewer", "ssrf", 0.7),
+            ("security_reviewer", "ssrf", 0.99),
+            ("security_reviewer", "unsafe-postmessage", 0.99),
             ("testing_reviewer", "test-assertion", 0.99),
             ("correctness_reviewer", "wrong-callee-contract", 0.99),
             ("quality_reviewer", "null-safety", 0.8),
@@ -301,6 +320,31 @@ class TestPublicationGate:
 
         assert PublicationGateReviewer.recall_protected(finding) is False
 
+    def test_only_critical_security_is_protected_from_operational_failure(self):
+        critical = _make_finding(
+            reviewer="security_reviewer",
+            category="command-injection",
+            confidence=0.9,
+        )
+        noisy = _make_finding(
+            reviewer="security_reviewer",
+            category="ssrf",
+            confidence=0.9,
+        )
+
+        assert PublicationGateReviewer.operational_recall_protected(critical) is True
+        assert PublicationGateReviewer.operational_recall_protected(noisy) is False
+
+    def test_high_confidence_contract_is_protected_only_when_gate_is_inconclusive(self):
+        contract = _make_finding(
+            reviewer="correctness_reviewer",
+            category="wrong-callee-contract",
+            confidence=0.9,
+        )
+
+        assert PublicationGateReviewer.recall_protected(contract) is False
+        assert PublicationGateReviewer.operational_recall_protected(contract) is True
+
     @pytest.mark.asyncio
     async def test_recall_guard_retains_protected_finding(
         self,
@@ -311,9 +355,9 @@ class TestPublicationGate:
         gate = PublicationGateReviewer(MockChatLLM(), gateway)
         finding = _make_finding(
             status="confirmed",
-            reviewer="security_reviewer",
-            category="ssrf",
-            confidence=0.8,
+            reviewer="correctness_reviewer",
+            category="error-handling",
+            confidence=0.85,
         )
         monkeypatch.setattr(gate, "_ensure_tools", lambda _state: ([], {}, None))
 
@@ -329,7 +373,7 @@ class TestPublicationGate:
         result = await gate.escalate(finding, state)
 
         assert result.status == "confirmed"
-        assert result.confidence == 0.8
+        assert result.confidence == 0.85
         assert result.verified_by == "publication-gate-recall-guard"
         assert "confidence=0.95" in result.verify_reason
         assert "not enough data flow" in result.verify_reason
@@ -339,7 +383,8 @@ class TestPublicationGate:
         ("reviewer", "category", "expected_status", "expected_verifier"),
         [
             ("correctness_reviewer", "logic-error", "candidate", "publication-gate-inconclusive"),
-            ("security_reviewer", "ssrf", "confirmed", "publication-gate-recall-guard"),
+            ("security_reviewer", "ssrf", "candidate", "publication-gate-inconclusive"),
+            ("security_reviewer", "command-injection", "confirmed", "publication-gate-recall-guard"),
         ],
     )
     async def test_provider_failure_isolated_per_finding(

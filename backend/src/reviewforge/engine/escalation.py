@@ -52,22 +52,12 @@ VALID_VERDICTS = {"confirmed", "false_positive"}
 # guard. The final gate still investigates them, but an inconclusive or
 # negative verdict cannot suppress them unless an earlier deterministic stage
 # has already done so.
-PUBLICATION_RECALL_SECURITY_CATEGORIES = {
-    "ci-security",
+PUBLICATION_OPERATIONAL_SECURITY_CATEGORIES = {
     "code-injection",
     "command-injection",
-    "data-leak",
-    "hardcoded-secrets",
     "insecure-deserialization",
-    "path-traversal",
     "rce",
-    "sandbox-escape",
     "sql-injection",
-    "ssrf",
-    "unsafe-postmessage",
-    "xss",
-    "xss-bypass",
-    "xxe",
 }
 
 # System prompt — shared across all escalation invocations.
@@ -268,11 +258,15 @@ class EscalationReviewer:
 
         return None
 
-    async def _force_final_verdict(self, chat: list[Any], llm: Any, budget: TokenBudget) -> dict | None:
-        """Budget/steps exhausted — force one final LLM call for verdict."""
+    async def _force_final_verdict(self, chat: list[Any], budget: TokenBudget) -> dict | None:
+        """Budget/steps exhausted — force a no-tools final verdict."""
         chat.append(HumanMessage(content="已达上限。请立刻只输出 verdict JSON。"))
         try:
-            final = await llm.ainvoke(chat)
+            # The tool-bound model may answer this request with yet another
+            # tool call, which contains no JSON and turns a semantic decision
+            # into an avoidable inconclusive result. Use the raw model so this
+            # final turn can only return content.
+            final = await self._llm.ainvoke(chat)
             budget.add(final)
             return self._parse_verdict(final.content)
         except Exception as e:
@@ -305,7 +299,7 @@ class EscalationReviewer:
         if result:
             return self._apply_verdict(finding, result)
 
-        result = await self._force_final_verdict(chat, llm, budget)
+        result = await self._force_final_verdict(chat, budget)
         if result:
             return self._apply_verdict(finding, result)
 
@@ -444,8 +438,6 @@ class PublicationGateReviewer(EscalationReviewer):
         category = normalize_category(finding.category)
         confidence = finding.confidence
 
-        if reviewer == "security_reviewer":
-            return confidence >= 0.75 and category in PUBLICATION_RECALL_SECURITY_CATEGORIES
         if reviewer == "localization_reviewer":
             return confidence >= 0.85 and category in {"language-mismatch", "script-mismatch"}
         if reviewer == "quality_reviewer":
@@ -457,6 +449,21 @@ class PublicationGateReviewer(EscalationReviewer):
             }
         return False
 
+    @classmethod
+    def operational_recall_protected(cls, finding: Finding) -> bool:
+        """Retain critical security findings only when the gate did not decide."""
+        if cls.recall_protected(finding):
+            return True
+        reviewer = finding.reviewer.strip().lower().replace("-", "_")
+        category = normalize_category(finding.category)
+        if reviewer == "correctness_reviewer":
+            return finding.confidence >= 0.9 and category == "wrong-callee-contract"
+        return (
+            reviewer == "security_reviewer"
+            and finding.confidence >= 0.85
+            and category in PUBLICATION_OPERATIONAL_SECURITY_CATEGORIES
+        )
+
     async def escalate(
         self,
         finding: Finding,
@@ -465,7 +472,8 @@ class PublicationGateReviewer(EscalationReviewer):
     ) -> Finding:
         original_status = finding.status
         original_confidence = finding.confidence
-        protected = self.recall_protected(finding)
+        negative_verdict_protected = self.recall_protected(finding)
+        operationally_protected = self.operational_recall_protected(finding)
         try:
             result = await super().escalate(finding, state, escalation_categories)
         except asyncio.CancelledError:
@@ -476,7 +484,7 @@ class PublicationGateReviewer(EscalationReviewer):
             result.verified_by = "publication-gate-provider-error"
             result.verify_reason = "Final publication verification failed before producing a verdict."
         if result.verified_by == "escalation":
-            if result.status == "false_positive" and protected:
+            if result.status == "false_positive" and negative_verdict_protected:
                 gate_confidence = result.confidence
                 gate_reason = result.verify_reason.strip() or "No reason supplied."
                 result.status = original_status
@@ -489,7 +497,7 @@ class PublicationGateReviewer(EscalationReviewer):
             result.verified_by = "publication-gate"
             return result
 
-        if protected:
+        if operationally_protected:
             gate_reason = result.verify_reason.strip() or "No final verdict was produced."
             result.status = original_status
             result.confidence = original_confidence

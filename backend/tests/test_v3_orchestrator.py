@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1054,6 +1055,35 @@ class TestTargetedClosureExecution:
         assert cell is not None
         return unit, cell
 
+    @staticmethod
+    def _install_two_units(orch: Orchestrator) -> tuple[list[SemanticUnit], list[CoverageCell]]:
+        units = [
+            SemanticUnit(
+                id=f"su_{name}",
+                path="src/shared.py",
+                start_line=4,
+                end_line=10,
+                risk_score=0.8,
+                risk_reasons=["changed-control-flow"],
+                risk_signals=[{"type": "changed-control-flow"}],
+            )
+            for name in ("first", "second")
+        ]
+        cells = [
+            CoverageCell(
+                unit_id=unit.id,
+                path=unit.path,
+                line=unit.start_line,
+                dimension=CoverageDimension.CORRECTNESS,
+                risk=unit.risk_score,
+                mandatory=True,
+            )
+            for unit in units
+        ]
+        orch._v3_change_set = MagicMock(units=units)
+        orch._v3_ledger = CoverageLedger(cells=cells)
+        return units, cells
+
     @pytest.mark.asyncio
     async def test_abstain_is_retried_and_second_unit_finding_covers(self):
         orch = _orchestrator(
@@ -1106,6 +1136,92 @@ class TestTargetedClosureExecution:
         assert cell.status == CoverageStatus.ABSTAINED
         assert not cell.finding_ids
         assert len(state.list_findings()) == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_cells_execute_concurrently(self):
+        orch = _orchestrator(
+            v3_enabled=True,
+            v3_coverage_max_attempts=1,
+            v3_coverage_max_cells_per_round=2,
+        )
+        self._install_two_units(orch)
+        state = _make_state(files_changed=["src/shared.py"])
+        both_started = asyncio.Event()
+        active = 0
+        peak_active = 0
+
+        async def execute(_task, _state):
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            if active == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            active -= 1
+            return []
+
+        reviewer = MagicMock()
+        reviewer.execute = AsyncMock(side_effect=execute)
+        with patch.object(orch, "_create_reviewer", return_value=reviewer):
+            await asyncio.wait_for(orch._v3_run_targeted_closure(state, "run-1", set()), timeout=2)
+
+        assert peak_active == 2
+        assert reviewer.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_completion_order_cannot_change_dedup_winner(self):
+        orch = _orchestrator(
+            v3_enabled=True,
+            v3_coverage_max_attempts=1,
+            v3_coverage_max_cells_per_round=2,
+        )
+        _units, cells = self._install_two_units(orch)
+        state = _make_state(files_changed=["src/shared.py"])
+        second_finished = asyncio.Event()
+
+        async def execute(task, _state):
+            if "su_first" in task.rationale:
+                await asyncio.wait_for(second_finished.wait(), timeout=1)
+                message = "first selected cell"
+            else:
+                second_finished.set()
+                message = "second completed first"
+            return [Finding(file="src/shared.py", line=7, category="logic-error", message=message)]
+
+        reviewer = MagicMock()
+        reviewer.execute = AsyncMock(side_effect=execute)
+        with patch.object(orch, "_create_reviewer", return_value=reviewer):
+            await orch._v3_run_targeted_closure(state, "run-1", set())
+
+        findings = state.list_findings()
+        assert len(findings) == 1
+        assert findings[0].message == "first selected cell"
+        assert cells[0].status == CoverageStatus.COVERED
+        assert cells[1].status == CoverageStatus.ABSTAINED
+
+    @pytest.mark.asyncio
+    async def test_one_cell_failure_does_not_cancel_sibling(self):
+        orch = _orchestrator(
+            v3_enabled=True,
+            v3_coverage_max_attempts=1,
+            v3_coverage_max_cells_per_round=2,
+        )
+        _units, cells = self._install_two_units(orch)
+        state = _make_state(files_changed=["src/shared.py"])
+
+        async def execute(task, _state):
+            if "su_first" in task.rationale:
+                raise RuntimeError("first failed")
+            return [Finding(file="src/shared.py", line=7, category="logic-error", message="sibling bug")]
+
+        reviewer = MagicMock()
+        reviewer.execute = AsyncMock(side_effect=execute)
+        with patch.object(orch, "_create_reviewer", return_value=reviewer):
+            await orch._v3_run_targeted_closure(state, "run-1", set())
+
+        assert cells[0].status == CoverageStatus.FAILED
+        assert cells[1].status == CoverageStatus.COVERED
+        assert [task.status for task in state.list_tasks()] == ["failed", "completed"]
 
 
 class TestBroadPassTracking:

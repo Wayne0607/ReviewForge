@@ -1248,141 +1248,178 @@ class Orchestrator:
             )
             return
 
-        # Group by path for efficient task creation
-        cells_by_path: dict[str, list[CoverageCell]] = {}
-        for cell in selected:
-            cells_by_path.setdefault(cell.path, []).append(cell)
-
         existing_keys = {finding_identity(f) for f in state.list_findings()}
+        scheduler = Scheduler(concurrency=4)
 
-        for path, path_cells in cells_by_path.items():
-            for cell in path_cells:
-                while (
-                    cell.status in (CoverageStatus.PENDING, CoverageStatus.ABSTAINED, CoverageStatus.FAILED)
-                    and len(cell.assigned_task_ids) < self._v3_coverage_max_attempts
-                ):
-                    unit = self._find_unit_by_id(cell.unit_id)
-                    dim = cell.dimension.value
-                    reviewer = self._dimension_reviewer(dim)
-                    is_retry = bool(cell.assigned_task_ids)
+        # Run one attempt per eligible cell in each wave. Reviewer calls are
+        # independent and expensive, so they may overlap; all shared-state
+        # integration stays below, in the stable ``selected`` order.
+        for _wave in range(self._v3_coverage_max_attempts):
+            wave_cells = [
+                cell
+                for cell in selected
+                if cell.status in (CoverageStatus.PENDING, CoverageStatus.ABSTAINED, CoverageStatus.FAILED)
+                and len(cell.assigned_task_ids) < self._v3_coverage_max_attempts
+            ]
+            if not wave_cells:
+                break
 
-                    focus = self._build_review_focus(
-                        path=path,
-                        symbol=getattr(unit, "symbol", "") if unit else "",
-                        start_line=getattr(unit, "start_line", 0) if unit else 0,
-                        end_line=getattr(unit, "end_line", 0) if unit else 0,
-                        dimension=dim,
-                        risk_reasons=getattr(unit, "risk_reasons", []) if unit else [],
-                        is_retry=is_retry,
+            wave_items: list[tuple[CoverageCell, Any, ReviewTask, Any]] = []
+            item_by_task_id: dict[str, tuple[CoverageCell, Any, ReviewTask, Any]] = {}
+            execution_results: dict[str, tuple[list[Finding] | None, Exception | None, int]] = {}
+
+            for cell in wave_cells:
+                unit = self._find_unit_by_id(cell.unit_id)
+                dim = cell.dimension.value
+                reviewer = self._dimension_reviewer(dim)
+                focus = self._build_review_focus(
+                    path=cell.path,
+                    symbol=getattr(unit, "symbol", "") if unit else "",
+                    start_line=getattr(unit, "start_line", 0) if unit else 0,
+                    end_line=getattr(unit, "end_line", 0) if unit else 0,
+                    dimension=dim,
+                    risk_reasons=getattr(unit, "risk_reasons", []) if unit else [],
+                    is_retry=bool(cell.assigned_task_ids),
+                )
+
+                task = ReviewTask(
+                    reviewer=reviewer,
+                    files=[cell.path],
+                    rationale=f"v3 targeted closure: {dim} for {cell.unit_id}",
+                    status="claimed",
+                )
+                state.add_task(task)
+                self._v3_closure_task_ids.add(task.id)
+
+                try:
+                    cell.transition(CoverageStatus.ASSIGNED, task_id=task.id)
+                except ValueError:
+                    self._events.emit(
+                        "v3.coverage.cell_failed",
+                        {"unit_id": cell.unit_id, "dimension": dim, "error": "invalid cell state"},
                     )
+                    continue
 
-                    task = ReviewTask(
-                        reviewer=reviewer,
-                        files=[path],
-                        rationale=f"v3 targeted closure: {dim} for {cell.unit_id}",
-                        status="claimed",
-                    )
-                    state.add_task(task)
-                    self._v3_closure_task_ids.add(task.id)
-
+                reviewer_obj = self._create_reviewer(reviewer)
+                if not reviewer_obj:
+                    error = f"unknown reviewer: {reviewer}"
+                    state.update_task(task.id, status="failed", error=error)
                     try:
-                        cell.transition(CoverageStatus.ASSIGNED, task_id=task.id)
+                        cell.transition(CoverageStatus.FAILED, terminal_reason=error)
                     except ValueError:
-                        self._events.emit(
-                            "v3.coverage.cell_failed",
-                            {"unit_id": cell.unit_id, "dimension": dim, "error": "invalid cell state"},
-                        )
-                        break
+                        pass
+                    self._events.emit(
+                        "v3.coverage.cell_failed",
+                        {"unit_id": cell.unit_id, "dimension": dim, "error": error},
+                    )
+                    continue
 
-                    reviewer_obj = self._create_reviewer(reviewer)
-                    if not reviewer_obj:
-                        error = f"unknown reviewer: {reviewer}"
-                        state.update_task(task.id, status="failed", error=error)
-                        try:
-                            cell.transition(CoverageStatus.FAILED, terminal_reason=error)
-                        except ValueError:
-                            pass
-                        self._events.emit(
-                            "v3.coverage.cell_failed",
-                            {"unit_id": cell.unit_id, "dimension": dim, "error": error},
-                        )
-                        continue
+                lang = self._detect_task_language(task)
+                fw = self._detect_task_framework(task)
+                self._attach_skill(reviewer_obj, lang, fw)
+                reviewer_obj._target_language = lang or ""
+                reviewer_obj._target_framework = fw or ""
+                reviewer_obj._review_focus = focus
 
-                    lang = self._detect_task_language(task)
-                    fw = self._detect_task_framework(task)
-                    self._attach_skill(reviewer_obj, lang, fw)
-                    reviewer_obj._target_language = lang or ""
-                    reviewer_obj._target_framework = fw or ""
-                    reviewer_obj._review_focus = focus
+                item = (cell, unit, task, reviewer_obj)
+                wave_items.append(item)
+                item_by_task_id[task.id] = item
 
-                    started = time.monotonic()
+            async def _execute_closure_task(task: ReviewTask) -> None:
+                reviewer_obj = item_by_task_id[task.id][3]
+                started = time.monotonic()
+                try:
+                    findings = await reviewer_obj.execute(task, state)
+                    execution_results[task.id] = (
+                        findings,
+                        None,
+                        int((time.monotonic() - started) * 1000),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    execution_results[task.id] = (
+                        None,
+                        exc,
+                        int((time.monotonic() - started) * 1000),
+                    )
+
+            await scheduler.dispatch([item[2] for item in wave_items], _execute_closure_task)
+
+            # Deterministic commit barrier: execution completion order cannot
+            # affect finding de-duplication, state insertion, or emitted events.
+            for cell, unit, task, _reviewer_obj in wave_items:
+                findings, error, duration_ms = execution_results.get(
+                    task.id,
+                    (None, RuntimeError("closure worker produced no result"), 0),
+                )
+                dim = cell.dimension.value
+                reviewer = task.reviewer
+                if error is not None:
+                    state.update_task(task.id, status="failed", error=str(error))
                     try:
-                        findings = await reviewer_obj.execute(task, state)
-                        accepted_task_findings: list[Finding] = []
-                        for finding in findings:
-                            key = finding_identity(finding)
-                            if key in phase0_keys or key in existing_keys:
-                                continue
-                            state.add_finding(finding)
-                            existing_keys.add(key)
-                            accepted_task_findings.append(finding)
-                            self._v3_closure_finding_ids.add(finding.id)
-                        state.update_task(task.id, status="completed")
-
-                        matching_findings = [
-                            finding for finding in accepted_task_findings if self._finding_matches_unit(finding, unit)
-                        ]
-                        if matching_findings:
-                            finding = matching_findings[0]
-                            cell.transition(
-                                CoverageStatus.COVERED,
-                                terminal_reason=f"closure finding:{finding.id}",
-                            )
-                            cell.add_finding(finding.id)
-                        else:
-                            cell.transition(
-                                CoverageStatus.ABSTAINED,
-                                terminal_reason="targeted closure produced no unit-specific finding",
-                            )
-
-                        self._events.emit(
-                            "v3.coverage.cell_reviewed",
-                            {
-                                "unit_id": cell.unit_id,
-                                "dimension": dim,
-                                "attempt": len(cell.assigned_task_ids),
-                                "findings": len(accepted_task_findings),
-                                "unit_specific_findings": len(matching_findings),
-                                "duration_ms": int((time.monotonic() - started) * 1000),
-                            },
+                        cell.transition(CoverageStatus.FAILED, terminal_reason=str(error)[:200])
+                    except ValueError:
+                        pass
+                    self._events.emit(
+                        "v3.coverage.cell_failed",
+                        {"unit_id": cell.unit_id, "dimension": dim, "error": str(error)},
+                    )
+                    if self._db:
+                        await self._db.insert_metric(
+                            run_id,
+                            f"v3_closure_{reviewer}",
+                            duration_ms=duration_ms,
+                            status="failed",
+                            error=str(error)[:200],
                         )
-                        if self._db:
-                            await self._db.insert_metric(
-                                run_id,
-                                f"v3_closure_{reviewer}",
-                                findings_count=len(accepted_task_findings),
-                                duration_ms=int((time.monotonic() - started) * 1000),
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        state.update_task(task.id, status="failed", error=str(exc))
-                        try:
-                            cell.transition(CoverageStatus.FAILED, terminal_reason=str(exc)[:200])
-                        except ValueError:
-                            pass
-                        self._events.emit(
-                            "v3.coverage.cell_failed",
-                            {"unit_id": cell.unit_id, "dimension": dim, "error": str(exc)},
-                        )
-                        if self._db:
-                            await self._db.insert_metric(
-                                run_id,
-                                f"v3_closure_{reviewer}",
-                                duration_ms=int((time.monotonic() - started) * 1000),
-                                status="failed",
-                                error=str(exc)[:200],
-                            )
+                    continue
+
+                accepted_task_findings: list[Finding] = []
+                for finding in findings or []:
+                    key = finding_identity(finding)
+                    if key in phase0_keys or key in existing_keys:
+                        continue
+                    state.add_finding(finding)
+                    existing_keys.add(key)
+                    accepted_task_findings.append(finding)
+                    self._v3_closure_finding_ids.add(finding.id)
+                state.update_task(task.id, status="completed")
+
+                matching_findings = [
+                    finding for finding in accepted_task_findings if self._finding_matches_unit(finding, unit)
+                ]
+                if matching_findings:
+                    finding = matching_findings[0]
+                    cell.transition(
+                        CoverageStatus.COVERED,
+                        terminal_reason=f"closure finding:{finding.id}",
+                    )
+                    cell.add_finding(finding.id)
+                else:
+                    cell.transition(
+                        CoverageStatus.ABSTAINED,
+                        terminal_reason="targeted closure produced no unit-specific finding",
+                    )
+
+                self._events.emit(
+                    "v3.coverage.cell_reviewed",
+                    {
+                        "unit_id": cell.unit_id,
+                        "dimension": dim,
+                        "attempt": len(cell.assigned_task_ids),
+                        "findings": len(accepted_task_findings),
+                        "unit_specific_findings": len(matching_findings),
+                        "duration_ms": duration_ms,
+                    },
+                )
+                if self._db:
+                    await self._db.insert_metric(
+                        run_id,
+                        f"v3_closure_{reviewer}",
+                        findings_count=len(accepted_task_findings),
+                        duration_ms=duration_ms,
+                    )
 
         self._events.emit(
             "v3.coverage.completed",

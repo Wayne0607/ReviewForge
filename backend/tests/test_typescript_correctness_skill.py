@@ -77,13 +77,13 @@ def test_resolve_skill_prefers_ts_correctness_over_universal_for_typescript():
     assert resolved.name == "typescript_correctness"
 
 
-def test_resolve_skill_falls_back_to_universal_for_python():
-    """For Python (no language-specific correctness skill), universal correctness_rules wins."""
+def test_resolve_skill_uses_python_specific_skill_for_python():
+    """Combined language skills keep Python on its own correctness rules."""
     orch = _orch()
     metas = orch._skills_by_type.get("correctness", [])
 
     resolved = orch._resolve_skill(metas, language="python")
-    assert resolved.name == "correctness_rules"
+    assert resolved.name == "python_correctness"
 
 
 def test_resolve_skill_falls_back_to_universal_when_no_language():
@@ -108,12 +108,12 @@ def test_ts_correctness_skill_attached_to_reviewer_for_typescript():
     assert "Promise" in r._skill_body or "async" in r._skill_body
 
 
-def test_universal_correctness_skill_attached_for_python():
-    """The correctness reviewer should get universal correctness_rules for .py files."""
+def test_python_correctness_skill_attached_for_python():
+    """The correctness reviewer should get python_correctness for .py files."""
     orch = _orch()
     r = orch._create_reviewer("correctness_reviewer")
     orch._attach_skill(r, target_language="python")
-    assert r._skill_name == "correctness_rules"
+    assert r._skill_name == "python_correctness"
 
 
 # ── Prompt injection ───────────────────────────────────────────

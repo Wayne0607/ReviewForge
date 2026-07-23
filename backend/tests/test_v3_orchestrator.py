@@ -23,6 +23,7 @@ import pytest
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.coverage_ledger import (
+    CoverageCell,
     CoverageDimension,
     CoverageLedger,
     CoverageStatus,
@@ -1020,6 +1021,80 @@ class TestSummaryStructure:
         assert summary["attempts"] == 0
         assert summary["selected"] == 0
         assert summary["closure_findings"] == 0
+
+
+class TestTargetedClosureExecution:
+    """Exercise the real retry loop and unit-specific closure accounting."""
+
+    @staticmethod
+    def _install_unit(orch: Orchestrator) -> tuple[SemanticUnit, CoverageCell]:
+        unit = SemanticUnit(
+            id="su_auth",
+            path="src/auth.py",
+            start_line=4,
+            end_line=10,
+            risk_score=0.8,
+            risk_reasons=["security-sensitive-symbol"],
+            risk_signals=[{"type": "security-sensitive-symbol"}],
+        )
+        orch._v3_change_set = MagicMock(units=[unit])
+        orch._v3_ledger = CoverageLedger.from_change_set({"units": [unit.to_dict()]})
+        cell = orch._v3_ledger.get_cell("su_auth", CoverageDimension.CORRECTNESS)
+        assert cell is not None
+        return unit, cell
+
+    @pytest.mark.asyncio
+    async def test_abstain_is_retried_and_second_unit_finding_covers(self):
+        orch = _orchestrator(
+            v3_enabled=True,
+            v3_coverage_max_attempts=2,
+            v3_coverage_max_cells_per_round=1,
+        )
+        _unit, cell = self._install_unit(orch)
+        reviewer = MagicMock()
+        reviewer.execute = AsyncMock(
+            side_effect=[
+                [],
+                [Finding(file="src/auth.py", line=7, category="logic-error", message="real bug")],
+            ]
+        )
+        state = _make_state(files_changed=["src/auth.py"])
+
+        with patch.object(orch, "_create_reviewer", return_value=reviewer):
+            await orch._v3_run_targeted_closure(state, "run-1", set())
+
+        assert reviewer.execute.await_count == 2
+        assert cell.status == CoverageStatus.COVERED
+        assert len(cell.assigned_task_ids) == 2
+        assert len(orch._v3_closure_task_ids) == 2
+        assert len(orch._v3_closure_finding_ids) == 1
+        assert orch._build_v3_coverage_summary()["selected"] == 1
+        assert orch._build_v3_coverage_summary()["closure_findings"] == 1
+
+    @pytest.mark.asyncio
+    async def test_out_of_unit_finding_does_not_close_cell(self):
+        orch = _orchestrator(
+            v3_enabled=True,
+            v3_coverage_max_attempts=2,
+            v3_coverage_max_cells_per_round=1,
+        )
+        _unit, cell = self._install_unit(orch)
+        reviewer = MagicMock()
+        reviewer.execute = AsyncMock(
+            side_effect=[
+                [Finding(file="src/auth.py", line=40, category="logic-error", message="other bug")],
+                [],
+            ]
+        )
+        state = _make_state(files_changed=["src/auth.py"])
+
+        with patch.object(orch, "_create_reviewer", return_value=reviewer):
+            await orch._v3_run_targeted_closure(state, "run-1", set())
+
+        assert reviewer.execute.await_count == 2
+        assert cell.status == CoverageStatus.ABSTAINED
+        assert not cell.finding_ids
+        assert len(state.list_findings()) == 1
 
 
 class TestBroadPassTracking:

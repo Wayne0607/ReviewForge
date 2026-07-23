@@ -108,6 +108,14 @@ def build_registry() -> SpecRegistry:
                 "type": "object",
                 "properties": {
                     "file_path": {"type": "string"},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional 1-based first line to return",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional inclusive last line to return",
+                    },
                 },
                 "required": ["file_path"],
             },

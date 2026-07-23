@@ -42,9 +42,18 @@ def build_reviewer_tools(
     """
     gw = gateway
 
-    async def read_file(file_path: str) -> str:
-        """Read full file content at PR head commit."""
-        return await gw.invoke("read_file", {"file_path": file_path}, state, agent_name=agent_name) or ""
+    async def read_file(
+        file_path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
+        """Read full or line-windowed file content at the PR head commit."""
+        params: dict[str, Any] = {"file_path": file_path}
+        if start_line is not None:
+            params["start_line"] = start_line
+        if end_line is not None:
+            params["end_line"] = end_line
+        return await gw.invoke("read_file", params, state, agent_name=agent_name) or ""
 
     async def search_code(pattern: str, file_glob: str = "") -> str:
         """Search code in repo by pattern."""
@@ -66,7 +75,7 @@ def build_reviewer_tools(
         StructuredTool.from_function(
             coroutine=read_file,
             name="read_file",
-            description="读取文件在 PR head 版本的完整内容；当 diff 上下文不足以判断时使用",
+            description="读取文件在 PR head 版本的完整内容或指定的 1-based 行窗口",
         ),
         StructuredTool.from_function(
             coroutine=search_code,

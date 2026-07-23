@@ -290,3 +290,69 @@ async def test_code_evidence_gate_runs_before_escalation_split():
     assert "escalation.started" not in event_types
     assert "calibration.started" not in event_types
     assert llm.calls == 3
+
+
+async def test_publication_gate_updates_every_confirmed_finding():
+    reg = build_registry()
+    llm = _VerdictLLM()
+    events = []
+    event_bus = EventBus()
+    event_bus.subscribe(events.append)
+    orch = Orchestrator(
+        registry=reg,
+        gateway=ToolGateway(reg, MockGitHubClient()),
+        event_bus=event_bus,
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        publication_gate_enabled=True,
+    )
+    state = StateStore(
+        pr_number=4,
+        repo="o/r",
+        head_sha="h4",
+        files_changed=["a.py"],
+    )
+    first = Finding(
+        file="a.py",
+        line=1,
+        severity="warning",
+        category="logic-error",
+        message="first",
+        confidence=0.8,
+        status="confirmed",
+    )
+    second = Finding(
+        file="a.py",
+        line=2,
+        severity="error",
+        category="null-safety",
+        message="second",
+        confidence=0.9,
+        status="confirmed",
+    )
+    state.add_finding(first)
+    state.add_finding(second)
+
+    class _Gate:
+        async def escalate_batch(self, findings, _state, concurrency):
+            assert concurrency == 4
+            findings[0].status = "false_positive"
+            findings[0].verified_by = "publication-gate"
+            findings[1].status = "candidate"
+            findings[1].verified_by = "publication-gate-inconclusive"
+            return findings
+
+    orch._publication_gate_reviewer = _Gate()
+    await orch._run_publication_gate(state)
+
+    assert state.findings[first.id].status == "false_positive"
+    assert state.findings[second.id].status == "candidate"
+    completed = [event for event in events if event.event_type == "publication_gate.completed"]
+    assert completed
+    assert completed[-1].data == {
+        "attempted": 2,
+        "confirmed": 0,
+        "filtered": 1,
+        "inconclusive": 1,
+    }

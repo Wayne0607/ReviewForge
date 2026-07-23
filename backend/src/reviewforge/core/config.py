@@ -144,6 +144,14 @@ class ReviewForgeConfig:
     escalation_max_steps: int = 3
     escalation_max_tokens: int = 5000
 
+    # Final agentic publication gate. Unlike calibration, this verifier reads
+    # the full file and may search repository contracts before a confirmed
+    # finding is allowed to become a review comment.
+    publication_gate_enabled: bool = False
+    publication_gate_max_steps: int = 4
+    publication_gate_max_tokens: int = 6000
+    publication_gate_concurrency: int = 4
+
     # Selective second pass for high-risk changed symbols that received no
     # finding in the broad first pass. Disabled by default for embedders;
     # production opts in through reviewforge.yaml.
@@ -268,6 +276,29 @@ class ReviewForgeConfig:
                         except (ValueError, TypeError):
                             pass
                     setattr(self, attr, v)
+        if "publication_gate" in data:
+            gate = data["publication_gate"] or {}
+            _gate_types = {
+                "enabled": bool,
+                "max_steps": int,
+                "max_tokens": int,
+                "concurrency": int,
+            }
+            for key, value in gate.items():
+                attr = f"publication_gate_{key}"
+                if not hasattr(self, attr):
+                    continue
+                expected = _gate_types.get(key)
+                if expected:
+                    try:
+                        value = (
+                            value.strip().lower() not in ("0", "false", "no", "")
+                            if expected is bool and isinstance(value, str)
+                            else expected(value)
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                setattr(self, attr, value)
         if "coverage_gap" in data:
             gap = data["coverage_gap"] or {}
             _gap_types = {

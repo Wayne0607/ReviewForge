@@ -108,6 +108,14 @@ escalation:
   max_steps: 3
   max_tokens: 5000
 
+# Final precision gate: every confirmed candidate must independently survive a
+# repository-aware tool loop before it can be published.
+publication_gate:
+  enabled: true
+  max_steps: 4
+  max_tokens: 6000
+  concurrency: 4
+
 # 对首轮未覆盖的高风险变更符号做一次受限 correctness 二审。
 # 二审只接受锚定到 Evidence Card 新增行且有足够置信度的具体缺陷。
 coverage_gap:

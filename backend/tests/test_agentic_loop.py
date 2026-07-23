@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessage
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import ReviewTask, StateStore
 from reviewforge.engine.mock_llm import MockChatLLM
-from reviewforge.engine.reviewers import BaseReviewer, SecurityReviewer
+from reviewforge.engine.reviewers import BaseReviewer, SecurityReviewer, build_reviewer_tools
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.mock_github import MockGitHubClient
 
@@ -153,6 +153,38 @@ async def test_agentic_tool_invokes_gateway(registry, gateway, state, task):
     # MockGitHubClient returns deterministic content
     assert isinstance(result, str)
     assert len(result) > 0
+
+
+@pytest.mark.asyncio
+async def test_read_file_supports_numbered_line_windows(registry, state):
+    class _GitHub:
+        async def get_file_content(self, repo, ref, file_path):
+            assert (repo, ref, file_path) == (
+                "test/repo",
+                "abc123",
+                "test.py",
+            )
+            return "alpha\nbeta\ngamma\ndelta"
+
+    gateway = ToolGateway(registry, _GitHub())
+
+    result = await gateway.invoke(
+        "read_file",
+        {"file_path": "test.py", "start_line": 2, "end_line": 3},
+        state,
+        "security_reviewer",
+    )
+
+    assert result == "2: beta\n3: gamma"
+
+    read_file = next(
+        tool for tool in build_reviewer_tools(gateway, state, "publication_gate") if tool.name == "read_file"
+    )
+    tool_result = await read_file.ainvoke(
+        {"file_path": "test.py", "start_line": 2, "end_line": 3},
+    )
+
+    assert tool_result == "2: beta\n3: gamma"
 
 
 @pytest.mark.asyncio

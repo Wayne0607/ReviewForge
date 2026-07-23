@@ -139,7 +139,22 @@ class ToolGateway:
         }
 
     async def _read_file(self, params: dict[str, Any], state: StateStore) -> str:
-        return await self._github.get_file_content(state.repo, state.head_sha, params["file_path"])
+        content = await self._github.get_file_content(
+            state.repo,
+            state.head_sha,
+            params["file_path"],
+        )
+        start_line = params.get("start_line")
+        end_line = params.get("end_line")
+        if start_line is None and end_line is None:
+            return content
+
+        lines = content.splitlines()
+        start = max(1, int(start_line or 1))
+        end = min(len(lines), int(end_line or len(lines)))
+        if end < start:
+            raise ValueError("read_file end_line must be >= start_line")
+        return "\n".join(f"{line_no}: {lines[line_no - 1]}" for line_no in range(start, end + 1))
 
     async def _search_code(self, params: dict[str, Any], state: StateStore) -> str:
         return await self._github.search_code(state.repo, params["pattern"], params.get("file_glob", ""))

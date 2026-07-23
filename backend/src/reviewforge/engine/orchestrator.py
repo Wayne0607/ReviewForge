@@ -33,7 +33,7 @@ from reviewforge.engine.coverage_ledger import (
 )
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
-from reviewforge.engine.escalation import EscalationReviewer
+from reviewforge.engine.escalation import EscalationReviewer, PublicationGateReviewer
 from reviewforge.engine.evidence_verifier import (
     EvidenceItem,
     EvidenceVerdict,
@@ -209,6 +209,10 @@ class Orchestrator:
         escalation_confidence_max: float = 0.7,
         escalation_max_steps: int = 3,
         escalation_max_tokens: int = 5000,
+        publication_gate_enabled: bool = False,
+        publication_gate_max_steps: int = 4,
+        publication_gate_max_tokens: int = 6000,
+        publication_gate_concurrency: int = 4,
         coverage_gap_enabled: bool = False,
         coverage_gap_min_risk_score: int = 4,
         coverage_gap_max_cards: int = 3,
@@ -236,6 +240,11 @@ class Orchestrator:
         self._escalation_confidence_max = escalation_confidence_max
         self._escalation_max_steps = escalation_max_steps
         self._escalation_max_tokens = escalation_max_tokens
+        self._publication_gate_enabled = publication_gate_enabled
+        self._publication_gate_max_steps = max(1, publication_gate_max_steps)
+        self._publication_gate_max_tokens = max(1, publication_gate_max_tokens)
+        self._publication_gate_concurrency = max(1, publication_gate_concurrency)
+        self._publication_gate_reviewer: PublicationGateReviewer | None = None
         self._coverage_gap_enabled = coverage_gap_enabled
         self._coverage_gap_min_risk_score = max(0, coverage_gap_min_risk_score)
         self._coverage_gap_max_cards = max(0, coverage_gap_max_cards)
@@ -910,6 +919,9 @@ class Orchestrator:
                     logger.error(f"Cross-PR analysis failed: {e}")
                     self._events.emit("cross_pr.failed", {"error": str(e)})
 
+            if self._publication_gate_enabled:
+                await self._run_publication_gate(state)
+
             # Persist all findings to DB
             if self._db:
                 for f in state.findings.values():
@@ -973,6 +985,62 @@ class Orchestrator:
             if self._db:
                 await self._db.fail_run(run_id, str(e))
             raise
+
+    async def _run_publication_gate(self, state: StateStore) -> None:
+        """Independently verify every not-yet-reported finding before publication."""
+
+        candidates = state.list_findings(status="confirmed")
+        if not candidates:
+            self._events.emit(
+                "publication_gate.completed",
+                {"attempted": 0, "confirmed": 0, "filtered": 0, "inconclusive": 0},
+            )
+            return
+
+        if self._publication_gate_reviewer is None:
+            gate_llm = self._escalation_llm_raw
+            if self._db:
+                gate_llm = TrackedChatLLM(
+                    inner=gate_llm,
+                    ctx=self._token_ctx,
+                    agent_name="publication_gate",
+                )
+            self._publication_gate_reviewer = PublicationGateReviewer(
+                llm=gate_llm,
+                gateway=self._gateway,
+                max_steps=self._publication_gate_max_steps,
+                max_tokens=self._publication_gate_max_tokens,
+                event_bus=self._events,
+            )
+
+        self._events.emit(
+            "publication_gate.started",
+            {"candidate_count": len(candidates)},
+        )
+        verdicts = await self._publication_gate_reviewer.escalate_batch(
+            candidates,
+            state,
+            concurrency=self._publication_gate_concurrency,
+        )
+        counts = {"confirmed": 0, "filtered": 0, "inconclusive": 0}
+        for finding in verdicts:
+            if finding.status == "confirmed":
+                counts["confirmed"] += 1
+            elif finding.status == "false_positive":
+                counts["filtered"] += 1
+            else:
+                counts["inconclusive"] += 1
+            state.update_finding(
+                finding.id,
+                status=finding.status,
+                verified_by=finding.verified_by,
+                verify_reason=finding.verify_reason,
+                confidence=finding.confidence,
+            )
+        self._events.emit(
+            "publication_gate.completed",
+            {"attempted": len(candidates), **counts},
+        )
 
     async def _run_coverage_gap_pass(
         self,

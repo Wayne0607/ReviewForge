@@ -60,6 +60,22 @@ _FUZZY_CATEGORY_PAIRS = {
     frozenset({"hardcoded-secrets", "data-leak"}),
     frozenset({"command-injection", "ci-security"}),
 }
+_ROOT_CAUSE_LINE_TOLERANCE = 20
+_VALIDATION_ROOT_CATEGORIES = frozenset(
+    {
+        "incorrect-argument",
+        "incorrect-null-check",
+        "input-validation",
+        "missing-input-validation",
+        "missing-validation",
+        "null-check",
+        "null-check-wrong-argument",
+        "null-safety",
+        "parameter-validation",
+        "wrong-argument",
+        "wrong-variable",
+    }
+)
 _MANIFEST_GUESS_CATEGORIES = {
     "dependency-deprecated",
     "dependency-version-range",
@@ -350,6 +366,13 @@ class Verifier:
         if fuzzy_dropped:
             out = [finding for finding in out if finding.id not in fuzzy_dropped]
 
+        # Agentic closure can report one validation root cause from several
+        # nearby lines with reviewer-invented category names. Collapse those
+        # only when both messages cite the same concrete code symbol/API; a
+        # generic shared word such as "validation" is deliberately insufficient.
+        out, root_dropped = self._merge_llm_root_duplicates(out)
+        dropped.extend(root_dropped)
+
         # Repeated copy/paste metric-recorder swaps are one root cause even when
         # they occur in several sibling methods. Keep opposite swap directions
         # independent (legacy->storage versus storage->legacy).
@@ -373,6 +396,40 @@ class Verifier:
         if dropped:
             logger.info(f"Verifier: {len(out)} kept, {len(dropped)} merged/dropped as duplicate/low-confidence")
         return out, dropped
+
+    @classmethod
+    def _merge_llm_root_duplicates(cls, findings: list[Finding]) -> tuple[list[Finding], list[str]]:
+        consolidated: list[Finding] = []
+        dropped: list[str] = []
+        for finding in findings:
+            duplicate_index = next(
+                (index for index, existing in enumerate(consolidated) if cls._same_validation_root(existing, finding)),
+                None,
+            )
+            if duplicate_index is None:
+                consolidated.append(finding)
+                continue
+            winner, loser = cls._merge(consolidated[duplicate_index], finding)
+            consolidated[duplicate_index] = winner
+            dropped.append(loser.id)
+        return consolidated, dropped
+
+    @classmethod
+    def _same_validation_root(cls, first: Finding, second: Finding) -> bool:
+        if cls._is_detector(first) or cls._is_detector(second):
+            return False
+        if first.file != second.file or abs(first.line - second.line) > _ROOT_CAUSE_LINE_TOLERANCE:
+            return False
+        if first.category not in _VALIDATION_ROOT_CATEGORIES or second.category not in _VALIDATION_ROOT_CATEGORIES:
+            return False
+        first_sinks = cls._sink_fingerprint(f"{first.message}\n{first.suggestion}")
+        second_sinks = cls._sink_fingerprint(f"{second.message}\n{second.suggestion}")
+        shared = first_sinks & second_sinks
+        first_symbols = {sink for sink in first_sinks if sink.startswith("symbol:")}
+        second_symbols = {sink for sink in second_sinks if sink.startswith("symbol:")}
+        if first_symbols and second_symbols:
+            return bool(first_symbols & second_symbols)
+        return any(sink.startswith(("call:", "symbol:")) or "." in sink for sink in shared)
 
     @classmethod
     def _merge(cls, first: Finding, second: Finding) -> tuple[Finding, Finding]:

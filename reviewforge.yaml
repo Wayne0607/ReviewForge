@@ -125,5 +125,5 @@ v3:
   coverage_min_risk_score: 0.15
   coverage_max_cells_per_round: 24
   coverage_max_attempts: 2
-  evidence_mode: shadow
+  evidence_mode: "off"
   evidence_max_candidates: 5

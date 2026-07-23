@@ -32,6 +32,13 @@ class TestV3Defaults:
 
 
 class TestV3YAMLLoading:
+    def test_production_yaml_uses_bounded_closure_without_shadow_cost(self):
+        project_root = Path(__file__).resolve().parents[2]
+        cfg = ReviewForgeConfig.load(project_root / "reviewforge.yaml")
+
+        assert cfg.v3.coverage_max_cells_per_round == 24
+        assert cfg.v3.evidence_mode == "off"
+
     def test_yaml_v3_section(self, tmp_path: Path):
         cfg_file = tmp_path / "reviewforge.yaml"
         cfg_file.write_text(

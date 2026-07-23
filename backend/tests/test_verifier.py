@@ -1033,3 +1033,52 @@ def test_verifier_merges_repeated_metric_recorder_swaps_but_keeps_opposite_direc
 
     assert [finding.id for finding in survivors] == ["legacy_create", "storage_delete"]
     assert dropped == ["legacy_update"]
+
+
+def test_verifier_merges_nearby_validation_aliases_with_same_symbol():
+    first = _finding(
+        "first",
+        file="AccessTokenContext.java",
+        line=72,
+        category="null-check",
+        message="Objects.requireNonNull(grantType) checks the wrong value instead of `rawTokenId`.",
+        confidence=0.8,
+        reviewer="correctness_reviewer",
+    )
+    stronger = _finding(
+        "stronger",
+        file="AccessTokenContext.java",
+        line=88,
+        category="wrong-variable",
+        message="Objects.requireNonNull must validate `rawTokenId`, not grantType.",
+        confidence=0.95,
+        reviewer="security_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([first, stronger])
+
+    assert [finding.id for finding in survivors] == ["stronger"]
+    assert survivors[0].reviewer == "correctness_reviewer,security_reviewer"
+    assert dropped == ["first"]
+
+
+def test_verifier_keeps_validation_findings_for_distinct_symbols():
+    raw_token = _finding(
+        "raw-token",
+        file="AccessTokenContext.java",
+        line=72,
+        category="null-check",
+        message="Objects.requireNonNull checks the wrong value instead of `rawTokenId`.",
+    )
+    grant_type = _finding(
+        "grant-type",
+        file="AccessTokenContext.java",
+        line=80,
+        category="missing-validation",
+        message="Objects.requireNonNull does not validate `grantType`.",
+    )
+
+    survivors, dropped = Verifier().verify([raw_token, grant_type])
+
+    assert [finding.id for finding in survivors] == ["raw-token", "grant-type"]
+    assert dropped == []

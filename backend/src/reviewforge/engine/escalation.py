@@ -53,11 +53,30 @@ VALID_VERDICTS = {"confirmed", "false_positive"}
 # negative verdict cannot suppress them unless an earlier deterministic stage
 # has already done so.
 PUBLICATION_OPERATIONAL_SECURITY_CATEGORIES = {
+    "authorization-bypass",
+    "authz-bypass",
     "code-injection",
     "command-injection",
+    "data-corruption",
     "insecure-deserialization",
     "rce",
     "sql-injection",
+}
+
+PUBLICATION_OPERATIONAL_CORRECTNESS_CATEGORIES = {
+    "missing-context-field",
+    "null-reference",
+    "race-condition",
+    "wrong-argument-contract",
+    "wrong-callee-contract",
+    "wrong-caller-callee-contract",
+    "wrong-logic",
+}
+
+PUBLICATION_SEMANTIC_RECALL_CATEGORIES = {
+    "correctness_reviewer": {"logic-error", "race-condition"},
+    "testing_reviewer": {"logic-error"},
+    "performance_reviewer": {"thread-safety"},
 }
 
 # System prompt — shared across all escalation invocations.
@@ -438,6 +457,8 @@ class PublicationGateReviewer(EscalationReviewer):
         category = normalize_category(finding.category)
         confidence = finding.confidence
 
+        if confidence >= 0.85 and category in PUBLICATION_SEMANTIC_RECALL_CATEGORIES.get(reviewer, set()):
+            return True
         if reviewer == "localization_reviewer":
             return confidence >= 0.85 and category in {"language-mismatch", "script-mismatch"}
         if reviewer == "quality_reviewer":
@@ -457,10 +478,12 @@ class PublicationGateReviewer(EscalationReviewer):
         reviewer = finding.reviewer.strip().lower().replace("-", "_")
         category = normalize_category(finding.category)
         if reviewer == "correctness_reviewer":
-            return finding.confidence >= 0.9 and category == "wrong-callee-contract"
+            return finding.confidence >= 0.8 and category in PUBLICATION_OPERATIONAL_CORRECTNESS_CATEGORIES
+        if reviewer == "quality_reviewer":
+            return finding.confidence >= 0.95 and category == "correctness"
         return (
             reviewer == "security_reviewer"
-            and finding.confidence >= 0.85
+            and finding.confidence >= 0.75
             and category in PUBLICATION_OPERATIONAL_SECURITY_CATEGORIES
         )
 

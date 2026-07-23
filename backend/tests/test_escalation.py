@@ -279,6 +279,9 @@ class TestPublicationGate:
             ("quality_reviewer", "null-safety", 0.9),
             ("correctness_reviewer", "nullish-vs-falsy-semantics", 0.85),
             ("correctness_reviewer", "error-handling", 0.85),
+            ("correctness_reviewer", "race-condition", 0.85),
+            ("testing_reviewer", "logic-error", 0.9),
+            ("performance_reviewer", "thread-safety", 0.88),
         ],
     )
     def test_high_cost_false_negative_families_are_recall_protected(
@@ -304,6 +307,9 @@ class TestPublicationGate:
             ("testing_reviewer", "test-assertion", 0.99),
             ("correctness_reviewer", "wrong-callee-contract", 0.99),
             ("quality_reviewer", "null-safety", 0.8),
+            ("correctness_reviewer", "logic-error", 0.8),
+            ("testing_reviewer", "logic-error", 0.8),
+            ("performance_reviewer", "thread-safety", 0.8),
         ],
     )
     def test_noisy_families_are_not_recall_protected(
@@ -320,10 +326,17 @@ class TestPublicationGate:
 
         assert PublicationGateReviewer.recall_protected(finding) is False
 
-    def test_only_critical_security_is_protected_from_operational_failure(self):
+    @pytest.mark.parametrize(
+        "category",
+        ["command-injection", "authorization-bypass", "data-corruption"],
+    )
+    def test_high_cost_security_is_protected_from_operational_failure(
+        self,
+        category,
+    ):
         critical = _make_finding(
             reviewer="security_reviewer",
-            category="command-injection",
+            category=category,
             confidence=0.9,
         )
         noisy = _make_finding(
@@ -344,6 +357,47 @@ class TestPublicationGate:
 
         assert PublicationGateReviewer.recall_protected(contract) is False
         assert PublicationGateReviewer.operational_recall_protected(contract) is True
+
+    @pytest.mark.parametrize(
+        "category",
+        [
+            "missing-context-field",
+            "null-reference",
+            "race-condition",
+            "wrong-argument-contract",
+            "wrong-caller-callee-contract",
+            "wrong-logic",
+        ],
+    )
+    def test_high_signal_correctness_families_are_operationally_protected(
+        self,
+        category,
+    ):
+        finding = _make_finding(
+            reviewer="correctness_reviewer",
+            category=category,
+            confidence=0.8,
+        )
+
+        assert PublicationGateReviewer.operational_recall_protected(finding) is True
+
+    def test_broad_combined_contract_category_is_not_operationally_protected(self):
+        finding = _make_finding(
+            reviewer="correctness_reviewer",
+            category="wrong-caller-callee-argument-return-contract",
+            confidence=0.99,
+        )
+
+        assert PublicationGateReviewer.operational_recall_protected(finding) is False
+
+    def test_high_confidence_quality_correctness_is_operationally_protected(self):
+        finding = _make_finding(
+            reviewer="quality_reviewer",
+            category="correctness",
+            confidence=0.95,
+        )
+
+        assert PublicationGateReviewer.operational_recall_protected(finding) is True
 
     @pytest.mark.asyncio
     async def test_recall_guard_retains_protected_finding(
@@ -382,7 +436,7 @@ class TestPublicationGate:
     @pytest.mark.parametrize(
         ("reviewer", "category", "expected_status", "expected_verifier"),
         [
-            ("correctness_reviewer", "logic-error", "candidate", "publication-gate-inconclusive"),
+            ("correctness_reviewer", "logic-error", "confirmed", "publication-gate-recall-guard"),
             ("security_reviewer", "ssrf", "candidate", "publication-gate-inconclusive"),
             ("security_reviewer", "command-injection", "confirmed", "publication-gate-recall-guard"),
         ],

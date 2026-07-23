@@ -546,6 +546,45 @@ class TestRiskScoring:
         assert any("test-evidence" in r for r in process.risk_reasons)
         assert process.risk_score > 0
 
+    def test_file_scoped_test_gap_does_not_inflate_other_files(self):
+        manifest = _sample_manifest()
+        manifest["files"].append(
+            {
+                "path": "src/helper.py",
+                "language": "python",
+                "added_lines": [2],
+                "changed_symbols": [
+                    {
+                        "name": "helper",
+                        "type": "function",
+                        "start_line": 1,
+                        "end_line": 3,
+                        "added_lines": [2],
+                    }
+                ],
+                "imports": [],
+                "calls": [],
+            }
+        )
+        manifest["risk_signals"].append(
+            {
+                "type": "test-evidence-not-discovered",
+                "file": "src/service.py",
+                "note": "no test file found",
+            }
+        )
+        state = _make_state(
+            files_changed=["src/service.py", "src/helper.py"],
+            impact_manifest=manifest,
+        )
+
+        cs = compile_semantic_changeset(state)
+        service = next(unit for unit in cs.units if unit.symbol == "process")
+        helper = next(unit for unit in cs.units if unit.symbol == "helper")
+
+        assert "test-evidence-not-discovered" in service.risk_reasons
+        assert "test-evidence-not-discovered" not in helper.risk_reasons
+
     def test_risk_score_bounded_at_one(self):
         """Risk score never exceeds 1.0."""
         manifest = _sample_manifest()

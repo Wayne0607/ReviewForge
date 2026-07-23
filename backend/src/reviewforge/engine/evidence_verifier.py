@@ -148,7 +148,9 @@ class EvidenceCapsule:
     @property
     def has_failure(self) -> bool:
         """True if any operational failure was recorded in retry_metadata."""
-        return any(k.endswith("_failed") and v is True for k, v in self.retry_metadata.items())
+        return "unexpected_error" in self.retry_metadata or any(
+            key.endswith("_failed") and value is True for key, value in self.retry_metadata.items()
+        )
 
     @property
     def final_verdict(self) -> EvidenceVerdict:

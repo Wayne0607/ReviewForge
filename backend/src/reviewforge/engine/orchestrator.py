@@ -34,6 +34,11 @@ from reviewforge.engine.coverage_ledger import (
 from reviewforge.engine.cross_pr_analyzer import CrossPRAnalyzer
 from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.escalation import EscalationReviewer
+from reviewforge.engine.evidence_verifier import (
+    EvidenceItem,
+    EvidenceVerdict,
+    EvidenceVerifier,
+)
 from reviewforge.engine.finding_anchors import (
     reanchor_accessibility_findings,
     reanchor_quality_detector_duplicates,
@@ -241,7 +246,10 @@ class Orchestrator:
         self._v3_coverage_min_risk_score = min(1.0, max(0.0, v3_coverage_min_risk_score))
         self._v3_coverage_max_cells_per_round = max(1, v3_coverage_max_cells_per_round)
         self._v3_coverage_max_attempts = max(1, v3_coverage_max_attempts)
-        self._v3_evidence_mode = v3_evidence_mode
+        normalized_evidence_mode = str(v3_evidence_mode).strip().lower()
+        self._v3_evidence_mode = (
+            normalized_evidence_mode if normalized_evidence_mode in {"off", "shadow", "enforce"} else "off"
+        )
         self._v3_evidence_max_candidates = max(1, v3_evidence_max_candidates)
 
         # V3 runtime tracking (populated per-run)
@@ -250,6 +258,11 @@ class Orchestrator:
         self._v3_task_dimensions: dict[str, list[str]] = {}  # task_id → [dimension, ...]
         self._v3_closure_task_ids: set[str] = set()
         self._v3_closure_finding_ids: set[str] = set()
+
+        # V3 evidence verifier (lazy-init, only when v3_enabled and mode != off)
+        self._v3_evidence_verifier: EvidenceVerifier | None = None
+        self._calibrator_llm_raw = calibrator_llm  # store for lazy evidence LLM init
+        self._v3_evidence_summary: dict[str, Any] | None = None
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
@@ -440,6 +453,7 @@ class Orchestrator:
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
         loop_detector = LoopDetector()  # B4: per-run instance
+        self._v3_evidence_summary = None
 
         # Resume (可恢复): if a prior run for this exact (repo, pr, head_sha) didn't
         # complete, reuse its run_id and rehydrate findings + completed reviewers from
@@ -766,6 +780,10 @@ class Orchestrator:
                     {"kept": len(candidates), "filtered": len(code_evidence_rejected)},
                 )
 
+            # V3: Evidence verification (after deterministic gates, before escalation/calibration)
+            if self._v3_enabled and self._v3_evidence_mode != "off":
+                candidates = await self._run_v3_evidence_verification(candidates, state, run_id)
+
             # Phase 3.5/4: split candidates — trace/uncertain findings → Escalation
             # (agentic verify, verdict is FINAL); the rest → Dynamic Calibration. Mutually
             # exclusive, so a finding is judged once and escalation verdicts are never
@@ -919,6 +937,8 @@ class Orchestrator:
                 v3_cov = self._build_v3_coverage_summary()
                 if v3_cov:
                     summary["v3_coverage"] = v3_cov
+                if self._v3_evidence_summary:
+                    summary["v3_evidence"] = self._v3_evidence_summary
             retryable_errors = list(planner_errors)
             if comment_result.retryable:
                 retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
@@ -1310,9 +1330,7 @@ class Orchestrator:
                         state.update_task(task.id, status="completed")
 
                         matching_findings = [
-                            finding
-                            for finding in accepted_task_findings
-                            if self._finding_matches_unit(finding, unit)
+                            finding for finding in accepted_task_findings if self._finding_matches_unit(finding, unit)
                         ]
                         if matching_findings:
                             finding = matching_findings[0]
@@ -1397,16 +1415,14 @@ class Orchestrator:
 
         # Normal selection: above risk threshold (mandatory status does not
         # bypass the risk gate — only the zero-candidate fallback does).
-        selected = [
-            c for c in unresolved if c.risk >= self._v3_coverage_min_risk_score
-        ][: self._v3_coverage_max_cells_per_round]
+        selected = [c for c in unresolved if c.risk >= self._v3_coverage_min_risk_score][
+            : self._v3_coverage_max_cells_per_round
+        ]
 
         # Zero-candidate fallback: if the PR has zero candidate findings,
         # include correctness cells regardless of risk.
         if not findings and not selected:
-            correctness_unresolved = [
-                c for c in unresolved if c.dimension == CoverageDimension.CORRECTNESS
-            ]
+            correctness_unresolved = [c for c in unresolved if c.dimension == CoverageDimension.CORRECTNESS]
             selected = correctness_unresolved[: self._v3_coverage_max_cells_per_round]
 
         return selected
@@ -1423,7 +1439,7 @@ class Orchestrator:
             "mandatory_success": cs["mandatory_success"],
             "abstained": cs["by_status"].get("abstained", 0),
             "failed": cs["by_status"].get("failed", 0),
-            "attempts": sum(c.attempts for c in self._v3_ledger.cells),
+            "attempts": sum(len(c.assigned_task_ids) for c in self._v3_ledger.cells),
             "selected": len(
                 [
                     c
@@ -1434,6 +1450,226 @@ class Orchestrator:
             "closure_findings": len(self._v3_closure_finding_ids),
         }
 
+    # ── V3 Evidence Verifier ──────────────────────────────────────────────────
+
+    def _init_v3_evidence_verifier(self) -> EvidenceVerifier | None:
+        """Lazy-init the EvidenceVerifier with three separate LLM wrappers.
+
+        Prover, refuter, and arbiter are separately attributable, derived from
+        calibrator_llm by default. When DB is available, each is wrapped with
+        a distinct agent_name for token tracking.
+        """
+        if self._v3_evidence_verifier is not None:
+            return self._v3_evidence_verifier
+
+        if not self._v3_enabled or self._v3_evidence_mode == "off":
+            return None
+
+        base = self._calibrator_llm_raw
+        if self._db:
+            prover_llm = TrackedChatLLM(inner=base, ctx=self._token_ctx, agent_name="evidence_prover")
+            refuter_llm = TrackedChatLLM(inner=base, ctx=self._token_ctx, agent_name="evidence_refuter")
+            arbiter_llm = TrackedChatLLM(inner=base, ctx=self._token_ctx, agent_name="evidence_arbiter")
+        else:
+            prover_llm = base
+            refuter_llm = base
+            arbiter_llm = base
+
+        self._v3_evidence_verifier = EvidenceVerifier(
+            prover_model=prover_llm,
+            refuter_model=refuter_llm,
+            arbiter_model=arbiter_llm,
+            max_candidates=self._v3_evidence_max_candidates,
+        )
+        return self._v3_evidence_verifier
+
+    def _build_evidence_items(
+        self,
+        finding: Finding,
+        state: StateStore,
+    ) -> list[EvidenceItem]:
+        """Build EvidenceItems from exact RIGHT-side diff lines for a finding.
+
+        Only lines parsed by iter_right_lines where path matches finding.file,
+        sha equals state.head_sha, and line equals finding.line are used.
+        trigger and violated_contract are left empty to avoid activating the
+        deterministic-confirm shortcut (an assertion is not proof).
+        """
+        patch = (state.file_diffs or {}).get(finding.file)
+        if not patch:
+            return []
+
+        right_lines = iter_right_lines(patch)
+        evidence: list[EvidenceItem] = []
+        for line_no, content in right_lines:
+            if line_no == finding.line:
+                evidence.append(
+                    EvidenceItem(
+                        kind="supporting",
+                        path=finding.file,
+                        sha=state.head_sha,
+                        line=line_no,
+                        snippet=content[:500],
+                        trigger="",
+                        violated_contract="",
+                    )
+                )
+        return evidence
+
+    async def _run_v3_evidence_verification(
+        self,
+        candidates: list[Finding],
+        state: StateStore,
+        run_id: str,
+    ) -> list[Finding]:
+        """Run v3 evidence verification on candidates.
+
+        Returns the list of candidates that should continue through the
+        existing escalation/calibration path (i.e., not resolved by enforce mode).
+
+        In shadow mode: records events/summary but does not mutate any finding.
+        In enforce mode: CONFIRMED → confirmed, REJECTED → false_positive,
+                         ABSTAIN/failure → continue through existing path.
+        Respects v3_evidence_max_candidates cap.
+        """
+        verifier = self._init_v3_evidence_verifier()
+        if verifier is None:
+            return candidates
+
+        mode = self._v3_evidence_mode
+        if mode == "off":
+            return candidates
+
+        cap = self._v3_evidence_max_candidates
+        capped = candidates[:cap]
+        skipped = candidates[cap:]
+
+        self._events.emit(
+            "v3_evidence.started",
+            {
+                "mode": mode,
+                "candidate_count": len(candidates),
+                "capped": len(capped),
+                "skipped": len(skipped),
+            },
+        )
+
+        # Build evidence items and diff for each candidate
+        evidence_map: dict[str, list[EvidenceItem]] = {}
+        for f in capped:
+            evidence_map[f.id] = self._build_evidence_items(f, state)
+
+        # Use the full PR diff (existing truncation handled by verifier)
+        full_diff = "\n\n".join(f"### {path}\n{patch}" for path, patch in (state.file_diffs or {}).items())
+
+        # A batch-level operational failure must never suppress candidates or
+        # fail the surrounding review.
+        try:
+            capsules = await verifier.verify_batch(
+                capped,
+                evidence_map,
+                full_diff,
+                expected_head_sha=state.head_sha,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("V3 evidence batch failed: %s", exc, exc_info=True)
+            summary = {
+                "mode": mode,
+                "attempted": 0,
+                "confirmed": 0,
+                "rejected": 0,
+                "abstained": 0,
+                "failed": len(capped),
+                "capped": len(skipped),
+                "skipped": len(skipped),
+            }
+            self._events.emit("v3_evidence.failed", {**summary, "error": str(exc)[:200]})
+            self._events.emit("v3_evidence.completed", summary)
+            self._v3_evidence_summary = summary
+            return list(candidates)
+
+        # Track summary
+        attempted = len(capsules)
+        confirmed = 0
+        rejected = 0
+        abstained = 0
+        failed = 0
+
+        resolved_ids: set[str] = set()
+
+        for finding, capsule in zip(capped, capsules):
+            verdict = capsule.final_verdict
+
+            operational_failure = capsule.has_failure or bool(capsule.retry_metadata)
+            if operational_failure:
+                failed += 1
+            elif verdict == EvidenceVerdict.CONFIRMED:
+                confirmed += 1
+            elif verdict == EvidenceVerdict.REJECTED:
+                rejected += 1
+            else:
+                abstained += 1
+
+            # Emit per-capsule event (bounded, no full prompts/diffs)
+            self._events.emit(
+                "v3_evidence.capsule",
+                {
+                    "finding_id": finding.id,
+                    "verdict": verdict.value,
+                    "confidence": round(capsule.confidence, 3),
+                    "has_failure": operational_failure,
+                    "evidence_count": len(capsule.evidence),
+                },
+            )
+
+            if mode == "shadow":
+                # Shadow: never mutate, all candidates pass through
+                continue
+            elif mode == "enforce":
+                if verdict == EvidenceVerdict.CONFIRMED and not operational_failure:
+                    state.update_finding(
+                        finding.id,
+                        status="confirmed",
+                        verified_by="v3-evidence",
+                        verify_reason=capsule.rationale[:500],
+                        confidence=capsule.confidence,
+                    )
+                    resolved_ids.add(finding.id)
+                    # Do NOT add to passthrough — removed from escalation/calibration
+                elif verdict == EvidenceVerdict.REJECTED and not operational_failure:
+                    state.update_finding(
+                        finding.id,
+                        status="false_positive",
+                        verified_by="v3-evidence",
+                        verify_reason=capsule.rationale[:500],
+                        confidence=max(0.0, 1.0 - capsule.confidence),
+                    )
+                    resolved_ids.add(finding.id)
+                    # Do NOT add to passthrough — removed from escalation/calibration
+                else:
+                    # ABSTAIN or failure → continue through existing path
+                    pass
+
+        # Emit summary event
+        summary = {
+            "mode": mode,
+            "attempted": attempted,
+            "confirmed": confirmed,
+            "rejected": rejected,
+            "abstained": abstained,
+            "failed": failed,
+            "capped": len(skipped),
+            "skipped": len(skipped),
+        }
+        self._events.emit("v3_evidence.completed", summary)
+
+        # Store summary for run result
+        self._v3_evidence_summary = summary
+
+        return [finding for finding in candidates if finding.id not in resolved_ids]
+
     @staticmethod
     def _reviewer_dimensions(reviewer: str) -> list[str]:
         """Map a reviewer name to the coverage dimensions it addresses."""
@@ -1442,10 +1678,9 @@ class Orchestrator:
             "testing_reviewer": ["testing"],
             "localization_reviewer": ["localization"],
             "performance_reviewer": ["performance"],
+            "correctness_reviewer": ["correctness"],
         }
-        return _reviewer_dim_map.get(
-            reviewer, ["correctness", "contract", "error-handling", "compatibility", "cross-PR"]
-        )
+        return _reviewer_dim_map.get(reviewer, ["correctness"])
 
     @staticmethod
     def _dimension_reviewer(dimension: str) -> str:

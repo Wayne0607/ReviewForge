@@ -1151,6 +1151,15 @@ class TestHasFailure:
         )
         assert capsule.has_failure is True
 
+    def test_unexpected_batch_error_is_a_failure(self):
+        capsule = EvidenceCapsule(
+            finding_id="f1",
+            retry_metadata={"unexpected_error": "provider crashed"},
+        )
+
+        assert capsule.has_failure is True
+        assert capsule.final_verdict == EvidenceVerdict.ABSTAIN
+
     def test_non_failed_metadata_ignored(self):
         """Metadata without _failed keys → has_failure is False."""
         capsule = EvidenceCapsule(

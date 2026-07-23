@@ -168,9 +168,7 @@ _SENSITIVE_NAME = re.compile(
     re.IGNORECASE,
 )
 
-_RESOURCE_SUFFIXES = frozenset(
-    {".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl"}
-)
+_RESOURCE_SUFFIXES = frozenset({".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl"})
 
 
 def _compute_risk(
@@ -348,10 +346,15 @@ def compile_semantic_changeset(state: StateStore) -> SemanticChangeSet:
         else:
             global_signals.append(signal)
 
-    has_test_evidence_gap = any(
-        str(s.get("type", "")) == "test-evidence-not-discovered"
-        for s in _list_or_empty(manifest.get("risk_signals", []))
+    global_test_evidence_gap = any(
+        str(signal.get("type", "")) == "test-evidence-not-discovered" for signal in global_signals
     )
+
+    def _has_test_evidence_gap(path: str) -> bool:
+        """Apply file-scoped gaps only to that file; preserve explicit global gaps."""
+        return global_test_evidence_gap or any(
+            str(signal.get("type", "")) == "test-evidence-not-discovered" for signal in signals_by_file.get(path, [])
+        )
 
     # Build units for every changed file.
     units: list[SemanticUnit] = []
@@ -383,7 +386,7 @@ def compile_semantic_changeset(state: StateStore) -> SemanticChangeSet:
                 signals=file_signals,
                 manifest_version=manifest_version,
             )
-            _finalize_risk(unit, has_test_evidence_gap=has_test_evidence_gap)
+            _finalize_risk(unit, has_test_evidence_gap=_has_test_evidence_gap(path))
             units.append(unit)
             unresolved.append(path)
             continue
@@ -457,7 +460,7 @@ def compile_semantic_changeset(state: StateStore) -> SemanticChangeSet:
                     note=f"symbol_type={sym_type}",
                 ),
             )
-            _finalize_risk(unit, has_test_evidence_gap=has_test_evidence_gap)
+            _finalize_risk(unit, has_test_evidence_gap=_has_test_evidence_gap(path))
             units.append(unit)
 
     # 2. Files in manifest resource_files.
@@ -487,7 +490,7 @@ def compile_semantic_changeset(state: StateStore) -> SemanticChangeSet:
                 note=f"locale={locale},entries={entries}",
             ),
         )
-        _finalize_risk(unit, has_test_evidence_gap=has_test_evidence_gap)
+        _finalize_risk(unit, has_test_evidence_gap=_has_test_evidence_gap(path))
         units.append(unit)
 
     # 3. Changed files NOT in the manifest (ContextEngine cap, unsupported
@@ -533,7 +536,7 @@ def compile_semantic_changeset(state: StateStore) -> SemanticChangeSet:
                     note="file not in manifest; no symbol extracted",
                 ),
             )
-        _finalize_risk(unit, has_test_evidence_gap=has_test_evidence_gap)
+        _finalize_risk(unit, has_test_evidence_gap=_has_test_evidence_gap(path))
         units.append(unit)
         unresolved.append(path)
 

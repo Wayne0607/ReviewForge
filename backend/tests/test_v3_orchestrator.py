@@ -911,20 +911,15 @@ class TestReviewerDimensionMapping:
         orch = _orchestrator(v3_enabled=True)
         assert "testing" in orch._reviewer_dimensions("testing_reviewer")
 
-    def test_correctness_reviewer_maps_multiple(self):
+    def test_correctness_reviewer_only_claims_broad_correctness(self):
         orch = _orchestrator(v3_enabled=True)
         dims = orch._reviewer_dimensions("correctness_reviewer")
-        assert "correctness" in dims
-        assert "contract" in dims
-        assert "error-handling" in dims
-        assert "compatibility" in dims
-        assert "cross-PR" in dims
+        assert dims == ["correctness"]
 
     def test_unknown_reviewer_maps_to_correctness(self):
         orch = _orchestrator(v3_enabled=True)
         dims = orch._reviewer_dimensions("custom_reviewer")
-        assert "correctness" in dims
-        assert "contract" in dims
+        assert dims == ["correctness"]
 
 
 class TestFindUnitById:
@@ -1021,6 +1016,22 @@ class TestSummaryStructure:
         assert summary["attempts"] == 0
         assert summary["selected"] == 0
         assert summary["closure_findings"] == 0
+
+    def test_attempts_summary_counts_dispatches_not_failed_transitions(self):
+        orch = _orchestrator(v3_enabled=True)
+        unit = SemanticUnit(id="su_test", path="src/auth.py", start_line=4, end_line=10)
+        orch._v3_change_set = MagicMock(units=[unit])
+        ledger = CoverageLedger.from_change_set({"units": [unit.to_dict()]})
+        orch._v3_ledger = ledger
+        cell = ledger.get_cell("su_test", CoverageDimension.CORRECTNESS)
+        assert cell is not None
+        cell.transition(CoverageStatus.ASSIGNED, task_id="task-1")
+        cell.transition(CoverageStatus.FAILED, terminal_reason="timeout")
+        cell.transition(CoverageStatus.ASSIGNED, task_id="task-2")
+        cell.transition(CoverageStatus.COVERED, terminal_reason="finding")
+
+        assert cell.attempts == 3  # legacy transition counter remains serializable
+        assert orch._build_v3_coverage_summary()["attempts"] == 2
 
 
 class TestTargetedClosureExecution:
@@ -1136,6 +1147,40 @@ class TestBroadPassTracking:
         assert sec_cell is not None
         assert sec_cell.status == CoverageStatus.COVERED
         assert finding.id in sec_cell.finding_ids
+
+    def test_broad_correctness_finding_does_not_cover_security_cell(self):
+        orch = _orchestrator(v3_enabled=True)
+        unit = SemanticUnit(
+            id="su_auth",
+            path="src/auth.py",
+            start_line=4,
+            end_line=10,
+            risk_score=0.8,
+            risk_reasons=["security-sensitive-symbol"],
+            risk_signals=[{"type": "security-sensitive-symbol"}],
+        )
+        orch._v3_change_set = MagicMock(units=[unit])
+        ledger = CoverageLedger.from_change_set({"units": [unit.to_dict()]})
+        orch._v3_ledger = ledger
+        finding = Finding(
+            file="src/auth.py",
+            line=7,
+            category="logic-error",
+            message="bug",
+            reviewer="correctness_reviewer",
+        )
+
+        orch._track_broad_pass_coverage(
+            task_id="t1",
+            reviewer="correctness_reviewer",
+            task_files=["src/auth.py"],
+            findings=[finding],
+        )
+
+        correctness = ledger.get_cell("su_auth", CoverageDimension.CORRECTNESS)
+        security = ledger.get_cell("su_auth", CoverageDimension.SECURITY)
+        assert correctness is not None and correctness.status == CoverageStatus.COVERED
+        assert security is not None and security.status == CoverageStatus.PENDING
 
     def test_no_findings_marks_abstained(self):
         """No findings marks cell ABSTAINED."""

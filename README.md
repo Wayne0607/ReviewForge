@@ -1,297 +1,217 @@
-# ReviewForge
+# ReviewForge v3
 
-AI 多 Agent 代码审查系统。监听 GitHub PR，通过 Planner-Reviewer-Verifier 三层架构自动审查代码，配合可视化 Dashboard 展示审查趋势和分析。
+ReviewForge 是面向 GitHub Pull Request 的 AI 代码审查系统。它把一次 PR 拆成可追踪的语义变更单元，用覆盖账本规划审查范围，再通过多 Reviewer、确定性规则、证据核验和发布闸门生成可执行的审查意见。
 
-## 架构
+v3 的目标不是“让模型自由阅读整个仓库”，而是让每个高风险变更都有明确的审查维度、证据来源和终止原因，同时记录延迟、Token 与最终裁决，便于持续评测和调优。
 
+## 核心能力
+
+- 语义变更建模：按函数、类、配置区块等单位编译 `SemanticChangeSet`
+- 覆盖驱动审查：用 `CoverageLedger` 跟踪 correctness、contract、security、testing、localization、performance、compatibility、cross-PR 等维度
+- 九类专业 Reviewer：安全、正确性、性能、测试、国际化、依赖、可访问性、文档和风格
+- 分层取证：确定性检测器、仓库上下文工具、风险区间升级核验、动态校准与最终发布闸门
+- 跨 PR 分析：结合持久化历史识别前后提交之间的契约与行为冲突
+- 多语言支持：通用审查能力加 Python、TypeScript 等语言 Skill，并提供 Go、Java、Ruby、Rust、Vue 等评测样本
+- 成本可观测：按 run 和 agent 记录模型调用与 Token 使用量
+- GitHub 原生接入：Webhook 触发、PR inline comment、自动部署、健康检查与失败回滚
+- 管理控制台：查看审查记录、发现、趋势、热点、Reviewer 表现与 Token 指标
+
+## v3 审查流程
+
+```mermaid
+flowchart LR
+    A["GitHub PR Webhook"] --> B["Context Engine<br/>仓库索引、影响面、Wiki facts"]
+    B --> C["SemanticChangeSet<br/>语义变更单元"]
+    C --> D["CoverageLedger<br/>风险 × 审查维度"]
+    D --> E["Planner<br/>单次任务规划"]
+    E --> F["Reviewer Scheduler<br/>并发专业审查"]
+    F --> G["Deterministic Gates<br/>去重、可执行性、代码证据"]
+    G --> H["Evidence / Escalation<br/>支持证据与反证"]
+    H --> I["Dynamic Calibrator"]
+    I --> J["Cross-PR Analyzer"]
+    J --> K["Publication Gate"]
+    K --> L["GitHub Comments + SQLite + Dashboard"]
+    D --> M["Coverage Closure<br/>高风险未覆盖项补审"]
+    M --> G
 ```
-GitHub PR Webhook
-       ↓
-  Planner (LLM 决策 + 确定性模式检测)
-       ↓
-  Reviewers (无状态 Agent，并行执行)
-  ├─ SecurityReviewer      → 安全漏洞检测
-  ├─ PerformanceReviewer   → 性能问题检测
-  ├─ StyleReviewer         → 代码风格检查
-  ├─ TestingReviewer       → 测试覆盖检查
-  ├─ DocumentationReviewer → 文档完整性检查
-  ├─ DependencyReviewer    → 依赖风险检查
-  ├─ AccessibilityReviewer → 可访问性检查
-  └─ [Plugin Reviewers]    → 自定义插件审查
-       ↓
-  Dynamic Calibrator (对抗性校准 + 条件裁决)
-       ↓
-  Commenter → 格式化评论，发到 GitHub PR
-       ↓
-  SQLite 持久化 → Dashboard API → React 前端
-```
 
-## 核心设计
+当前默认配置启用 v3 覆盖账本和最终发布闸门；证据验证器保留但默认关闭，`coverage_gap` 也默认关闭，只有经过基准验证后才建议在生产开启。Security Reviewer 使用受限工具循环，其余 Reviewer 默认单次执行，以控制 Token 和延迟。
 
-- **Spec-Driven**: 所有 Agent 和 Tool 通过声明式 Spec 注册，新增审查维度零代码改动
-- **Conductor Single-Shot**: Planner 每轮一次 LLM 调用，保证可观测、可恢复、成本可控
-- **State Store**: 共享状态中心化存储，Pydantic schema 校验，Agent 间深拷贝隔离
-- **Tool Gateway**: 工具调用经过权限检查和策略验证
-- **Loop Detection**: 两阶段救援（rescue → stall），防无限循环
-- **渐进式 Skill 加载**: 审查规则集按需加载，最小化 token 消耗
-- **Mock/Live 双模式**: 开发测试用 mock 模式，不依赖真实 LLM 和 GitHub API
-- **事件日志**: 全流程 JSONL 日志，每次状态变更可审计
-- **多模型路由**: 不同 Agent 使用不同模型配置（Planner 用快模型，Security 用准确模型）
-- **插件系统**: 自定义 Reviewer 放入 `plugins/` 目录，自动发现加载
-- **跨 PR 分析**: SQLite 持久化 + Dashboard API，支持趋势分析和热点检测
+更完整的契约说明见 [docs/v3-architecture.md](docs/v3-architecture.md)，当前评测边界与目标见 [docs/v3-benchmark-diagnosis.md](docs/v3-benchmark-diagnosis.md)。
 
 ## 快速开始
 
-### 方式一：Docker（推荐）
+### Docker
 
 ```bash
-# 1. 克隆仓库
 git clone https://github.com/Wayne0607/ReviewForge.git
 cd ReviewForge
-
-# 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env，填入 GitHub Token 和 LLM API Key
-
-# 3. 启动（包含前端构建）
-docker-compose up -d
-
-# Mock 模式测试（不需要真实 LLM）
-docker-compose --profile mock up reviewforge-mock
+# 编辑 .env，至少配置 GitHub、LLM 和 API Token
+docker compose up -d --build
 ```
 
-### 方式二：本地安装
+服务默认只绑定 `127.0.0.1:8000`。验证状态：
 
 ```bash
-# 1. 安装后端依赖
-cd backend
-pip install -e .
-
-# 2. 安装前端依赖并构建
-cd ../frontend
-npm install
-npm run build       # 构建到 backend/src/reviewforge/static/
-
-# 3. 配置
-cp ../.env.example ../.env
-# 编辑 .env
-
-# 4. 校验配置
-cd ../backend
-python -m reviewforge spec-check
-
-# 5. 启动
-python -m reviewforge serve
-
-# Mock 模式
-python -m reviewforge serve --mock
+curl http://127.0.0.1:8000/health
 ```
 
-### 前端开发模式
+无需真实 GitHub 或模型的本地演示：
+
+```bash
+docker compose --profile mock up --build reviewforge-mock
+```
+
+Mock 服务位于 `127.0.0.1:8001`。
+
+### 本地开发
+
+需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和 Node.js 20+。
+
+```bash
+cd backend
+uv sync --frozen
+uv run reviewforge spec-check
+
+cd ../frontend
+npm ci
+npm run build
+
+cd ../backend
+uv run reviewforge serve --host 127.0.0.1 --port 8000
+```
+
+前端热更新模式：
 
 ```bash
 cd frontend
-npm run dev         # 启动 Vite 开发服务器 (localhost:5173)
-# 自动代理 /api 请求到后端 (localhost:8000)
+npm run dev
 ```
 
-## Dashboard 功能
-
-访问 `http://localhost:8000` 查看可视化面板：
-
-- **总览**: 审查总数、发现数、确认率、分类分布图、趋势折线图
-- **审查记录**: 所有 PR 审查历史，支持搜索和筛选
-- **审查详情**: 单次审查的 findings 列表，按严重度/状态筛选
-- **趋势分析**: 热点文件排行、Reviewer 效率对比、反复出现的问题
-- **系统信息**: 注册的 Agents/Tools/Skills、当前配置
+Vite 默认运行在 `http://localhost:5173`，并将 `/api` 请求代理到后端。
 
 ## 配置
 
-### 环境变量（.env）
+复制 `.env.example` 后配置以下变量：
+
+```dotenv
+GITHUB_TOKEN=github-token
+GITHUB_WEBHOOK_SECRET=webhook-secret
+
+LLM_BASE_URL=https://your-openai-compatible-endpoint/v1
+LLM_API_KEY=llm-api-key
+REVIEWFORGE_MODEL=your-model
+
+REVIEWFORGE_API_TOKEN=dashboard-api-token
+REVIEWFORGE_CORS_ORIGINS=http://localhost:5173
+```
+
+`reviewforge.yaml` 管理 Reviewer、模型 profile、置信度阈值、升级核验、发布闸门和 v3 参数。环境变量优先于 YAML。模型服务只要兼容 OpenAI Chat Completions 接口即可；可以为快速任务和高精度任务配置不同 profile。
+
+生产前至少检查：
 
 ```bash
-# GitHub
-GITHUB_TOKEN=ghp_xxxxxxxxxxxx          # Personal Access Token
-GITHUB_WEBHOOK_SECRET=your-secret      # Webhook 密钥
-
-# LLM
-LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
-LLM_API_KEY=your-api-key
-REVIEWFORGE_MODEL=mimo-v2.5-pro
-
-# 可选
-REVIEWFORGE_HOST=127.0.0.1
-REVIEWFORGE_PORT=8000
+cd backend
+uv run reviewforge spec-check
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
 ```
 
-### 配置文件（reviewforge.yaml）
+## GitHub Webhook
 
-```yaml
-llm:
-  model: "mimo-v2.5-pro"
-  temperature_planner: 0.0
-  temperature_reviewer: 0.1
-  temperature_verifier: 0.0
+在目标仓库的 `Settings → Webhooks` 中创建 Webhook：
 
-  # 多模型路由 profiles
-  profiles:
-    fast:
-      model: "mimo-v2.5-pro"
-      temperature: 0.1       # 快速 Agent（Planner, Style, Testing）
-    accurate:
-      model: "mimo-v2.5-pro"
-      temperature: 0.0       # 准确 Agent（Security, Verifier）
+- Payload URL：`https://<host>/webhook/github`
+- Content type：`application/json`
+- Secret：与 `GITHUB_WEBHOOK_SECRET` 一致
+- Events：选择 Pull requests
 
-reviewers:
-  - name: security_reviewer
-    type: security
-    max_steps: 10
-  - name: performance_reviewer
-    type: performance
-    max_steps: 8
-  - name: style_reviewer
-    type: style
-    max_steps: 6
-  - name: testing_reviewer
-    type: testing
-    max_steps: 6
-  - name: doc_reviewer
-    type: documentation
-    max_steps: 5
-  - name: dependency_reviewer
-    type: dependency
-    max_steps: 6
-  - name: accessibility_reviewer
-    type: accessibility
-    max_steps: 6
+除 `/health` 和 GitHub Webhook 外，管理 API 需要 `REVIEWFORGE_API_TOKEN`。
 
-confidence_threshold: 0.5
+常用端点：
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /health` | 服务健康检查 |
+| `POST /webhook/github` | 接收 GitHub PR 事件 |
+| `GET /api/v1/specs` | Agent、Tool 与 Skill 注册信息 |
+| `GET /api/v1/config` | 当前运行配置 |
+| `GET /api/v1/dashboard/reviews` | 审查历史 |
+| `GET /api/v1/dashboard/tokens/summary` | Token 汇总 |
+| `GET /api/v1/admin/skills` | Skill 管理 |
+| `GET /api/v1/admin/agents` | Reviewer 管理 |
+
+## 评测
+
+评测定义位于 `backend/eval/`，可执行入口位于 `backend/scripts/`，所有临时结果和日志统一写入 `backend/eval/artifacts/`。该目录只保留说明文件，不提交运行产物。
+
+确定性 golden gauntlet：
+
+```bash
+cd backend
+uv run python scripts/eval_gauntlet.py \
+  --scanner-only \
+  --out eval/artifacts/gauntlet-scanner.json
 ```
 
-环境变量优先级高于配置文件。
+对真实 PR 导出的 findings、Token 与盲测 manifest 做逐行评分：
 
-## 插件系统
-
-在 `backend/src/reviewforge/plugins/` 目录下创建 `.py` 文件即可添加自定义 Reviewer：
-
-```python
-# plugins/my_reviewer.py
-from reviewforge.engine.reviewers import BaseReviewer
-
-class MyReviewer(BaseReviewer):
-    plugin_name = "my_custom_reviewer"
-    plugin_type = "custom"
-
-    def __init__(self, llm, registry, gateway):
-        super().__init__(
-            name=self.plugin_name,
-            reviewer_type=self.plugin_type,
-            llm=llm, registry=registry, gateway=gateway,
-            max_steps=6,
-        )
+```bash
+cd backend
+uv run python scripts/eval_live_benchmark.py \
+  --manifest eval/artifacts/manifest.json \
+  --findings eval/artifacts/findings.json \
+  --tokens eval/artifacts/tokens.json \
+  --out eval/artifacts/live-benchmark.json
 ```
 
-启动时自动发现并加载。详见 `plugins/example_reviewer.py`。
-
-## 配置 GitHub Webhook
-
-1. 进入仓库 → Settings → Webhooks → Add webhook
-2. Payload URL: `http://你的服务器:8000/webhook/github`
-3. Content type: `application/json`
-4. Secret: 与 `.env` 中 `GITHUB_WEBHOOK_SECRET` 一致
-5. Events: 勾选 `Pull requests`
-
-## API 端点
-
-| 端点 | 方法 | 说明 |
-|---|---|---|
-| `/health` | GET | 健康检查 |
-| `/api/v1/specs` | GET | 查看已注册的 Agent/Tool/Skill |
-| `/api/v1/config` | GET | 查看当前配置 |
-| `/webhook/github` | POST | GitHub Webhook 接收 |
-| `/api/v1/dashboard/reviews` | GET | 审查历史列表 |
-| `/api/v1/dashboard/reviews/{id}` | GET | 单次审查详情 |
-| `/api/v1/dashboard/metrics/summary` | GET | 总体统计 |
-| `/api/v1/dashboard/metrics/categories` | GET | 分类分布 |
-| `/api/v1/dashboard/metrics/trends` | GET | 周趋势 |
-| `/api/v1/dashboard/metrics/hotspots` | GET | 热点文件 |
-| `/api/v1/dashboard/metrics/reviewers` | GET | Reviewer 统计 |
-| `/api/v1/dashboard/metrics/recurring` | GET | 反复出现的问题 |
+指标包括 TP、FP、FN、Precision、Recall、F1、严重级别召回、干净 PR 误报率、延迟和 Token。产品对比结论必须使用未参与调优的 holdout PR，并由独立裁判复核；仓库不把训练集成绩描述为行业领先。
 
 ## 项目结构
 
-```
-reviewforge/
-├── backend/
-│   ├── src/reviewforge/
-│   │   ├── core/                    # 核心基础设施
-│   │   │   ├── specs.py             # Spec Registry（能力注册表）
-│   │   │   ├── state.py             # State Store（schema 校验 + 深拷贝隔离）
-│   │   │   ├── events.py            # EventBus（JSONL 日志 + 事件订阅）
-│   │   │   ├── config.py            # 配置系统（YAML + 环境变量 + 多模型 profiles）
-│   │   │   ├── database.py          # SQLite 持久化（审查历史 + 指标）
-│   │   │   └── loop_detector.py     # 循环检测（两阶段救援）
-│   │   │
-│   │   ├── engine/                  # Agent 引擎
-│   │   │   ├── orchestrator.py      # 主循环编排器（含 DB 持久化）
-│   │   │   ├── planner.py           # Planner Agent（LLM + 确定性模式检测）
-│   │   │   ├── reviewers.py         # 7 个 Reviewer Agents
-│   │   │   ├── calibrator.py        # Dynamic Calibrator（对抗性校准）
-│   │   │   ├── model_router.py      # 多模型路由
-│   │   │   ├── plugin_loader.py     # 插件发现和加载
-│   │   │   ├── prompt.py            # Prompt 构建器（section 模式）
-│   │   │   └── mock_llm.py          # Mock LLM（测试用）
-│   │   │
-│   │   ├── plugins/                 # 自定义 Reviewer 插件目录
-│   │   │   └── example_reviewer.py  # 示例插件
-│   │   │
-│   │   ├── tools/                   # 工具层
-│   │   │   ├── gateway.py           # Tool Gateway（权限门控）
-│   │   │   ├── github_api.py        # GitHub API 客户端
-│   │   │   └── mock_github.py       # Mock GitHub（测试用）
-│   │   │
-│   │   ├── skills/                  # Skill 系统
-│   │   │   ├── loader.py            # 渐进式加载器
-│   │   │   ├── security_rules/
-│   │   │   ├── python_best_practices/
-│   │   │   └── react_patterns/
-│   │   │
-│   │   ├── api/
-│   │   │   ├── webhook.py           # GitHub Webhook 处理
-│   │   │   └── dashboard.py         # Dashboard API（审查历史 + 趋势分析）
-│   │   │
-│   │   ├── static/                  # 前端构建产物（npm run build 生成）
-│   │   ├── app.py                   # 应用工厂
-│   │   └── cli.py                   # CLI 入口
-│   │
-│   ├── tests/                       # 单元测试
-│   └── pyproject.toml
-│
-├── frontend/                        # React 前端
-│   ├── src/
-│   │   ├── api/client.ts            # API 客户端
-│   │   ├── components/              # 可复用组件
-│   │   ├── pages/                   # 页面（Dashboard, Reviews, Analytics, System）
-│   │   └── types/                   # TypeScript 类型
-│   ├── package.json
-│   └── vite.config.ts
-│
-├── docs/                            # 架构文档
-├── scripts/                         # 部署脚本
-├── Dockerfile                       # 多阶段构建（Node + Python）
-├── docker-compose.yml
-├── reviewforge.yaml                 # 配置文件
-└── .env.example                     # 环境变量模板
+```text
+ReviewForge/
+├─ .github/workflows/       # main 分支 CI 与自动部署
+├─ backend/
+│  ├─ eval/                 # golden 数据与统一评测产物目录
+│  ├─ scripts/              # gauntlet / live benchmark 入口
+│  ├─ src/reviewforge/
+│  │  ├─ api/               # Webhook、Dashboard、Admin API
+│  │  ├─ core/              # 配置、状态、事件、数据库、Spec
+│  │  ├─ engine/            # v3 编排、语义差异、覆盖、证据与 Reviewer
+│  │  ├─ eval/              # 评分实现
+│  │  ├─ skills/            # Reviewer 方法与语言规则
+│  │  └─ tools/             # GitHub 与受控工具网关
+│  └─ tests/
+├─ frontend/                # React + TypeScript 控制台
+├─ test_fixtures/           # 多语言基准样本
+├─ docs/                    # v3 架构与评测诊断
+├─ scripts/                 # 部署、服务器初始化与运维脚本
+└─ reviewforge.yaml         # 生产默认配置
 ```
 
-## 技术栈
+## 自动部署
 
-- **后端**: Python 3.11+ / FastAPI / LangChain / Pydantic / aiosqlite
-- **前端**: React 18 / TypeScript / Vite / TailwindCSS / Recharts
-- **LLM**: 小米 MiMo TokenPlan（OpenAI 兼容 API）
-- **GitHub API**: httpx + REST API v3 + Webhook
-- **部署**: Docker 多阶段构建 / Nginx + systemd / GitHub Actions CI/CD
+推送到 `main` 后，GitHub Actions 会依次执行 Ruff、pytest、构建部署 bundle、上传服务器、重启服务并进行健康检查。部署脚本带进程锁和失败回滚。
 
-## License
+需要在 GitHub Actions 中配置：
 
-MIT
+- `SERVER_HOST`
+- `SERVER_USER`
+- `SERVER_SSH_KEY`
+
+服务器默认目录为 `/opt/reviewforge`，服务名为 `reviewforge`。相关脚本位于 `scripts/deploy.sh` 与 `scripts/setup-server.sh`。
+
+## 开发约定
+
+新增 Reviewer 时：
+
+1. 在 `backend/src/reviewforge/core/specs.py` 注册 `AgentSpec`
+2. 在 `backend/src/reviewforge/skills/` 添加 Skill
+3. 在 `backend/src/reviewforge/engine/reviewers.py` 实现 Reviewer
+4. 在 prompt builder 中接入对应审查方法
+5. 运行 `spec-check`、Ruff 与 pytest
+
+Reviewer 不直接发布评论；所有发现必须经过统一状态存储、验证与发布链路。

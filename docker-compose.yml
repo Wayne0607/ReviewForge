@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./skills:/app/skills
+      - ./backend/src/reviewforge/skills:/app/backend/src/reviewforge/skills
       - ./.reviewforge:/app/.reviewforge
       - ./reviewforge.yaml:/app/reviewforge.yaml
     restart: unless-stopped
@@ -23,6 +23,6 @@ services:
       - LLM_API_KEY=mock
       - REVIEWFORGE_API_TOKEN=mock
     volumes:
-      - ./skills:/app/skills
+      - ./backend/src/reviewforge/skills:/app/backend/src/reviewforge/skills
     profiles:
       - mock

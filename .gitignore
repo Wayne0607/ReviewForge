@@ -1,10 +1,16 @@
 # Python
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 *.py[cod]
 *.egg-info/
 dist/
 build/
 .venv/
+.venv-codex/
+.uv-cache/
+.uv-python/
+.tmp/
 *.egg
 
 # Environment
@@ -23,6 +29,14 @@ Thumbs.db
 
 # ReviewForge runtime
 .reviewforge/
+*.log
+
+# Generated evaluation inputs, results, and logs
+backend/eval/artifacts/*
+!backend/eval/artifacts/README.md
+
+# Never place unrelated worktrees inside this repository
+/tcode-*/
 
 # Node
 node_modules/

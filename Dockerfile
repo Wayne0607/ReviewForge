@@ -19,7 +19,6 @@ RUN pip install --no-cache-dir -e backend/
 
 # Copy source
 COPY backend/src/ backend/src/
-COPY skills/ skills/
 COPY reviewforge.yaml .
 COPY .env.example .
 

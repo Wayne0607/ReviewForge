@@ -39,8 +39,6 @@ flowchart LR
 
 更完整的契约说明见 [docs/v3-architecture.md](docs/v3-architecture.md)，当前评测边界与目标见 [docs/v3-benchmark-diagnosis.md](docs/v3-benchmark-diagnosis.md)。
 
-如果希望从产品创作者视角系统理解架构、迭代过程、效果边界和面试表达，请阅读 [ReviewForge v3 创作者完全理解与面试表达手册](docs/v3-creator-interview-guide.md)。
-
 ## 快速开始
 
 ### Docker

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 
 from fastapi import Header, HTTPException
@@ -12,5 +13,5 @@ def require_token(authorization: str = Header(default="")) -> None:
     expected = os.environ.get("REVIEWFORGE_API_TOKEN", "")
     if not expected:
         raise HTTPException(status_code=503, detail="API token 未配置")
-    if authorization != f"Bearer {expected}":
+    if not hmac.compare_digest(authorization, f"Bearer {expected}"):
         raise HTTPException(status_code=401, detail="Invalid or missing API token")

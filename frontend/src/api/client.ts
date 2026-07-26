@@ -24,9 +24,19 @@ function getHeaders(): Record<string, string> {
   return headers
 }
 
+async function apiError(res: Response): Promise<Error> {
+  const text = await res.text()
+  try {
+    const body = JSON.parse(text) as { detail?: string }
+    return new Error(body.detail || `API ${res.status}`)
+  } catch {
+    return new Error(text || `API ${res.status}`)
+  }
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { headers: getHeaders() })
-  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`)
+  if (!res.ok) throw await apiError(res)
   return res.json()
 }
 
@@ -36,7 +46,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     headers: { ...getHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`)
+  if (!res.ok) throw await apiError(res)
   return res.json()
 }
 
@@ -146,6 +156,24 @@ export interface BuiltinAgent {
   description: string
 }
 
+export interface LLMSettings {
+  base_url: string
+  model: string
+  fast_model: string
+  accurate_model: string
+  api_key_configured: boolean
+  api_key_last4: string
+  source: 'console' | 'startup'
+}
+
+export interface LLMSettingsPayload {
+  base_url: string
+  model: string
+  fast_model: string
+  accurate_model: string
+  api_key?: string
+}
+
 export const admin = {
   listSkills: () => get<{ skills: SkillMeta[] }>('/admin/skills'),
   getSkill: (name: string) =>
@@ -166,4 +194,11 @@ export const admin = {
     enabled?: boolean
   }) => post<{ ok: boolean }>('/admin/agents', a),
   deleteAgent: (reviewerType: string) => post<{ ok: boolean }>(`/admin/agents/${reviewerType}/delete`, {}),
+  getLLMSettings: () => get<LLMSettings>('/admin/llm-settings'),
+  testLLMSettings: (settings: LLMSettingsPayload) =>
+    post<{ ok: boolean; latency_ms: number; model: string }>('/admin/llm-settings/test', settings),
+  saveLLMSettings: (settings: LLMSettingsPayload) =>
+    post<{ ok: boolean; settings: LLMSettings; connection: { latency_ms: number } }>('/admin/llm-settings', settings),
+  resetLLMSettings: () =>
+    post<{ ok: boolean; settings: LLMSettings }>('/admin/llm-settings/reset', {}),
 }

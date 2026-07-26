@@ -21,11 +21,12 @@ from fastapi.staticfiles import StaticFiles
 from reviewforge.api.webhook import router as webhook_router
 from reviewforge.core.auth import require_token
 from reviewforge.core.config import ReviewForgeConfig
+from reviewforge.core.custom_store import CustomAgentStore, SkillStore
 from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
-from reviewforge.core.specs import SpecRegistry, build_registry
-from reviewforge.engine.orchestrator import Orchestrator
-from reviewforge.tools.gateway import ToolGateway
+from reviewforge.core.llm_settings import EncryptedLLMSettingsStore, LLMSettingsError, apply_override
+from reviewforge.core.runtime import LLMRuntimeManager
+from reviewforge.core.specs import SpecRegistry
 from reviewforge.tools.github_api import GitHubClient
 
 
@@ -43,6 +44,15 @@ def create_app(config_path: str | None = None) -> FastAPI:
         # Load config
         cfg = ReviewForgeConfig.load(config_path)
         mock_mode = os.environ.get("REVIEWFORGE_MOCK") == "1"
+        bootstrap_llm_config = apply_override(cfg.llm, None)
+        runtime_dir = Path(cfg.events_dir).parent
+        llm_settings_store = EncryptedLLMSettingsStore(runtime_dir)
+        try:
+            stored_llm_override = llm_settings_store.load()
+        except LLMSettingsError as exc:
+            stored_llm_override = None
+            logger.error("Ignoring unreadable console LLM settings: %s", exc)
+        cfg.llm = apply_override(bootstrap_llm_config, stored_llm_override)
 
         # S1: 非 mock 模式下 webhook_secret 必填
         if not mock_mode and not cfg.github.webhook_secret:
@@ -61,31 +71,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
         else:
             github = GitHubClient(token=cfg.github.token)
 
-        # Spec registry
-        registry = build_registry()
-        errors = registry.validate()
-        if errors:
-            raise RuntimeError(f"Spec validation failed: {errors}")
-
-        # LLM clients — D6: multi-model routing
-        model_router = None
-        if mock_mode:
-            from reviewforge.engine.mock_llm import MockChatLLM
-
-            planner_llm = MockChatLLM()
-            reviewer_llm = MockChatLLM()
-            verifier_llm = MockChatLLM()
-            logger.info("Mock mode: using MockChatLLM")
-        else:
-            from reviewforge.engine.model_router import ModelRouter
-
-            model_router = ModelRouter(cfg.llm)
-            planner_llm = model_router.get_llm("planner")
-            reviewer_llm = model_router.get_llm("reviewer")
-            verifier_llm = model_router.get_llm("verifier")
-
         # Database
-        db = Database(Path(cfg.events_dir).parent / "reviewforge.db")
+        db = Database(runtime_dir / "reviewforge.db")
         await db.connect()
         orphaned = await db.fail_running_runs("orphaned by service restart")
         if orphaned:
@@ -95,95 +82,34 @@ def create_app(config_path: str | None = None) -> FastAPI:
         # Event bus
         event_bus = EventBus(log_dir=Path(cfg.events_dir))
 
-        # Tool gateway
-        gateway = ToolGateway(registry, github)
-
-        # Cross-PR analyzer LLM (reuses verifier model)
-        cross_pr_llm = verifier_llm if not mock_mode else None
-
-        # Orchestrator
-        orchestrator = Orchestrator(
-            registry=registry,
-            gateway=gateway,
+        # Console-driven settings/agents are outside the Git tree and survive deploys.
+        custom_agent_store = CustomAgentStore(runtime_dir / "custom_agents.json")
+        runtime_manager = LLMRuntimeManager(
+            config=cfg,
+            github=github,
             event_bus=event_bus,
-            planner_llm=planner_llm,
-            reviewer_llm=reviewer_llm,
-            calibrator_llm=verifier_llm,
             db=db,
-            cross_pr_llm=cross_pr_llm,
-            github_client=github,
-            model_router=model_router,
-            agentic_reviewers=cfg.agentic_reviewers,
-            agentic_default=cfg.agentic_default,
-            escalation_enabled=cfg.escalation_enabled,
-            escalation_confidence_min=cfg.escalation_confidence_min,
-            escalation_confidence_max=cfg.escalation_confidence_max,
-            escalation_max_steps=cfg.escalation_max_steps,
-            escalation_max_tokens=cfg.escalation_max_tokens,
-            publication_gate_enabled=cfg.publication_gate_enabled,
-            publication_gate_max_steps=cfg.publication_gate_max_steps,
-            publication_gate_max_tokens=cfg.publication_gate_max_tokens,
-            publication_gate_concurrency=cfg.publication_gate_concurrency,
-            coverage_gap_enabled=cfg.coverage_gap_enabled,
-            coverage_gap_min_risk_score=cfg.coverage_gap_min_risk_score,
-            coverage_gap_max_cards=cfg.coverage_gap_max_cards,
-            coverage_gap_min_confidence=cfg.coverage_gap_min_confidence,
-            skills_dir=cfg.skills_dir,
-            v3_enabled=cfg.v3.enabled,
-            v3_coverage_min_risk_score=cfg.v3.coverage_min_risk_score,
-            v3_coverage_max_cells_per_round=cfg.v3.coverage_max_cells_per_round,
-            v3_coverage_max_attempts=cfg.v3.coverage_max_attempts,
-            v3_evidence_mode=cfg.v3.evidence_mode,
-            v3_evidence_max_candidates=cfg.v3.evidence_max_candidates,
+            custom_agent_store=custom_agent_store,
+            mock_mode=mock_mode,
         )
+        bundle = runtime_manager.build(cfg.llm)
+        runtime_manager.activate(app, bundle, cfg.llm)
 
-        # S4: 插件默认关闭，靠显式 env 开启
-        if os.environ.get("REVIEWFORGE_ENABLE_PLUGINS") == "1":
-            from reviewforge.engine.plugin_loader import PluginLoader
-
-            plugin_loader = PluginLoader()
-            plugins_dir = Path(__file__).parent / "plugins"
-            plugins = plugin_loader.discover(plugins_dir)
-            if plugins:
-                orchestrator.register_plugin_reviewers(plugins)
-                logger.warning(f"⚠️ 已加载 {len(plugins)} 个插件（执行任意代码）: {list(plugins.keys())}")
-        else:
-            logger.info("插件加载已禁用（设 REVIEWFORGE_ENABLE_PLUGINS=1 开启）")
-
-        # Console-driven Skills + config-type Agents (CRUD via /api/v1/admin, hot-reloaded)
-        from reviewforge.core.custom_store import CustomAgentStore, SkillStore
-
-        app.state.skill_store = SkillStore(orchestrator.skills_dir)
-        custom_agent_store = CustomAgentStore(Path(cfg.events_dir).parent / "custom_agents.json")
-        loaded_agents = 0
-        for spec in custom_agent_store.list():
-            if not spec.get("enabled", True):
-                continue
-            try:
-                orchestrator.register_config_agent(
-                    reviewer_type=spec["reviewer_type"],
-                    description=spec.get("description", ""),
-                    allowed_tools=spec.get("allowed_tools", []),
-                    model_profile=spec.get("model_profile", "default"),
-                    max_steps=spec.get("max_steps", 6),
-                    instructions=spec.get("instructions", ""),
-                )
-                loaded_agents += 1
-            except Exception as e:
-                logger.warning(f"Failed to register custom agent {spec.get('reviewer_type')}: {e}")
+        app.state.skill_store = SkillStore(bundle.orchestrator.skills_dir)
         app.state.custom_agent_store = custom_agent_store
-        if loaded_agents:
-            logger.info(f"Loaded {loaded_agents} custom config-type agent(s)")
+        app.state.llm_runtime_manager = runtime_manager
+        app.state.llm_settings_store = llm_settings_store
+        app.state.llm_settings_source = "console" if stored_llm_override else "startup"
+        app.state.bootstrap_llm_config = bootstrap_llm_config
+        app.state.mock_mode = mock_mode
 
         # S7: 并发控制
         app.state.review_tasks = set()
         app.state.review_semaphore = asyncio.Semaphore(int(os.environ.get("REVIEWFORGE_MAX_CONCURRENT_REVIEWS", "3")))
 
         # Store on app state
-        app.state.orchestrator = orchestrator
         app.state.github_client = github
         app.state.webhook_secret = cfg.github.webhook_secret
-        app.state.registry = registry
         app.state.config = cfg
         app.state.db = db
 

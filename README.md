@@ -109,6 +109,16 @@ REVIEWFORGE_CORS_ORIGINS=http://localhost:5173
 
 `reviewforge.yaml` 管理 Reviewer、模型 profile、置信度阈值、升级核验、发布闸门和 v3 参数。环境变量优先于 YAML。模型服务只要兼容 OpenAI Chat Completions 接口即可；可以为快速任务和高精度任务配置不同 profile。
 
+部署完成后也可以在控制台的“系统信息 → 模型服务”中测试、保存或恢复模型配置，无需重启服务。控制台采用单管理员模式，不引入用户系统：
+
+- `REVIEWFORGE_API_TOKEN` 统一保护管理 API
+- 生产控制台应放在 HTTPS 反向代理之后，避免 API Token 和新密钥在传输途中泄露
+- API Key 通过 Fernet 加密保存在 `.reviewforge/llm-settings.enc`，接口只返回是否已配置和末四位
+- 主密钥使用 `REVIEWFORGE_SECRETS_KEY`；未设置时自动生成 `.reviewforge/master.key` 并限制为服务账号读写
+- 保存前会发起最小 Chat Completions 请求，成功后原子切换；运行中的审查不受影响
+- 默认拒绝公网 HTTP、云元数据和内网地址，内网模型需显式设置 `REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=1`
+- 控制台配置优先于环境变量/YAML；“恢复启动配置”会删除加密覆盖并重新使用环境变量/YAML
+
 生产前至少检查：
 
 ```bash
@@ -142,6 +152,10 @@ uv run ruff format --check .
 | `GET /api/v1/dashboard/tokens/summary` | Token 汇总 |
 | `GET /api/v1/admin/skills` | Skill 管理 |
 | `GET /api/v1/admin/agents` | Reviewer 管理 |
+| `GET /api/v1/admin/llm-settings` | 脱敏后的当前模型配置 |
+| `POST /api/v1/admin/llm-settings/test` | 测试候选模型配置 |
+| `POST /api/v1/admin/llm-settings` | 测试、加密保存并热切换 |
+| `POST /api/v1/admin/llm-settings/reset` | 恢复环境变量/YAML 启动配置 |
 
 ## 评测
 

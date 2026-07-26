@@ -10,12 +10,21 @@ Reviewers needing custom Python still go through the gated file-plugin path.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from reviewforge.core.custom_store import ValidationError, normalize_agent
+from reviewforge.core.llm_settings import (
+    LLMSettingsError,
+    apply_override,
+    make_override,
+    safe_settings,
+    validate_endpoint_security,
+    validate_llm_profiles,
+)
 
 router = APIRouter(prefix="/api/v1/admin")
 
@@ -57,11 +66,106 @@ class AgentPayload(BaseModel):
     enabled: bool = True
 
 
+class LLMSettingsPayload(BaseModel):
+    base_url: str = Field(min_length=1, max_length=2048)
+    model: str = Field(min_length=1, max_length=200)
+    api_key: str | None = Field(default=None, max_length=4096)
+    fast_model: str = Field(default="", max_length=200)
+    accurate_model: str = Field(default="", max_length=200)
+
+
 def _orch(request: Request):
     orch = getattr(request.app.state, "orchestrator", None)
     if orch is None:
         raise HTTPException(503, "orchestrator not ready")
     return orch
+
+
+def _llm_candidate(payload: LLMSettingsPayload, request: Request):
+    current = request.app.state.config.llm
+    override = make_override(
+        current,
+        base_url=payload.base_url,
+        model=payload.model,
+        api_key=payload.api_key,
+        fast_model=payload.fast_model,
+        accurate_model=payload.accurate_model,
+    )
+    candidate = apply_override(request.app.state.bootstrap_llm_config, override)
+    return override, candidate
+
+
+async def _test_candidate(candidate, request: Request) -> dict[str, Any]:
+    if getattr(request.app.state, "mock_mode", False):
+        await asyncio.to_thread(validate_endpoint_security, candidate.base_url)
+        return {
+            "ok": True,
+            "latency_ms": 0,
+            "model": candidate.model,
+            "tested_models": sorted(
+                {
+                    candidate.model,
+                    candidate.profiles["fast"].model or candidate.model,
+                    candidate.profiles["accurate"].model or candidate.model,
+                }
+            ),
+        }
+    return await validate_llm_profiles(candidate)
+
+
+# ── LLM settings ─────────────────────────────────────────────
+
+
+@router.get("/llm-settings")
+async def get_llm_settings(request: Request) -> dict[str, Any]:
+    return safe_settings(
+        request.app.state.config.llm,
+        getattr(request.app.state, "llm_settings_source", "startup"),
+    )
+
+
+@router.post("/llm-settings/test")
+async def test_llm_settings(payload: LLMSettingsPayload, request: Request) -> dict[str, Any]:
+    try:
+        _, candidate = _llm_candidate(payload, request)
+        return await _test_candidate(candidate, request)
+    except LLMSettingsError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/llm-settings")
+async def save_llm_settings(payload: LLMSettingsPayload, request: Request) -> dict[str, Any]:
+    manager = request.app.state.llm_runtime_manager
+    try:
+        async with manager.lock:
+            override, candidate = _llm_candidate(payload, request)
+            connection = await _test_candidate(candidate, request)
+            bundle = manager.build(candidate)
+            request.app.state.llm_settings_store.save(override)
+            manager.activate(request.app, bundle, candidate)
+            request.app.state.llm_settings_source = "console"
+    except LLMSettingsError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "ok": True,
+        "connection": connection,
+        "settings": safe_settings(candidate, "console"),
+    }
+
+
+@router.post("/llm-settings/reset")
+async def reset_llm_settings(request: Request) -> dict[str, Any]:
+    manager = request.app.state.llm_runtime_manager
+    async with manager.lock:
+        candidate = apply_override(request.app.state.bootstrap_llm_config, None)
+        bundle = manager.build(candidate)
+        request.app.state.llm_settings_store.delete()
+        manager.activate(request.app, bundle, candidate)
+        request.app.state.llm_settings_source = "startup"
+    return {
+        "ok": True,
+        "settings": safe_settings(candidate, "startup"),
+    }
 
 
 # ── Skills ───────────────────────────────────────────────────

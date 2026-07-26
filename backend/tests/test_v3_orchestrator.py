@@ -883,13 +883,12 @@ class TestAppConfigWiring:
         assert orch._v3_coverage_max_attempts == 2
 
     def test_app_wiring_passes_v3_fields(self):
-        """app.py create_app passes cfg.v3 fields to Orchestrator."""
-        # We verify by checking the source code imports v3 fields
+        """The hot-swappable runtime passes cfg.v3 fields to Orchestrator."""
         import inspect
 
-        from reviewforge.app import create_app
+        from reviewforge.core.runtime import LLMRuntimeManager
 
-        source = inspect.getsource(create_app)
+        source = inspect.getsource(LLMRuntimeManager.build)
         assert "v3_enabled" in source
         assert "v3_coverage_min_risk_score" in source
         assert "v3_coverage_max_cells_per_round" in source

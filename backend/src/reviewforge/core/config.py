@@ -231,9 +231,7 @@ class ReviewForgeConfig:
     # so embedding applications opt in explicitly. Production enables
     # ``shadow`` first and only switches to ``enforce`` after replay
     # validation. Owned by the engine via ``PublicationPolicy``.
-    publication_policy: PublicationPolicyConfigYAML = field(
-        default_factory=PublicationPolicyConfigYAML
-    )
+    publication_policy: PublicationPolicyConfigYAML = field(default_factory=PublicationPolicyConfigYAML)
 
     # Selective second pass for high-risk changed symbols that received no
     # finding in the broad first pass. Disabled by default for embedders;
@@ -420,9 +418,7 @@ class ReviewForgeConfig:
             if isinstance(v3, dict):
                 self.v3 = _v3_from_dict(v3)
         if "publication_policy" in data:
-            self.publication_policy = _publication_policy_from_dict(
-                data["publication_policy"]
-            )
+            self.publication_policy = _publication_policy_from_dict(data["publication_policy"])
 
     def _apply_env(self) -> None:
         """Environment variables override config file."""
@@ -464,9 +460,7 @@ class ReviewForgeConfig:
         pp_mode = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_MODE")
         if pp_mode is not None:
             self.publication_policy.mode = _normalize_publication_policy_mode(pp_mode)
-        pp_budget_enabled = os.environ.get(
-            "REVIEWFORGE_PUBLICATION_POLICY_BUDGET_ENABLED"
-        )
+        pp_budget_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_BUDGET_ENABLED")
         if pp_budget_enabled is not None:
             self.publication_policy.budget_enabled = _parse_bool(pp_budget_enabled)
         # REVIEWFORGE_PUBLICATION_POLICY_MAX_COMMENTS — top-N budget.  Must

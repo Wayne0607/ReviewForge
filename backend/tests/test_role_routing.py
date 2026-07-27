@@ -292,9 +292,7 @@ def test_apply_override_populates_role_overrides_from_v2():
 def test_make_override_keeps_existing_role_key_when_blank():
     current = LLMConfig(
         api_key="sk-existing",
-        role_overrides={
-            "deep_review": RoleOverride(api_key="sk-dedicated-old")
-        },
+        role_overrides={"deep_review": RoleOverride(api_key="sk-dedicated-old")},
     )
     override = make_override(
         current,
@@ -366,9 +364,7 @@ def test_make_override_explicit_role_reset_clears_override():
 
 
 def test_apply_override_none_preserves_startup_role_overrides():
-    base = LLMConfig(
-        role_overrides={"planner": RoleOverride(model="startup-planner")}
-    )
+    base = LLMConfig(role_overrides={"planner": RoleOverride(model="startup-planner")})
     effective = apply_override(base, None)
     assert effective.role_overrides["planner"].model == "startup-planner"
 

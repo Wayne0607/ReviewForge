@@ -611,14 +611,9 @@ class TestPostFinalizeBudget:
                 high_risk_overflow=0,
             )
         )
-        findings = [
-            _make_finding(id=f"finding-{index}", line=5)
-            for index in range(4)
-        ]
+        findings = [_make_finding(id=f"finding-{index}", line=5) for index in range(4)]
         decision = policy.post_finalize(findings, state)
-        assert [finding.id for finding in decision.kept] == [
-            finding.id for finding in findings
-        ]
+        assert [finding.id for finding in decision.kept] == [finding.id for finding in findings]
         assert decision.dropped == []
         assert decision.metrics["budget_enabled"] == 0
 

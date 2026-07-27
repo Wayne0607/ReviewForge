@@ -145,9 +145,7 @@ class EncryptedLLMSettingsStore:
             version = 2
         payload = {
             **asdict(settings),
-            "roles": {
-                name: asdict(override) for name, override in settings.roles.items() if name in ROLE_NAMES
-            },
+            "roles": {name: asdict(override) for name, override in settings.roles.items() if name in ROLE_NAMES},
             "version": version,
             "updated_at": int(time.time()),
         }
@@ -230,9 +228,7 @@ def make_override(
         if len(value.strip()) > 200:
             raise LLMSettingsError(f"{label}名称过长")
     role_overrides: dict[str, RoleOverride] = {
-        name: deepcopy(value)
-        for name, value in current.role_overrides.items()
-        if name in ROLE_NAMES
+        name: deepcopy(value) for name, value in current.role_overrides.items() if name in ROLE_NAMES
     }
     if roles:
         for name, raw in roles.items():
@@ -259,9 +255,7 @@ def make_override(
             effective_key = role_key or existing.api_key or current.api_key
             if not effective_key:
                 raise LLMSettingsError(f"角色 {name} 的 API Key 缺失或留空")
-            role_overrides[name] = RoleOverride(
-                base_url=url, api_key=effective_key, model=model_name
-            )
+            role_overrides[name] = RoleOverride(base_url=url, api_key=effective_key, model=model_name)
     return LLMSettingsOverride(
         base_url=normalized_url,
         api_key=key,
@@ -300,15 +294,9 @@ def _safe_roles(config: LLMConfig) -> dict[str, Any]:
             "model": effective["model"],
             "api_key_configured": bool(key),
             "api_key_last4": key[-4:] if len(key) >= 8 else ("****" if key else ""),
-            "overrides_base_url": bool(
-                config.role_overrides.get(name) and config.role_overrides[name].base_url
-            ),
-            "overrides_model": bool(
-                config.role_overrides.get(name) and config.role_overrides[name].model
-            ),
-            "overrides_api_key": bool(
-                config.role_overrides.get(name) and config.role_overrides[name].api_key
-            ),
+            "overrides_base_url": bool(config.role_overrides.get(name) and config.role_overrides[name].base_url),
+            "overrides_model": bool(config.role_overrides.get(name) and config.role_overrides[name].model),
+            "overrides_api_key": bool(config.role_overrides.get(name) and config.role_overrides[name].api_key),
         }
     return out
 

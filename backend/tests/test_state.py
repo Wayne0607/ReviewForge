@@ -11,6 +11,13 @@ def test_state_add_finding():
     assert len(state.findings) == 1
 
 
+def test_finding_persists_validated_line_coercion():
+    finding = Finding(file="test.py", line="123", message="normalized")  # type: ignore[arg-type]
+
+    assert finding.line == 123
+    assert isinstance(finding.line, int)
+
+
 def test_state_deep_copy_isolation():
     state = StateStore()
     f = Finding(file="test.py", line=10, message="original")

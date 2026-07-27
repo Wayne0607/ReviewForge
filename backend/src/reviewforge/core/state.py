@@ -73,7 +73,7 @@ class Finding:
     verify_reason: str = ""
 
     def __post_init__(self) -> None:
-        FindingSchema(
+        validated = FindingSchema(
             id=self.id,
             file=self.file,
             line=self.line,
@@ -87,6 +87,11 @@ class Finding:
             verified_by=self.verified_by,
             verify_reason=self.verify_reason,
         )
+        # Pydantic may legitimately coerce provider output (for example,
+        # ``"123"`` to line 123). Persist those normalized values instead of
+        # validating and then leaving the unsafe original types in place.
+        for name, value in validated.model_dump().items():
+            setattr(self, name, value)
 
     def to_dict(self) -> dict[str, Any]:
         return {

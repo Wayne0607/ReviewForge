@@ -12,9 +12,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 TASK_RATIONALE_MAX_LENGTH = 500
+FINDING_VERIFY_REASON_MAX_LENGTH = 500
 
 
 class FindingSchema(BaseModel):
@@ -31,7 +32,14 @@ class FindingSchema(BaseModel):
     reviewer: str = Field(default="")
     status: str = Field(default="candidate", pattern="^(candidate|confirmed|false_positive|reported)$")
     verified_by: str = Field(default="")
-    verify_reason: str = Field(default="", max_length=500)
+    verify_reason: str = Field(default="", max_length=FINDING_VERIFY_REASON_MAX_LENGTH)
+
+    @field_validator("verify_reason", mode="before")
+    @classmethod
+    def bound_verify_reason(cls, value: object) -> str:
+        """Keep provider explanations within the persisted state contract."""
+
+        return str(value or "")[:FINDING_VERIFY_REASON_MAX_LENGTH]
 
 
 class TaskSchema(BaseModel):
@@ -209,9 +217,11 @@ class StateStore:
         if unknown:
             raise ValueError(f"未知 finding 字段: {unknown}")
         candidate = {**f.to_dict(), **kwargs}
-        FindingSchema(**candidate)
-        for k, v in kwargs.items():
-            setattr(f, k, v)
+        validated = FindingSchema(**candidate).model_dump()
+        for key in kwargs:
+            # Persist Pydantic coercion and field-level normalization instead
+            # of validating one value and then storing the unsafe original.
+            setattr(f, key, validated[key])
 
     def add_task(self, task: ReviewTask) -> str:
         self.tasks[task.id] = task

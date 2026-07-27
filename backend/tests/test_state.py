@@ -18,6 +18,23 @@ def test_finding_persists_validated_line_coercion():
     assert isinstance(finding.line, int)
 
 
+def test_state_update_persists_normalized_provider_values():
+    state = StateStore()
+    finding = Finding(file="test.py", line=1, message="normalized update")
+    state.add_finding(finding)
+
+    state.update_finding(
+        finding.id,
+        line="42",
+        verify_reason="证" * 700,
+    )
+
+    updated = state.findings[finding.id]
+    assert updated.line == 42
+    assert isinstance(updated.line, int)
+    assert updated.verify_reason == "证" * 500
+
+
 def test_state_deep_copy_isolation():
     state = StateStore()
     f = Finding(file="test.py", line=10, message="original")

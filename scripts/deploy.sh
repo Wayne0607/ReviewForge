@@ -26,6 +26,31 @@ log() {
     printf '%s\n' "$*"
 }
 
+stop_local_benchmark_workers() {
+    local pid_file
+    local pid
+    local command
+    local stopped=0
+
+    # Benchmarks are resumable from their result files, but their concurrent
+    # model workers can exhaust a small production host while Vite links the
+    # dashboard bundle. Quiesce only ReviewForge's explicitly tracked workers.
+    for pid_file in "$APP_DIR"/.reviewforge/benchmarks/*/full50/shard-*/pid; do
+        [[ -f "$pid_file" ]] || continue
+        pid="$(cat "$pid_file" 2> /dev/null || true)"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        command="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null || true)"
+        [[ "$command" == *martian_runner.py* ]] || continue
+        kill -TERM "$pid" 2> /dev/null || true
+        stopped=$((stopped + 1))
+    done
+
+    if (( stopped > 0 )); then
+        log "Stopped ${stopped} resumable benchmark worker(s) before deployment"
+        sleep 5
+    fi
+}
+
 die() {
     log "ERROR: $*" >&2
     exit 1
@@ -228,6 +253,7 @@ main() {
 
     [[ -d "$APP_DIR/.git" ]] || die "Not a git repository: $APP_DIR"
     load_service_environment
+    stop_local_benchmark_workers
 
     # FD 9 remains open for the whole process, including rollback.
     exec 9> "$LOCK_FILE" || die "Cannot open deployment lock: $LOCK_FILE"

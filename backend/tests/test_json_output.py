@@ -10,9 +10,7 @@ void run() { call(); }
 {"findings":[{"file":"app.py","line":7}]}
 ```"""
 
-    assert extract_json_value(content, required_key="findings") == {
-        "findings": [{"file": "app.py", "line": 7}]
-    }
+    assert extract_json_value(content, required_key="findings") == {"findings": [{"file": "app.py", "line": 7}]}
 
 
 def test_skips_textual_tool_call_objects_when_findings_are_required() -> None:

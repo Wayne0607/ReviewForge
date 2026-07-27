@@ -7,7 +7,6 @@ triggers Go-specific security checks, Rust code triggers Rust-specific ones, etc
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections import Counter
@@ -15,6 +14,7 @@ from collections import Counter
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import TASK_RATIONALE_MAX_LENGTH, ReviewTask, StateStore
 from reviewforge.engine.context_engine import render_impact_manifest
@@ -389,20 +389,8 @@ class Planner:
         Validation is deliberately per item: one malformed proposal must not
         discard valid sibling tasks or fail the entire review round.
         """
-        if not isinstance(content, str):
-            logger.warning("Planner returned non-text content, ignoring LLM tasks")
-            return []
-
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
+        data = extract_json_value(content, required_key="tasks", allow_list=False)
+        if data is None:
             logger.warning("Planner returned invalid JSON, falling back to style-only review")
             return []
 
@@ -508,17 +496,7 @@ class Planner:
 
     @staticmethod
     def _has_valid_task_envelope(content: object) -> bool:
-        if not isinstance(content, str):
-            return False
-        stripped = content.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-        try:
-            data = json.loads(stripped.strip())
-        except json.JSONDecodeError:
-            return False
+        data = extract_json_value(content, required_key="tasks", allow_list=False)
         return isinstance(data, dict) and isinstance(data.get("tasks"), list)
 
 

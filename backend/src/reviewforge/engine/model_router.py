@@ -8,7 +8,10 @@ profile override is specified.
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit, urlunsplit
 
+from langchain_anthropic import ChatAnthropic
+from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.config import LLMConfig
@@ -35,6 +38,43 @@ DEFAULT_PROFILE_MAP = {
 }
 
 
+def _is_minimax(base_url: str, model: str) -> bool:
+    return "minimax" in base_url.lower() and model.lower().startswith("minimax-")
+
+
+def _minimax_anthropic_url(base_url: str) -> str:
+    """Map either MiniMax OpenAI endpoint to its Anthropic-compatible root."""
+
+    parsed = urlsplit(base_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/anthropic", "", ""))
+
+
+def _build_llm(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    temperature: float,
+    max_tokens: int | None = None,
+) -> BaseChatModel:
+    common = {
+        "model": model,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        common["max_tokens"] = max_tokens
+    if _is_minimax(base_url, model):
+        # MiniMax recommends Anthropic compatibility for M-series models. It
+        # preserves native tool calls and lets M3 return final text without
+        # spending the response budget on OpenAI-style <think> content.
+        return ChatAnthropic(
+            base_url=_minimax_anthropic_url(base_url),
+            anthropic_api_key=api_key,
+            **common,
+        )
+    return ChatOpenAI(base_url=base_url, api_key=api_key, **common)
+
+
 class ModelRouter:
     """Routes agent names to ChatOpenAI instances based on config profiles.
 
@@ -54,9 +94,9 @@ class ModelRouter:
 
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
-        self._cache: dict[str, ChatOpenAI] = {}
+        self._cache: dict[str, BaseChatModel] = {}
 
-    def get_llm(self, agent_name: str) -> ChatOpenAI:
+    def get_llm(self, agent_name: str) -> BaseChatModel:
         """Get or create an LLM instance for the given agent."""
         profile_name = DEFAULT_PROFILE_MAP.get(agent_name, "default")
 
@@ -65,14 +105,16 @@ class ModelRouter:
 
         profile = self._config.profiles.get(profile_name)
         if profile:
-            llm = ChatOpenAI(
-                base_url=profile.base_url or self._config.base_url,
+            base_url = profile.base_url or self._config.base_url
+            model = profile.model or self._config.model
+            llm = _build_llm(
+                base_url=base_url,
                 api_key=profile.api_key or self._config.api_key,
-                model=profile.model or self._config.model,
+                model=model,
                 temperature=profile.temperature,
                 max_tokens=profile.max_tokens,
             )
-            logger.info(f"LLM[{profile_name}]: model={profile.model or self._config.model}, temp={profile.temperature}")
+            logger.info(f"LLM[{profile_name}]: model={model}, temp={profile.temperature}")
         else:
             # Fallback to default config
             temp_map = {
@@ -80,7 +122,7 @@ class ModelRouter:
                 "verifier": self._config.temperature_verifier,
             }
             temp = temp_map.get(agent_name, self._config.temperature_reviewer)
-            llm = ChatOpenAI(
+            llm = _build_llm(
                 base_url=self._config.base_url,
                 api_key=self._config.api_key,
                 model=self._config.model,

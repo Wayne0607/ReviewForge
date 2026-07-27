@@ -22,6 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.database import Database
+from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.security_categories import is_security_category, normalize_category
@@ -2049,32 +2050,10 @@ reason 不得复述源码、凭据或密钥，且不超过 200 个中文字符�
 
     def _parse_confirmation(self, content: str, chains: list[CrossPRChain]) -> list[Finding]:
         """Parse LLM confirmation output into findings."""
-        if not isinstance(content, str):
+        data = extract_json_value(content)
+        if data is None:
+            logger.warning("Cross-PR: LLM returned invalid JSON")
             return []
-        # Strip code fences
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            # Try to find JSON array
-            import re
-
-            match = re.search(r"\[.*\]", content, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group())
-                except json.JSONDecodeError:
-                    logger.warning("Cross-PR: LLM returned invalid JSON")
-                    return []
-            else:
-                logger.warning("Cross-PR: LLM returned invalid JSON")
-                return []
 
         if not isinstance(data, list):
             return []

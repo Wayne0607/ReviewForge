@@ -12,16 +12,15 @@ Architecture:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import Finding
 
 logger = logging.getLogger(__name__)
@@ -458,27 +457,8 @@ def _strip_code_fences(content: str) -> str:
 
 def _extract_json(content: str) -> dict | None:
     """Extract a single JSON object from LLM output."""
-    content = _strip_code_fences(content)
-
-    # Direct parse
-    try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError:
-        pass
-
-    # Find {...} pattern
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-
-    return None
+    data = extract_json_value(content, required_key="verdict", allow_list=False)
+    return data if isinstance(data, dict) else None
 
 
 def _parse_verdict_response(content: str) -> dict | None:

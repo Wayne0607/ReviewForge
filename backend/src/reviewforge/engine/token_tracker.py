@@ -134,12 +134,14 @@ class TrackedChatLLM(BaseChatModel):
         return self._inner._identifying_params
 
     def bind_tools(self, tools, **kwargs):
-        # Bind tools onto THIS wrapper (not the raw inner) so tool-calling invocations
-        # still route through _agenerate and get their token usage recorded.
-        from langchain_core.utils.function_calling import convert_to_openai_tool
-
-        formatted = [convert_to_openai_tool(t) for t in tools]
-        return self.bind(tools=formatted, **kwargs)
+        # Let the provider format its own schema (OpenAI and Anthropic use
+        # different envelopes), then bind those request kwargs onto this
+        # wrapper so invocations still pass through token accounting.
+        provider_bound = self._inner.bind_tools(tools, **kwargs)
+        provider_kwargs = getattr(provider_bound, "kwargs", None)
+        if not isinstance(provider_kwargs, dict):
+            raise TypeError("Provider bind_tools did not return bindable request arguments")
+        return self.bind(**provider_kwargs)
 
     def with_structured_output(self, schema, **kwargs):
         return self._inner.with_structured_output(schema, **kwargs)

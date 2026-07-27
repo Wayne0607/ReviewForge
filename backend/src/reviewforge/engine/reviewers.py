@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
+from reviewforge.core.json_output import extract_json_value, strip_reasoning_blocks
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.budget import MAX_TOOL_CALLS_PER_FILE, MAX_TOOL_OUTPUT_CHARS, TokenBudget
@@ -379,34 +380,7 @@ class BaseReviewer:
     @staticmethod
     def _extract_json(content: str) -> Any:
         """Extract JSON from LLM output, handling extra text around it."""
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-
-        match = re.search(r"(\{.*\}|\[.*\])", content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(content[start : end + 1])
-            except json.JSONDecodeError:
-                pass
-
-        return None
+        return extract_json_value(content, required_key="findings")
 
     @staticmethod
     def _recover_truncated_findings(content: str) -> dict[str, list[dict[str, Any]]] | None:
@@ -417,7 +391,7 @@ class BaseReviewer:
         The unfinished tail is discarded, and prose JSON snippets are ignored.
         """
 
-        stripped = str(content or "").strip()
+        stripped = strip_reasoning_blocks(content)
         if stripped.startswith("```"):
             stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
         stripped = stripped.removesuffix("```").strip()

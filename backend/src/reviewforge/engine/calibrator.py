@@ -10,7 +10,6 @@ Stops early when consensus is reached. Max 3 rounds.
 from __future__ import annotations
 
 import ast
-import json
 import logging
 import math
 import re
@@ -19,6 +18,7 @@ from dataclasses import dataclass, replace
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding
 from reviewforge.engine.detectors.accessibility import is_deterministic_accessibility_finding
@@ -1911,39 +1911,4 @@ Dependency and duplicate-finding rules:
     @staticmethod
     def _extract_json(content: str) -> list | dict | None:
         """Extract JSON from LLM output, handling extra text around it."""
-        content = DynamicCalibrator._strip_code_fences(content)
-
-        # Try direct parse first
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-
-        # Try to find JSON array in the content
-        # Look for [...] pattern
-        match = re.search(r"\[.*\]", content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-        # Try to find JSON object {...} pattern
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-        # Try removing leading/trailing non-JSON text
-        for start_char, end_char in [("[", "]"), ("{", "}")]:
-            start = content.find(start_char)
-            end = content.rfind(end_char)
-            if start != -1 and end != -1 and end > start:
-                try:
-                    return json.loads(content[start : end + 1])
-                except json.JSONDecodeError:
-                    continue
-
-        return None
+        return extract_json_value(content)

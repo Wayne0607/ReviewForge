@@ -23,6 +23,7 @@ def _patch_chat_openai(monkeypatch):
     """Replace ChatOpenAI with DummyLLM for every test."""
     DummyLLM.instances.clear()
     monkeypatch.setattr("reviewforge.engine.model_router.ChatOpenAI", DummyLLM)
+    monkeypatch.setattr("reviewforge.engine.model_router.ChatAnthropic", DummyLLM)
 
 
 def _make_config() -> LLMConfig:
@@ -71,3 +72,33 @@ def test_profile_cache_returns_same_instance():
 def test_default_profile_map_routes_correctness_to_accurate():
     """The mapping constant itself should point correctness to accurate."""
     assert DEFAULT_PROFILE_MAP["correctness_reviewer"] == "accurate"
+
+
+def test_minimax_models_use_anthropic_compatibility():
+    """MiniMax M-series must use its native tool/thinking protocol."""
+    config = _make_config()
+    config.base_url = "https://api.minimaxi.com/v1"
+    config.profiles["accurate"].model = "MiniMax-M3"
+
+    ModelRouter(config).get_llm("correctness_reviewer")
+
+    assert DummyLLM.instances[-1].kwargs["base_url"] == "https://api.minimaxi.com/anthropic"
+    assert DummyLLM.instances[-1].kwargs["anthropic_api_key"] == "sk-test"
+
+
+def test_other_openai_compatible_providers_do_not_receive_minimax_options():
+    ModelRouter(_make_config()).get_llm("correctness_reviewer")
+
+    assert DummyLLM.instances[-1].kwargs["base_url"] == "https://test.example.com/v1"
+    assert DummyLLM.instances[-1].kwargs["api_key"] == "sk-test"
+    assert "anthropic_api_key" not in DummyLLM.instances[-1].kwargs
+
+
+def test_minimax_m27_also_uses_anthropic_compatibility():
+    config = _make_config()
+    config.base_url = "https://api.minimaxi.com/v1"
+    config.profiles["accurate"].model = "MiniMax-M2.7"
+
+    ModelRouter(config).get_llm("correctness_reviewer")
+
+    assert DummyLLM.instances[-1].kwargs["base_url"] == "https://api.minimaxi.com/anthropic"

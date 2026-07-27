@@ -116,6 +116,8 @@ def _language(ctx: dict[str, Any]) -> str:
 
 
 def _available_tools(ctx: dict[str, Any]) -> str | None:
+    if not ctx.get("tools_enabled"):
+        return None
     registry: SpecRegistry = ctx["registry"]
     agent_name = ctx.get("agent_name", "")
     if not agent_name or agent_name not in registry.agents:

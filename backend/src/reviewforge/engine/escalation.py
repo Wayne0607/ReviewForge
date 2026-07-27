@@ -15,15 +15,14 @@ approach: same accuracy, ~1/3 token cost on clean/obvious code.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.events import EventBus
+from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.budget import MAX_TOOL_OUTPUT_CHARS, TokenBudget
 from reviewforge.engine.reviewers import build_reviewer_tools
@@ -376,30 +375,8 @@ class EscalationReviewer:
     @staticmethod
     def _parse_verdict(content: str) -> dict | None:
         """Parse verdict JSON from LLM response."""
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-
-        try:
-            data = json.loads(content)
-            if isinstance(data, dict) and "verdict" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
-
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group())
-                if isinstance(data, dict) and "verdict" in data:
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-        return None
+        data = extract_json_value(content, required_key="verdict", allow_list=False)
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def _apply_verdict(finding: Finding, verdict: dict) -> Finding:

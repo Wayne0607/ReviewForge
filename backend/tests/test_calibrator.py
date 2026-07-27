@@ -2288,6 +2288,22 @@ def test_prompt_diff_budget_recycles_unused_small_file_share():
     assert len(reviewer) < 42_000
 
 
+def test_reviewer_prompt_advertises_tools_only_when_they_are_bound():
+    base = {
+        "registry": build_registry(),
+        "reviewer_type": "correctness",
+        "agent_name": "correctness_reviewer",
+        "files_to_review": ["service.py"],
+        "diffs": {"service.py": "+return result"},
+    }
+
+    singleshot = build_reviewer_prompt(base)[0]["content"]
+    agentic = build_reviewer_prompt({**base, "tools_enabled": True})[0]["content"]
+
+    assert "## Available Tools" not in singleshot
+    assert "## Available Tools" in agentic
+
+
 def test_correctness_prompt_accepts_direct_diff_contradictions_as_evidence():
     system = build_reviewer_prompt(
         {

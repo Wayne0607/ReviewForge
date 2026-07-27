@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 _VALID_EVIDENCE_MODES = frozenset({"off", "shadow", "enforce"})
+_VALID_PUBLICATION_POLICY_MODES = _VALID_EVIDENCE_MODES
 
 
 def _normalize_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -40,11 +41,56 @@ def _normalize_evidence_mode(value: Any) -> str:
     return "shadow"
 
 
+def _normalize_publication_policy_mode(value: Any) -> str:
+    """Return a valid publication-policy mode, falling back to ``off``."""
+    if isinstance(value, str) and value.strip().lower() in _VALID_PUBLICATION_POLICY_MODES:
+        return value.strip().lower()
+    return "off"
+
+
+def _publication_policy_from_dict(data: dict[str, Any]) -> PublicationPolicyConfigYAML:
+    cfg = PublicationPolicyConfigYAML()
+    if not isinstance(data, dict):
+        return cfg
+    if "enabled" in data:
+        cfg.enabled = _parse_bool(data["enabled"])
+    if "mode" in data:
+        cfg.mode = _normalize_publication_policy_mode(data["mode"])
+    if "budget_enabled" in data:
+        cfg.budget_enabled = _parse_bool(data["budget_enabled"])
+    if "max_comments" in data:
+        try:
+            cfg.max_comments = max(1, int(data["max_comments"]))
+        except (TypeError, ValueError):
+            pass
+    if "high_risk_overflow" in data:
+        try:
+            cfg.high_risk_overflow = max(0, int(data["high_risk_overflow"]))
+        except (TypeError, ValueError):
+            pass
+    return cfg
+
+
 def _parse_bool(value: Any) -> bool:
     """Parse a bool from YAML or env, handling string representations."""
     if isinstance(value, str):
         return value.strip().lower() not in ("0", "false", "no", "")
     return bool(value)
+
+
+@dataclass
+class PublicationPolicyConfigYAML:
+    """YAML shape for the publication policy block.
+
+    Mirrors ``reviewforge.engine.publication_policy.PublicationPolicyConfig``;
+    kept here to avoid coupling the YAML loader to the engine module.
+    """
+
+    enabled: bool = False
+    mode: str = "off"
+    budget_enabled: bool = True
+    max_comments: int = 4
+    high_risk_overflow: int = 1
 
 
 @dataclass
@@ -71,6 +117,31 @@ class ModelProfile:
 
 
 @dataclass
+class RoleOverride:
+    """Per-role LLM override for the 5 fixed functional roles.
+
+    Empty fields fall back to the global LLMConfig.  Used by the
+    single-admin console so each role can point at a different endpoint,
+    key, or model without changing the global config.
+    """
+
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+
+
+# The five fixed functional roles.  Centralised here so model_router,
+# llm_settings, admin API and frontend all reference the same set.
+ROLE_NAMES: tuple[str, ...] = (
+    "planner",
+    "fast_review",
+    "deep_review",
+    "verifier",
+    "publication_gate",
+)
+
+
+@dataclass
 class LLMConfig:
     base_url: str = "https://token-plan-cn.xiaomimimo.com/v1"
     api_key: str = ""
@@ -79,6 +150,10 @@ class LLMConfig:
     temperature_reviewer: float = 0.1
     temperature_verifier: float = 0.0
     profiles: dict[str, ModelProfile] = field(default_factory=dict)
+    # Per-role overrides keyed by one of ROLE_NAMES.  Missing roles fall
+    # back to base_url/api_key/model at the global level.  Legacy fast/
+    # accurate profile routing remains available for compatibility.
+    role_overrides: dict[str, RoleOverride] = field(default_factory=dict)
 
 
 @dataclass
@@ -151,6 +226,14 @@ class ReviewForgeConfig:
     publication_gate_max_steps: int = 4
     publication_gate_max_tokens: int = 6000
     publication_gate_concurrency: int = 4
+
+    # Model-agnostic publication policy (Stage 1). Library default is OFF
+    # so embedding applications opt in explicitly. Production enables
+    # ``shadow`` first and only switches to ``enforce`` after replay
+    # validation. Owned by the engine via ``PublicationPolicy``.
+    publication_policy: PublicationPolicyConfigYAML = field(
+        default_factory=PublicationPolicyConfigYAML
+    )
 
     # Selective second pass for high-risk changed symbols that received no
     # finding in the broad first pass. Disabled by default for embedders;
@@ -232,6 +315,16 @@ class ReviewForgeConfig:
             for k, v in data["llm"].items():
                 if k == "profiles" and isinstance(v, dict):
                     self.llm.profiles = {name: ModelProfile(**p) if isinstance(p, dict) else p for name, p in v.items()}
+                elif k == "role_overrides" and isinstance(v, dict):
+                    self.llm.role_overrides = {
+                        name: RoleOverride(
+                            base_url=str(raw.get("base_url") or ""),
+                            api_key=str(raw.get("api_key") or ""),
+                            model=str(raw.get("model") or ""),
+                        )
+                        for name, raw in v.items()
+                        if name in ROLE_NAMES and isinstance(raw, dict)
+                    }
                 elif hasattr(self.llm, k):
                     setattr(self.llm, k, v)
         if "server" in data:
@@ -326,6 +419,10 @@ class ReviewForgeConfig:
             v3 = data["v3"]
             if isinstance(v3, dict):
                 self.v3 = _v3_from_dict(v3)
+        if "publication_policy" in data:
+            self.publication_policy = _publication_policy_from_dict(
+                data["publication_policy"]
+            )
 
     def _apply_env(self) -> None:
         """Environment variables override config file."""
@@ -360,3 +457,33 @@ class ReviewForgeConfig:
         v3_mode = os.environ.get("REVIEWFORGE_V3_EVIDENCE_MODE")
         if v3_mode is not None:
             self.v3.evidence_mode = _normalize_evidence_mode(v3_mode)
+        # Publication-policy env overrides
+        pp_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_ENABLED")
+        if pp_enabled is not None:
+            self.publication_policy.enabled = _parse_bool(pp_enabled)
+        pp_mode = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_MODE")
+        if pp_mode is not None:
+            self.publication_policy.mode = _normalize_publication_policy_mode(pp_mode)
+        pp_budget_enabled = os.environ.get(
+            "REVIEWFORGE_PUBLICATION_POLICY_BUDGET_ENABLED"
+        )
+        if pp_budget_enabled is not None:
+            self.publication_policy.budget_enabled = _parse_bool(pp_budget_enabled)
+        # REVIEWFORGE_PUBLICATION_POLICY_MAX_COMMENTS — top-N budget.  Must
+        # be >= 1; bad values fall back to the YAML/default value rather
+        # than disabling the policy.
+        pp_max_comments = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_MAX_COMMENTS")
+        if pp_max_comments is not None:
+            try:
+                self.publication_policy.max_comments = max(1, int(pp_max_comments))
+            except (TypeError, ValueError):
+                pass
+        # REVIEWFORGE_PUBLICATION_POLICY_HIGH_RISK_OVERFLOW — bounded
+        # detector-error overflow slots.  0 disables overflow; negative
+        # values clamp to 0; bad values fall back to the YAML/default.
+        pp_overflow = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_HIGH_RISK_OVERFLOW")
+        if pp_overflow is not None:
+            try:
+                self.publication_policy.high_risk_overflow = max(0, int(pp_overflow))
+            except (TypeError, ValueError):
+                pass

@@ -11,6 +11,7 @@ from typing import Any
 from reviewforge.core.config import LLMConfig, ReviewForgeConfig
 from reviewforge.core.specs import SpecRegistry, build_registry
 from reviewforge.engine.orchestrator import Orchestrator
+from reviewforge.engine.publication_policy import PublicationPolicy, PublicationPolicyConfig
 from reviewforge.tools.gateway import ToolGateway
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,24 @@ class RuntimeBundle:
     registry: SpecRegistry
     gateway: ToolGateway
     orchestrator: Orchestrator
+
+
+# Per-agent → role map.  Mirrors the 5-role model in model_router.ROLE_MAP
+# so the runtime manager hands the orchestrator the right LLM for every
+# internal agent (planner, reviewer families, verifier/calibrator/cross-PR,
+# evidence prover/refuter/arbiter, and the publication gate).
+_ROLE_AGENT_NAMES: dict[str, str] = {
+    "planner": "planner",
+    "verifier": "verifier",
+    "calibrator": "calibrator",
+    "cross_pr_analyzer": "cross_pr_analyzer",
+    "evidence_prover": "evidence_prover",
+    "evidence_refuter": "evidence_refuter",
+    "evidence_arbiter": "evidence_arbiter",
+    "publication_gate": "publication_gate",
+    "fast_review": "performance_reviewer",
+    "deep_review": "correctness_reviewer",
+}
 
 
 class LLMRuntimeManager:
@@ -58,16 +77,33 @@ class LLMRuntimeManager:
             planner_llm = MockChatLLM()
             reviewer_llm = MockChatLLM()
             verifier_llm = MockChatLLM()
+            publication_gate_llm = MockChatLLM()
         else:
             from reviewforge.engine.model_router import ModelRouter
 
             model_router = ModelRouter(llm_config)
+            # Source a dedicated LLM for each internal agent from the
+            # model_router so role overrides propagate automatically.  The
+            # 5 fixed roles (planner / fast_review / deep_review / verifier
+            # / publication_gate) get their own LLM, distinct from the
+            # generic reviewer_llm used by the broad pass.
             planner_llm = model_router.get_llm("planner")
-            reviewer_llm = model_router.get_llm("reviewer")
+            reviewer_llm = model_router.get_llm("performance_reviewer")  # fast_review family
             verifier_llm = model_router.get_llm("verifier")
+            publication_gate_llm = model_router.get_llm("publication_gate")
+            # Invalidate any cached LLMs from a prior build so the new
+            # build does not reuse stale instances after a hot-swap.
+            model_router.invalidate_cache()
 
         gateway = ToolGateway(registry, self.github)
         cfg = self.config
+        policy_cfg = PublicationPolicyConfig(
+            enabled=cfg.publication_policy.enabled,
+            mode=cfg.publication_policy.mode,
+            budget_enabled=cfg.publication_policy.budget_enabled,
+            max_comments=cfg.publication_policy.max_comments,
+            high_risk_overflow=cfg.publication_policy.high_risk_overflow,
+        )
         orchestrator = Orchestrator(
             registry=registry,
             gateway=gateway,
@@ -86,10 +122,15 @@ class LLMRuntimeManager:
             escalation_confidence_max=cfg.escalation_confidence_max,
             escalation_max_steps=cfg.escalation_max_steps,
             escalation_max_tokens=cfg.escalation_max_tokens,
+            escalation_llm=verifier_llm,
             publication_gate_enabled=cfg.publication_gate_enabled,
             publication_gate_max_steps=cfg.publication_gate_max_steps,
             publication_gate_max_tokens=cfg.publication_gate_max_tokens,
             publication_gate_concurrency=cfg.publication_gate_concurrency,
+            # Always pass the dedicated publication_gate LLM so the gate
+            # never silently reuses the broad-pass reviewer_llm.
+            publication_gate_llm=publication_gate_llm,
+            publication_policy=PublicationPolicy(policy_cfg),
             coverage_gap_enabled=cfg.coverage_gap_enabled,
             coverage_gap_min_risk_score=cfg.coverage_gap_min_risk_score,
             coverage_gap_max_cards=cfg.coverage_gap_max_cards,

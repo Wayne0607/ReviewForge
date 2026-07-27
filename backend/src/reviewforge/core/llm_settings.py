@@ -11,7 +11,7 @@ import os
 import socket
 import time
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
-from reviewforge.core.config import LLMConfig, ModelProfile
+from reviewforge.core.config import ROLE_NAMES, LLMConfig, ModelProfile, RoleOverride
 
 
 class LLMSettingsError(ValueError):
@@ -28,7 +28,11 @@ class LLMSettingsError(ValueError):
 
 @dataclass(frozen=True)
 class LLMSettingsOverride:
-    """The small set of LLM fields managed by the single-admin console."""
+    """The small set of LLM fields managed by the single-admin console.
+
+    V1 stores global base_url/api_key/model + fast/accurate model names.
+    V2 additionally stores per-role overrides keyed by one of ROLE_NAMES.
+    """
 
     base_url: str
     api_key: str
@@ -36,6 +40,7 @@ class LLMSettingsOverride:
     fast_model: str = ""
     accurate_model: str = ""
     version: int = 1
+    roles: dict[str, RoleOverride] = field(default_factory=dict)
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -59,6 +64,16 @@ def _write_private(path: Path, data: bytes) -> None:
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+
+def _coerce_role_override(raw: Any) -> RoleOverride:
+    """Build a RoleOverride from a possibly-partial dict, ignoring junk."""
+    if not isinstance(raw, dict):
+        return RoleOverride()
+    base_url = str(raw.get("base_url") or "").strip()
+    api_key = str(raw.get("api_key") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    return RoleOverride(base_url=base_url, api_key=api_key, model=model)
 
 
 class EncryptedLLMSettingsStore:
@@ -98,20 +113,42 @@ class EncryptedLLMSettingsStore:
         try:
             clear = Fernet(self._key()).decrypt(self.path.read_bytes())
             data = json.loads(clear.decode("utf-8"))
-            return LLMSettingsOverride(
-                base_url=str(data["base_url"]),
-                api_key=str(data["api_key"]),
-                model=str(data["model"]),
-                fast_model=str(data.get("fast_model", "")),
-                accurate_model=str(data.get("accurate_model", "")),
-                version=int(data.get("version", 1)),
-            )
         except (InvalidToken, KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
             raise LLMSettingsError("加密模型配置损坏或主密钥不匹配") from exc
+        return self._coerce(data)
+
+    @staticmethod
+    def _coerce(data: dict[str, Any]) -> LLMSettingsOverride:
+        """Build a settings object from a decrypted dict, accepting v1 + v2 shapes."""
+        raw_roles = data.get("roles", {})
+        roles: dict[str, RoleOverride] = {}
+        if isinstance(raw_roles, dict):
+            for name, value in raw_roles.items():
+                if name not in ROLE_NAMES:
+                    continue
+                roles[name] = _coerce_role_override(value)
+        return LLMSettingsOverride(
+            base_url=str(data.get("base_url", "")),
+            api_key=str(data.get("api_key", "")),
+            model=str(data.get("model", "")),
+            fast_model=str(data.get("fast_model", "")),
+            accurate_model=str(data.get("accurate_model", "")),
+            version=int(data.get("version", 1)),
+            roles=roles,
+        )
 
     def save(self, settings: LLMSettingsOverride) -> None:
+        # Bump to v2 whenever any per-role override is present so reloads
+        # can detect that role data is in use.
+        version = settings.version
+        if version < 2 and settings.roles:
+            version = 2
         payload = {
             **asdict(settings),
+            "roles": {
+                name: asdict(override) for name, override in settings.roles.items() if name in ROLE_NAMES
+            },
+            "version": version,
             "updated_at": int(time.time()),
         }
         encrypted = Fernet(self._key()).encrypt(
@@ -123,10 +160,27 @@ class EncryptedLLMSettingsStore:
         self.path.unlink(missing_ok=True)
 
 
+def _effective_role_config(base: LLMConfig, role: str, override: RoleOverride | None) -> dict[str, str]:
+    """Resolve the effective (base_url, api_key, model) for a single role."""
+    if override is None:
+        return {
+            "base_url": base.base_url,
+            "api_key": base.api_key,
+            "model": base.model,
+        }
+    return {
+        "base_url": override.base_url or base.base_url,
+        "api_key": override.api_key or base.api_key,
+        "model": override.model or base.model,
+    }
+
+
 def apply_override(base: LLMConfig, override: LLMSettingsOverride | None) -> LLMConfig:
     """Return a detached effective config without mutating the startup config."""
     cfg = deepcopy(base)
     if override is None:
+        for role_name in ROLE_NAMES:
+            cfg.role_overrides.setdefault(role_name, RoleOverride())
         return cfg
     cfg.base_url = override.base_url
     cfg.api_key = override.api_key
@@ -142,6 +196,13 @@ def apply_override(base: LLMConfig, override: LLMSettingsOverride | None) -> LLM
         # secrets so a hidden YAML value cannot silently win.
         profile.base_url = ""
         profile.api_key = ""
+    # Unspecified entries preserve startup/YAML role routing. An explicit
+    # empty RoleOverride clears that role to its legacy/global fallback.
+    for role_name, role_override in override.roles.items():
+        if role_name in ROLE_NAMES:
+            cfg.role_overrides[role_name] = deepcopy(role_override)
+    for role_name in ROLE_NAMES:
+        cfg.role_overrides.setdefault(role_name, RoleOverride())
     return cfg
 
 
@@ -153,6 +214,7 @@ def make_override(
     api_key: str | None,
     fast_model: str = "",
     accurate_model: str = "",
+    roles: dict[str, dict[str, Any]] | None = None,
 ) -> LLMSettingsOverride:
     """Normalize a console payload, keeping the active key when left blank."""
     normalized_url = base_url.strip().rstrip("/")
@@ -167,19 +229,54 @@ def make_override(
     for value, label in ((fast_model, "快速模型"), (accurate_model, "高精度模型")):
         if len(value.strip()) > 200:
             raise LLMSettingsError(f"{label}名称过长")
+    role_overrides: dict[str, RoleOverride] = {
+        name: deepcopy(value)
+        for name, value in current.role_overrides.items()
+        if name in ROLE_NAMES
+    }
+    if roles:
+        for name, raw in roles.items():
+            if name not in ROLE_NAMES or not isinstance(raw, dict):
+                continue
+            if bool(raw.get("reset")):
+                role_overrides[name] = RoleOverride()
+                continue
+            url = str(raw.get("base_url") or "").strip().rstrip("/")
+            model_name = str(raw.get("model") or "").strip()
+            role_key = str(raw.get("api_key") or "").strip()
+            if not url and not model_name and not role_key:
+                # Empty entry — keep no override (falls back to global).
+                continue
+            if url and (len(url) > 2048 or not url):
+                raise LLMSettingsError(f"角色 {name} 的 Base URL 无效")
+            if model_name and len(model_name) > 200:
+                raise LLMSettingsError(f"角色 {name} 的模型名称过长")
+            if role_key and len(role_key) > 4096:
+                raise LLMSettingsError(f"角色 {name} 的 API Key 过长")
+            # When the operator blanks the API key for a role we keep the
+            # global key — same UX as the global blank-key semantics.
+            existing = current.role_overrides.get(name, RoleOverride())
+            effective_key = role_key or existing.api_key or current.api_key
+            if not effective_key:
+                raise LLMSettingsError(f"角色 {name} 的 API Key 缺失或留空")
+            role_overrides[name] = RoleOverride(
+                base_url=url, api_key=effective_key, model=model_name
+            )
     return LLMSettingsOverride(
         base_url=normalized_url,
         api_key=key,
         model=normalized_model,
         fast_model=fast_model.strip(),
         accurate_model=accurate_model.strip(),
+        version=2 if role_overrides else 1,
+        roles=role_overrides,
     )
 
 
 def safe_settings(config: LLMConfig, source: str) -> dict[str, Any]:
     """Serialize effective settings without ever returning the API key."""
     key = config.api_key or ""
-    return {
+    base_payload: dict[str, Any] = {
         "base_url": config.base_url,
         "model": config.model,
         "fast_model": config.profiles.get("fast", ModelProfile()).model or config.model,
@@ -188,6 +285,32 @@ def safe_settings(config: LLMConfig, source: str) -> dict[str, Any]:
         "api_key_last4": key[-4:] if len(key) >= 8 else ("****" if key else ""),
         "source": source,
     }
+    base_payload["roles"] = _safe_roles(config)
+    return base_payload
+
+
+def _safe_roles(config: LLMConfig) -> dict[str, Any]:
+    """Return per-role safe metadata — never the key itself, only configured/last4."""
+    out: dict[str, Any] = {}
+    for name in ROLE_NAMES:
+        effective = _effective_role_config(config, name, config.role_overrides.get(name))
+        key = effective["api_key"] or ""
+        out[name] = {
+            "base_url": effective["base_url"],
+            "model": effective["model"],
+            "api_key_configured": bool(key),
+            "api_key_last4": key[-4:] if len(key) >= 8 else ("****" if key else ""),
+            "overrides_base_url": bool(
+                config.role_overrides.get(name) and config.role_overrides[name].base_url
+            ),
+            "overrides_model": bool(
+                config.role_overrides.get(name) and config.role_overrides[name].model
+            ),
+            "overrides_api_key": bool(
+                config.role_overrides.get(name) and config.role_overrides[name].api_key
+            ),
+        }
+    return out
 
 
 def validate_endpoint_security(base_url: str) -> None:
@@ -279,18 +402,63 @@ async def test_llm_connection(config: LLMConfig, timeout: float = 15.0) -> dict[
     }
 
 
+def _distinct_effective_endpoints(config: LLMConfig) -> list[dict[str, str]]:
+    """Collect every distinct (base_url, api_key, model) the router may dial.
+
+    The empty-field guard only skips ALL-empty rows so a test-time config
+    with deliberately blank base_url/api_key still surfaces its configured
+    models for verification.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    candidates: list[dict[str, str]] = []
+    pairs: list[tuple[str, str, str]] = [(config.base_url, config.api_key, config.model)]
+    # Legacy fast/accurate profiles.
+    for profile_name in ("fast", "accurate"):
+        profile = config.profiles.get(profile_name, ModelProfile())
+        effective_model = profile.model or config.model
+        if effective_model != config.model or profile_name in config.profiles:
+            pairs.append(
+                (
+                    profile.base_url or config.base_url,
+                    profile.api_key or config.api_key,
+                    effective_model,
+                )
+            )
+    # Per-role overrides.
+    for role_name in ROLE_NAMES:
+        eff = _effective_role_config(config, role_name, config.role_overrides.get(role_name))
+        pairs.append((eff["base_url"], eff["api_key"], eff["model"]))
+    for base_url, api_key, model in pairs:
+        if not base_url and not api_key and not model:
+            continue
+        key = (base_url, api_key, model)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"base_url": base_url, "api_key": api_key, "model": model})
+    return candidates
+
+
 async def validate_llm_profiles(config: LLMConfig) -> dict[str, Any]:
-    """Validate every distinct model that the production router will use."""
-    models = [
-        config.model,
-        config.profiles.get("fast", ModelProfile()).model or config.model,
-        config.profiles.get("accurate", ModelProfile()).model or config.model,
-    ]
-    results = []
-    for model in dict.fromkeys(models):
-        candidate = deepcopy(config)
-        candidate.model = model
-        results.append(await test_llm_connection(candidate))
+    """Validate every distinct endpoint/model credential the production router will use.
+
+    Covers the legacy fast/accurate profiles as well as the 5 fixed functional
+    roles (planner, fast_review, deep_review, verifier, publication_gate).
+    """
+    candidates = _distinct_effective_endpoints(config)
+    if not candidates:
+        # Fall back to the single global candidate so the UI still gets a
+        # structured response when the global config is empty.
+        candidates = [{"base_url": config.base_url, "api_key": config.api_key, "model": config.model}]
+    results: list[dict[str, Any]] = []
+    for entry in candidates:
+        candidate = LLMConfig(
+            base_url=entry["base_url"],
+            api_key=entry["api_key"],
+            model=entry["model"],
+        )
+        result = await test_llm_connection(candidate)
+        results.append(result)
     return {
         "ok": True,
         "latency_ms": sum(item["latency_ms"] for item in results),

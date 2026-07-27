@@ -156,6 +156,16 @@ export interface BuiltinAgent {
   description: string
 }
 
+export interface LLMRoleSettings {
+  base_url: string
+  model: string
+  api_key_configured: boolean
+  api_key_last4: string
+  overrides_base_url: boolean
+  overrides_model: boolean
+  overrides_api_key: boolean
+}
+
 export interface LLMSettings {
   base_url: string
   model: string
@@ -164,6 +174,14 @@ export interface LLMSettings {
   api_key_configured: boolean
   api_key_last4: string
   source: 'console' | 'startup'
+  roles: Record<string, LLMRoleSettings>
+}
+
+export interface LLMRolePayload {
+  base_url?: string
+  model?: string
+  api_key?: string
+  reset?: boolean
 }
 
 export interface LLMSettingsPayload {
@@ -172,6 +190,7 @@ export interface LLMSettingsPayload {
   fast_model: string
   accurate_model: string
   api_key?: string
+  roles?: Record<string, LLMRolePayload>
 }
 
 export const admin = {
@@ -196,7 +215,10 @@ export const admin = {
   deleteAgent: (reviewerType: string) => post<{ ok: boolean }>(`/admin/agents/${reviewerType}/delete`, {}),
   getLLMSettings: () => get<LLMSettings>('/admin/llm-settings'),
   testLLMSettings: (settings: LLMSettingsPayload) =>
-    post<{ ok: boolean; latency_ms: number; model: string }>('/admin/llm-settings/test', settings),
+    post<{ ok: boolean; latency_ms: number; model: string; tested_models: string[]; roles?: Record<string, LLMRoleSettings> }>(
+      '/admin/llm-settings/test',
+      settings
+    ),
   saveLLMSettings: (settings: LLMSettingsPayload) =>
     post<{ ok: boolean; settings: LLMSettings; connection: { latency_ms: number } }>('/admin/llm-settings', settings),
   resetLLMSettings: () =>

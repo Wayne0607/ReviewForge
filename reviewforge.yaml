@@ -116,6 +116,28 @@ publication_gate:
   max_tokens: 6000
   concurrency: 4
 
+# Model-agnostic Publication Policy (Stage 1).  Pure-logic dedup,
+# coordinate validation and optional budget cap around the gate. Historical
+# replay across MiMo and MiniMax validated the conservative pre-filter, while
+# fixed comment caps exceeded the allowed true-positive loss. Production
+# therefore enforces only the pre-filter and leaves the budget disabled.
+#
+# Env-var overrides (env > yaml > defaults):
+#   REVIEWFORGE_PUBLICATION_POLICY_ENABLED            -> bool
+#   REVIEWFORGE_PUBLICATION_POLICY_MODE               -> off|shadow|enforce
+#   REVIEWFORGE_PUBLICATION_POLICY_BUDGET_ENABLED     -> bool
+#   REVIEWFORGE_PUBLICATION_POLICY_MAX_COMMENTS       -> int (>=1, bad -> default)
+#   REVIEWFORGE_PUBLICATION_POLICY_HIGH_RISK_OVERFLOW -> int (>=0, bad -> default)
+publication_policy:
+  enabled: true
+  mode: "enforce"
+  # Historical replay across both MiMo and MiniMax showed that fixed caps
+  # remove too many true positives. Keep deterministic evidence filtering
+  # enforced, but leave the final comment budget disabled.
+  budget_enabled: false
+  max_comments: 4
+  high_risk_overflow: 1
+
 # 对首轮未覆盖的高风险变更符号做一次受限 correctness 二审。
 # 二审只接受锚定到 Evidence Card 新增行且有足够置信度的具体缺陷。
 coverage_gap:

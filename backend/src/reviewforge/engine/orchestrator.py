@@ -48,6 +48,12 @@ from reviewforge.engine.finding_anchors import (
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.planner import Planner
+from reviewforge.engine.publication_policy import (
+    PolicyDecision,
+    PublicationPolicy,
+    PublicationPolicyConfig,
+    format_verify_reason,
+)
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticUnit, compile_semantic_changeset
@@ -209,10 +215,16 @@ class Orchestrator:
         escalation_confidence_max: float = 0.7,
         escalation_max_steps: int = 3,
         escalation_max_tokens: int = 5000,
+        escalation_llm: ChatOpenAI | None = None,
         publication_gate_enabled: bool = False,
         publication_gate_max_steps: int = 4,
         publication_gate_max_tokens: int = 6000,
         publication_gate_concurrency: int = 4,
+        # Optional independent LLM for the publication gate role.  When
+        # omitted the orchestrator falls back to ``reviewer_llm`` so older
+        # callers keep working.
+        publication_gate_llm: ChatOpenAI | None = None,
+        publication_policy: PublicationPolicy | None = None,
         coverage_gap_enabled: bool = False,
         coverage_gap_min_risk_score: int = 4,
         coverage_gap_max_cards: int = 3,
@@ -244,7 +256,13 @@ class Orchestrator:
         self._publication_gate_max_steps = max(1, publication_gate_max_steps)
         self._publication_gate_max_tokens = max(1, publication_gate_max_tokens)
         self._publication_gate_concurrency = max(1, publication_gate_concurrency)
+        # The publication gate has its own functional role, so it must be
+        # able to use a dedicated LLM instead of inheriting reviewer_llm.
+        # Older call sites can omit ``publication_gate_llm`` and the
+        # orchestrator falls back to reviewer_llm.
+        self._publication_gate_llm_raw = publication_gate_llm or reviewer_llm
         self._publication_gate_reviewer: PublicationGateReviewer | None = None
+        self._publication_policy: PublicationPolicy = publication_policy or PublicationPolicy(PublicationPolicyConfig())
         self._coverage_gap_enabled = coverage_gap_enabled
         self._coverage_gap_min_risk_score = max(0, coverage_gap_min_risk_score)
         self._coverage_gap_max_cards = max(0, coverage_gap_max_cards)
@@ -275,7 +293,7 @@ class Orchestrator:
 
         # Token tracking context — updated per-run
         self._token_ctx = RunContext()
-        self._escalation_llm_raw = reviewer_llm  # store for lazy init
+        self._escalation_llm_raw = escalation_llm or reviewer_llm
 
         # Wrap LLMs with token tracking if DB available
         if db:
@@ -919,8 +937,25 @@ class Orchestrator:
                     logger.error(f"Cross-PR analysis failed: {e}")
                     self._events.emit("cross_pr.failed", {"error": str(e)})
 
+            # Publication Policy is independent of the Publication Gate.
+            # Pre-filter (invalid coordinates, generic advice, root-cause
+            # dedup) and post-budget (top-N sort + overflow) run whenever
+            # the policy itself is enabled, regardless of whether the
+            # expensive LLM gate runs.  This lets operators deploy the
+            # policy alone for shadow replay validation.
+            if self._publication_policy.enabled:
+                # Stage 1 — model-agnostic pre-filter.  Trims invalid
+                # coordinates, generic advice and cross-reviewer duplicates
+                # from the confirmed set so the expensive Publication Gate
+                # runs over fewer, higher-quality candidates.
+                self._run_publication_policy_pre(state)
             if self._publication_gate_enabled:
                 await self._run_publication_gate(state)
+            if self._publication_policy.enabled:
+                # Stage 2 — final sort + budget.  Applies a deterministic
+                # ranking + ``max_comments`` cap plus a bounded
+                # ``high_risk_overflow`` for detector-backed error findings.
+                self._run_publication_policy_post(state)
 
             # Persist all findings to DB
             if self._db:
@@ -986,6 +1021,79 @@ class Orchestrator:
                 await self._db.fail_run(run_id, str(e))
             raise
 
+    def _run_publication_policy_pre(self, state: StateStore) -> None:
+        """Apply the Stage-1 publication policy before the LLM gate runs."""
+        if not self._publication_policy.enabled:
+            return
+        confirmed = state.list_findings(status="confirmed")
+        if not confirmed:
+            return
+        mode = self._publication_policy.mode
+        self._events.emit(
+            "publication_policy.pre.started",
+            {"mode": mode, "candidate_count": len(confirmed)},
+        )
+        decision = self._publication_policy.pre_filter(confirmed, state)
+        self._apply_policy_decision(state, decision, phase="pre")
+        self._events.emit(
+            "publication_policy.pre.completed",
+            {**decision.metrics, "phase": "pre", "mode": mode},
+        )
+
+    def _run_publication_policy_post(self, state: StateStore) -> None:
+        """Apply the Stage-2 budget after the LLM gate has run."""
+        if not self._publication_policy.enabled:
+            return
+        confirmed = state.list_findings(status="confirmed")
+        if not confirmed:
+            return
+        mode = self._publication_policy.mode
+        self._events.emit(
+            "publication_policy.post.started",
+            {"mode": mode, "candidate_count": len(confirmed)},
+        )
+        decision = self._publication_policy.post_finalize(confirmed, state)
+        self._apply_policy_decision(state, decision, phase="post")
+        self._events.emit(
+            "publication_policy.post.completed",
+            {**decision.metrics, "phase": "post", "mode": mode},
+        )
+
+    def _apply_policy_decision(
+        self,
+        state: StateStore,
+        decision: PolicyDecision,
+        *,
+        phase: str,
+    ) -> None:
+        """Mark dropped findings false_positive in enforce mode.
+
+        ``off`` and ``shadow`` modes never mutate state.  This keeps the
+        reported / retry semantics untouched: status="reported" never enters
+        the policy input set, and findings already past the gate whose
+        policy verdict is shadow/off continue past untouched.
+        """
+        mode = self._publication_policy.mode
+        if mode != "enforce":
+            return
+        for finding in decision.dropped:
+            if finding.status == "reported":
+                continue
+            try:
+                state.update_finding(
+                    finding.id,
+                    status="false_positive",
+                    verified_by="publication-policy",
+                    verify_reason=format_verify_reason(decision, finding),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "publication-policy %s phase could not mark %s as false_positive: %s",
+                    phase,
+                    finding.id,
+                    exc,
+                )
+
     async def _run_publication_gate(self, state: StateStore) -> None:
         """Independently verify every not-yet-reported finding before publication."""
 
@@ -998,7 +1106,12 @@ class Orchestrator:
             return
 
         if self._publication_gate_reviewer is None:
-            gate_llm = self._escalation_llm_raw
+            # Always dial the publication_gate role LLM, never the generic
+            # reviewer_llm — operators configure a strong model here on
+            # purpose.  Falls back to the orchestrator-provided
+            # ``publication_gate_llm`` which the runtime manager sources
+            # from the role override (or the global config).
+            gate_llm = self._publication_gate_llm_raw
             if self._db:
                 gate_llm = TrackedChatLLM(
                     inner=gate_llm,

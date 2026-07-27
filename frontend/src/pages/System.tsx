@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Bot,
   Wrench,
@@ -11,10 +11,55 @@ import {
   FlaskConical,
   RotateCcw,
   LoaderCircle,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react'
 import { admin, system } from '../api/client'
-import type { LLMSettings, LLMSettingsPayload } from '../api/client'
+import type { LLMSettings, LLMSettingsPayload, LLMRolePayload, LLMRoleSettings } from '../api/client'
 import type { SystemSpecs } from '../types'
+
+// The five fixed functional roles.  Order matches ROLE_NAMES on the
+// backend; keep them in sync.
+const ROLE_LABELS: Record<string, { title: string; description: string }> = {
+  planner: {
+    title: 'Planner（规划）',
+    description: '为每轮 PR 审查决定派哪些 Reviewer。',
+  },
+  fast_review: {
+    title: 'Fast Review（快速）',
+    description: '轻量级 reviewer：性能/风格/本地化/测试/文档/依赖/可访问性。',
+  },
+  deep_review: {
+    title: 'Deep Review（深度）',
+    description: '高资源 reviewer：安全/正确性/覆盖空缺审查。',
+  },
+  verifier: {
+    title: 'Verifier（验证/校准）',
+    description: '动态校准、Cross-PR、证据验证、Escalation 仲裁。',
+  },
+  publication_gate: {
+    title: 'Publication Gate（发版前门）',
+    description: '发布前对确认 finding 再次校验，独立模型避免复用 reviewer。',
+  },
+}
+
+const ROLE_ORDER = ['planner', 'fast_review', 'deep_review', 'verifier', 'publication_gate']
+
+type RoleFormState = {
+  base_url: string
+  model: string
+  api_key: string
+  reset: boolean
+}
+
+const emptyRoleForm = (): RoleFormState => ({ base_url: '', model: '', api_key: '', reset: false })
+
+const roleFormFromSettings = (settings: LLMRoleSettings | undefined): RoleFormState => ({
+  base_url: '',
+  model: '',
+  api_key: '',
+  reset: false,
+})
 
 export default function System() {
   const [specs, setSpecs] = useState<SystemSpecs | null>(null)
@@ -27,6 +72,10 @@ export default function System() {
     accurate_model: '',
     api_key: '',
   })
+  const [roleForms, setRoleForms] = useState<Record<string, RoleFormState>>(() =>
+    Object.fromEntries(ROLE_ORDER.map((name) => [name, emptyRoleForm()]))
+  )
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [llmBusy, setLLMBusy] = useState<'test' | 'save' | 'reset' | null>(null)
   const [llmMessage, setLLMMessage] = useState<{ ok: boolean; text: string } | null>(null)
   const [loading, setLoading] = useState(true)
@@ -51,17 +100,50 @@ export default function System() {
       accurate_model: settings.accurate_model,
       api_key: '',
     })
+    // Reset per-role forms: blank inputs mean "preserve the existing
+    // override, otherwise fall back to the global config".
+    setRoleForms(
+      Object.fromEntries(
+        ROLE_ORDER.map((name) => [name, roleFormFromSettings(settings.roles?.[name])])
+      )
+    )
   }
 
   const llmError = (error: unknown) =>
     error instanceof Error ? error.message.replace(/^API \d+:\s*/, '') : '操作失败'
 
+  const updateRoleForm = (name: string, patch: Partial<RoleFormState>) => {
+    setRoleForms((value) => ({ ...value, [name]: { ...value[name], ...patch } }))
+  }
+
+  const buildPayload = (): LLMSettingsPayload => {
+    const roles: Record<string, LLMRolePayload> = {}
+    for (const name of ROLE_ORDER) {
+      const form = roleForms[name]
+      // Only emit a role entry when at least one field is non-blank.
+      if (form.reset) {
+        roles[name] = { reset: true }
+      } else if (form.base_url || form.model || form.api_key) {
+        roles[name] = {
+          base_url: form.base_url,
+          model: form.model,
+          api_key: form.api_key,
+        }
+      }
+    }
+    return { ...llmForm, roles }
+  }
+
   const testConnection = async () => {
     setLLMBusy('test')
     setLLMMessage(null)
     try {
-      const result = await admin.testLLMSettings(llmForm)
-      setLLMMessage({ ok: true, text: `连接成功，延迟 ${result.latency_ms} ms` })
+      const result = await admin.testLLMSettings(buildPayload())
+      const models = result.tested_models?.length ?? 0
+      setLLMMessage({
+        ok: true,
+        text: `连接成功，累计延迟 ${result.latency_ms} ms，校验 ${models} 个有效端点`,
+      })
     } catch (error) {
       setLLMMessage({ ok: false, text: llmError(error) })
     } finally {
@@ -73,7 +155,7 @@ export default function System() {
     setLLMBusy('save')
     setLLMMessage(null)
     try {
-      const result = await admin.saveLLMSettings(llmForm)
+      const result = await admin.saveLLMSettings(buildPayload())
       applyLLMSettings(result.settings)
       setConfig((value) =>
         value ? { ...value, llm: { model: result.settings.model, base_url: result.settings.base_url } } : value
@@ -83,7 +165,14 @@ export default function System() {
       setLLMMessage({ ok: false, text: llmError(error) })
     } finally {
       setLLMBusy(null)
+      // After a save, blank out any keys the operator typed so the next
+      // round does not accidentally re-send the same secret.
       setLLMForm((value) => ({ ...value, api_key: '' }))
+      setRoleForms((value) =>
+        Object.fromEntries(
+          ROLE_ORDER.map((name) => [name, { ...value[name], api_key: '' }])
+        )
+      )
     }
   }
 
@@ -120,6 +209,18 @@ export default function System() {
   // Separate built-in and plugin reviewers
   const builtInAgents = Object.entries(agents).filter(
     ([name]) => !name.startsWith('plugin_')
+  )
+
+  const anyRoleDirty = useMemo(
+    () =>
+      ROLE_ORDER.some(
+        (name) =>
+          roleForms[name]?.base_url ||
+          roleForms[name]?.model ||
+          roleForms[name]?.api_key ||
+          roleForms[name]?.reset
+      ),
+    [roleForms]
   )
 
   return (
@@ -203,6 +304,101 @@ export default function System() {
                   spellCheck={false}
                 />
               </label>
+            </div>
+
+            {/* Advanced per-role routing */}
+            <div className="border border-gray-200 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setAdvancedOpen((value) => !value)}
+                className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                <div className="flex items-center gap-2">
+                  {advancedOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                  高级：按角色配置模型（5 个固定角色）
+                </div>
+                {anyRoleDirty && <span className="badge badge-warning text-xs">未保存的修改</span>}
+              </button>
+              {advancedOpen && (
+                <div className="border-t border-gray-200 p-4 space-y-4">
+                  <p className="text-xs text-gray-500">
+                    留空字段表示沿用全局 Base URL / API Key / 默认模型。每个角色可独立指向另一家服务商。
+                    当前生效配置（不包含密钥）展示在下方，仅供确认。
+                  </p>
+                  {ROLE_ORDER.map((name) => {
+                    const meta = ROLE_LABELS[name]
+                    const settings = llmSettings.roles?.[name]
+                    return (
+                      <div key={name} className="rounded-lg border border-gray-100 bg-gray-50/50 p-3 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="text-sm font-medium text-gray-800">{meta.title}</div>
+                            <div className="text-xs text-gray-500">{meta.description}</div>
+                          </div>
+                          {settings && (
+                            <div className="text-right text-xs text-gray-500 leading-tight">
+                              <div>当前 base URL：{settings.base_url || '(同全局)'}</div>
+                              <div>当前模型：{settings.model || '(同全局)'}</div>
+                              <div>
+                                API Key：
+                                {settings.api_key_configured
+                                  ? `已配置（末四位 ${settings.api_key_last4}）`
+                                  : '沿用全局'}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                          <input
+                            value={roleForms[name]?.base_url ?? ''}
+                            onChange={(event) => updateRoleForm(name, { base_url: event.target.value })}
+                            placeholder="Base URL（留空 = 沿用全局）"
+                            className="rounded-lg border border-gray-300 px-2 py-1.5 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
+                            spellCheck={false}
+                            disabled={roleForms[name]?.reset}
+                          />
+                          <input
+                            value={roleForms[name]?.model ?? ''}
+                            onChange={(event) => updateRoleForm(name, { model: event.target.value })}
+                            placeholder="模型名（留空 = 沿用全局）"
+                            className="rounded-lg border border-gray-300 px-2 py-1.5 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
+                            spellCheck={false}
+                            disabled={roleForms[name]?.reset}
+                          />
+                          <input
+                            type="password"
+                            value={roleForms[name]?.api_key ?? ''}
+                            onChange={(event) => updateRoleForm(name, { api_key: event.target.value })}
+                            placeholder={
+                              settings?.api_key_configured
+                                ? `API Key（留空保留旧值，末四位 ${settings.api_key_last4}）`
+                                : 'API Key（留空 = 沿用全局）'
+                            }
+                            autoComplete="new-password"
+                            className="rounded-lg border border-gray-300 px-2 py-1.5 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
+                            spellCheck={false}
+                            disabled={roleForms[name]?.reset}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          className="text-xs text-red-600 hover:text-red-700"
+                          onClick={() =>
+                            updateRoleForm(name, {
+                              base_url: '',
+                              model: '',
+                              api_key: '',
+                              reset: !roleForms[name]?.reset,
+                            })
+                          }
+                        >
+                          {roleForms[name]?.reset ? '取消恢复' : '恢复该角色为全局配置'}
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
 
             {llmMessage && (

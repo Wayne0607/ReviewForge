@@ -66,12 +66,23 @@ class AgentPayload(BaseModel):
     enabled: bool = True
 
 
+class RolePayload(BaseModel):
+    base_url: str = Field(default="", max_length=2048)
+    api_key: str | None = Field(default=None, max_length=4096)
+    model: str = Field(default="", max_length=200)
+    reset: bool = False
+
+
 class LLMSettingsPayload(BaseModel):
     base_url: str = Field(min_length=1, max_length=2048)
     model: str = Field(min_length=1, max_length=200)
     api_key: str | None = Field(default=None, max_length=4096)
     fast_model: str = Field(default="", max_length=200)
     accurate_model: str = Field(default="", max_length=200)
+    # Per-role overrides.  Empty entries ("") mean "preserve the global key
+    # / use the global base URL / model" so a blank field is a no-op rather
+    # than a destructive clear.
+    roles: dict[str, RolePayload] = Field(default_factory=dict)
 
 
 def _orch(request: Request):
@@ -79,6 +90,19 @@ def _orch(request: Request):
     if orch is None:
         raise HTTPException(503, "orchestrator not ready")
     return orch
+
+
+def _payload_roles(payload: LLMSettingsPayload) -> dict[str, dict[str, Any]]:
+    """Convert the RolePayload dict into the {role: {field: value}} shape."""
+    out: dict[str, dict[str, str]] = {}
+    for name, role_payload in payload.roles.items():
+        out[name] = {
+            "base_url": role_payload.base_url or "",
+            "api_key": role_payload.api_key or "",
+            "model": role_payload.model or "",
+            "reset": role_payload.reset,
+        }
+    return out
 
 
 def _llm_candidate(payload: LLMSettingsPayload, request: Request):
@@ -90,6 +114,7 @@ def _llm_candidate(payload: LLMSettingsPayload, request: Request):
         api_key=payload.api_key,
         fast_model=payload.fast_model,
         accurate_model=payload.accurate_model,
+        roles=_payload_roles(payload),
     )
     candidate = apply_override(request.app.state.bootstrap_llm_config, override)
     return override, candidate
@@ -97,18 +122,20 @@ def _llm_candidate(payload: LLMSettingsPayload, request: Request):
 
 async def _test_candidate(candidate, request: Request) -> dict[str, Any]:
     if getattr(request.app.state, "mock_mode", False):
-        await asyncio.to_thread(validate_endpoint_security, candidate.base_url)
+        # Validate every distinct endpoint (global + per-role) that the
+        # production router will dial.  We never echo the keys back; only
+        # the structured result and per-endpoint validation outcome.
+        from reviewforge.core.llm_settings import _distinct_effective_endpoints, _safe_roles
+
+        endpoints = _distinct_effective_endpoints(candidate)
+        for entry in endpoints:
+            await asyncio.to_thread(validate_endpoint_security, entry["base_url"])
         return {
             "ok": True,
             "latency_ms": 0,
             "model": candidate.model,
-            "tested_models": sorted(
-                {
-                    candidate.model,
-                    candidate.profiles["fast"].model or candidate.model,
-                    candidate.profiles["accurate"].model or candidate.model,
-                }
-            ),
+            "tested_models": [entry["model"] for entry in endpoints],
+            "roles": _safe_roles(candidate),
         }
     return await validate_llm_profiles(candidate)
 

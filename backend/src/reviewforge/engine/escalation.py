@@ -128,6 +128,8 @@ _PUBLICATION_GATE_SYSTEM_PROMPT = """你是 ReviewForge 的最终发布仲裁器
 必须遵守：
 1. 先用 read_file 的 start_line/end_line 读取候选行前后至少 100 行；
    需要确认声明、调用方、配置或兄弟实现时，再用 search_code。
+   如果候选声称本次变更删除、移动或缩小了锁、guard、校验、参数或 API 契约，
+   必须再调用 read_diff 核对删除行和新增行；当前文件内容不能证明“本次变更引入”。
 2. 只有证据能证明本次变更引入了具体、可复现且有用户影响的缺陷时，才输出 confirmed。
 3. 证据不足、只存在理论可能、依赖未证明前提、只是风格偏好或仅建议补测试/文档时，输出 false_positive。
 4. 空指针/越界结论必须排除已有 guard、框架契约和调用方前置条件。
@@ -510,8 +512,10 @@ class PublicationGateReviewer(EscalationReviewer):
 - 初步核实来源: {finding.verified_by}
 - 初步核实理由: {finding.verify_reason}
 
-先调用 read_file(file_path="{finding.file}", start_line={max(1, finding.line - 120)}, end_line={finding.line + 120})，
-再按需搜索契约。最后只输出 JSON，并从工具结果逐字复制 evidence_quote。"""
+先调用 read_file(file_path="{finding.file}", start_line={max(1, finding.line - 120)}, end_line={finding.line + 120})。
+如果描述涉及删除、移动、回归或前后行为变化，再调用 read_diff(file_path="{finding.file}")；
+其余情况按需搜索契约。最后只输出 JSON，并从工具结果逐字复制 evidence_quote。
+若证据来自不相邻的多处代码，用单独一行 `...` 分隔逐字片段，不要自行改写。"""
         return SystemMessage(content=_PUBLICATION_GATE_SYSTEM_PROMPT), HumanMessage(content=user)
 
     @staticmethod
@@ -526,19 +530,42 @@ class PublicationGateReviewer(EscalationReviewer):
             normalized_lines.append(_READ_FILE_LINE_PREFIX.sub("", line))
         return re.sub(r"\s+", " ", "\n".join(normalized_lines)).strip()
 
+    @classmethod
+    def _evidence_is_grounded(cls, quote: str, transcript: str) -> bool:
+        """Accept one contiguous quote or multiple independently exact fragments.
+
+        Regression findings commonly need one deleted line and one added line.
+        Tool output does not place those snippets contiguously, so requiring the
+        whole model quote to be one substring turns a formatting mismatch into a
+        semantic false positive.  Every accepted fragment still has to occur
+        verbatim in tool output and the combined evidence must be substantial.
+        """
+
+        normalized_quote = cls._normalize_evidence(quote)
+        normalized_transcript = cls._normalize_evidence(transcript)
+        compact_quote = "".join(normalized_quote.split())
+        if len(compact_quote) >= 16 and normalized_quote in normalized_transcript:
+            return True
+
+        raw_fragments = re.split(r"(?:\r?\n\s*)?(?:\.\.\.|…)(?:\s*\r?\n)?", str(quote))
+        fragments = [cls._normalize_evidence(fragment) for fragment in raw_fragments]
+        fragments = [fragment for fragment in fragments if len("".join(fragment.split())) >= 8]
+        return (
+            len(fragments) >= 2
+            and sum(len("".join(fragment.split())) for fragment in fragments) >= 16
+            and all(fragment in normalized_transcript for fragment in fragments)
+        )
+
     @staticmethod
     def _apply_verdict(finding: Finding, verdict: dict) -> Finding:
-        """Require evidence to remain contiguous after safe normalization."""
+        """Require all approval evidence to be copied from tool output."""
 
         checked = dict(verdict)
         ungrounded = False
         if checked.get("verdict") == "confirmed":
             quote = str(checked.get("evidence_quote") or "").strip()
             transcript = str(checked.get("_tool_evidence") or "")
-            normalized_quote = PublicationGateReviewer._normalize_evidence(quote)
-            normalized_transcript = PublicationGateReviewer._normalize_evidence(transcript)
-            compact_quote = "".join(normalized_quote.split())
-            if len(compact_quote) < 16 or normalized_quote not in normalized_transcript:
+            if not PublicationGateReviewer._evidence_is_grounded(quote, transcript):
                 ungrounded = True
                 checked.update(
                     {

@@ -345,6 +345,41 @@ class TestPublicationGate:
         assert result.status == "confirmed"
         assert result.verified_by == "escalation"
 
+    def test_noncontiguous_exact_tool_fragments_are_grounded(self):
+        finding = _make_finding(status="confirmed")
+        result = PublicationGateReviewer._apply_verdict(
+            finding,
+            {
+                "verdict": "confirmed",
+                "confidence": 0.94,
+                "reason": "The lock no longer covers the check-and-build sequence.",
+                "evidence_quote": "cacheMu.Lock()\ndefer cacheMu.Unlock()\n...\ncacheMu.Lock()\ncache[key] = idx",
+                "_tool_evidence": (
+                    "88: cacheMu.Lock()\n89: defer cacheMu.Unlock()\n"
+                    "120: idx := buildIndex()\n137: cacheMu.Lock()\n138: cache[key] = idx\n"
+                ),
+            },
+        )
+
+        assert result.status == "confirmed"
+        assert result.verified_by == "escalation"
+
+    def test_noncontiguous_quote_rejects_any_invented_fragment(self):
+        finding = _make_finding(status="confirmed")
+        result = PublicationGateReviewer._apply_verdict(
+            finding,
+            {
+                "verdict": "confirmed",
+                "confidence": 0.94,
+                "reason": "claimed",
+                "evidence_quote": "cacheMu.Lock()\n...\ncache[key] = invented",
+                "_tool_evidence": "88: cacheMu.Lock()\n138: cache[key] = idx\n",
+            },
+        )
+
+        assert result.status == "false_positive"
+        assert result.verified_by == "publication-gate-ungrounded"
+
     @pytest.mark.parametrize(
         "quote",
         [

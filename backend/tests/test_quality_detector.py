@@ -10,6 +10,77 @@ def _keys(findings):
     return {(finding.file, finding.line, finding.category) for finding in findings}
 
 
+def test_quality_detector_covers_cross_line_contract_regressions():
+    go_patch = (
+        "@@ -85,4 +85,5 @@ func (b *Builder) BuildIndex(key string) {\n"
+        "-  b.cacheMu.Lock()\n"
+        "-  defer b.cacheMu.Unlock()\n"
+        "   idx := buildIndex(key)\n"
+        "+  b.cacheMu.Lock()\n"
+        "+  b.cache[key] = idx\n"
+        "+  b.cacheMu.Unlock()\n"
+        " }\n"
+    )
+    findings = detect_quality_findings(
+        {
+            "pkg/index.go": go_patch,
+            "src/EventManager.ts": _patch(
+                "const [mainHost] = event.destinationCalendar ?? [];\n"
+                "return mainHost.integration;"
+            ),
+            "app/controllers/embed_controller.rb": _patch(
+                "response.headers['X-Frame-Options'] = \"ALLOWALL\""
+            ),
+            "app/views/layouts/embed.html.erb": _patch(
+                "parent.postMessage({\n"
+                "  ready: true\n"
+                "}, '<%= request.referer %>');"
+            ),
+        }
+    )
+
+    assert {
+        ("pkg/index.go", 86, "race-condition"),
+        ("src/EventManager.ts", 2, "null-safety"),
+        ("app/controllers/embed_controller.rb", 1, "clickjacking"),
+        ("app/views/layouts/embed.html.erb", 3, "api-contract"),
+    } <= _keys(findings)
+
+
+def test_optional_array_destructure_requires_unguarded_added_dereference():
+    findings = detect_quality_findings(
+        {
+            "guarded.ts": _patch(
+                "const [mainHost] = event.destinationCalendar ?? [];\n"
+                "if (!mainHost) return null;\n"
+                "return mainHost.integration;"
+            ),
+            "optional.ts": _patch(
+                "const [mainHost] = event.destinationCalendar ?? [];\n"
+                "return mainHost?.integration;"
+            ),
+        }
+    )
+
+    assert not any(finding.category == "null-safety" for finding in findings)
+
+
+def test_lock_scope_rule_requires_removed_function_scope_unlock():
+    patch = (
+        "@@ -1,3 +1,4 @@\n"
+        " func update() {\n"
+        "+  cacheMu.Lock()\n"
+        "+  cache[key] = value\n"
+        "+  cacheMu.Unlock()\n"
+        " }\n"
+    )
+
+    assert not any(
+        finding.category == "race-condition"
+        for finding in detect_quality_findings({"safe.go": patch})
+    )
+
+
 def test_quality_detector_covers_high_signal_multilanguage_shapes():
     findings = detect_quality_findings(
         {

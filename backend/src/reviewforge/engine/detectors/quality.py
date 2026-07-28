@@ -1088,6 +1088,153 @@ def _browser_import_findings(file_path: str, rows: list[tuple[int, str]], added:
     ]
 
 
+def _optional_array_destructure_findings(
+    file_path: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    """Detect dereferencing the possibly-missing first item of ``value ?? []``."""
+
+    findings: list[DetectorFinding] = []
+    for index, (assignment_line, content) in enumerate(rows):
+        match = re.search(
+            r"(?:const|let|var)?\s*\[\s*(?P<name>[A-Za-z_$][\w$]*)\s*\]\s*="
+            r"\s*[^;\n]+?\?\?\s*\[\s*\]",
+            content,
+        )
+        if not match:
+            continue
+        name = match.group("name")
+        for line_no, candidate in rows[index + 1 :]:
+            if line_no > assignment_line + 80:
+                break
+            if re.search(rf"\b(?:const|let|var)\s+{re.escape(name)}\b", candidate):
+                break
+            if re.search(
+                rf"\bif\s*\(\s*!?\s*{re.escape(name)}\s*\)|"
+                rf"\b{re.escape(name)}\s*(?:&&|\?\.|==?=\s*(?:null|undefined)|!=+)",
+                candidate,
+            ):
+                break
+            if line_no in added and re.search(rf"\b{re.escape(name)}\s*\.[A-Za-z_$]", candidate):
+                findings.append(
+                    _finding(
+                        file_path,
+                        line_no,
+                        "null-safety",
+                        f"`{name}` can be undefined when the optional array is absent or empty, "
+                        "but it is dereferenced without a guard.",
+                        f"Check `{name}` before property access or preserve a non-optional fallback object.",
+                        severity="error",
+                        confidence=0.99,
+                    )
+                )
+                break
+    return findings
+
+
+def _erb_contract_findings(
+    file_path: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    """Detect browser API arguments whose invalid shape is explicit in ERB."""
+
+    findings: list[DetectorFinding] = []
+    for index, (line_no, content) in enumerate(rows):
+        if line_no not in added:
+            continue
+        nearby = "\n".join(text for _line, text in rows[max(0, index - 8) : index + 1])
+        if (
+            re.search(r"['\"]<%=?\s*request\.referer\s*%>['\"]\s*\)", content)
+            and re.search(r"\bpostMessage\s*\(", nearby)
+        ):
+            findings.append(
+                _finding(
+                    file_path,
+                    line_no,
+                    "api-contract",
+                    "`postMessage` receives the full request referrer, but `targetOrigin` must be an origin "
+                    "(scheme, host, and optional port) rather than a URL with a path.",
+                    "Parse the referrer and pass only its validated origin.",
+                    severity="error",
+                    confidence=0.99,
+                )
+            )
+    return findings
+
+
+def _ruby_header_contract_findings(
+    file_path: str,
+    rows: list[tuple[int, str]],
+    added: set[int],
+) -> list[DetectorFinding]:
+    """Detect response-security headers set to unsupported permissive values."""
+
+    return [
+        _finding(
+            file_path,
+            line_no,
+            "clickjacking",
+            "`X-Frame-Options: ALLOWALL` is not a valid directive, so browsers do not enforce framing protection.",
+            "Use `DENY`/`SAMEORIGIN`, or a validated CSP `frame-ancestors` policy for selected embedders.",
+            severity="error",
+            confidence=0.99,
+        )
+        for line_no, content in rows
+        if line_no in added
+        and re.search(
+            r"X-Frame-Options['\"]?\s*\]\s*=\s*['\"]ALLOWALL['\"]",
+            content,
+            re.IGNORECASE,
+        )
+    ]
+
+
+def _go_lock_scope_regression_findings(file_path: str, patch: str) -> list[DetectorFinding]:
+    """Detect a mutex moved from function scope to only the final mutation."""
+
+    removed = [
+        line[1:]
+        for line in patch.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    ]
+    added_rows = iter_added_lines(patch)
+    added_text = "\n".join(content for _line, content in added_rows)
+    findings: list[DetectorFinding] = []
+    for removed_line in removed:
+        lock = re.search(r"\b(?P<mutex>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.Lock\s*\(\s*\)", removed_line)
+        if not lock:
+            continue
+        mutex = lock.group("mutex")
+        escaped = re.escape(mutex)
+        if not any(re.search(rf"\bdefer\s+{escaped}\.Unlock\s*\(\s*\)", line) for line in removed):
+            continue
+        if re.search(rf"\bdefer\s+{escaped}\.Unlock\s*\(\s*\)", added_text):
+            continue
+        lock_rows = [
+            (line_no, content)
+            for line_no, content in added_rows
+            if re.search(rf"\b{escaped}\.Lock\s*\(\s*\)", content)
+        ]
+        if not lock_rows or not re.search(rf"\b{escaped}\.Unlock\s*\(\s*\)", added_text):
+            continue
+        line_no, _content = lock_rows[0]
+        findings.append(
+            _finding(
+                file_path,
+                line_no,
+                "race-condition",
+                f"`{mutex}` was moved from function scope to a later critical section. Concurrent callers "
+                "can now pass the earlier cache/check path and perform the same build simultaneously.",
+                "Keep the check-and-build sequence under the mutex or use a per-key single-flight mechanism.",
+                severity="error",
+                confidence=0.95,
+            )
+        )
+    return findings
+
+
 _BSD_SED_I = re.compile(
     r"(?<![\"'`])"  # not inside a documentation string
     r"\bsed\b"
@@ -1255,7 +1402,21 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
         if _is_low_signal_path(file_path) and not _is_shell_tool_path(file_path):
             continue
         suffix = PurePosixPath(file_path.replace("\\", "/")).suffix.lower()
-        if suffix not in {".java", ".vue", ".py", ".rb", ".go", ".rs", ".tsx", ".jsx", ".sh", ".bash"}:
+        if suffix not in {
+            ".java",
+            ".vue",
+            ".py",
+            ".rb",
+            ".go",
+            ".rs",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".erb",
+            ".sh",
+            ".bash",
+        }:
             continue
         added_rows = iter_added_lines(patch)
         if not added_rows:
@@ -1269,8 +1430,11 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
             ".rb": "ruby",
             ".go": "go",
             ".rs": "rust",
+            ".ts": "typescript",
             ".tsx": "typescript",
+            ".js": "javascript",
             ".jsx": "javascript",
+            ".erb": "ruby",
             ".sh": "shell",
             ".bash": "shell",
         }[suffix]
@@ -1284,13 +1448,14 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
             findings.extend(_python_findings(file_path, patch, rows, added))
         elif suffix == ".rb":
             findings.extend(_ruby_findings(file_path, patch, code_rows, added, rows))
+            findings.extend(_ruby_header_contract_findings(file_path, rows, added))
         elif suffix == ".go":
             findings.extend(_go_findings(file_path, code_rows, added))
+            findings.extend(_go_lock_scope_regression_findings(file_path, patch))
         elif suffix == ".rs":
             findings.extend(_rust_findings(file_path, code_rows, added, rows))
-        elif suffix in {".sh", ".bash"}:
-            findings.extend(_shell_findings(file_path, rows, added))
-        else:
+        elif suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            findings.extend(_optional_array_destructure_findings(file_path, rows, added))
             findings.extend(
                 _browser_import_findings(
                     file_path,
@@ -1298,7 +1463,12 @@ def detect_quality_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                     added,
                 )
             )
-            findings.extend(_react_render_side_effect_findings(file_path, patch, rows, added))
+            if suffix in {".tsx", ".jsx"}:
+                findings.extend(_react_render_side_effect_findings(file_path, patch, rows, added))
+        elif suffix == ".erb":
+            findings.extend(_erb_contract_findings(file_path, rows, added))
+        elif suffix in {".sh", ".bash"}:
+            findings.extend(_shell_findings(file_path, rows, added))
     return dedupe_findings(findings)
 
 

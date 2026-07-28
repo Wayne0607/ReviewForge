@@ -57,6 +57,7 @@ def _finding(
     reviewer: str = "correctness_reviewer",
     category: str = "logic-error",
     confidence: float = 0.7,
+    verified_by: str = "",
 ) -> Finding:
     return Finding(
         id=finding_id,
@@ -69,6 +70,7 @@ def _finding(
         confidence=confidence,
         reviewer=reviewer,
         status="confirmed",
+        verified_by=verified_by,
     )
 
 
@@ -79,7 +81,7 @@ def _response(*rows: tuple[str, str]) -> str:
                 {
                     "id": finding_id,
                     "verdict": verdict,
-                    "confidence": 0.8,
+                    "confidence": 0.95,
                     "reason": f"{verdict} evidence",
                 }
                 for finding_id, verdict in rows
@@ -108,18 +110,51 @@ async def test_triage_parses_mixed_batch_and_bounds_context():
     )
 
     assert [verdicts[key].verdict for key in ("f1", "f2", "f3")] == [
-        VERDICT_CONFIRMED,
+        VERDICT_NEEDS_TOOL,
         VERDICT_FALSE_POSITIVE,
         VERDICT_NEEDS_TOOL,
     ]
     assert stats.triage_batches == 1
-    assert stats.triage_confirmed == 1
+    assert stats.triage_confirmed == 0
     assert stats.triage_filtered == 1
-    assert stats.triage_needs_tool == 1
+    assert stats.triage_needs_tool == 2
     prompt = llm.calls[0][0][1].content
     assert "<UNTRUSTED_DIFF>" in prompt
     assert "bad()" in prompt
     assert len(prompt) < 10_000
+
+
+@pytest.mark.asyncio
+async def test_only_independently_checkable_findings_can_bypass_tools():
+    detector = _finding("detector", verified_by="detector")
+    localized = _finding(
+        "localized",
+        reviewer="localization_reviewer",
+        category="language-mismatch",
+        confidence=0.95,
+    )
+    ordinary = _finding("ordinary", confidence=0.99)
+    triage = PublicationTriage(
+        _StaticLLM(
+            _response(
+                ("detector", VERDICT_CONFIRMED),
+                ("localized", VERDICT_CONFIRMED),
+                ("ordinary", VERDICT_CONFIRMED),
+            )
+        ),
+        config=PublicationTriageConfig(enabled=True),
+    )
+
+    verdicts, stats = await triage.classify(
+        [detector, localized, ordinary],
+        _state(),
+    )
+
+    assert verdicts["detector"].verdict == VERDICT_CONFIRMED
+    assert verdicts["localized"].verdict == VERDICT_CONFIRMED
+    assert verdicts["ordinary"].verdict == VERDICT_NEEDS_TOOL
+    assert stats.triage_confirmed == 2
+    assert stats.triage_needs_tool == 1
 
 
 @pytest.mark.asyncio
@@ -180,7 +215,12 @@ async def test_recall_guard_routes_negative_triage_verdict_to_tools():
 @pytest.mark.asyncio
 async def test_orchestrator_sends_only_needs_tool_to_agentic_gate():
     state = _state()
-    direct = _finding("direct")
+    direct = _finding(
+        "direct",
+        reviewer="localization_reviewer",
+        category="language-mismatch",
+        confidence=0.95,
+    )
     rejected = _finding("rejected")
     unresolved = _finding("unresolved")
     for finding in (direct, rejected, unresolved):
@@ -226,6 +266,51 @@ async def test_orchestrator_sends_only_needs_tool_to_agentic_gate():
     assert state.get_finding("unresolved").status == "confirmed"
     assert stats.agentic_attempted == 1
     assert stats.agentic_confirmed == 1
+
+
+@pytest.mark.asyncio
+async def test_agentic_inconclusive_does_not_block_independent_confirmations():
+    state = _state()
+    confirmed = _finding("confirmed")
+    inconclusive = _finding("inconclusive")
+    for finding in (confirmed, inconclusive):
+        state.add_finding(finding)
+
+    triage_llm = _StaticLLM(
+        _response(
+            ("confirmed", VERDICT_NEEDS_TOOL),
+            ("inconclusive", VERDICT_NEEDS_TOOL),
+        )
+    )
+    registry = build_registry()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=triage_llm,
+        reviewer_llm=triage_llm,
+        calibrator_llm=triage_llm,
+        publication_gate_llm=triage_llm,
+        publication_gate_enabled=True,
+        publication_triage_enabled=True,
+    )
+
+    class _Gate:
+        async def escalate_batch(self, findings, _state, concurrency):
+            findings[0].status = "confirmed"
+            findings[0].verified_by = "publication-gate"
+            findings[1].status = "candidate"
+            findings[1].verified_by = "publication-gate-inconclusive"
+            return findings
+
+    orchestrator._publication_gate_reviewer = _Gate()
+    stats = await orchestrator._run_publication_gate(state)
+
+    assert state.get_finding("confirmed").status == "confirmed"
+    assert state.get_finding("inconclusive").status == "candidate"
+    assert stats.agentic_inconclusive == 1
+    assert stats.retryable is False
+    assert stats.errors == []
 
 
 @pytest.mark.asyncio

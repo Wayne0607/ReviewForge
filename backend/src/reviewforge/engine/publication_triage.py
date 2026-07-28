@@ -49,7 +49,9 @@ excerpt. Return strict JSON:
 }
 
 Use confirmed only when the diff excerpt directly proves a concrete,
-reproducible defect and its impact. Use false_positive only when the claim is
+reproducible defect and its impact; the runtime will still require tool
+verification unless the finding has deterministic provenance or is a directly
+visible locale/script mismatch. Use false_positive only when the claim is
 directly contradicted, unrelated to the change, generic advice, or a duplicate
 without independent impact. Use needs_tool whenever callers, declarations,
 configuration, sibling implementations, cross-file contracts, or security
@@ -222,6 +224,29 @@ class PublicationTriage:
             or self._recall_protector.operational_recall_protected(finding)
         )
 
+    @staticmethod
+    def _can_direct_confirm(finding: Finding, verdict: TriageVerdict) -> bool:
+        """Allow a tool-free approval only for independently checkable evidence.
+
+        Model confidence is not a publication credential.  Ordinary reviewer
+        findings still need repository-grounded verification even when the
+        batch model calls them confirmed.  The two exceptions are deterministic
+        detector provenance and locale/script mismatches that are directly
+        visible in the bounded diff.
+        """
+
+        provenance = (finding.verified_by or "").strip().lower()
+        if provenance in {"detector", "detector-auto"}:
+            return verdict.confidence >= 0.9
+        reviewer = finding.reviewer.strip().lower().replace("-", "_")
+        category = finding.category.strip().lower().replace("_", "-")
+        return bool(
+            reviewer == "localization_reviewer"
+            and category in {"language-mismatch", "script-mismatch"}
+            and finding.confidence >= 0.9
+            and verdict.confidence >= 0.9
+        )
+
     async def classify(
         self,
         findings: list[Finding],
@@ -282,6 +307,13 @@ class PublicationTriage:
                         VERDICT_NEEDS_TOOL,
                         finding.confidence,
                         "Recall guard requires tool verification.",
+                    )
+                elif verdict.verdict == VERDICT_CONFIRMED and not self._can_direct_confirm(finding, verdict):
+                    verdict = TriageVerdict(
+                        finding.id,
+                        VERDICT_NEEDS_TOOL,
+                        verdict.confidence,
+                        "Ordinary model findings require tool-grounded publication verification.",
                     )
                 verdicts[finding.id] = verdict
                 if verdict.verdict == VERDICT_CONFIRMED:

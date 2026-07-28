@@ -48,9 +48,9 @@ TRACE_CATEGORIES = {
 VALID_VERDICTS = {"confirmed", "false_positive"}
 
 # Findings with a high false-negative cost get a narrow deterministic recall
-# guard. The final gate still investigates them, but an inconclusive or
-# negative verdict cannot suppress them unless an earlier deterministic stage
-# has already done so.
+# guard in the cheap triage stage. A negative triage verdict routes them to the
+# tool-enabled final gate; the final gate's evidence-grounded verdict is never
+# overridden.
 PUBLICATION_OPERATIONAL_SECURITY_CATEGORIES = {
     "authorization-bypass",
     "authz-bypass",
@@ -251,7 +251,7 @@ class EscalationReviewer:
             if not tool_calls:
                 result = self._parse_verdict(resp.content)
                 if result:
-                    return result
+                    return self._attach_tool_evidence(result, chat)
                 chat.append(HumanMessage(content="请基于已收集的信息，现在只输出 verdict JSON。"))
                 continue
 
@@ -276,6 +276,17 @@ class EscalationReviewer:
 
         return None
 
+    @staticmethod
+    def _attach_tool_evidence(result: dict, chat: list[Any]) -> dict:
+        """Attach the actual tool transcript for final-gate grounding checks."""
+
+        evidence = "\n".join(
+            str(message.content)
+            for message in chat
+            if isinstance(message, ToolMessage)
+        )
+        return {**result, "_tool_evidence": evidence[:100_000]}
+
     async def _force_final_verdict(self, chat: list[Any], budget: TokenBudget) -> dict | None:
         """Budget/steps exhausted — force a no-tools final verdict."""
         chat.append(HumanMessage(content="已达上限。请立刻只输出 verdict JSON。"))
@@ -286,7 +297,8 @@ class EscalationReviewer:
             # final turn can only return content.
             final = await self._llm.ainvoke(chat)
             budget.add(final)
-            return self._parse_verdict(final.content)
+            result = self._parse_verdict(final.content)
+            return self._attach_tool_evidence(result, chat) if result else None
         except Exception as e:
             logger.error(f"Escalation force-finish failed: {e}")
             return None
@@ -428,8 +440,30 @@ class PublicationGateReviewer(EscalationReviewer):
         return SystemMessage(content=_PUBLICATION_GATE_SYSTEM_PROMPT), HumanMessage(content=user)
 
     @staticmethod
+    def _apply_verdict(finding: Finding, verdict: dict) -> Finding:
+        """Require a confirmed verdict to quote the tool transcript exactly."""
+
+        checked = dict(verdict)
+        if checked.get("verdict") == "confirmed":
+            quote = str(checked.get("evidence_quote") or "").strip()
+            transcript = str(checked.get("_tool_evidence") or "")
+            compact_quote = "".join(quote.split())
+            if len(compact_quote) < 8 or quote not in transcript:
+                checked.update(
+                    {
+                        "verdict": "false_positive",
+                        "confidence": 1.0,
+                        "reason": (
+                            "Publication gate rejected an ungrounded approval: "
+                            "evidence_quote was missing or not present in tool output."
+                        ),
+                    }
+                )
+        return EscalationReviewer._apply_verdict(finding, checked)
+
+    @staticmethod
     def recall_protected(finding: Finding) -> bool:
-        """Protect narrow, high-cost finding families from gate false negatives."""
+        """Require narrow, high-cost families to reach tool verification."""
         reviewer = finding.reviewer.strip().lower().replace("-", "_")
         category = normalize_category(finding.category)
         confidence = finding.confidence
@@ -449,7 +483,7 @@ class PublicationGateReviewer(EscalationReviewer):
 
     @classmethod
     def operational_recall_protected(cls, finding: Finding) -> bool:
-        """Retain critical security findings only when the gate did not decide."""
+        """Require operationally critical families to reach tool verification."""
         if cls.recall_protected(finding):
             return True
         reviewer = finding.reviewer.strip().lower().replace("-", "_")
@@ -470,10 +504,7 @@ class PublicationGateReviewer(EscalationReviewer):
         state: StateStore,
         escalation_categories: set[str] | None = None,
     ) -> Finding:
-        original_status = finding.status
         original_confidence = finding.confidence
-        negative_verdict_protected = self.recall_protected(finding)
-        operationally_protected = self.operational_recall_protected(finding)
         try:
             result = await super().escalate(finding, state, escalation_categories)
         except asyncio.CancelledError:
@@ -491,28 +522,10 @@ class PublicationGateReviewer(EscalationReviewer):
             result.confidence = original_confidence
             return result
         if result.verified_by == "escalation":
-            if result.status == "false_positive" and negative_verdict_protected:
-                gate_confidence = result.confidence
-                gate_reason = result.verify_reason.strip() or "No reason supplied."
-                result.status = original_status
-                result.confidence = original_confidence
-                result.verified_by = "publication-gate-recall-guard"
-                result.verify_reason = (
-                    f"Recall guard overrode a false-positive verdict (confidence={gate_confidence:.2f}): {gate_reason}"
-                )[:500]
-                return result
             result.verified_by = "publication-gate"
             return result
 
-        if operationally_protected:
-            gate_reason = result.verify_reason.strip() or "No final verdict was produced."
-            result.status = original_status
-            result.confidence = original_confidence
-            result.verified_by = "publication-gate-recall-guard"
-            result.verify_reason = (f"Recall guard retained an inconclusive high-cost finding: {gate_reason}")[:500]
-            return result
-
-        # Provider, budget, parse and invalid-verdict failures are not approval.
+        # Budget, parse and invalid-verdict failures are not approval.
         result.status = "candidate"
         result.confidence = original_confidence
         result.verified_by = "publication-gate-inconclusive"

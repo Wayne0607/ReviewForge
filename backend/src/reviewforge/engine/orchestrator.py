@@ -1232,10 +1232,10 @@ class Orchestrator:
             else:
                 counts["inconclusive"] += 1
                 stats.agentic_inconclusive += 1
-                stats.retryable = True
                 if finding.verified_by == "publication-gate-provider-error":
                     stats.provider_errors += 1
-                stats.errors.append(f"Publication gate could not verify finding {finding.id}.")
+                    stats.retryable = True
+                    stats.errors.append(f"Publication gate provider failed for finding {finding.id}.")
             state.update_finding(
                 finding.id,
                 status=finding.status,

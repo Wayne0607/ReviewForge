@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import Finding, StateStore
@@ -223,7 +223,53 @@ class TestPublicationGate:
             "verdict": "confirmed",
             "confidence": 0.9,
             "reason": "grounded",
+            "_tool_evidence": "",
         }
+
+    def test_confirmed_verdict_requires_exact_tool_evidence(self):
+        finding = _make_finding(status="confirmed")
+        result = PublicationGateReviewer._apply_verdict(
+            finding,
+            {
+                "verdict": "confirmed",
+                "confidence": 0.9,
+                "reason": "grounded",
+                "evidence_quote": "return user.is_admin",
+                "_tool_evidence": "if active:\n    return user.is_admin\n",
+            },
+        )
+
+        assert result.status == "confirmed"
+        assert result.verified_by == "escalation"
+
+    @pytest.mark.parametrize("quote", ["", "not in the transcript"])
+    def test_ungrounded_confirmation_is_rejected(self, quote):
+        finding = _make_finding(status="confirmed")
+        result = PublicationGateReviewer._apply_verdict(
+            finding,
+            {
+                "verdict": "confirmed",
+                "confidence": 0.9,
+                "reason": "claimed",
+                "evidence_quote": quote,
+                "_tool_evidence": "actual repository code",
+            },
+        )
+
+        assert result.status == "false_positive"
+        assert result.verified_by == "escalation"
+        assert "ungrounded approval" in result.verify_reason
+
+    def test_tool_transcript_is_attached_to_verdict(self):
+        result = EscalationReviewer._attach_tool_evidence(
+            {"verdict": "confirmed"},
+            [
+                ToolMessage(content="first evidence", tool_call_id="one"),
+                ToolMessage(content="second evidence", tool_call_id="two"),
+            ],
+        )
+
+        assert result["_tool_evidence"] == "first evidence\nsecond evidence"
 
     @pytest.mark.asyncio
     async def test_valid_verdict_is_attributed_to_publication_gate(
@@ -400,7 +446,7 @@ class TestPublicationGate:
         assert PublicationGateReviewer.operational_recall_protected(finding) is True
 
     @pytest.mark.asyncio
-    async def test_recall_guard_retains_protected_finding(
+    async def test_explicit_negative_verdict_is_never_overridden(
         self,
         gateway,
         state,
@@ -426,11 +472,10 @@ class TestPublicationGate:
 
         result = await gate.escalate(finding, state)
 
-        assert result.status == "confirmed"
-        assert result.confidence == 0.85
-        assert result.verified_by == "publication-gate-recall-guard"
-        assert "confidence=0.95" in result.verify_reason
-        assert "not enough data flow" in result.verify_reason
+        assert result.status == "false_positive"
+        assert result.confidence == 0.95
+        assert result.verified_by == "publication-gate"
+        assert result.verify_reason == "not enough data flow"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

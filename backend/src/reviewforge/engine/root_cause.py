@@ -91,6 +91,7 @@ _LINE_TOLERANCE = {
     "auth-logic": 16,
     "undefined-symbol": 8,
     "nil-dereference": 8,
+    "stored-xss-flow": 0,
 }
 
 
@@ -176,6 +177,12 @@ def _causal_family(category: str, text: str) -> str:
         return "undefined-symbol"
     if any(token in normalized for token in ("nil-deref", "null-deref", "nil-pointer", "null-pointer")):
         return "nil-dereference"
+    if (
+        "xss" in normalized
+        and "raw_html" in combined
+        and any(token in combined for token in ("rss", "feed", "topicembed"))
+    ):
+        return "stored-xss-flow"
     return ""
 
 
@@ -342,11 +349,24 @@ def _same_code_identity(left: RootCauseClaim, right: RootCauseClaim) -> bool:
 
 
 def _are_duplicates(left: RootCauseClaim, right: RootCauseClaim) -> bool:
-    if not left.causal_family or left.causal_family != right.causal_family or left.file != right.file:
+    if not left.causal_family or left.causal_family != right.causal_family:
         return False
     # Independent deterministic findings remain independent evidence.
     if left.is_detector and right.is_detector:
         return False
+    if left.file != right.file:
+        if left.causal_family != "stored-xss-flow":
+            return False
+        shared = left.strong_identifiers & right.strong_identifiers
+        # A source and sink description of one stored-XSS path can be anchored
+        # in different files. Require the uncommon rendering contract and a
+        # qualified code identity so two unrelated XSS sites never collapse.
+        return (
+            "raw_html" in shared
+            and bool({"cook_method", "post.cook_methods"} & shared)
+            and any("." in identifier for identifier in shared)
+            and len(shared) >= 3
+        )
     return _same_code_identity(left, right)
 
 

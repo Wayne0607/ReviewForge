@@ -109,6 +109,58 @@ def test_same_identifier_in_different_files_does_not_cluster() -> None:
     assert result.kept == (left, right)
 
 
+def test_cross_file_stored_xss_source_and_sink_cluster_on_exact_render_contract() -> None:
+    sink = _finding(
+        "sink",
+        file="app/models/topic_embed.rb",
+        line=10,
+        category="xss",
+        message=(
+            "RSS contents reach PostCreator with `cook_method: Post.cook_methods[:raw_html]`, "
+            "so untrusted HTML is stored without sanitization."
+        ),
+        confidence=0.9,
+    )
+    source = _finding(
+        "source",
+        file="app/jobs/scheduled/poll_feed.rb",
+        line=31,
+        category="xss",
+        message=(
+            "RSS feed content is forwarded to TopicEmbed.import and rendered through "
+            "`cook_method: Post.cook_methods[:raw_html]` without sanitization."
+        ),
+        confidence=0.85,
+        reviewer="security_reviewer",
+    )
+
+    result = cluster_root_causes([sink, source])
+
+    assert result.kept == (sink,)
+    assert result.absorbed == (source,)
+    assert result.clusters[0].causal_family == "stored-xss-flow"
+
+
+def test_unrelated_cross_file_xss_findings_do_not_cluster() -> None:
+    first = _finding(
+        "first",
+        file="feed.rb",
+        category="xss",
+        message="RSS is rendered using `cook_method: Post.cook_methods[:raw_html]`.",
+    )
+    second = _finding(
+        "second",
+        file="profile.rb",
+        category="xss",
+        message="Profile bio reaches UserHtml.render without sanitization.",
+    )
+
+    result = cluster_root_causes([first, second])
+
+    assert result.kept == (first, second)
+    assert result.absorbed == ()
+
+
 def test_distinct_calls_of_same_function_do_not_cluster() -> None:
     left = _finding("left", category="missing-action", message="save(user) omits auditUser", line=1)
     right = _finding("right", category="missing-side-effect", message="save(order) omits auditOrder", line=2)

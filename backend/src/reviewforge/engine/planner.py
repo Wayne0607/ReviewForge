@@ -455,8 +455,18 @@ class Planner:
             reviewer = reviewer_map.get(reviewer, reviewer)
 
             if reviewer not in self._registry.agents:
-                logger.warning("Planner task %d proposed an unknown reviewer; skipping", index)
-                continue
+                # Provider models occasionally invent a narrower role such as
+                # ``api_contract_reviewer`` or ``concurrency_reviewer`` even
+                # though the prompt enumerates the registry.  Dropping the task
+                # loses its file selection and rationale.  The generic
+                # correctness reviewer is the safe, tool-bounded fallback and
+                # later merge logic collapses duplicate correctness tasks.
+                logger.warning(
+                    "Planner task %d proposed unknown reviewer %r; routing to correctness_reviewer",
+                    index,
+                    reviewer,
+                )
+                reviewer = "correctness_reviewer"
 
             raw_files = item.get("files")
             if not isinstance(raw_files, list):

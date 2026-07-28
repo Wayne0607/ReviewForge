@@ -109,6 +109,28 @@ def test_malformed_task_is_skipped_without_losing_valid_siblings() -> None:
     assert tasks[0].rationale == ""
 
 
+def test_unknown_model_role_falls_back_to_tool_bounded_correctness() -> None:
+    planner = Planner(_StaticPlannerLLM("{}"), build_registry())  # type: ignore[arg-type]
+    content = json.dumps(
+        {
+            "tasks": [
+                {
+                    "reviewer": "api_contract_reviewer",
+                    "files": ["src/calendar.ts"],
+                    "rationale": "compare the changed interface with implementations",
+                }
+            ]
+        }
+    )
+
+    tasks = planner._parse_response(content, allowed_files=["src/calendar.ts"])
+
+    assert len(tasks) == 1
+    assert tasks[0].reviewer == "correctness_reviewer"
+    assert tasks[0].files == ["src/calendar.ts"]
+    assert tasks[0].rationale == "compare the changed interface with implementations"
+
+
 def test_planner_contract_advertises_runtime_bounds() -> None:
     tasks_contract = build_registry().get_agent("planner").output_contract["properties"]["tasks"]
 

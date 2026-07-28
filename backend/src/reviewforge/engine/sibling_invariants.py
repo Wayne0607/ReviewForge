@@ -276,6 +276,13 @@ def _telemetry_argument_invariants(
                 or len(support_by_symbol) / max(1, len(independent_symbols)) < 0.75
             ):
                 continue
+            # Restrict automatic telemetry findings to the strongest label
+            # contract shape: siblings pass a qualified field (options.Kind)
+            # while the changed call passes a bare value (name), or vice
+            # versa.  Two bare phase-local variables such as startStorage and
+            # startLegacy often differ intentionally and are not proof.
+            if ("." in expected) == ("." in outlier.args[index]):
+                continue
             # The proposed outlier must be unique across independent methods;
             # otherwise this is a legitimate second convention, not a broken
             # repeated invariant.

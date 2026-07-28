@@ -145,3 +145,35 @@ func (d *Writer) Delete(name string, options Options) {
             )
         ),
     )
+
+
+def test_does_not_treat_phase_local_timer_as_a_label_contract():
+    content = """package rest
+
+func (d *Writer) Create(options Options) {
+    d.recordStorageDuration(false, mode, options.Kind, "create", startStorage)
+}
+func (d *Writer) Update(options Options) {
+    d.recordStorageDuration(false, mode, options.Kind, "update", startStorage)
+}
+func (d *Writer) List(options Options) {
+    d.recordStorageDuration(false, mode, options.Kind, "list", startStorage)
+}
+func (d *Writer) DeleteCollection(options Options) {
+    d.recordStorageDuration(false, mode, options.Kind, "delete", startLegacy)
+}
+"""
+    target_line = next(index for index, line in enumerate(content.splitlines(), start=1) if "startLegacy" in line)
+
+    invariants = analyze_sibling_invariants(
+        content,
+        "writer.go",
+        _go_patch(
+            (
+                target_line,
+                '    d.recordStorageDuration(false, mode, options.Kind, "delete", startLegacy)',
+            )
+        ),
+    )
+
+    assert not [invariant for invariant in invariants if invariant.kind == "telemetry-argument-outlier"]

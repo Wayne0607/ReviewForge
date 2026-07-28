@@ -46,7 +46,25 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: cd backend && uv sync --frozen && uv run pytest -q
+      - name: Sync test environment
+        run: cd backend && uv sync --frozen
+      - name: Run tests with one stall retry
+        shell: bash
+        run: |
+          cd backend
+          run_tests() {
+            timeout --signal=TERM --kill-after=15s 180 \
+              uv run --no-sync pytest -q
+          }
+          run_tests || {
+            status=$?
+            if [[ "$status" -ne 124 && "$status" -ne 137 && "$status" -ne 143 ]]; then
+              exit "$status"
+            fi
+            echo "::warning::Test runner stalled; retrying once in a fresh process"
+            run_tests
+          }

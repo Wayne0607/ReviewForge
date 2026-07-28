@@ -652,7 +652,6 @@ class PublicationGateReviewer(EscalationReviewer):
         escalation_categories: set[str] | None = None,
     ) -> Finding:
         original_confidence = finding.confidence
-        original_verified_by = finding.verified_by
         try:
             result = await super().escalate(finding, state, escalation_categories)
         except asyncio.CancelledError:
@@ -670,11 +669,7 @@ class PublicationGateReviewer(EscalationReviewer):
             result.confidence = original_confidence
             return result
         if result.verified_by == "publication-gate-ungrounded":
-            if self._diff_proves_detector_finding(
-                result,
-                state,
-                original_verified_by=original_verified_by,
-            ):
+            if self._diff_proves_detector_finding(result, state):
                 return result
             return result
         if result.verified_by == "escalation":
@@ -682,11 +677,7 @@ class PublicationGateReviewer(EscalationReviewer):
             return result
 
         # Budget, parse and invalid-verdict failures are not approval.
-        if self._diff_proves_detector_finding(
-            result,
-            state,
-            original_verified_by=original_verified_by,
-        ):
+        if self._diff_proves_detector_finding(result, state):
             return result
         result.status = "candidate"
         result.confidence = original_confidence
@@ -698,13 +689,9 @@ class PublicationGateReviewer(EscalationReviewer):
     def _diff_proves_detector_finding(
         finding: Finding,
         state: StateStore,
-        *,
-        original_verified_by: str,
     ) -> bool:
-        """Confirm a narrow detector result when the model produced no usable verdict."""
+        """Confirm a narrow diff-proven result when the model produced no usable verdict."""
 
-        if (original_verified_by or "").strip().lower() not in {"detector", "detector-auto"}:
-            return False
         diff = (state.file_diffs or {}).get(finding.file, "")
         if not is_diff_proven_quality_regression(
             finding.file,

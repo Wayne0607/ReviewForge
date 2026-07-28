@@ -409,14 +409,13 @@ class TestPublicationGate:
         proved = PublicationGateReviewer._diff_proves_detector_finding(
             finding,
             state,
-            original_verified_by="detector",
         )
 
         assert proved is True
         assert finding.status == "confirmed"
         assert finding.verified_by == "publication-gate-diff-proof"
 
-    def test_diff_proof_does_not_apply_to_model_provenance(self):
+    def test_diff_proof_does_not_apply_without_reproducible_patch_shape(self):
         state = StateStore(repo="owner/repo", pr_number=1, file_diffs={"index.go": "@@ -1 +1 @@\n+x = 1"})
         finding = _make_finding(file="index.go", line=1, category="race-condition")
 
@@ -424,7 +423,6 @@ class TestPublicationGate:
             PublicationGateReviewer._diff_proves_detector_finding(
                 finding,
                 state,
-                original_verified_by="correctness_reviewer",
             )
             is False
         )

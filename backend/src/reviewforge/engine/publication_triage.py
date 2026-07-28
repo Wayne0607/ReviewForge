@@ -99,6 +99,7 @@ class TriageStats:
     agentic_attempted: int = 0
     agentic_confirmed: int = 0
     agentic_filtered: int = 0
+    agentic_ungrounded: int = 0
     agentic_inconclusive: int = 0
     provider_errors: int = 0
     duration_ms: int = 0
@@ -115,6 +116,7 @@ class TriageStats:
             "agentic_attempted": self.agentic_attempted,
             "agentic_confirmed": self.agentic_confirmed,
             "agentic_filtered": self.agentic_filtered,
+            "agentic_ungrounded": self.agentic_ungrounded,
             "agentic_inconclusive": self.agentic_inconclusive,
             "provider_errors": self.provider_errors,
             "duration_ms": self.duration_ms,

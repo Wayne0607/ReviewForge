@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -47,6 +49,22 @@ def _make_finding(**overrides) -> Finding:
     }
     defaults.update(overrides)
     return Finding(**defaults)
+
+
+class _CountingTool:
+    def __init__(self, results, delay: float = 0.0):
+        self.results = list(results)
+        self.delay = delay
+        self.calls = 0
+
+    async def ainvoke(self, _args):
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        result = self.results[min(self.calls - 1, len(self.results) - 1)]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 # ── should_escalate ──────────────────────────────────────────────
@@ -187,6 +205,75 @@ class TestEscalate:
 # ── _parse_verdict ───────────────────────────────────────────────
 
 
+class TestVerificationToolCache:
+    @pytest.mark.asyncio
+    async def test_same_successful_call_is_cached(self, gateway, state):
+        reviewer = EscalationReviewer(MockChatLLM(), gateway)
+        reviewer._ensure_tools(state)
+        tool = _CountingTool(["repository evidence"])
+
+        first = await reviewer._invoke_verification_tool("read_file", {"file_path": "app.py"}, tool)
+        second = await reviewer._invoke_verification_tool("read_file", {"file_path": "app.py"}, tool)
+
+        assert first == second == "repository evidence"
+        assert tool.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_share_single_flight(self, gateway, state):
+        reviewer = EscalationReviewer(MockChatLLM(), gateway)
+        reviewer._ensure_tools(state)
+        tool = _CountingTool(["repository evidence"], delay=0.01)
+
+        results = await asyncio.gather(
+            reviewer._invoke_verification_tool("search_code", {"pattern": "target"}, tool),
+            reviewer._invoke_verification_tool("search_code", {"pattern": "target"}, tool),
+        )
+
+        assert results == ["repository evidence", "repository evidence"]
+        assert tool.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_exception_is_not_cached(self, gateway, state):
+        reviewer = EscalationReviewer(MockChatLLM(), gateway)
+        reviewer._ensure_tools(state)
+        tool = _CountingTool([RuntimeError("temporary failure"), "recovered evidence"])
+
+        with pytest.raises(RuntimeError, match="temporary failure"):
+            await reviewer._invoke_verification_tool("read_file", {"file_path": "app.py"}, tool)
+        result = await reviewer._invoke_verification_tool("read_file", {"file_path": "app.py"}, tool)
+
+        assert result == "recovered evidence"
+        assert tool.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_error_sentinel_is_not_cached(self, gateway, state):
+        reviewer = EscalationReviewer(MockChatLLM(), gateway)
+        reviewer._ensure_tools(state)
+        tool = _CountingTool(["Search failed: rate limited", "recovered evidence"])
+
+        first = await reviewer._invoke_verification_tool("search_code", {"pattern": "target"}, tool)
+        second = await reviewer._invoke_verification_tool("search_code", {"pattern": "target"}, tool)
+
+        assert first == "Search failed: rate limited"
+        assert second == "recovered evidence"
+        assert tool.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_cache_is_invalidated_by_head_sha(self, gateway, state):
+        reviewer = EscalationReviewer(MockChatLLM(), gateway)
+        reviewer._ensure_tools(state)
+        tool = _CountingTool(["old-head evidence", "new-head evidence"])
+
+        first = await reviewer._invoke_verification_tool("read_file", {"file_path": "app.py"}, tool)
+        state.head_sha = "new-head"
+        reviewer._ensure_tools(state)
+        second = await reviewer._invoke_verification_tool("read_file", {"file_path": "app.py"}, tool)
+
+        assert first == "old-head evidence"
+        assert second == "new-head evidence"
+        assert tool.calls == 2
+
+
 class TestPublicationGate:
     def test_all_confirmed_findings_require_verification(self):
         finding = _make_finding(
@@ -242,7 +329,31 @@ class TestPublicationGate:
         assert result.status == "confirmed"
         assert result.verified_by == "escalation"
 
-    @pytest.mark.parametrize("quote", ["", "not in the transcript"])
+    def test_line_numbers_fences_and_whitespace_are_presentation_only(self):
+        finding = _make_finding(status="confirmed")
+        result = PublicationGateReviewer._apply_verdict(
+            finding,
+            {
+                "verdict": "confirmed",
+                "confidence": 0.9,
+                "reason": "grounded",
+                "evidence_quote": "```python\nif active:\n return user.is_admin\n```",
+                "_tool_evidence": "41: if active:\r\n42:     return user.is_admin\r\n",
+            },
+        )
+
+        assert result.status == "confirmed"
+        assert result.verified_by == "escalation"
+
+    @pytest.mark.parametrize(
+        "quote",
+        [
+            "",
+            "return ok",
+            "not in the transcript at all",
+            "first evidence unrelated words second evidence",
+        ],
+    )
     def test_ungrounded_confirmation_is_rejected(self, quote):
         finding = _make_finding(status="confirmed")
         result = PublicationGateReviewer._apply_verdict(
@@ -252,12 +363,12 @@ class TestPublicationGate:
                 "confidence": 0.9,
                 "reason": "claimed",
                 "evidence_quote": quote,
-                "_tool_evidence": "actual repository code",
+                "_tool_evidence": "first evidence\nactual repository code\nsecond evidence",
             },
         )
 
         assert result.status == "false_positive"
-        assert result.verified_by == "escalation"
+        assert result.verified_by == "publication-gate-ungrounded"
         assert "ungrounded approval" in result.verify_reason
 
     def test_tool_transcript_is_attached_to_verdict(self):
@@ -295,6 +406,33 @@ class TestPublicationGate:
 
         assert result.status == "false_positive"
         assert result.verified_by == "publication-gate"
+
+    @pytest.mark.asyncio
+    async def test_ungrounded_verdict_keeps_distinct_attribution(
+        self,
+        gateway,
+        state,
+        monkeypatch,
+    ):
+        gate = PublicationGateReviewer(MockChatLLM(), gateway)
+        finding = _make_finding(status="confirmed")
+        monkeypatch.setattr(gate, "_ensure_tools", lambda _state: ([], {}, None))
+
+        async def verdict(*_args, **_kwargs):
+            return {
+                "verdict": "confirmed",
+                "confidence": 0.95,
+                "reason": "claimed",
+                "evidence_quote": "not found anywhere in evidence",
+                "_tool_evidence": "actual repository evidence",
+            }
+
+        monkeypatch.setattr(gate, "_run_tool_loop", verdict)
+
+        result = await gate.escalate(finding, state)
+
+        assert result.status == "false_positive"
+        assert result.verified_by == "publication-gate-ungrounded"
 
     @pytest.mark.asyncio
     async def test_inconclusive_verification_is_not_published(

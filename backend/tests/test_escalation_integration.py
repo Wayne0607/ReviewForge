@@ -338,16 +338,17 @@ async def test_publication_gate_updates_every_confirmed_finding():
         async def escalate_batch(self, findings, _state, concurrency):
             assert concurrency == 4
             findings[0].status = "false_positive"
-            findings[0].verified_by = "publication-gate"
+            findings[0].verified_by = "publication-gate-ungrounded"
             findings[1].status = "candidate"
             findings[1].verified_by = "publication-gate-inconclusive"
             return findings
 
     orch._publication_gate_reviewer = _Gate()
-    await orch._run_publication_gate(state)
+    stats = await orch._run_publication_gate(state)
 
     assert state.findings[first.id].status == "false_positive"
     assert state.findings[second.id].status == "candidate"
+    assert stats.agentic_ungrounded == 1
     completed = [event for event in events if event.event_type == "publication_gate.completed"]
     assert completed
     assert completed[-1].data == {

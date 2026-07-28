@@ -15,7 +15,10 @@ approach: same accuracy, ~1/3 token cost on clean/obvious code.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+from collections import OrderedDict
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -46,6 +49,22 @@ TRACE_CATEGORIES = {
 
 # Valid verdict values the LLM can return.
 VALID_VERDICTS = {"confirmed", "false_positive"}
+_CACHEABLE_VERIFICATION_TOOLS = {
+    "get_change_context",
+    "read_diff",
+    "read_file",
+    "search_code",
+}
+_MAX_VERIFICATION_TOOL_CACHE_ENTRIES = 256
+_TOOL_ERROR_PREFIXES = (
+    "error:",
+    "read failed:",
+    "search failed:",
+    "tool error:",
+    "unknown tool:",
+)
+_READ_FILE_LINE_PREFIX = re.compile(r"^\s*\d+\s*:\s?")
+_MARKDOWN_FENCE = re.compile(r"^\s*```(?:[\w.+-]+)?\s*$")
 
 # Findings with a high false-negative cost get a narrow deterministic recall
 # guard in the cheap triage stage. A negative triage verdict routes them to the
@@ -156,21 +175,81 @@ class EscalationReviewer:
         self._confidence_min = confidence_min
         self._confidence_max = confidence_max
         self._events = event_bus
-        # Cached tools — keyed by (repo, pr_number) to invalidate on state change.
-        self._cache_key: tuple[str, int] | None = None
+        # Cached tools — keyed by (repo, pr_number, head_sha).
+        self._cache_key: tuple[str, int, str] | None = None
         self._cached_tools: list | None = None
         self._cached_tool_map: dict | None = None
         self._cached_bound_llm: Any = None
+        self._tool_result_cache: OrderedDict[tuple[str, int, str, str, str], str] = OrderedDict()
+        self._tool_result_loads: dict[tuple[str, int, str, str, str], asyncio.Task[Any]] = {}
 
     def _ensure_tools(self, state: StateStore) -> tuple[list, dict, Any]:
         """Build and cache tools + bound LLM. Invalidates when state changes."""
-        key = (state.repo, state.pr_number)
+        key = (state.repo, state.pr_number, state.head_sha)
         if self._cache_key != key:
             self._cached_tools = build_reviewer_tools(self._gateway, state, "escalation_reviewer")
             self._cached_tool_map = {t.name: t for t in self._cached_tools}
             self._cached_bound_llm = self._llm.bind_tools(self._cached_tools)
             self._cache_key = key
+            self._tool_result_cache.clear()
+            self._tool_result_loads.clear()
         return self._cached_tools, self._cached_tool_map, self._cached_bound_llm
+
+    @staticmethod
+    def _is_cacheable_tool_result(result: str) -> bool:
+        """Return whether a successful read-only result is safe to reuse."""
+
+        lowered = result.lstrip().lower()
+        return not lowered.startswith(_TOOL_ERROR_PREFIXES)
+
+    async def _invoke_verification_tool(
+        self,
+        name: str,
+        args: Any,
+        tool: Any,
+    ) -> Any:
+        """Invoke a read-only tool with bounded per-head cache and single-flight."""
+
+        if (
+            name not in _CACHEABLE_VERIFICATION_TOOLS
+            or tool is None
+            or not isinstance(args, dict)
+            or self._cache_key is None
+        ):
+            return await tool.ainvoke(args) if tool else f"Unknown tool: {name}"
+
+        scope = self._cache_key
+        stable_args = json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
+        cache_key = (*scope, name, stable_args)
+        cached = self._tool_result_cache.get(cache_key)
+        if cached is not None:
+            self._tool_result_cache.move_to_end(cache_key)
+            return cached
+
+        load = self._tool_result_loads.get(cache_key)
+        if load is None:
+            load = asyncio.create_task(tool.ainvoke(args))
+            self._tool_result_loads[cache_key] = load
+
+            def _discard_completed(completed: asyncio.Task[Any]) -> None:
+                if self._tool_result_loads.get(cache_key) is completed:
+                    self._tool_result_loads.pop(cache_key, None)
+
+            load.add_done_callback(_discard_completed)
+
+        try:
+            result = await asyncio.shield(load)
+        finally:
+            if self._tool_result_loads.get(cache_key) is load and load.done():
+                self._tool_result_loads.pop(cache_key, None)
+
+        result_text = str(result)[:MAX_TOOL_OUTPUT_CHARS]
+        if scope == self._cache_key and self._is_cacheable_tool_result(result_text):
+            self._tool_result_cache[cache_key] = result_text
+            self._tool_result_cache.move_to_end(cache_key)
+            while len(self._tool_result_cache) > _MAX_VERIFICATION_TOOL_CACHE_ENTRIES:
+                self._tool_result_cache.popitem(last=False)
+        return result_text
 
     @staticmethod
     def should_escalate(
@@ -267,7 +346,7 @@ class EscalationReviewer:
                 else:
                     tool = tool_map.get(name)
                     try:
-                        result = await tool.ainvoke(args) if tool else f"Unknown tool: {name}"
+                        result = await self._invoke_verification_tool(name, args, tool)
                     except Exception as e:
                         result = f"Tool error: {e}"
 
@@ -436,15 +515,31 @@ class PublicationGateReviewer(EscalationReviewer):
         return SystemMessage(content=_PUBLICATION_GATE_SYSTEM_PROMPT), HumanMessage(content=user)
 
     @staticmethod
+    def _normalize_evidence(text: str) -> str:
+        """Normalize presentation-only formatting without semantic fuzziness."""
+
+        lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        normalized_lines = []
+        for line in lines:
+            if _MARKDOWN_FENCE.fullmatch(line):
+                continue
+            normalized_lines.append(_READ_FILE_LINE_PREFIX.sub("", line))
+        return re.sub(r"\s+", " ", "\n".join(normalized_lines)).strip()
+
+    @staticmethod
     def _apply_verdict(finding: Finding, verdict: dict) -> Finding:
-        """Require a confirmed verdict to quote the tool transcript exactly."""
+        """Require evidence to remain contiguous after safe normalization."""
 
         checked = dict(verdict)
+        ungrounded = False
         if checked.get("verdict") == "confirmed":
             quote = str(checked.get("evidence_quote") or "").strip()
             transcript = str(checked.get("_tool_evidence") or "")
-            compact_quote = "".join(quote.split())
-            if len(compact_quote) < 8 or quote not in transcript:
+            normalized_quote = PublicationGateReviewer._normalize_evidence(quote)
+            normalized_transcript = PublicationGateReviewer._normalize_evidence(transcript)
+            compact_quote = "".join(normalized_quote.split())
+            if len(compact_quote) < 16 or normalized_quote not in normalized_transcript:
+                ungrounded = True
                 checked.update(
                     {
                         "verdict": "false_positive",
@@ -455,7 +550,10 @@ class PublicationGateReviewer(EscalationReviewer):
                         ),
                     }
                 )
-        return EscalationReviewer._apply_verdict(finding, checked)
+        result = EscalationReviewer._apply_verdict(finding, checked)
+        if ungrounded:
+            result.verified_by = "publication-gate-ungrounded"
+        return result
 
     @staticmethod
     def recall_protected(finding: Finding) -> bool:
@@ -516,6 +614,8 @@ class PublicationGateReviewer(EscalationReviewer):
             # orchestrator mark the run retryable.
             result.status = "candidate"
             result.confidence = original_confidence
+            return result
+        if result.verified_by == "publication-gate-ungrounded":
             return result
         if result.verified_by == "escalation":
             result.verified_by = "publication-gate"

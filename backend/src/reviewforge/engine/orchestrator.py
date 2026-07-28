@@ -1229,6 +1229,8 @@ class Orchestrator:
             elif finding.status == "false_positive":
                 counts["filtered"] += 1
                 stats.agentic_filtered += 1
+                if finding.verified_by == "publication-gate-ungrounded":
+                    stats.agentic_ungrounded += 1
             else:
                 counts["inconclusive"] += 1
                 stats.agentic_inconclusive += 1

@@ -280,11 +280,7 @@ class EscalationReviewer:
     def _attach_tool_evidence(result: dict, chat: list[Any]) -> dict:
         """Attach the actual tool transcript for final-gate grounding checks."""
 
-        evidence = "\n".join(
-            str(message.content)
-            for message in chat
-            if isinstance(message, ToolMessage)
-        )
+        evidence = "\n".join(str(message.content) for message in chat if isinstance(message, ToolMessage))
         return {**result, "_tool_evidence": evidence[:100_000]}
 
     async def _force_final_verdict(self, chat: list[Any], budget: TokenBudget) -> dict | None:

@@ -444,11 +444,142 @@ class TestRootCauseDedup:
         assert kept_ids == {"near"}
         assert "far" in dropped_ids
 
+    def test_wrong_argument_reports_merge_across_reviewer_vocabularies(self):
+        state = _make_state(None)
+        policy = PublicationPolicy(PublicationPolicyConfig(enabled=True, mode="enforce"))
+        correctness = _make_finding(
+            id="correctness",
+            file="dualwriter.go",
+            line=90,
+            category="wrong-argument",
+            reviewer="correctness_reviewer",
+            message="recordStorageDuration receives `name` instead of `options.Kind`.",
+            suggestion="Use d.recordStorageDuration(false, mode, options.Kind, method, start).",
+        )
+        performance = _make_finding(
+            id="performance",
+            file="dualwriter.go",
+            line=125,
+            category="metric-label-error",
+            reviewer="performance_reviewer",
+            message="The metric label passes `name`, not `options.Kind`.",
+            suggestion="Call d.recordStorageDuration(false, mode, options.Kind, method, start).",
+        )
+
+        decision = policy.pre_filter([correctness, performance], state)
+
+        assert [finding.id for finding in decision.kept] == ["correctness"]
+        assert [finding.id for finding in decision.dropped] == ["performance"]
+
+    def test_repeated_undefined_symbol_merges_across_distant_test_lines(self):
+        state = _make_state(None)
+        policy = PublicationPolicy(PublicationPolicyConfig(enabled=True, mode="enforce"))
+        first = _make_finding(
+            id="first",
+            file="dualwriter_test.go",
+            line=71,
+            category="undefined-identifier",
+            message="The identifier `p` is undefined in this test.",
+            suggestion="Define `p` before NewDualWriter.",
+        )
+        repeated = _make_finding(
+            id="repeated",
+            file="dualwriter_test.go",
+            line=349,
+            category="undefined-symbol",
+            message="This test also uses undefined symbol `p`.",
+            suggestion="Initialize `p` locally.",
+        )
+        independent = _make_finding(
+            id="independent",
+            file="dualwriter_test.go",
+            line=350,
+            category="undefined-symbol",
+            message="This test uses undefined symbol `fixture`.",
+            suggestion="Define `fixture`.",
+        )
+
+        decision = policy.pre_filter([first, repeated, independent], state)
+
+        assert {finding.id for finding in decision.kept} == {"first", "independent"}
+        assert [finding.id for finding in decision.dropped] == ["repeated"]
+
 
 # ── Invalid coordinate and generic advice drops ────────────────────────────
 
 
 class TestInvalidCoordinateAndGenericAdvice:
+    def test_testing_reviewer_cannot_publish_production_code_bug(self):
+        state = _make_state(None)
+        policy = PublicationPolicy(PublicationPolicyConfig(enabled=True, mode="enforce"))
+        finding = _make_finding(
+            id="testing-production",
+            file="src/controller.rb",
+            reviewer="testing_reviewer",
+            category="nil-handling",
+            message="`host.destroy` raises when `host` is nil.",
+            suggestion="Guard `host` before the call.",
+        )
+
+        decision = policy.pre_filter([finding], state)
+
+        assert decision.kept == []
+        assert decision.dropped == [finding]
+        assert decision.scored[0].drop_reason == "reviewer-scope"
+        assert decision.metrics["reviewer_scope_dropped"] == 1
+
+    def test_testing_reviewer_keeps_test_artifact_defect(self):
+        state = _make_state(None)
+        policy = PublicationPolicy(PublicationPolicyConfig(enabled=True, mode="enforce"))
+        finding = _make_finding(
+            id="testing-test",
+            file="tests/test_controller.py",
+            reviewer="testing_reviewer",
+            category="broken-assertion",
+            message="The assertion compares `actual` with the wrong `expected` fixture.",
+            suggestion="Use the matching `expected` fixture.",
+        )
+
+        decision = policy.pre_filter([finding], state)
+
+        assert decision.kept == [finding]
+        assert decision.dropped == []
+
+    def test_correctness_reviewer_defers_test_artifact_to_testing_specialist(self):
+        state = _make_state(None)
+        policy = PublicationPolicy(PublicationPolicyConfig(enabled=True, mode="enforce"))
+        finding = _make_finding(
+            id="correctness-test",
+            file="pkg/handler_test.go",
+            reviewer="correctness_reviewer",
+            category="undefined-identifier",
+            message="The test appears to use undefined `registry`.",
+            suggestion="Define `registry` in the fixture.",
+        )
+
+        decision = policy.pre_filter([finding], state)
+
+        assert decision.kept == []
+        assert decision.dropped == [finding]
+        assert decision.scored[0].drop_reason == "reviewer-scope"
+
+    def test_security_reviewer_may_publish_test_artifact_security_issue(self):
+        state = _make_state(None)
+        policy = PublicationPolicy(PublicationPolicyConfig(enabled=True, mode="enforce"))
+        finding = _make_finding(
+            id="security-test",
+            file="tests/test_deploy.py",
+            reviewer="security_reviewer",
+            category="hardcoded-secrets",
+            message="The fixture exposes `production_token` in repository history.",
+            suggestion="Load it from a test-only secret store.",
+        )
+
+        decision = policy.pre_filter([finding], state)
+
+        assert decision.kept == [finding]
+        assert decision.dropped == []
+
     def test_invalid_right_line_dropped(self):
         diff = "@@ -1,3 +1,4 @@\n x = 1\n+# new comment at line 2\n y = 2\n z = 3\n"
         state = _make_state({"src/auth.py": diff})

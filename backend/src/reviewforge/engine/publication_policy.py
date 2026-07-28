@@ -40,7 +40,9 @@ from typing import Any
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.verifier import (
+    _CALL_IDENTIFIER,
     _DOTTED_IDENTIFIER,
+    _QUOTED_IDENTIFIER,
     _SINK_FAMILY_PATTERNS,
     _SINK_PATTERNS,
 )
@@ -57,6 +59,26 @@ _DETECTOR_PROVENANCE = frozenset({"detector", "detector-auto"})
 # grouping.  The publication policy uses a focused window (10) so reviewers
 # describing distinct sinks in different methods of the same file survive.
 _ROOT_CAUSE_LINE_TOLERANCE = 10
+_SEMANTIC_ROOT_LINE_TOLERANCE = 30
+_ARGUMENT_ROOT_LINE_TOLERANCE = 60
+_TEST_FILE_PATTERN = re.compile(
+    r"(?:^|/)(?:tests?|specs?|__tests__)(?:/|$)|"
+    r"(?:^|[._-])(?:test|tests|spec)(?:[._-]|$)",
+    re.IGNORECASE,
+)
+_CLAIM_TOKEN_STOPWORDS = frozenset(
+    {
+        "call:if",
+        "call:return",
+        "call:with",
+        "symbol:error",
+        "symbol:false",
+        "symbol:nil",
+        "symbol:none",
+        "symbol:null",
+        "symbol:true",
+    }
+)
 
 # Generic advice category buckets — these suggestions are rarely anchored to a
 # concrete sink and almost never survive a deterministic right-side check.
@@ -249,6 +271,64 @@ class PolicyDecision:
 
 def _is_detector(finding: Finding) -> bool:
     return (finding.verified_by or "").strip().lower() in _DETECTOR_PROVENANCE
+
+
+def _is_reviewer_scope_noise(finding: Finding) -> bool:
+    """Keep specialist findings inside their owned production/test surface."""
+
+    reviewers = {
+        value.strip().lower().replace("-", "_") for value in str(finding.reviewer or "").split(",") if value.strip()
+    }
+    is_test_file = bool(_TEST_FILE_PATTERN.search(finding.file))
+    if reviewers == {"testing_reviewer"}:
+        return not is_test_file
+    if (
+        is_test_file
+        and not _is_detector(finding)
+        and reviewers
+        and reviewers.isdisjoint({"dependency_reviewer", "security_reviewer", "testing_reviewer"})
+    ):
+        return True
+    return False
+
+
+def _claim_family(finding: Finding) -> str:
+    """Map reviewer vocabularies to a small model-independent root family."""
+
+    category = str(finding.category or "").lower().replace("_", "-")
+    text = f"{category}\n{finding.message}".lower()
+    if "undefined" in text or "not defined" in text or "undeclared" in text:
+        return "undefined-symbol"
+    if any(marker in text for marker in ("nil-", "null-", "nil ", "null ", "existence-check", "missing-nil")):
+        return "nil-dereference"
+    if any(
+        marker in category
+        for marker in (
+            "argument",
+            "incorrect-metric",
+            "metric-label",
+            "parameter-mismatch",
+            "wrong-variable",
+        )
+    ):
+        return "wrong-argument"
+    if any(marker in category for marker in ("lost-logger", "context-inconsistency", "logging-context")):
+        return "lost-context"
+    if any(marker in category for marker in ("incomplete-implementation", "missing-action")):
+        return "incomplete-action"
+    if any(marker in category for marker in ("authorization-logic", "logic-bug", "wrong-logic")):
+        return "logic"
+    return ""
+
+
+def _claim_tokens(finding: Finding) -> frozenset[str]:
+    """Extract concrete code tokens from the claim and proposed fix."""
+
+    text = f"{finding.message}\n{finding.suggestion}"
+    tokens = {re.sub(r"\s+", "", match.group(0)).lower() for match in _DOTTED_IDENTIFIER.finditer(text)}
+    tokens.update("call:" + re.sub(r"\s+", "", match).lower() for match in _CALL_IDENTIFIER.findall(text))
+    tokens.update("symbol:" + match.lower() for match in _QUOTED_IDENTIFIER.findall(text))
+    return frozenset(token for token in tokens if token not in _CLAIM_TOKEN_STOPWORDS)
 
 
 def _sink_tokens(message: str) -> set[str]:
@@ -471,6 +551,8 @@ class PublicationPolicy:
         for scored_finding in scored:
             if scored_finding.invalid_coordinate:
                 scored_finding.drop_reason = "invalid-coordinate"
+            elif _is_reviewer_scope_noise(scored_finding.finding):
+                scored_finding.drop_reason = "reviewer-scope"
             elif scored_finding.is_generic_advice:
                 scored_finding.drop_reason = "generic-advice"
 
@@ -484,6 +566,7 @@ class PublicationPolicy:
         metrics = {
             "input": len(scored),
             "invalid_coordinate_dropped": sum(1 for s in scored if s.drop_reason == "invalid-coordinate"),
+            "reviewer_scope_dropped": sum(1 for s in scored if s.drop_reason == "reviewer-scope"),
             "generic_advice_dropped": sum(1 for s in scored if s.drop_reason == "generic-advice"),
             "root_cause_merged_dropped": sum(1 for s in scored if s in pre_filtered and s not in deduped),
             "kept": len(kept),
@@ -715,14 +798,42 @@ class PublicationPolicy:
     def _can_merge_root_causes(cls, kept: ScoredFinding, candidate: ScoredFinding) -> bool:
         if kept.finding.file != candidate.finding.file:
             return False
-        if abs(kept.finding.line - candidate.finding.line) > cls._ROOT_CAUSE_LINE_TOLERANCE:
-            return False
+        distance = abs(kept.finding.line - candidate.finding.line)
         # Both findings must resolve to one concrete call site. Broad family
         # overlap (for example command execution) and suggestion text never
         # participate; an empty identity means resolution was ambiguous.
-        if not (kept.sink_sites and candidate.sink_sites):
+        if (
+            distance <= cls._ROOT_CAUSE_LINE_TOLERANCE
+            and kept.sink_sites
+            and candidate.sink_sites
+            and kept.sink_sites & candidate.sink_sites
+        ):
+            return True
+
+        # Model vocabularies vary, so use code tokens rather than category
+        # equality for a conservative semantic fallback. This catches repeated
+        # reports of one wrong argument, nil dereference, or undefined symbol
+        # even when reviewers anchor nearby setup/call lines differently.
+        if _is_detector(kept.finding) or _is_detector(candidate.finding):
             return False
-        return bool(kept.sink_sites & candidate.sink_sites)
+        kept_family = _claim_family(kept.finding)
+        candidate_family = _claim_family(candidate.finding)
+        if not kept_family or kept_family != candidate_family:
+            return False
+        shared = _claim_tokens(kept.finding) & _claim_tokens(candidate.finding)
+        if not shared:
+            return False
+        if kept_family == "undefined-symbol":
+            if any(token.startswith("symbol:") for token in shared):
+                return True
+            concrete = {token for token in shared if token.startswith("call:") or "." in token}
+            return len(concrete) >= 2
+        if kept_family == "wrong-argument":
+            concrete = {token for token in shared if token.startswith(("call:", "symbol:")) or "." in token}
+            return distance <= _ARGUMENT_ROOT_LINE_TOLERANCE and len(concrete) >= 2
+        return distance <= _SEMANTIC_ROOT_LINE_TOLERANCE and any(
+            token.startswith(("call:", "symbol:")) or "." in token for token in shared
+        )
 
 
 # ── Helpers used by the orchestrator to format reasons ──────────────────────

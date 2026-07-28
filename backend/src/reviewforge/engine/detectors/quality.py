@@ -1473,3 +1473,29 @@ def is_deterministic_quality_finding(file_path: str, line: int, category: str, d
     return any(
         finding.line == line and finding.category == category for finding in detect_quality_findings({file_path: diff})
     )
+
+
+def is_diff_proven_quality_regression(file_path: str, line: int, category: str, diff: str) -> bool:
+    """Reproduce only narrow rules whose complete proof is present in a patch.
+
+    This is intentionally smaller than the general quality detector.  It is
+    suitable as a publication-gate fallback when the model fails to produce a
+    verdict, but never overrides an explicit evidence-grounded rejection.
+    """
+
+    suffix = PurePosixPath(file_path.replace("\\", "/")).suffix.lower()
+    rows = iter_right_lines(diff)
+    added = {line_no for line_no, _content in iter_added_lines(diff)}
+    if not rows or not added:
+        return False
+
+    findings: list[DetectorFinding] = []
+    if suffix == ".go" and category == "race-condition":
+        findings = _go_lock_scope_regression_findings(file_path, diff)
+    elif suffix in {".ts", ".tsx", ".js", ".jsx"} and category == "null-safety":
+        findings = _optional_array_destructure_findings(file_path, rows, added)
+    elif suffix == ".rb" and category == "clickjacking":
+        findings = _ruby_header_contract_findings(file_path, rows, added)
+    elif suffix == ".erb" and category == "api-contract":
+        findings = _erb_contract_findings(file_path, rows, added)
+    return any(finding.line == line and finding.category == category for finding in findings)

@@ -380,6 +380,55 @@ class TestPublicationGate:
         assert result.status == "false_positive"
         assert result.verified_by == "publication-gate-ungrounded"
 
+    def test_inconclusive_gate_uses_narrow_diff_proof_for_detector(self):
+        patch = (
+            "@@ -85,4 +85,5 @@ func build() {\n"
+            "-  cacheMu.Lock()\n"
+            "-  defer cacheMu.Unlock()\n"
+            "   idx := buildIndex()\n"
+            "+  cacheMu.Lock()\n"
+            "+  cache[key] = idx\n"
+            "+  cacheMu.Unlock()\n"
+            " }\n"
+        )
+        state = StateStore(
+            repo="owner/repo",
+            pr_number=1,
+            files_changed=["index.go"],
+            file_diffs={"index.go": patch},
+        )
+        finding = _make_finding(
+            file="index.go",
+            line=86,
+            category="race-condition",
+            reviewer="quality_reviewer",
+            status="candidate",
+            confidence=0.95,
+        )
+
+        proved = PublicationGateReviewer._diff_proves_detector_finding(
+            finding,
+            state,
+            original_verified_by="detector",
+        )
+
+        assert proved is True
+        assert finding.status == "confirmed"
+        assert finding.verified_by == "publication-gate-diff-proof"
+
+    def test_diff_proof_does_not_apply_to_model_provenance(self):
+        state = StateStore(repo="owner/repo", pr_number=1, file_diffs={"index.go": "@@ -1 +1 @@\n+x = 1"})
+        finding = _make_finding(file="index.go", line=1, category="race-condition")
+
+        assert (
+            PublicationGateReviewer._diff_proves_detector_finding(
+                finding,
+                state,
+                original_verified_by="correctness_reviewer",
+            )
+            is False
+        )
+
     @pytest.mark.parametrize(
         "quote",
         [

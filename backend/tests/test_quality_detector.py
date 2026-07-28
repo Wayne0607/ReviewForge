@@ -1,4 +1,7 @@
-from reviewforge.engine.detectors.quality import detect_quality_findings
+from reviewforge.engine.detectors.quality import (
+    detect_quality_findings,
+    is_diff_proven_quality_regression,
+)
 
 
 def _patch(content: str) -> str:
@@ -61,6 +64,23 @@ def test_lock_scope_rule_requires_removed_function_scope_unlock():
     patch = "@@ -1,3 +1,4 @@\n func update() {\n+  cacheMu.Lock()\n+  cache[key] = value\n+  cacheMu.Unlock()\n }\n"
 
     assert not any(finding.category == "race-condition" for finding in detect_quality_findings({"safe.go": patch}))
+    assert not is_diff_proven_quality_regression("safe.go", 2, "race-condition", patch)
+
+
+def test_diff_proof_reproduces_exact_lock_scope_anchor():
+    patch = (
+        "@@ -85,4 +85,5 @@ func (b *Builder) BuildIndex(key string) {\n"
+        "-  b.cacheMu.Lock()\n"
+        "-  defer b.cacheMu.Unlock()\n"
+        "   idx := buildIndex(key)\n"
+        "+  b.cacheMu.Lock()\n"
+        "+  b.cache[key] = idx\n"
+        "+  b.cacheMu.Unlock()\n"
+        " }\n"
+    )
+
+    assert is_diff_proven_quality_regression("index.go", 86, "race-condition", patch)
+    assert not is_diff_proven_quality_regression("index.go", 85, "race-condition", patch)
 
 
 def test_quality_detector_covers_high_signal_multilanguage_shapes():

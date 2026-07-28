@@ -28,6 +28,7 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.budget import MAX_TOOL_OUTPUT_CHARS, TokenBudget
+from reviewforge.engine.detectors.quality import is_diff_proven_quality_regression
 from reviewforge.engine.reviewers import build_reviewer_tools
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.tools.gateway import ToolGateway
@@ -110,9 +111,12 @@ PUBLICATION_SEMANTIC_RECALL_CATEGORIES = {
         "api-contract-change",
         "attribute-access",
         "contract-mismatch",
+        "data-race",
         "null-dereference",
         "null-reference",
         "null-safety",
+        "race-condition",
+        "thread-safety",
         "type-contract-change",
     },
     "testing_reviewer": {"logic-error"},
@@ -648,6 +652,7 @@ class PublicationGateReviewer(EscalationReviewer):
         escalation_categories: set[str] | None = None,
     ) -> Finding:
         original_confidence = finding.confidence
+        original_verified_by = finding.verified_by
         try:
             result = await super().escalate(finding, state, escalation_categories)
         except asyncio.CancelledError:
@@ -665,14 +670,51 @@ class PublicationGateReviewer(EscalationReviewer):
             result.confidence = original_confidence
             return result
         if result.verified_by == "publication-gate-ungrounded":
+            if self._diff_proves_detector_finding(
+                result,
+                state,
+                original_verified_by=original_verified_by,
+            ):
+                return result
             return result
         if result.verified_by == "escalation":
             result.verified_by = "publication-gate"
             return result
 
         # Budget, parse and invalid-verdict failures are not approval.
+        if self._diff_proves_detector_finding(
+            result,
+            state,
+            original_verified_by=original_verified_by,
+        ):
+            return result
         result.status = "candidate"
         result.confidence = original_confidence
         result.verified_by = "publication-gate-inconclusive"
         result.verify_reason = result.verify_reason or "Final publication verification was inconclusive."
         return result
+
+    @staticmethod
+    def _diff_proves_detector_finding(
+        finding: Finding,
+        state: StateStore,
+        *,
+        original_verified_by: str,
+    ) -> bool:
+        """Confirm a narrow detector result when the model produced no usable verdict."""
+
+        if (original_verified_by or "").strip().lower() not in {"detector", "detector-auto"}:
+            return False
+        diff = (state.file_diffs or {}).get(finding.file, "")
+        if not is_diff_proven_quality_regression(
+            finding.file,
+            finding.line,
+            normalize_category(finding.category),
+            diff,
+        ):
+            return False
+        finding.status = "confirmed"
+        finding.confidence = max(0.95, finding.confidence)
+        finding.verified_by = "publication-gate-diff-proof"
+        finding.verify_reason = "A narrow deterministic rule reproduced the complete defect proof from the PR diff."
+        return True

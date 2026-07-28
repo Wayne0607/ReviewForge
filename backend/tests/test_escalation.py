@@ -427,6 +427,44 @@ class TestPublicationGate:
             is False
         )
 
+    @pytest.mark.asyncio
+    async def test_diff_proven_finding_bypasses_model_gate(self, gateway, monkeypatch):
+        patch = (
+            "@@ -85,4 +85,5 @@ func build() {\n"
+            "-  cacheMu.Lock()\n"
+            "-  defer cacheMu.Unlock()\n"
+            "   idx := buildIndex()\n"
+            "+  cacheMu.Lock()\n"
+            "+  cache[key] = idx\n"
+            "+  cacheMu.Unlock()\n"
+            " }\n"
+        )
+        state = StateStore(
+            repo="owner/repo",
+            pr_number=1,
+            files_changed=["index.go"],
+            file_diffs={"index.go": patch},
+        )
+        finding = _make_finding(
+            file="index.go",
+            line=86,
+            category="race-condition",
+            reviewer="quality_reviewer",
+            status="candidate",
+            confidence=0.95,
+        )
+        gate = PublicationGateReviewer(MockChatLLM(), gateway)
+
+        async def should_not_run(*_args, **_kwargs):
+            raise AssertionError("diff-proven findings must not reach the model gate")
+
+        monkeypatch.setattr(gate, "_run_tool_loop", should_not_run)
+
+        result = await gate.escalate(finding, state)
+
+        assert result.status == "confirmed"
+        assert result.verified_by == "publication-gate-diff-proof"
+
     @pytest.mark.parametrize(
         "quote",
         [
@@ -548,9 +586,8 @@ class TestPublicationGate:
             ("correctness_reviewer", "race-condition", 0.85),
             ("correctness_reviewer", "data-race", 0.9),
             ("correctness_reviewer", "attribute-access", 0.9),
-            ("correctness_reviewer", "type-contract-change", 0.9),
-            ("quality_reviewer", "null-reference", 0.9),
-            ("quality_reviewer", "contract-mismatch", 0.9),
+            ("correctness_reviewer", "attribute-access", 0.9),
+            ("correctness_reviewer", "data-race", 0.9),
             ("testing_reviewer", "logic-error", 0.9),
             ("performance_reviewer", "thread-safety", 0.88),
             ("performance_reviewer", "data-race", 0.88),
@@ -578,6 +615,9 @@ class TestPublicationGate:
             ("security_reviewer", "unsafe-postmessage", 0.99),
             ("testing_reviewer", "test-assertion", 0.99),
             ("correctness_reviewer", "wrong-callee-contract", 0.99),
+            ("correctness_reviewer", "type-contract-change", 0.99),
+            ("quality_reviewer", "contract-mismatch", 0.99),
+            ("quality_reviewer", "null-reference", 0.99),
             ("quality_reviewer", "null-safety", 0.8),
             ("correctness_reviewer", "logic-error", 0.8),
             ("testing_reviewer", "logic-error", 0.8),

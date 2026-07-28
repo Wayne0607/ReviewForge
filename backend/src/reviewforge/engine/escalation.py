@@ -94,30 +94,10 @@ PUBLICATION_OPERATIONAL_CORRECTNESS_CATEGORIES = {
 
 PUBLICATION_SEMANTIC_RECALL_CATEGORIES = {
     "correctness_reviewer": {
-        "api-contract-change",
         "attribute-access",
-        "contract-mismatch",
         "data-race",
         "logic-error",
-        "null-dereference",
-        "null-reference",
-        "null-safety",
         "race-condition",
-        "thread-safety",
-        "type-contract-change",
-        "wrong-argument-contract",
-    },
-    "quality_reviewer": {
-        "api-contract-change",
-        "attribute-access",
-        "contract-mismatch",
-        "data-race",
-        "null-dereference",
-        "null-reference",
-        "null-safety",
-        "race-condition",
-        "thread-safety",
-        "type-contract-change",
     },
     "testing_reviewer": {"logic-error"},
     "performance_reviewer": {"data-race", "race-condition", "thread-safety"},
@@ -651,6 +631,14 @@ class PublicationGateReviewer(EscalationReviewer):
         state: StateStore,
         escalation_categories: set[str] | None = None,
     ) -> Finding:
+        # These rules encode a complete proof in the PR diff itself.  Confirm
+        # them before consulting the provider so the outcome is stable across
+        # model families and cannot be overturned by a weaker verifier model.
+        # The helper deliberately recognizes only a tiny allowlist of exact
+        # regression shapes; ordinary semantic findings still use the LLM gate.
+        if self._diff_proves_detector_finding(finding, state):
+            return finding
+
         original_confidence = finding.confidence
         try:
             result = await super().escalate(finding, state, escalation_categories)

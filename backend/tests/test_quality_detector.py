@@ -25,16 +25,11 @@ def test_quality_detector_covers_cross_line_contract_regressions():
         {
             "pkg/index.go": go_patch,
             "src/EventManager.ts": _patch(
-                "const [mainHost] = event.destinationCalendar ?? [];\n"
-                "return mainHost.integration;"
+                "const [mainHost] = event.destinationCalendar ?? [];\nreturn mainHost.integration;"
             ),
-            "app/controllers/embed_controller.rb": _patch(
-                "response.headers['X-Frame-Options'] = \"ALLOWALL\""
-            ),
+            "app/controllers/embed_controller.rb": _patch("response.headers['X-Frame-Options'] = \"ALLOWALL\""),
             "app/views/layouts/embed.html.erb": _patch(
-                "parent.postMessage({\n"
-                "  ready: true\n"
-                "}, '<%= request.referer %>');"
+                "parent.postMessage({\n  ready: true\n}, '<%= request.referer %>');"
             ),
         }
     )
@@ -55,10 +50,7 @@ def test_optional_array_destructure_requires_unguarded_added_dereference():
                 "if (!mainHost) return null;\n"
                 "return mainHost.integration;"
             ),
-            "optional.ts": _patch(
-                "const [mainHost] = event.destinationCalendar ?? [];\n"
-                "return mainHost?.integration;"
-            ),
+            "optional.ts": _patch("const [mainHost] = event.destinationCalendar ?? [];\nreturn mainHost?.integration;"),
         }
     )
 
@@ -66,19 +58,9 @@ def test_optional_array_destructure_requires_unguarded_added_dereference():
 
 
 def test_lock_scope_rule_requires_removed_function_scope_unlock():
-    patch = (
-        "@@ -1,3 +1,4 @@\n"
-        " func update() {\n"
-        "+  cacheMu.Lock()\n"
-        "+  cache[key] = value\n"
-        "+  cacheMu.Unlock()\n"
-        " }\n"
-    )
+    patch = "@@ -1,3 +1,4 @@\n func update() {\n+  cacheMu.Lock()\n+  cache[key] = value\n+  cacheMu.Unlock()\n }\n"
 
-    assert not any(
-        finding.category == "race-condition"
-        for finding in detect_quality_findings({"safe.go": patch})
-    )
+    assert not any(finding.category == "race-condition" for finding in detect_quality_findings({"safe.go": patch}))
 
 
 def test_quality_detector_covers_high_signal_multilanguage_shapes():

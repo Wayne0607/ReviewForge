@@ -1145,9 +1145,8 @@ def _erb_contract_findings(
         if line_no not in added:
             continue
         nearby = "\n".join(text for _line, text in rows[max(0, index - 8) : index + 1])
-        if (
-            re.search(r"['\"]<%=?\s*request\.referer\s*%>['\"]\s*\)", content)
-            and re.search(r"\bpostMessage\s*\(", nearby)
+        if re.search(r"['\"]<%=?\s*request\.referer\s*%>['\"]\s*\)", content) and re.search(
+            r"\bpostMessage\s*\(", nearby
         ):
             findings.append(
                 _finding(
@@ -1194,11 +1193,7 @@ def _ruby_header_contract_findings(
 def _go_lock_scope_regression_findings(file_path: str, patch: str) -> list[DetectorFinding]:
     """Detect a mutex moved from function scope to only the final mutation."""
 
-    removed = [
-        line[1:]
-        for line in patch.splitlines()
-        if line.startswith("-") and not line.startswith("---")
-    ]
+    removed = [line[1:] for line in patch.splitlines() if line.startswith("-") and not line.startswith("---")]
     added_rows = iter_added_lines(patch)
     added_text = "\n".join(content for _line, content in added_rows)
     findings: list[DetectorFinding] = []
@@ -1213,9 +1208,7 @@ def _go_lock_scope_regression_findings(file_path: str, patch: str) -> list[Detec
         if re.search(rf"\bdefer\s+{escaped}\.Unlock\s*\(\s*\)", added_text):
             continue
         lock_rows = [
-            (line_no, content)
-            for line_no, content in added_rows
-            if re.search(rf"\b{escaped}\.Lock\s*\(\s*\)", content)
+            (line_no, content) for line_no, content in added_rows if re.search(rf"\b{escaped}\.Lock\s*\(\s*\)", content)
         ]
         if not lock_rows or not re.search(rf"\b{escaped}\.Unlock\s*\(\s*\)", added_text):
             continue

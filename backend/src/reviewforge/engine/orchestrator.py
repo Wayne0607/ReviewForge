@@ -966,6 +966,18 @@ class Orchestrator:
                     logger.error(f"Cross-PR analysis failed: {e}")
                     self._events.emit("cross_pr.failed", {"error": str(e)})
 
+            # Run the same zero-token root-cause pass over the much smaller
+            # confirmed set.  Some model variants only converge onto a common
+            # causal description during calibration; removing those duplicates
+            # here also avoids repeated Publication Gate calls.
+            confirmed_for_publication = state.list_findings(status="confirmed")
+            if confirmed_for_publication:
+                self._apply_root_cause_clustering(
+                    confirmed_for_publication,
+                    state,
+                    phase="pre-publication",
+                )
+
             # Publication Policy is independent of the Publication Gate.
             # Pre-filter (invalid coordinates, generic advice, root-cause
             # dedup) and post-budget (top-N sort + overflow) run whenever
@@ -1068,6 +1080,8 @@ class Orchestrator:
         self,
         candidates: list[Finding],
         state: StateStore,
+        *,
+        phase: str = "pre-evidence",
     ) -> list[Finding]:
         """Apply the pure root-cause layer and fail open on any defect."""
 
@@ -1081,7 +1095,7 @@ class Orchestrator:
             logger.warning("Root-cause clustering failed; passing candidates through: %s", exc, exc_info=True)
             self._events.emit(
                 "root_cause_cluster.failed",
-                {"error": str(exc)[:200], "input": len(candidates)},
+                {"error": str(exc)[:200], "input": len(candidates), "phase": phase},
             )
             return candidates
 
@@ -1099,7 +1113,7 @@ class Orchestrator:
                     f"Merged into root-cause representative {representative_id} (family={family_by_id[absorbed.id]})."
                 ),
             )
-        self._events.emit("root_cause_cluster.completed", result.stats)
+        self._events.emit("root_cause_cluster.completed", {**result.stats, "phase": phase})
         return list(result.kept)
 
     def _run_publication_policy_pre(self, state: StateStore) -> None:

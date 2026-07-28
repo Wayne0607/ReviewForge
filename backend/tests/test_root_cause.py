@@ -238,6 +238,7 @@ def test_orchestrator_marks_absorbed_finding_and_emits_stats() -> None:
     assert "representative left" in absorbed.verify_reason
     assert events[-1].event_type == "root_cause_cluster.completed"
     assert events[-1].data["absorbed"] == 1
+    assert events[-1].data["phase"] == "pre-evidence"
 
 
 def test_orchestrator_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,3 +257,4 @@ def test_orchestrator_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
     assert kept == [finding]
     assert state.get_finding("only").status == "candidate"
     assert events[-1].event_type == "root_cause_cluster.failed"
+    assert events[-1].data["phase"] == "pre-evidence"

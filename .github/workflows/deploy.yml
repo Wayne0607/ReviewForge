@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+concurrency:
+  group: reviewforge-production-deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
     needs: [lint, test]
@@ -13,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Create deploy bundle
-        run: git bundle create reviewforge-main.bundle main
+        run: git bundle create "reviewforge-${GITHUB_SHA}.bundle" main
 
       - name: Upload deploy bundle
         uses: appleboy/scp-action@v0.1.7
@@ -21,7 +25,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: reviewforge-main.bundle
+          source: reviewforge-${{ github.sha }}.bundle
           target: /tmp
           overwrite: true
 
@@ -33,9 +37,10 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
             cd /opt/reviewforge
-            git fetch /tmp/reviewforge-main.bundle main
+            BUNDLE_PATH="/tmp/reviewforge-${{ github.sha }}.bundle"
+            git fetch "$BUNDLE_PATH" main
             git reset --hard FETCH_HEAD
-            bash scripts/deploy.sh
+            REVIEWFORGE_BUNDLE_PATH="$BUNDLE_PATH" bash scripts/deploy.sh
 
   lint:
     runs-on: ubuntu-latest

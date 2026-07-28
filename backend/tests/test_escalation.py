@@ -499,8 +499,14 @@ class TestPublicationGate:
             ("correctness_reviewer", "nullish-vs-falsy-semantics", 0.85),
             ("correctness_reviewer", "error-handling", 0.85),
             ("correctness_reviewer", "race-condition", 0.85),
+            ("correctness_reviewer", "data-race", 0.9),
+            ("correctness_reviewer", "attribute-access", 0.9),
+            ("correctness_reviewer", "type-contract-change", 0.9),
+            ("quality_reviewer", "null-reference", 0.9),
+            ("quality_reviewer", "contract-mismatch", 0.9),
             ("testing_reviewer", "logic-error", 0.9),
             ("performance_reviewer", "thread-safety", 0.88),
+            ("performance_reviewer", "data-race", 0.88),
         ],
     )
     def test_high_cost_false_negative_families_are_recall_protected(

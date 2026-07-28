@@ -92,9 +92,31 @@ PUBLICATION_OPERATIONAL_CORRECTNESS_CATEGORIES = {
 }
 
 PUBLICATION_SEMANTIC_RECALL_CATEGORIES = {
-    "correctness_reviewer": {"logic-error", "race-condition"},
+    "correctness_reviewer": {
+        "api-contract-change",
+        "attribute-access",
+        "contract-mismatch",
+        "data-race",
+        "logic-error",
+        "null-dereference",
+        "null-reference",
+        "null-safety",
+        "race-condition",
+        "thread-safety",
+        "type-contract-change",
+        "wrong-argument-contract",
+    },
+    "quality_reviewer": {
+        "api-contract-change",
+        "attribute-access",
+        "contract-mismatch",
+        "null-dereference",
+        "null-reference",
+        "null-safety",
+        "type-contract-change",
+    },
     "testing_reviewer": {"logic-error"},
-    "performance_reviewer": {"thread-safety"},
+    "performance_reviewer": {"data-race", "race-condition", "thread-safety"},
 }
 
 # System prompt — shared across all escalation invocations.

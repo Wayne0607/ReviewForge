@@ -65,6 +65,7 @@ from reviewforge.engine.publication_triage import (
     TriageStats,
 )
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
+from reviewforge.engine.root_cause import cluster_root_causes
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticUnit, compile_semantic_changeset
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
@@ -831,6 +832,10 @@ class Orchestrator:
                     {"kept": len(candidates), "filtered": len(code_evidence_rejected)},
                 )
 
+            # Phase 2.6: collapse duplicate descriptions before any expensive
+            # evidence or calibration calls.
+            candidates = self._apply_root_cause_clustering(candidates, state)
+
             # V3: Evidence verification (after deterministic gates, before escalation/calibration)
             if self._v3_enabled and self._v3_evidence_mode != "off":
                 candidates = await self._run_v3_evidence_verification(candidates, state, run_id)
@@ -1058,6 +1063,44 @@ class Orchestrator:
             if self._db:
                 await self._db.fail_run(run_id, str(e))
             raise
+
+    def _apply_root_cause_clustering(
+        self,
+        candidates: list[Finding],
+        state: StateStore,
+    ) -> list[Finding]:
+        """Apply the pure root-cause layer and fail open on any defect."""
+
+        try:
+            result = cluster_root_causes(
+                candidates,
+                state.diff_summary,
+                file_diffs=state.file_diffs or {},
+            )
+        except Exception as exc:
+            logger.warning("Root-cause clustering failed; passing candidates through: %s", exc, exc_info=True)
+            self._events.emit(
+                "root_cause_cluster.failed",
+                {"error": str(exc)[:200], "input": len(candidates)},
+            )
+            return candidates
+
+        representative_by_id = dict(result.absorbed_to_representative)
+        family_by_id = {
+            member_id: cluster.causal_family for cluster in result.clusters for member_id in cluster.member_ids
+        }
+        for absorbed in result.absorbed:
+            representative_id = representative_by_id[absorbed.id]
+            state.update_finding(
+                absorbed.id,
+                status="false_positive",
+                verified_by="root-cause-cluster",
+                verify_reason=(
+                    f"Merged into root-cause representative {representative_id} (family={family_by_id[absorbed.id]})."
+                ),
+            )
+        self._events.emit("root_cause_cluster.completed", result.stats)
+        return list(result.kept)
 
     def _run_publication_policy_pre(self, state: StateStore) -> None:
         """Apply the Stage-1 publication policy before the LLM gate runs."""

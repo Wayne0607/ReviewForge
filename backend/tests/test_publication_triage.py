@@ -158,6 +158,105 @@ async def test_only_independently_checkable_findings_can_bypass_tools():
 
 
 @pytest.mark.asyncio
+async def test_grounded_local_finding_can_bypass_per_finding_tool_loop():
+    source = "def calculate(total, discount):\n    return total + discount\n"
+
+    class _SourceGitHub:
+        async def get_file_content(self, repo, ref, file_path):
+            return source
+
+    finding = _finding(
+        "local",
+        category="wrong-logic",
+        confidence=0.91,
+    )
+    finding.line = 2
+    response = json.dumps(
+        {
+            "verdicts": [
+                {
+                    "id": "local",
+                    "verdict": VERDICT_CONFIRMED,
+                    "confidence": 0.96,
+                    "reason": "The changed calculation adds the discount.",
+                    "evidence_quote": "return total + discount",
+                }
+            ]
+        }
+    )
+    registry = build_registry()
+    triage = PublicationTriage(
+        _StaticLLM(response),
+        config=PublicationTriageConfig(enabled=True),
+        gateway=ToolGateway(registry, _SourceGitHub()),
+    )
+
+    verdicts, stats = await triage.classify([finding], _state())
+
+    assert verdicts["local"].verdict == VERDICT_CONFIRMED
+    assert stats.triage_confirmed == 1
+    assert stats.triage_needs_tool == 0
+
+
+@pytest.mark.asyncio
+async def test_ungrounded_quote_cannot_bypass_per_finding_tool_loop():
+    class _SourceGitHub:
+        async def get_file_content(self, repo, ref, file_path):
+            return "def calculate(total, discount):\n    return total - discount\n"
+
+    response = json.dumps(
+        {
+            "verdicts": [
+                {
+                    "id": "local",
+                    "verdict": VERDICT_CONFIRMED,
+                    "confidence": 0.99,
+                    "reason": "Claimed evidence is absent.",
+                    "evidence_quote": "return total + discount",
+                }
+            ]
+        }
+    )
+    registry = build_registry()
+    triage = PublicationTriage(
+        _StaticLLM(response),
+        config=PublicationTriageConfig(enabled=True),
+        gateway=ToolGateway(registry, _SourceGitHub()),
+    )
+
+    verdicts, stats = await triage.classify(
+        [_finding("local", category="wrong-logic", confidence=0.99)],
+        _state(),
+    )
+
+    assert verdicts["local"].verdict == VERDICT_NEEDS_TOOL
+    assert stats.triage_needs_tool == 1
+
+
+def test_triage_batches_keep_root_representatives_from_one_file_together():
+    findings = [
+        _finding("a2"),
+        _finding("a1"),
+        Finding(
+            id="b1",
+            file="other.py",
+            line=1,
+            message="problem",
+            status="confirmed",
+        ),
+    ]
+    findings[0].line = 20
+    findings[1].line = 10
+
+    batches = PublicationTriage._group_batches(findings, batch_size=6)
+
+    assert [[finding.id for finding in batch] for batch in batches] == [
+        ["a1", "a2"],
+        ["b1"],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_invalid_batch_response_routes_everything_to_tools_and_retries():
     triage = PublicationTriage(
         _StaticLLM('{"verdicts": [{"id": "f1", "verdict": "confirmed"}]}'),

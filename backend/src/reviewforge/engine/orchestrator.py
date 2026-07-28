@@ -68,6 +68,7 @@ from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.root_cause import cluster_root_causes
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticUnit, compile_semantic_changeset
+from reviewforge.engine.sibling_invariants import findings_from_sibling_invariants
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 from reviewforge.engine.verifier import Verifier
 from reviewforge.tools.gateway import ToolGateway
@@ -594,6 +595,8 @@ class Orchestrator:
             # merged at ingestion instead of becoming duplicate findings.
             self._events.emit("deterministic_scan.started", {"file_count": len(state.files_changed)})
             scan_result = await scan_changed_files(self._gateway, state)
+            sibling_findings = findings_from_sibling_invariants(state.impact_manifest)
+            scan_result.findings.extend(sibling_findings)
             phase0_keys = {finding_identity(finding) for finding in scan_result.findings}
             existing_keys = {finding_identity(finding) for finding in state.list_findings()}
             added_count = 0
@@ -611,6 +614,7 @@ class Orchestrator:
                     "files_failed": len(scan_result.file_errors),
                     "scanners_failed": len(scan_result.scanner_errors),
                     "findings_count": added_count,
+                    "sibling_invariants": len(sibling_findings),
                 },
             )
 
@@ -1216,6 +1220,7 @@ class Orchestrator:
                 triage_llm,
                 config=self._publication_triage_config,
                 event_bus=self._events,
+                gateway=self._gateway,
             )
             verdicts, stats = await triage.classify(candidates, state)
             needs_tool: list[Finding] = []

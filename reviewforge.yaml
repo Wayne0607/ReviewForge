@@ -121,9 +121,9 @@ publication_gate:
 publication_triage:
   enabled: true
   batch_size: 6
-  concurrency: 1
+  concurrency: 2
   max_candidates: 24
-  context_lines: 12
+  context_lines: 24
   max_tokens: 4000
 
 # Model-agnostic Publication Policy (Stage 1).  Pure-logic dedup,

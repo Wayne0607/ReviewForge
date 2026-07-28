@@ -19,6 +19,7 @@ from typing import Any
 from reviewforge.core.database import Database
 from reviewforge.core.state import StateStore
 from reviewforge.engine.detectors.unified_diff import iter_added_lines
+from reviewforge.engine.sibling_invariants import analyze_sibling_invariants
 from reviewforge.engine.symbol_extractor import (
     CallInfo,
     ImportInfo,
@@ -75,6 +76,7 @@ class ImpactFile:
     changed_symbols: list[dict[str, Any]] = field(default_factory=list)
     imports: list[dict[str, Any]] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
+    sibling_invariants: list[dict[str, Any]] = field(default_factory=list)
     content_available: bool = False
     wiki_pages: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
@@ -117,6 +119,9 @@ class ContextEngine:
             payload = asdict(item)
             payload.pop("wiki_pages", None)
             file_payloads.append(payload)
+        sibling_invariants = [invariant for item in file_payloads for invariant in item.pop("sibling_invariants", [])][
+            :24
+        ]
         manifest: dict[str, Any] = {
             "version": 2,
             "files": file_payloads,
@@ -126,6 +131,7 @@ class ContextEngine:
             "wiki_pages": wiki_context,
             "resource_files": resource_context,
             "risk_signals": risk_signals,
+            "sibling_invariants": sibling_invariants,
             "coverage": {
                 "changed_files": len(state.files_changed),
                 "indexed_files": len(files),
@@ -197,6 +203,18 @@ class ContextEngine:
                 source_sha=state.head_sha,
             )
         ]
+        sibling_invariants = (
+            [
+                invariant.to_dict()
+                for invariant in analyze_sibling_invariants(
+                    content,
+                    path,
+                    diff,
+                )
+            ]
+            if content
+            else []
+        )
         return ImpactFile(
             path=path,
             language=detect_language(path),
@@ -210,6 +228,7 @@ class ContextEngine:
                 {"caller": item.caller, "callee": item.callee, "line": item.line}
                 for item in relevant_calls[:_MAX_SYMBOLS_PER_FILE]
             ],
+            sibling_invariants=sibling_invariants,
             content_available=bool(content),
             wiki_pages=wiki_pages,
         )
@@ -466,6 +485,11 @@ def render_impact_manifest(
         for item in manifest.get("resource_files", [])
         if not selected_files or str(item.get("path", "")) in selected_files
     ]
+    payload["sibling_invariants"] = [
+        item
+        for item in manifest.get("sibling_invariants", [])
+        if not selected_files or str(item.get("file", "")) in selected_files
+    ][:12]
     coverage_gap = payload.get("coverage_gap")
     if isinstance(coverage_gap, dict):
         coverage_gap["cards"] = [
@@ -491,6 +515,11 @@ def render_impact_manifest(
             for item in manifest.get("resource_files", [])
             if needle in json.dumps(item, ensure_ascii=False).lower()
         ]
+        payload["sibling_invariants"] = [
+            item
+            for item in manifest.get("sibling_invariants", [])
+            if needle in json.dumps(item, ensure_ascii=False).lower()
+        ]
         if isinstance(coverage_gap, dict):
             coverage_gap["cards"] = [
                 item for item in coverage_gap.get("cards", []) if needle in json.dumps(item, ensure_ascii=False).lower()
@@ -502,7 +531,7 @@ def render_impact_manifest(
     # Keep tool output valid JSON while progressively dropping lowest-value
     # tail data. A raw string slice can leave the model with malformed evidence.
     payload["truncated"] = True
-    for key in ("historical_graph", "wiki_pages", "risk_signals", "references", "files"):
+    for key in ("historical_graph", "wiki_pages", "risk_signals", "references", "files", "sibling_invariants"):
         items = payload.get(key)
         while (
             isinstance(items, list)

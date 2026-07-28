@@ -226,6 +226,12 @@ class ReviewForgeConfig:
     publication_gate_max_steps: int = 4
     publication_gate_max_tokens: int = 6000
     publication_gate_concurrency: int = 4
+    publication_triage_enabled: bool = False
+    publication_triage_batch_size: int = 6
+    publication_triage_concurrency: int = 1
+    publication_triage_max_candidates: int = 24
+    publication_triage_context_lines: int = 12
+    publication_triage_max_tokens: int = 4000
 
     # Model-agnostic publication policy (Stage 1). Library default is OFF
     # so embedding applications opt in explicitly. Production enables
@@ -380,6 +386,31 @@ class ReviewForgeConfig:
                 if not hasattr(self, attr):
                     continue
                 expected = _gate_types.get(key)
+                if expected:
+                    try:
+                        value = (
+                            value.strip().lower() not in ("0", "false", "no", "")
+                            if expected is bool and isinstance(value, str)
+                            else expected(value)
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                setattr(self, attr, value)
+        if "publication_triage" in data:
+            triage = data["publication_triage"] or {}
+            triage_types = {
+                "enabled": bool,
+                "batch_size": int,
+                "concurrency": int,
+                "max_candidates": int,
+                "context_lines": int,
+                "max_tokens": int,
+            }
+            for key, value in triage.items():
+                attr = f"publication_triage_{key}"
+                if not hasattr(self, attr):
+                    continue
+                expected = triage_types.get(key)
                 if expected:
                     try:
                         value = (

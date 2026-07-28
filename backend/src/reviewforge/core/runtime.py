@@ -127,6 +127,12 @@ class LLMRuntimeManager:
             publication_gate_max_steps=cfg.publication_gate_max_steps,
             publication_gate_max_tokens=cfg.publication_gate_max_tokens,
             publication_gate_concurrency=cfg.publication_gate_concurrency,
+            publication_triage_enabled=cfg.publication_triage_enabled,
+            publication_triage_batch_size=cfg.publication_triage_batch_size,
+            publication_triage_concurrency=cfg.publication_triage_concurrency,
+            publication_triage_max_candidates=cfg.publication_triage_max_candidates,
+            publication_triage_context_lines=cfg.publication_triage_context_lines,
+            publication_triage_max_tokens=cfg.publication_triage_max_tokens,
             # Always pass the dedicated publication_gate LLM so the gate
             # never silently reuses the broad-pass reviewer_llm.
             publication_gate_llm=publication_gate_llm,

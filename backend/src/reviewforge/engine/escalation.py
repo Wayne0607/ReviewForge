@@ -483,6 +483,13 @@ class PublicationGateReviewer(EscalationReviewer):
             result = finding
             result.verified_by = "publication-gate-provider-error"
             result.verify_reason = "Final publication verification failed before producing a verdict."
+        if result.verified_by == "publication-gate-provider-error":
+            # A provider outage is not an approval, including for
+            # recall-protected findings. Keep it unpublished and let the
+            # orchestrator mark the run retryable.
+            result.status = "candidate"
+            result.confidence = original_confidence
+            return result
         if result.verified_by == "escalation":
             if result.status == "false_positive" and negative_verdict_protected:
                 gate_confidence = result.confidence

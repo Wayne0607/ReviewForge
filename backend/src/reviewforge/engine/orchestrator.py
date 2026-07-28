@@ -54,6 +54,16 @@ from reviewforge.engine.publication_policy import (
     PublicationPolicyConfig,
     format_verify_reason,
 )
+from reviewforge.engine.publication_triage import (
+    TRIAGE_TAG_CONFIRMED,
+    TRIAGE_TAG_FILTERED,
+    TRIAGE_TAG_NEEDS_TOOL,
+    VERDICT_CONFIRMED,
+    VERDICT_FALSE_POSITIVE,
+    PublicationTriage,
+    PublicationTriageConfig,
+    TriageStats,
+)
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticUnit, compile_semantic_changeset
@@ -220,6 +230,12 @@ class Orchestrator:
         publication_gate_max_steps: int = 4,
         publication_gate_max_tokens: int = 6000,
         publication_gate_concurrency: int = 4,
+        publication_triage_enabled: bool = False,
+        publication_triage_batch_size: int = 6,
+        publication_triage_concurrency: int = 1,
+        publication_triage_max_candidates: int = 24,
+        publication_triage_context_lines: int = 12,
+        publication_triage_max_tokens: int = 4000,
         # Optional independent LLM for the publication gate role.  When
         # omitted the orchestrator falls back to ``reviewer_llm`` so older
         # callers keep working.
@@ -256,6 +272,14 @@ class Orchestrator:
         self._publication_gate_max_steps = max(1, publication_gate_max_steps)
         self._publication_gate_max_tokens = max(1, publication_gate_max_tokens)
         self._publication_gate_concurrency = max(1, publication_gate_concurrency)
+        self._publication_triage_config = PublicationTriageConfig(
+            enabled=publication_triage_enabled,
+            batch_size=publication_triage_batch_size,
+            concurrency=publication_triage_concurrency,
+            max_candidates=publication_triage_max_candidates,
+            context_lines=publication_triage_context_lines,
+            max_tokens=publication_triage_max_tokens,
+        ).normalized()
         # The publication gate has its own functional role, so it must be
         # able to use a dedicated LLM instead of inheriting reviewer_llm.
         # Older call sites can omit ``publication_gate_llm`` and the
@@ -949,8 +973,9 @@ class Orchestrator:
                 # from the confirmed set so the expensive Publication Gate
                 # runs over fewer, higher-quality candidates.
                 self._run_publication_policy_pre(state)
+            publication_gate_stats: TriageStats | None = None
             if self._publication_gate_enabled:
-                await self._run_publication_gate(state)
+                publication_gate_stats = await self._run_publication_gate(state)
             if self._publication_policy.enabled:
                 # Stage 2 — final sort + budget.  Applies a deterministic
                 # ranking + ``max_comments`` cap plus a bounded
@@ -965,7 +990,16 @@ class Orchestrator:
             # Phase 4: Comment
             confirmed = state.list_findings(status="confirmed")
             comment_result = CommentDeliveryResult()
-            if confirmed:
+            publication_blocked = bool(publication_gate_stats and publication_gate_stats.retryable)
+            if confirmed and publication_blocked:
+                self._events.emit(
+                    "commenter.skipped",
+                    {
+                        "finding_count": len(confirmed),
+                        "reason": "publication verification is incomplete and retryable",
+                    },
+                )
+            elif confirmed:
                 self._events.emit("commenter.started", {"finding_count": len(confirmed)})
                 comment_result = await self._post_comments(confirmed, state)
                 self._events.emit("commenter.completed", comment_result.to_dict())
@@ -986,7 +1020,11 @@ class Orchestrator:
                     summary["v3_coverage"] = v3_cov
                 if self._v3_evidence_summary:
                     summary["v3_evidence"] = self._v3_evidence_summary
+            if publication_gate_stats is not None:
+                summary["publication_gate"] = publication_gate_stats.public_summary()
             retryable_errors = list(planner_errors)
+            if publication_gate_stats and publication_gate_stats.retryable:
+                retryable_errors.extend(publication_gate_stats.errors)
             if comment_result.retryable:
                 retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
             if retryable_errors:
@@ -1094,18 +1132,66 @@ class Orchestrator:
                     exc,
                 )
 
-    async def _run_publication_gate(self, state: StateStore) -> None:
+    async def _run_publication_gate(self, state: StateStore) -> TriageStats:
         """Independently verify every not-yet-reported finding before publication."""
 
+        started = time.monotonic()
+        stats = TriageStats()
         candidates = state.list_findings(status="confirmed")
         if not candidates:
-            self._events.emit(
-                "publication_gate.completed",
-                {"attempted": 0, "confirmed": 0, "filtered": 0, "inconclusive": 0},
+            payload = (
+                stats.to_dict()
+                if self._publication_triage_config.enabled
+                else {"attempted": 0, "confirmed": 0, "filtered": 0, "inconclusive": 0}
             )
-            return
+            self._events.emit("publication_gate.completed", payload)
+            return stats
 
-        if self._publication_gate_reviewer is None:
+        if self._publication_triage_config.enabled:
+            triage_llm = self._publication_gate_llm_raw
+            if self._db:
+                triage_llm = TrackedChatLLM(
+                    inner=triage_llm,
+                    ctx=self._token_ctx,
+                    agent_name="publication_triage",
+                )
+            triage = PublicationTriage(
+                triage_llm,
+                config=self._publication_triage_config,
+                event_bus=self._events,
+            )
+            verdicts, stats = await triage.classify(candidates, state)
+            needs_tool: list[Finding] = []
+            for finding in candidates:
+                verdict = verdicts[finding.id]
+                if verdict.verdict == VERDICT_CONFIRMED:
+                    state.update_finding(
+                        finding.id,
+                        verified_by=TRIAGE_TAG_CONFIRMED,
+                        verify_reason=verdict.reason,
+                    )
+                elif verdict.verdict == VERDICT_FALSE_POSITIVE:
+                    state.update_finding(
+                        finding.id,
+                        status="false_positive",
+                        verified_by=TRIAGE_TAG_FILTERED,
+                        verify_reason=verdict.reason,
+                    )
+                else:
+                    state.update_finding(
+                        finding.id,
+                        verified_by=TRIAGE_TAG_NEEDS_TOOL,
+                        verify_reason=verdict.reason,
+                    )
+                    needs_tool.append(state.get_finding(finding.id))
+            candidates = needs_tool
+
+        stats.agentic_attempted = len(candidates)
+        if not candidates:
+            stats.duration_ms = int((time.monotonic() - started) * 1000)
+            self._events.emit("publication_gate.completed", stats.to_dict())
+            return stats
+        if candidates and self._publication_gate_reviewer is None:
             # Always dial the publication_gate role LLM, never the generic
             # reviewer_llm — operators configure a strong model here on
             # purpose.  Falls back to the orchestrator-provided
@@ -1139,10 +1225,17 @@ class Orchestrator:
         for finding in verdicts:
             if finding.status == "confirmed":
                 counts["confirmed"] += 1
+                stats.agentic_confirmed += 1
             elif finding.status == "false_positive":
                 counts["filtered"] += 1
+                stats.agentic_filtered += 1
             else:
                 counts["inconclusive"] += 1
+                stats.agentic_inconclusive += 1
+                stats.retryable = True
+                if finding.verified_by == "publication-gate-provider-error":
+                    stats.provider_errors += 1
+                stats.errors.append(f"Publication gate could not verify finding {finding.id}.")
             state.update_finding(
                 finding.id,
                 status=finding.status,
@@ -1150,10 +1243,18 @@ class Orchestrator:
                 verify_reason=finding.verify_reason,
                 confidence=finding.confidence,
             )
+        stats.duration_ms = int((time.monotonic() - started) * 1000)
+        event_data: dict[str, Any] = {
+            "attempted": len(candidates),
+            **counts,
+        }
+        if self._publication_triage_config.enabled:
+            event_data = {**stats.to_dict(), **event_data}
         self._events.emit(
             "publication_gate.completed",
-            {"attempted": len(candidates), **counts},
+            event_data,
         )
+        return stats
 
     async def _run_coverage_gap_pass(
         self,

@@ -436,9 +436,9 @@ class TestPublicationGate:
     @pytest.mark.parametrize(
         ("reviewer", "category", "expected_status", "expected_verifier"),
         [
-            ("correctness_reviewer", "logic-error", "confirmed", "publication-gate-recall-guard"),
-            ("security_reviewer", "ssrf", "candidate", "publication-gate-inconclusive"),
-            ("security_reviewer", "command-injection", "confirmed", "publication-gate-recall-guard"),
+            ("correctness_reviewer", "logic-error", "candidate", "publication-gate-provider-error"),
+            ("security_reviewer", "ssrf", "candidate", "publication-gate-provider-error"),
+            ("security_reviewer", "command-injection", "candidate", "publication-gate-provider-error"),
         ],
     )
     async def test_provider_failure_isolated_per_finding(

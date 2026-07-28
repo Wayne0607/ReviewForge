@@ -116,6 +116,16 @@ publication_gate:
   max_tokens: 6000
   concurrency: 4
 
+# Batch low-cost semantic decisions before the per-finding tool loop. Only
+# unresolved findings enter the expensive agentic publication gate.
+publication_triage:
+  enabled: true
+  batch_size: 6
+  concurrency: 1
+  max_candidates: 24
+  context_lines: 12
+  max_tokens: 4000
+
 # Model-agnostic Publication Policy (Stage 1).  Pure-logic dedup,
 # coordinate validation and optional budget cap around the gate. Historical
 # replay across MiMo and MiniMax validated the conservative pre-filter, while

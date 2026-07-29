@@ -310,6 +310,13 @@ async def test_webhook_retriggers_failed_partial_run(tmp_path):
             content=body,
             headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request"},
         )
+        # The endpoint deliberately returns before the background review
+        # finishes. Let the TestClient portal drain that task before its event
+        # loop and the shared aiosqlite connection are closed; otherwise Linux
+        # CI can deadlock while tearing down two different async loops.
+        deadline = time.monotonic() + 2
+        while app.state.review_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "review_triggered"

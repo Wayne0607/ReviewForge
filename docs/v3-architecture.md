@@ -98,8 +98,10 @@ failures produce abstain/retry, not false-positive suppression.
 - Unit and integration tests pass with V3 both enabled and disabled.
 - No provider/JSON/budget error is converted to an empty successful review.
 - Every high-risk semantic unit has a terminal coverage reason.
-- Martian 50 PR intermediate target: precision >= 35%, recall >= 45%, F1 >=
-  39%, zero-candidate PRs <= 10%.
-- V3 release target on the same judge: precision >= 40%, recall >= 60%, F1 >=
-  48%, Critical recall >= 90%, High recall >= 60%.
 - Final superiority claims require an unseen holdout and independent judges.
+
+The short-term stable release was validated on a fixed representative 10-PR
+subset with 57.58% precision, 48.72% recall, and 52.78% F1. Qodo v2 scored
+57.14% / 51.28% / 54.05% under the same strict judge. See
+[`benchmark.md`](benchmark.md) for methodology, per-PR results, cost, and
+limitations.

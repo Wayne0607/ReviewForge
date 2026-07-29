@@ -1,63 +1,84 @@
 # ReviewForge v3
 
-ReviewForge 是面向 GitHub Pull Request 的 AI 代码审查系统。它把一次 PR 拆成可追踪的语义变更单元，用覆盖账本规划审查范围，再通过多 Reviewer、确定性规则、证据核验和发布闸门生成可执行的审查意见。
+面向小型研发团队的自部署 AI Pull Request 审查系统。
 
-v3 的目标不是“让模型自由阅读整个仓库”，而是让每个高风险变更都有明确的审查维度、证据来源和终止原因，同时记录延迟、Token 与最终裁决，便于持续评测和调优。
+ReviewForge 不把一次代码审查当成单轮聊天，而是把 PR 编译成语义变更单元，规划需要覆盖的风险维度，让专业 Reviewer 并行取证，再通过确定性规则、动态校准、根因合并和最终发布门控筛掉无法证明或重复的问题。最终评论、审查过程、延迟和 Token 消耗都会被记录并展示在管理控制台中。
+
+> 当前状态：v3 是短期稳定版。生产默认配置经过固定代表性 PR 集验证，适合约 10 人团队异步使用。它不是零误报工具，也不应替代测试、静态分析和人工审批。
+
+## 当前效果
+
+2026-07-29，在 Martian Code Review Benchmark 中固定选取 10 个具有代表性的真实 PR，ReviewForge 与 Qodo v2 使用相同金标、相同候选去重规则和相同 MiniMax 裁判复核：
+
+| 指标 | ReviewForge v3 | Qodo v2 |
+| --- | ---: | ---: |
+| TP / FP / FN | 19 / 14 / 20 | 20 / 15 / 19 |
+| Precision | **57.58%** | 57.14% |
+| Recall | 48.72% | **51.28%** |
+| F1 | 52.78% | **54.05%** |
+
+ReviewForge 的精确率和误报数略优，召回率与综合 F1 略低。两者在该样本上接近，但不能据此宣称 ReviewForge 已全面超过 Qodo。10 PR 审查消耗 3,343,534 Token；三分片并行墙钟时间约 67 分钟，最大 PR 单次审查约 52 分钟。
+
+详细口径、逐 PR 结果和限制见 [docs/benchmark.md](docs/benchmark.md)。
 
 ## 核心能力
 
-- 语义变更建模：按函数、类、配置区块等单位编译 `SemanticChangeSet`
-- 覆盖驱动审查：用 `CoverageLedger` 跟踪 correctness、contract、security、testing、localization、performance、compatibility、cross-PR 等维度
-- 九类专业 Reviewer：安全、正确性、性能、测试、国际化、依赖、可访问性、文档和风格
-- 分层取证：确定性检测器、仓库上下文工具、风险区间升级核验、动态校准与最终发布闸门
-- 跨 PR 分析：结合持久化历史识别前后提交之间的契约与行为冲突
-- 多语言支持：通用审查能力加 Python、TypeScript 等语言 Skill，并提供 Go、Java、Ruby、Rust、Vue 等评测样本
-- 成本可观测：按 run 和 agent 记录模型调用与 Token 使用量
-- GitHub 原生接入：Webhook 触发、PR inline comment、自动部署、健康检查与失败回滚
-- 管理控制台：查看审查记录、发现、趋势、热点、Reviewer 表现与 Token 指标
+- **语义变更建模**：按函数、类、配置区块等边界生成 `SemanticChangeSet`
+- **覆盖驱动规划**：`CoverageLedger` 追踪 correctness、contract、security、testing、localization、performance、compatibility 与 cross-PR 等维度
+- **专业 Reviewer**：安全、正确性、性能、测试、国际化、依赖、可访问性、文档与代码质量分工审查
+- **受控上下文工具**：Reviewer 可读取文件、搜索符号、查看 diff 和引用资料，不直接获得无限制仓库访问
+- **模型无关过滤**：坐标校验、确定性证据、去重与根因聚类由纯逻辑层执行
+- **分层验证**：动态校准、Escalation、Publication Triage 与 Publication Gate 逐级核实候选
+- **跨 PR 分析**：利用持久化历史识别前后提交之间的契约和行为冲突
+- **按角色模型路由**：Planner、Fast Review、Deep Review、Verifier、Publication Gate 可分别配置模型、端点与密钥
+- **单管理员控制台**：不引入用户系统，提供审查记录、趋势、Reviewer 表现、Token 统计和模型热切换
+- **安全自部署**：Webhook 签名验证、管理 API Token、加密模型密钥、HTTPS 反向代理与内网端点保护
+- **自动部署保护**：`main` 推送后执行 lint、测试、部署锁、服务重启、健康检查和失败回滚
 
-## v3 审查流程
+## 审查架构
 
 ```mermaid
 flowchart LR
-    A["GitHub PR Webhook"] --> B["Context Engine<br/>仓库索引、影响面、Wiki facts"]
-    B --> C["SemanticChangeSet<br/>语义变更单元"]
-    C --> D["CoverageLedger<br/>风险 × 审查维度"]
-    D --> E["Planner<br/>单次任务规划"]
-    E --> F["Reviewer Scheduler<br/>并发专业审查"]
-    F --> G["Deterministic Gates<br/>去重、可执行性、代码证据"]
-    G --> H["Evidence / Escalation<br/>支持证据与反证"]
+    A["GitHub PR Webhook"] --> B["Context Engine"]
+    B --> C["SemanticChangeSet"]
+    C --> D["CoverageLedger"]
+    D --> E["Planner"]
+    E --> F["Reviewer Scheduler"]
+    F --> G["Candidate Findings"]
+    G --> H["Deterministic Verification"]
     H --> I["Dynamic Calibrator"]
-    I --> J["Cross-PR Analyzer"]
-    J --> K["Publication Gate"]
-    K --> L["GitHub Comments + SQLite + Dashboard"]
-    D --> M["Coverage Closure<br/>高风险未覆盖项补审"]
-    M --> G
+    I --> J["Cross-PR + Root Cause Merge"]
+    J --> K["Publication Triage / Gate"]
+    K --> L["GitHub Comments"]
+    K --> M["SQLite + Dashboard + Token Metrics"]
 ```
 
-当前默认配置启用 v3 覆盖账本和最终发布闸门；证据验证器保留但默认关闭，`coverage_gap` 也默认关闭，只有经过基准验证后才建议在生产开启。Security Reviewer 使用受限工具循环，其余 Reviewer 默认单次执行，以控制 Token 和延迟。
+核心原则：
 
-更完整的契约说明见 [docs/v3-architecture.md](docs/v3-architecture.md)，当前评测边界与目标见 [docs/v3-benchmark-diagnosis.md](docs/v3-benchmark-diagnosis.md)。
+1. LLM 负责发现、理解和解释问题。
+2. 纯逻辑层负责可复现的校验、去重、预算和状态流转。
+3. 能从 diff 完整证明的窄规则不依赖具体模型裁决。
+4. 普通语义判断必须经过最终证据门控，无法核实则不发布。
+5. Reviewer 不能直接向 GitHub 写评论，所有结果统一经过编排器。
+
+更完整的内部契约见 [docs/v3-architecture.md](docs/v3-architecture.md)。
 
 ## 快速开始
 
-### Docker
+### Docker Compose
 
 ```bash
 git clone https://github.com/Wayne0607/ReviewForge.git
 cd ReviewForge
 cp .env.example .env
-# 编辑 .env，至少配置 GitHub、LLM 和 API Token
+# 编辑 .env，填写 GitHub、模型服务和管理 API 配置
 docker compose up -d --build
-```
-
-服务默认只绑定 `127.0.0.1:8000`。验证状态：
-
-```bash
 curl http://127.0.0.1:8000/health
 ```
 
-无需真实 GitHub 或模型的本地演示：
+服务默认只绑定 `127.0.0.1:8000`。生产环境应通过 HTTPS 反向代理访问，不要直接暴露应用端口。
+
+无需真实 GitHub 或模型服务的本地演示：
 
 ```bash
 docker compose --profile mock up --build reviewforge-mock
@@ -73,6 +94,7 @@ Mock 服务位于 `127.0.0.1:8001`。
 cd backend
 uv sync --frozen
 uv run reviewforge spec-check
+uv run pytest -q
 
 cd ../frontend
 npm ci
@@ -82,18 +104,18 @@ cd ../backend
 uv run reviewforge serve --host 127.0.0.1 --port 8000
 ```
 
-前端热更新模式：
+前端开发服务器：
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-Vite 默认运行在 `http://localhost:5173`，并将 `/api` 请求代理到后端。
+Vite 默认运行在 `http://localhost:5173`，并将 `/api` 代理到后端。
 
 ## 配置
 
-复制 `.env.example` 后配置以下变量：
+最低启动配置：
 
 ```dotenv
 GITHUB_TOKEN=github-token
@@ -104,84 +126,84 @@ LLM_API_KEY=llm-api-key
 REVIEWFORGE_MODEL=your-model
 
 REVIEWFORGE_API_TOKEN=dashboard-api-token
-REVIEWFORGE_CORS_ORIGINS=http://localhost:5173
+REVIEWFORGE_CORS_ORIGINS=https://review.example.com
 ```
 
-`reviewforge.yaml` 管理 Reviewer、模型 profile、置信度阈值、升级核验、发布闸门和 v3 参数。环境变量优先于 YAML。模型服务只要兼容 OpenAI Chat Completions 接口即可；可以为快速任务和高精度任务配置不同 profile。
+优先级为：**控制台加密配置 > 环境变量 > `reviewforge.yaml` > 程序默认值**。
 
-部署完成后也可以在控制台的“系统信息 → 模型服务”中测试、保存或恢复模型配置，无需重启服务。控制台采用单管理员模式，不引入用户系统：
+部署完成后可在“系统信息 → 模型服务”中测试、保存或恢复模型配置，无需重启服务。全局模型之外，以下五个角色可以分别设置 Base URL、模型和 API Key：
 
-- `REVIEWFORGE_API_TOKEN` 统一保护管理 API
-- 生产控制台应放在 HTTPS 反向代理之后，避免 API Token 和新密钥在传输途中泄露
-- API Key 通过 Fernet 加密保存在 `.reviewforge/llm-settings.enc`，接口只返回是否已配置和末四位
-- 主密钥使用 `REVIEWFORGE_SECRETS_KEY`；未设置时自动生成 `.reviewforge/master.key` 并限制为服务账号读写
-- 保存前会发起最小 Chat Completions 请求，成功后原子切换；运行中的审查不受影响
-- 默认拒绝公网 HTTP、云元数据和内网地址，内网模型需显式设置 `REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=1`
-- 控制台配置优先于环境变量/YAML；“恢复启动配置”会删除加密覆盖并重新使用环境变量/YAML
+| 角色 | 主要职责 |
+| --- | --- |
+| Planner | 规划 PR 审查任务 |
+| Fast Review | 性能、测试、国际化、依赖、文档、可访问性等轻量任务 |
+| Deep Review | 安全、正确性与高风险覆盖任务 |
+| Verifier | 动态校准、跨 PR、证据验证与 Escalation |
+| Publication Gate | 评论发布前的独立最终核验 |
 
-生产前至少检查：
+模型配置安全措施：
 
-```bash
-cd backend
-uv run reviewforge spec-check
-uv run pytest -q
-uv run ruff check .
-uv run ruff format --check .
-```
+- API Key 使用 Fernet 加密保存在 `.reviewforge/llm-settings.enc`
+- 主密钥来自 `REVIEWFORGE_SECRETS_KEY`，未设置时生成权限为 `0600` 的 `.reviewforge/master.key`
+- API 只返回密钥是否存在及末四位，不回传明文
+- 保存前执行最小连接测试，成功后原子切换；进行中的审查继续使用旧配置
+- 默认拒绝公网 HTTP、云元数据地址和内网地址
+- 确需使用内网模型时设置 `REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=1`
+- `REVIEWFORGE_API_TOKEN` 统一保护管理 API；本项目没有多用户系统
 
 ## GitHub Webhook
 
-在目标仓库的 `Settings → Webhooks` 中创建 Webhook：
+在目标仓库的 `Settings → Webhooks` 中创建：
 
 - Payload URL：`https://<host>/webhook/github`
 - Content type：`application/json`
-- Secret：与 `GITHUB_WEBHOOK_SECRET` 一致
-- Events：选择 Pull requests
+- Secret：与 `GITHUB_WEBHOOK_SECRET` 相同
+- Events：Pull requests
 
-除 `/health` 和 GitHub Webhook 外，管理 API 需要 `REVIEWFORGE_API_TOKEN`。
+除 `/health` 和 GitHub Webhook 外，管理 API 均需要 `REVIEWFORGE_API_TOKEN`。
 
-常用端点：
+## 常用接口
 
-| 端点 | 用途 |
+| 接口 | 用途 |
 | --- | --- |
-| `GET /health` | 服务健康检查 |
+| `GET /health` | 健康检查 |
 | `POST /webhook/github` | 接收 GitHub PR 事件 |
 | `GET /api/v1/specs` | Agent、Tool 与 Skill 注册信息 |
 | `GET /api/v1/config` | 当前运行配置 |
 | `GET /api/v1/dashboard/reviews` | 审查历史 |
 | `GET /api/v1/dashboard/tokens/summary` | Token 汇总 |
-| `GET /api/v1/admin/skills` | Skill 管理 |
-| `GET /api/v1/admin/agents` | Reviewer 管理 |
-| `GET /api/v1/admin/llm-settings` | 脱敏后的当前模型配置 |
+| `GET /api/v1/admin/llm-settings` | 脱敏后的模型配置 |
 | `POST /api/v1/admin/llm-settings/test` | 测试候选模型配置 |
 | `POST /api/v1/admin/llm-settings` | 测试、加密保存并热切换 |
-| `POST /api/v1/admin/llm-settings/reset` | 恢复环境变量/YAML 启动配置 |
+| `POST /api/v1/admin/llm-settings/reset` | 恢复启动配置 |
 
-## 评测
+## 评测与质量检查
 
-评测定义位于 `backend/eval/`，可执行入口位于 `backend/scripts/`，所有临时结果和日志统一写入 `backend/eval/artifacts/`。该目录只保留说明文件，不提交运行产物。
-
-确定性 golden gauntlet：
+仓库只保留可复现的评测代码、golden 数据和说明，不提交运行日志、数据库或结果产物。生成内容统一写入已忽略的 `backend/eval/artifacts/` 或 `.reviewforge/`。
 
 ```bash
 cd backend
+
+# 确定性扫描基准
 uv run python scripts/eval_gauntlet.py \
   --scanner-only \
   --out eval/artifacts/gauntlet-scanner.json
-```
 
-对真实 PR 导出的 findings、Token 与盲测 manifest 做逐行评分：
-
-```bash
-cd backend
+# 真实 PR 导出结果的统一评分
 uv run python scripts/eval_live_benchmark.py \
   --manifest eval/artifacts/manifest.json \
   --findings eval/artifacts/findings.json \
   --tokens eval/artifacts/tokens.json \
   --out eval/artifacts/live-benchmark.json
+
+# 提交前检查
+uv run reviewforge spec-check
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
 ```
 
-指标包括 TP、FP、FN、Precision、Recall、F1、严重级别召回、干净 PR 误报率、延迟和 Token。产品对比结论必须使用未参与调优的 holdout PR，并由独立裁判复核；仓库不把训练集成绩描述为行业领先。
+指标包括 TP、FP、FN、Precision、Recall、F1、严重级别召回、干净 PR 误报率、延迟和 Token。任何“超过某产品”的结论都应使用未参与调优的 holdout PR 和独立裁判复核。
 
 ## 项目结构
 
@@ -189,34 +211,40 @@ uv run python scripts/eval_live_benchmark.py \
 ReviewForge/
 ├─ .github/workflows/       # main 分支 CI 与自动部署
 ├─ backend/
-│  ├─ eval/                 # golden 数据与统一评测产物目录
-│  ├─ scripts/              # gauntlet / live benchmark 入口
+│  ├─ eval/                 # golden 数据与评测说明
+│  ├─ scripts/              # gauntlet / live benchmark
 │  ├─ src/reviewforge/
 │  │  ├─ api/               # Webhook、Dashboard、Admin API
-│  │  ├─ core/              # 配置、状态、事件、数据库、Spec
-│  │  ├─ engine/            # v3 编排、语义差异、覆盖、证据与 Reviewer
-│  │  ├─ eval/              # 评分实现
+│  │  ├─ core/              # 配置、状态、数据库、事件与 Agent Spec
+│  │  ├─ engine/            # v3 编排、上下文、覆盖、验证与 Reviewer
+│  │  ├─ eval/              # 统一评分实现
 │  │  ├─ skills/            # Reviewer 方法与语言规则
 │  │  └─ tools/             # GitHub 与受控工具网关
 │  └─ tests/
-├─ frontend/                # React + TypeScript 控制台
-├─ test_fixtures/           # 多语言基准样本
-├─ docs/                    # v3 架构与评测诊断
-├─ scripts/                 # 部署、服务器初始化与运维脚本
-└─ reviewforge.yaml         # 生产默认配置
+├─ frontend/                # React + TypeScript 管理控制台
+├─ test_fixtures/           # 多语言确定性测试样本
+├─ docs/                    # 架构和基准说明
+├─ scripts/                 # 部署、初始化与运维脚本
+└─ reviewforge.yaml         # 生产默认策略
 ```
 
 ## 自动部署
 
-推送到 `main` 后，GitHub Actions 会依次执行 Ruff、pytest、构建部署 bundle、上传服务器、重启服务并进行健康检查。部署脚本带进程锁和失败回滚。
+推送到 `main` 后，GitHub Actions 会执行：
 
-需要在 GitHub Actions 中配置：
+1. Ruff lint 与格式检查
+2. 完整 pytest
+3. 构建 Git bundle 并上传服务器
+4. 使用进程锁部署，重启 `reviewforge` 服务
+5. 执行健康检查；失败时自动回滚
+
+需要配置以下 GitHub Actions Secrets：
 
 - `SERVER_HOST`
 - `SERVER_USER`
 - `SERVER_SSH_KEY`
 
-服务器默认目录为 `/opt/reviewforge`，服务名为 `reviewforge`。相关脚本位于 `scripts/deploy.sh` 与 `scripts/setup-server.sh`。
+默认服务器目录为 `/opt/reviewforge`，systemd 服务名为 `reviewforge`。
 
 ## 开发约定
 
@@ -225,7 +253,7 @@ ReviewForge/
 1. 在 `backend/src/reviewforge/core/specs.py` 注册 `AgentSpec`
 2. 在 `backend/src/reviewforge/skills/` 添加 Skill
 3. 在 `backend/src/reviewforge/engine/reviewers.py` 实现 Reviewer
-4. 在 prompt builder 中接入对应审查方法
-5. 运行 `spec-check`、Ruff 与 pytest
+4. 在 prompt builder 接入对应方法
+5. 运行 `spec-check`、Ruff 和 pytest
 
-Reviewer 不直接发布评论；所有发现必须经过统一状态存储、验证与发布链路。
+所有 Reviewer 输出都必须经过统一状态存储、验证和发布链路，禁止绕过编排器直接发布评论。

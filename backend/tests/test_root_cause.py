@@ -472,6 +472,59 @@ def test_orchestrator_marks_absorbed_finding_and_emits_stats() -> None:
     assert events[-1].data["phase"] == "pre-evidence"
 
 
+def test_orchestrator_records_cross_reviewer_consensus_for_publication() -> None:
+    events: list[ReviewEvent] = []
+    orchestrator = _orchestrator_with_events(events)
+    left = _finding(
+        "security",
+        category="sql-injection",
+        message="f-string SQL query allows user_id injection",
+        reviewer="security_reviewer",
+    )
+    right = _finding(
+        "correctness",
+        category="sql-injection",
+        message="f-string SQL query allows user_id injection",
+        reviewer="correctness_reviewer",
+        confidence=0.8,
+    )
+    state = StateStore()
+    state.add_finding(left)
+    state.add_finding(right)
+
+    kept = orchestrator._apply_root_cause_clustering([left, right], state)
+
+    assert kept == [left]
+    evidence = state.impact_manifest["publication_evidence"]
+    assert evidence["consensus_ids"] == ["security"]
+    assert evidence["root_cause_clusters"][0]["reviewers"] == [
+        "correctness_reviewer",
+        "security_reviewer",
+    ]
+
+
+def test_hardcoded_smtp_credential_does_not_absorb_missing_tls() -> None:
+    hardcoded = _finding(
+        "hardcoded",
+        category="hardcoded-secrets",
+        message="SMTP password is hardcoded in plaintext source and repository history",
+        line=23,
+        reviewer="security_reviewer",
+    )
+    transport = _finding(
+        "transport",
+        category="smtp-no-tls",
+        message="deliver_email calls SMTP login without STARTTLS over the network",
+        line=58,
+        reviewer="correctness_reviewer",
+    )
+
+    result = cluster_root_causes([hardcoded, transport])
+
+    assert result.kept == (hardcoded, transport)
+    assert result.absorbed == ()
+
+
 def test_orchestrator_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[ReviewEvent] = []
     orchestrator = _orchestrator_with_events(events)

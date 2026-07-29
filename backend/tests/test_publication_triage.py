@@ -12,7 +12,7 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import Finding, StateStore
 from reviewforge.engine.mock_llm import MockChatLLM
-from reviewforge.engine.orchestrator import Orchestrator
+from reviewforge.engine.orchestrator import CommentDeliveryResult, Orchestrator
 from reviewforge.engine.publication_triage import (
     VERDICT_CONFIRMED,
     VERDICT_FALSE_POSITIVE,
@@ -550,7 +550,7 @@ def test_extended_root_cause_families_env_kill_switch(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retryable_publication_failure_skips_comments_and_fails_db_run(
+async def test_retryable_publication_failure_publishes_verified_comments_and_fails_db_run(
     tmp_path,
 ):
     database = Database(tmp_path / "reviewforge.db")
@@ -607,12 +607,177 @@ async def test_retryable_publication_failure_skips_comments_and_fails_db_run(
                         orchestrator,
                         "_post_comments",
                         new_callable=AsyncMock,
+                        return_value=CommentDeliveryResult(reported=1),
                     ) as post_comments:
                         summary = await orchestrator.run(state)
 
     assert summary["status"] == "partial"
     assert summary["retryable"] is True
-    post_comments.assert_not_awaited()
+    post_comments.assert_awaited_once()
+    assert summary["comment_delivery"]["reported"] == 1
     runs = await database.get_runs(repo="owner/repo")
     assert runs[0]["status"] == "failed"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_model_independent_evidence_bypasses_triage_and_agentic_gate():
+    state = _state()
+    state.add_finding(_finding("detector-proof", verified_by="detector"))
+    llm = _StaticLLM(error=AssertionError("protected evidence must not call an LLM"))
+    registry = build_registry()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        publication_gate_llm=llm,
+        publication_gate_enabled=True,
+        publication_triage_enabled=True,
+    )
+    gate = AsyncMock()
+    orchestrator._publication_gate_reviewer = gate
+
+    stats = await orchestrator._run_publication_gate(state)
+
+    protected = state.get_finding("detector-proof")
+    assert protected.status == "confirmed"
+    assert protected.verified_by == "detector"
+    assert stats.evidence_bypassed == 1
+    assert stats.dedup_input == 1
+    assert stats.dedup_output == 1
+    assert llm.calls == []
+    gate.escalate_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_changed_source_evidence_collapses_same_proof_before_publication():
+    state = StateStore(
+        pr_number=1,
+        repo="owner/repo",
+        head_sha="head",
+        files_changed=["app.py"],
+        diff_summary=(
+            "--- app.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+def hash_password(password: str) -> str:\n"
+            "+    return hashlib.md5(password.encode()).hexdigest()\n"
+        ),
+        file_diffs={
+            "app.py": (
+                "@@ -0,0 +1,2 @@\n"
+                "+def hash_password(password: str) -> str:\n"
+                "+    return hashlib.md5(password.encode()).hexdigest()\n"
+            )
+        },
+    )
+    weak_one = _finding(
+        "weak-one",
+        line=2,
+        category="weak-password-hashing",
+    )
+    weak_one.message = "hash_password uses unsalted MD5 for password storage"
+    state.add_finding(weak_one)
+    weak_two = _finding(
+        "weak-two",
+        line=2,
+        category="crypto",
+    )
+    weak_two.message = "password hashing relies on MD5"
+    state.add_finding(weak_two)
+    llm = _StaticLLM(error=AssertionError("protected evidence must not call an LLM"))
+    registry = build_registry()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        publication_gate_llm=llm,
+        publication_gate_enabled=True,
+        publication_triage_enabled=True,
+    )
+    gate = AsyncMock()
+    orchestrator._publication_gate_reviewer = gate
+
+    stats = await orchestrator._run_publication_gate(state)
+
+    assert len(state.list_findings(status="confirmed")) == 1
+    duplicate = state.list_findings(status="false_positive")
+    assert len(duplicate) == 1
+    assert duplicate[0].verified_by == "publication-evidence-duplicate"
+    assert stats.evidence_bypassed == 1
+    assert stats.evidence_collapsed == 1
+    assert gate.escalate_batch.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_after_gate_provider_error_skips_all_expensive_stages(tmp_path):
+    database = Database(tmp_path / "reviewforge.db")
+    await database.connect()
+    run_id = "publication-retry"
+    await database.create_run(
+        run_id=run_id,
+        repo="owner/repo",
+        pr_number=1,
+        head_sha="head",
+    )
+    retry_finding = _finding("retry-only")
+    retry_finding.status = "candidate"
+    retry_finding.verified_by = "publication-gate-provider-error"
+    await database.insert_finding(run_id, retry_finding.to_dict())
+    await database.fail_run(run_id, "publication provider rate limited")
+
+    registry = build_registry()
+    llm = MockChatLLM()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        db=database,
+        publication_gate_enabled=True,
+    )
+    state = _state()
+    resumed_stats = TriageStats(agentic_confirmed=1)
+
+    with (
+        patch.object(orchestrator._planner, "plan", new_callable=AsyncMock) as planner,
+        patch.object(orchestrator._context_engine, "build", new_callable=AsyncMock) as context,
+        patch(
+            "reviewforge.engine.orchestrator.scan_changed_files",
+            new_callable=AsyncMock,
+        ) as phase0,
+        patch.object(
+            orchestrator,
+            "_run_publication_gate",
+            new_callable=AsyncMock,
+            return_value=resumed_stats,
+        ) as publication_gate,
+        patch.object(
+            orchestrator,
+            "_post_comments",
+            new_callable=AsyncMock,
+            return_value=CommentDeliveryResult(reported=1),
+        ) as post_comments,
+    ):
+        summary = await orchestrator.run(state)
+
+    planner.assert_not_awaited()
+    context.assert_not_awaited()
+    phase0.assert_not_awaited()
+    publication_gate.assert_awaited_once_with(state, candidate_ids={"retry-only"})
+    post_comments.assert_awaited_once()
+    assert summary["resume"] == {
+        "mode": "publication-only",
+        "retried_findings": 1,
+    }
+    assert summary.get("retryable") is None
+    runs = await database.get_runs(repo="owner/repo")
+    assert runs[0]["status"] == "completed"
     await database.close()

@@ -48,6 +48,7 @@ from reviewforge.engine.finding_anchors import (
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.planner import Planner
+from reviewforge.engine.publication_evidence import protect_publication_finding
 from reviewforge.engine.publication_policy import (
     PolicyDecision,
     PublicationPolicy,
@@ -581,6 +582,18 @@ class Orchestrator:
 
         planner_errors: list[str] = []
         try:
+            publication_retry_ids = {
+                finding.id
+                for finding in state.list_findings()
+                if finding.status == "candidate" and finding.verified_by == "publication-gate-provider-error"
+            }
+            if resumed and publication_retry_ids:
+                return await self._resume_publication_only(
+                    state,
+                    run_id,
+                    publication_retry_ids,
+                )
+
             # Build repository-aware context before planning. Failure is
             # non-fatal: the original diff-only pipeline remains available.
             self._events.emit("context_engine.started", {"file_count": len(state.files_changed)})
@@ -1026,12 +1039,14 @@ class Orchestrator:
             publication_blocked = bool(publication_gate_stats and publication_gate_stats.retryable)
             if confirmed and publication_blocked:
                 self._events.emit(
-                    "commenter.skipped",
+                    "commenter.partial",
                     {
                         "finding_count": len(confirmed),
-                        "reason": "publication verification is incomplete and retryable",
+                        "reason": "publishing independently verified findings while provider failures remain retryable",
                     },
                 )
+                comment_result = await self._post_comments(confirmed, state)
+                self._events.emit("commenter.completed", comment_result.to_dict())
             elif confirmed:
                 self._events.emit("commenter.started", {"finding_count": len(confirmed)})
                 comment_result = await self._post_comments(confirmed, state)
@@ -1120,6 +1135,28 @@ class Orchestrator:
         family_by_id = {
             member_id: cluster.causal_family for cluster in result.clusters for member_id in cluster.member_ids
         }
+        publication_evidence = state.impact_manifest.setdefault("publication_evidence", {})
+        consensus_ids = set(publication_evidence.get("consensus_ids", []))
+        cluster_evidence = list(publication_evidence.get("root_cause_clusters", []))
+        for cluster in result.clusters:
+            reviewer_roles = {
+                role.strip().lower().replace("-", "_")
+                for reviewer in cluster.reviewers
+                for role in str(reviewer or "").split(",")
+                if role.strip()
+            }
+            if len(reviewer_roles) >= 2:
+                consensus_ids.add(cluster.representative_id)
+            cluster_evidence.append(
+                {
+                    "representative_id": cluster.representative_id,
+                    "member_ids": list(cluster.member_ids),
+                    "reviewers": sorted(reviewer_roles),
+                    "causal_family": cluster.causal_family,
+                }
+            )
+        publication_evidence["consensus_ids"] = sorted(consensus_ids)
+        publication_evidence["root_cause_clusters"] = cluster_evidence[-500:]
         for absorbed in result.absorbed:
             representative_id = representative_by_id[absorbed.id]
             state.update_finding(
@@ -1270,12 +1307,87 @@ class Orchestrator:
                     exc,
                 )
 
-    async def _run_publication_gate(self, state: StateStore) -> TriageStats:
+    async def _resume_publication_only(
+        self,
+        state: StateStore,
+        run_id: str,
+        retry_ids: set[str],
+    ) -> dict[str, Any]:
+        """Retry only provider-failed publication candidates.
+
+        Reviewer, calibration and successful gate work is immutable for the
+        same PR head.  Re-running those stages changes the candidate set and
+        can double the token bill, so a publication-provider failure resumes
+        directly from the persisted finding checkpoint.
+        """
+
+        self._events.emit(
+            "publication_gate.resumed",
+            {"run_id": run_id, "retry_count": len(retry_ids), "finding_ids": sorted(retry_ids)},
+        )
+        for finding_id in retry_ids:
+            state.update_finding(finding_id, status="confirmed")
+
+        stats = await self._run_publication_gate(state, candidate_ids=retry_ids)
+        if self._publication_policy.enabled:
+            self._run_publication_policy_post(state)
+
+        if self._db:
+            for finding in state.findings.values():
+                await self._db.insert_finding(run_id, finding.to_dict())
+
+        confirmed = state.list_findings(status="confirmed")
+        comment_result = CommentDeliveryResult()
+        if confirmed:
+            self._events.emit("commenter.resumed", {"finding_count": len(confirmed)})
+            comment_result = await self._post_comments(confirmed, state)
+            self._events.emit("commenter.completed", comment_result.to_dict())
+
+        summary: dict[str, Any] = {
+            "total_findings": len(state.findings),
+            "confirmed": len(state.list_findings(status="confirmed")) + len(state.list_findings(status="reported")),
+            "false_positives": len(state.list_findings(status="false_positive")),
+            "tasks_completed": len(state.list_tasks(status="completed")),
+            "tasks_failed": len(state.list_tasks(status="failed")),
+            "comment_delivery": comment_result.to_dict(),
+            "publication_gate": stats.public_summary(),
+            "resume": {
+                "mode": "publication-only",
+                "retried_findings": len(retry_ids),
+            },
+        }
+        retryable_errors = list(stats.errors) if stats.retryable else []
+        if comment_result.retryable:
+            retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
+        if retryable_errors:
+            summary.update({"status": "partial", "retryable": True})
+            self._events.emit("review.partial", {**summary, "errors": retryable_errors})
+        self._events.emit("review.completed", summary)
+
+        if self._db:
+            if retryable_errors:
+                await self._db.fail_run(
+                    run_id,
+                    "Publication retry incomplete: " + "; ".join(retryable_errors),
+                    summary=summary,
+                )
+            else:
+                await self._db.complete_run(run_id, summary)
+        return summary
+
+    async def _run_publication_gate(
+        self,
+        state: StateStore,
+        *,
+        candidate_ids: set[str] | None = None,
+    ) -> TriageStats:
         """Independently verify every not-yet-reported finding before publication."""
 
         started = time.monotonic()
         stats = TriageStats()
         candidates = state.list_findings(status="confirmed")
+        if candidate_ids is not None:
+            candidates = [finding for finding in candidates if finding.id in candidate_ids]
         if not candidates:
             payload = (
                 stats.to_dict()
@@ -1320,6 +1432,57 @@ class Orchestrator:
                 },
             )
 
+        protected: list[Finding] = []
+        needs_verification: list[Finding] = []
+        protected_keys: dict[tuple[str, str], str] = {}
+        for finding in candidates:
+            protection = protect_publication_finding(finding, state)
+            if protection.protected:
+                evidence_key = (
+                    (finding.file or "").strip(),
+                    protection.dedup_key,
+                )
+                representative_id = protected_keys.get(evidence_key) if protection.dedup_key else None
+                if representative_id:
+                    state.update_finding(
+                        finding.id,
+                        status="false_positive",
+                        verified_by="publication-evidence-duplicate",
+                        verify_reason=(
+                            f"Same changed-source proof as publication-evidence representative {representative_id}."
+                        ),
+                    )
+                    stats.evidence_collapsed += 1
+                    stats.dedup_collapsed += 1
+                    stats.dedup_output = max(0, stats.dedup_output - 1)
+                    continue
+                state.update_finding(
+                    finding.id,
+                    verified_by=(
+                        finding.verified_by
+                        if (finding.verified_by or "").strip().lower() in {"detector", "detector-auto"}
+                        else "publication-evidence"
+                    ),
+                    verify_reason=protection.reason,
+                )
+                protected_finding = state.get_finding(finding.id)
+                protected.append(protected_finding)
+                if protection.dedup_key:
+                    protected_keys[evidence_key] = finding.id
+            else:
+                needs_verification.append(finding)
+        candidates = needs_verification
+        stats.evidence_bypassed = len(protected)
+        if protected:
+            self._events.emit(
+                "publication_gate.evidence_bypassed",
+                {
+                    "count": len(protected),
+                    "collapsed": stats.evidence_collapsed,
+                    "finding_ids": [finding.id for finding in protected],
+                },
+            )
+
         if self._publication_triage_config.enabled:
             triage_llm = self._publication_gate_llm_raw
             if self._db:
@@ -1334,7 +1497,13 @@ class Orchestrator:
                 event_bus=self._events,
                 gateway=self._gateway,
             )
-            verdicts, stats = await triage.classify(candidates, state)
+            verdicts, triage_stats = await triage.classify(candidates, state)
+            triage_stats.dedup_input = stats.dedup_input
+            triage_stats.dedup_collapsed = stats.dedup_collapsed
+            triage_stats.dedup_output = stats.dedup_output
+            triage_stats.evidence_bypassed = stats.evidence_bypassed
+            triage_stats.evidence_collapsed = stats.evidence_collapsed
+            stats = triage_stats
             needs_tool: list[Finding] = []
             for finding in candidates:
                 verdict = verdicts[finding.id]

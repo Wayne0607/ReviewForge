@@ -313,6 +313,57 @@ class TestPublicationGate:
             "_tool_evidence": "",
         }
 
+    @pytest.mark.asyncio
+    async def test_last_configured_step_uses_raw_model_and_avoids_third_call(self, gateway):
+        class _RawFinalLLM:
+            def __init__(self):
+                self.calls = 0
+
+            async def ainvoke(self, _messages):
+                self.calls += 1
+                return AIMessage(
+                    content=(
+                        '{"verdict":"confirmed","confidence":0.9,"reason":"grounded","evidence_quote":"exact evidence"}'
+                    ),
+                )
+
+        class _ToolBoundLLM:
+            def __init__(self):
+                self.calls = 0
+
+            async def ainvoke(self, _messages):
+                self.calls += 1
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "read_file",
+                            "args": {"file_path": "app.py"},
+                            "id": "call-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+
+        raw = _RawFinalLLM()
+        bound = _ToolBoundLLM()
+        gate = PublicationGateReviewer(raw, gateway, max_steps=2)
+        tool = _CountingTool(["exact evidence"])
+
+        result = await gate._run_tool_loop(
+            [],
+            bound,
+            {"read_file": tool},
+            TokenBudget(4000),
+            "finding-1",
+        )
+
+        assert result is not None
+        assert result["verdict"] == "confirmed"
+        assert raw.calls == 1
+        assert bound.calls == 1
+        assert tool.calls == 1
+
     def test_confirmed_verdict_requires_exact_tool_evidence(self):
         finding = _make_finding(status="confirmed")
         result = PublicationGateReviewer._apply_verdict(

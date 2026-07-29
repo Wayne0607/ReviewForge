@@ -97,6 +97,9 @@ class TriageVerdict:
 
 @dataclass
 class TriageStats:
+    dedup_input: int = 0
+    dedup_collapsed: int = 0
+    dedup_output: int = 0
     triage_batches: int = 0
     triage_confirmed: int = 0
     triage_filtered: int = 0
@@ -114,6 +117,9 @@ class TriageStats:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "dedup_input": self.dedup_input,
+            "dedup_collapsed": self.dedup_collapsed,
+            "dedup_output": self.dedup_output,
             "triage_batches": self.triage_batches,
             "triage_confirmed": self.triage_confirmed,
             "triage_filtered": self.triage_filtered,

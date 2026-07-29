@@ -30,8 +30,9 @@ def test_dedup_collapses_same_root_cause_keeps_highest_confidence():
         _finding("b", "x.py", 10, "sql-injection", 0.95),  # higher confidence
         _finding("c", "x.py", 10, "sql-injection", 0.70),
     ]
-    kept, stats = orch._dedup_by_root_cause(candidates)
+    kept, absorbed, stats = orch._dedup_by_root_cause(candidates)
     assert [f.id for f in kept] == ["b"]
+    assert {f.id for f in absorbed} == {"a", "c"}
     assert stats.collapsed == 2
     assert stats.buckets == 1
 
@@ -43,8 +44,9 @@ def test_dedup_disabled_returns_input_unchanged():
         _finding("a", "x.py", 10, "sql-injection", 0.80),
         _finding("b", "x.py", 10, "sql-injection", 0.95),
     ]
-    kept, stats = orch._dedup_by_root_cause(candidates)
+    kept, absorbed, stats = orch._dedup_by_root_cause(candidates)
     assert [f.id for f in kept] == ["a", "b"]
+    assert absorbed == []
     assert stats.collapsed == 0
 
 
@@ -57,8 +59,9 @@ def test_dedup_keeps_distinct_anchor_and_category():
         _finding("c", "y.py", 10, "sql-injection", 0.80),  # different file
         _finding("d", "x.py", 10, "xss", 0.80),  # different category
     ]
-    kept, stats = orch._dedup_by_root_cause(candidates)
+    kept, absorbed, stats = orch._dedup_by_root_cause(candidates)
     assert [f.id for f in kept] == ["a", "b", "c", "d"]
+    assert absorbed == []
     assert stats.collapsed == 0
     assert stats.buckets == 4
 
@@ -71,8 +74,9 @@ def test_dedup_keeps_unkeyed_findings():
         _finding("b", "x.py", 0, "sql-injection", 0.80),  # missing line
         _finding("c", "x.py", 10, "sql-injection", 0.80),  # normal
     ]
-    kept, stats = orch._dedup_by_root_cause(candidates)
+    kept, absorbed, stats = orch._dedup_by_root_cause(candidates)
     assert len(kept) == 3
+    assert absorbed == []
     assert stats.collapsed == 0
 
 

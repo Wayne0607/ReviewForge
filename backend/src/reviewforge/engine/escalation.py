@@ -320,7 +320,20 @@ class EscalationReviewer:
                 logger.warning(f"Escalation: token budget exhausted at step {step}")
                 break
 
-            resp = await llm.ainvoke(chat)
+            # Reserve the final configured step for a raw, no-tools verdict.
+            # Previously a tool-bound model could request another tool on the
+            # last step and then trigger an extra forced-final LLM call. With a
+            # two-step gate that produced three calls per finding. The raw
+            # model cannot emit executable tool calls, so the common path now
+            # stays within the configured call count.
+            if step == self._max_steps - 1:
+                chat.append(
+                    HumanMessage(content="这是最后一步。请基于已有工具证据，只输出 verdict JSON，不再调用工具。")
+                )
+                step_llm = self._llm
+            else:
+                step_llm = llm
+            resp = await step_llm.ainvoke(chat)
             chat.append(resp)
             budget.add(resp)
 

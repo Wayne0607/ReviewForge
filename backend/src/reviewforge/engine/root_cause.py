@@ -84,6 +84,16 @@ _EXACT_FAMILIES = {
     "null-dereference": "nil-dereference",
 }
 
+_EXTENDED_EXACT_FAMILIES = {
+    "smtp-no-tls": "smtp-plaintext",
+    "insecure-smtp": "smtp-plaintext",
+    "sql-injection": "sql-injection",
+    "ssrf": "ssrf-host-validation",
+    "ssrf-protection-bypass": "ssrf-host-validation",
+    "ssrf-resource-exhaustion": "ssrf-host-validation",
+    "weak-password-hashing": "weak-password-hash",
+}
+
 _LINE_TOLERANCE = {
     "wrong-metric": 40,
     "context-loss": 30,
@@ -92,6 +102,12 @@ _LINE_TOLERANCE = {
     "undefined-symbol": 8,
     "nil-dereference": 8,
     "stored-xss-flow": 0,
+    "smtp-plaintext": 45,
+    "sql-injection": 10,
+    "ssrf-host-validation": 45,
+    "weak-webhook-signature": 12,
+    "weak-password-hash": 16,
+    "password-verification": 10,
 }
 
 
@@ -151,7 +167,7 @@ def _normalize_category(category: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (category or "").lower())).strip("-")
 
 
-def _causal_family(category: str, text: str) -> str:
+def _causal_family(category: str, text: str, *, extended_families: bool = True) -> str:
     normalized = _normalize_category(category)
     exact = _EXACT_FAMILIES.get(normalized)
     if exact:
@@ -183,6 +199,35 @@ def _causal_family(category: str, text: str) -> str:
         and any(token in combined for token in ("rss", "feed", "topicembed"))
     ):
         return "stored-xss-flow"
+    if not extended_families:
+        return ""
+    extended_exact = _EXTENDED_EXACT_FAMILIES.get(normalized)
+    if extended_exact:
+        return extended_exact
+    if "smtp" in combined and any(token in combined for token in ("starttls", "plaintext", "明文", "tls")):
+        return "smtp-plaintext"
+    if "ssrf" in combined and any(
+        token in combined for token in ("internal", "metadata", "host", "scheme", "内网", "元数据")
+    ):
+        return "ssrf-host-validation"
+    if normalized in {"sql-injection", "sqli"}:
+        return "sql-injection"
+    if ("os.time" in combined or "os`.`time" in combined) and any(
+        token in combined for token in ("attributeerror", "不存在", "name-error", "wrong-callee")
+    ):
+        return "undefined-symbol"
+    if "md5" in combined and any(
+        token in combined for token in ("webhook", "signature", "签名", "_sign_webhook_payload")
+    ):
+        return "weak-webhook-signature"
+    if any(token in combined for token in ("verify_password", "compare_digest")) and any(
+        token in combined for token in ("password", "password_hash", "密码", "明文")
+    ):
+        return "password-verification"
+    if "md5" in combined and any(
+        token in combined for token in ("password", "hash_password", "password-hash", "密码", "口令")
+    ):
+        return "weak-password-hash"
     return ""
 
 
@@ -269,7 +314,13 @@ def _anchor_for_line(patch: str, line: int) -> str:
     return ""
 
 
-def _build_claim(finding: Finding, diff_summary: str, file_diffs: Mapping[str, str]) -> RootCauseClaim:
+def _build_claim(
+    finding: Finding,
+    diff_summary: str,
+    file_diffs: Mapping[str, str],
+    *,
+    extended_families: bool = True,
+) -> RootCauseClaim:
     patch = file_diffs.get(finding.file)
     if patch is None:
         patch = _extract_file_patch(diff_summary, finding.file)
@@ -281,7 +332,11 @@ def _build_claim(finding: Finding, diff_summary: str, file_diffs: Mapping[str, s
         file=finding.file,
         line=finding.line,
         reviewer=finding.reviewer,
-        causal_family=_causal_family(finding.category, f"{finding.message}\n{finding.suggestion}"),
+        causal_family=_causal_family(
+            finding.category,
+            f"{finding.message}\n{finding.suggestion}",
+            extended_families=extended_families,
+        ),
         identifiers=identifiers,
         strong_identifiers=strong_identifiers,
         anchor_identifiers=anchor_identifiers,
@@ -389,11 +444,20 @@ def cluster_root_causes(
     diff_summary: str = "",
     *,
     file_diffs: Mapping[str, str] | None = None,
+    extended_families: bool = True,
 ) -> RootCauseClusterResult:
     """Collapse only high-confidence duplicate descriptions of one code defect."""
 
     source = tuple(findings)
-    claims = tuple(_build_claim(finding, diff_summary, file_diffs or {}) for finding in source)
+    claims = tuple(
+        _build_claim(
+            finding,
+            diff_summary,
+            file_diffs or {},
+            extended_families=extended_families,
+        )
+        for finding in source
+    )
     groups: list[list[int]] = []
 
     for index, claim in enumerate(claims):

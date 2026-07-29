@@ -128,6 +128,7 @@ class LLMRuntimeManager:
             publication_gate_max_tokens=cfg.publication_gate_max_tokens,
             publication_gate_concurrency=cfg.publication_gate_concurrency,
             publication_gate_dedup=cfg.publication_gate_dedup,
+            root_cause_extended_families=cfg.root_cause_extended_families,
             publication_triage_enabled=cfg.publication_triage_enabled,
             publication_triage_batch_size=cfg.publication_triage_batch_size,
             publication_triage_concurrency=cfg.publication_triage_concurrency,

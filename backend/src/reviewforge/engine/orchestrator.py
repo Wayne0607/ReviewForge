@@ -241,6 +241,7 @@ class Orchestrator:
         publication_gate_max_tokens: int = 6000,
         publication_gate_concurrency: int = 4,
         publication_gate_dedup: bool = True,
+        root_cause_extended_families: bool = True,
         publication_triage_enabled: bool = False,
         publication_triage_batch_size: int = 6,
         publication_triage_concurrency: int = 1,
@@ -284,6 +285,7 @@ class Orchestrator:
         self._publication_gate_max_tokens = max(1, publication_gate_max_tokens)
         self._publication_gate_concurrency = max(1, publication_gate_concurrency)
         self._publication_gate_dedup = bool(publication_gate_dedup)
+        self._root_cause_extended_families = bool(root_cause_extended_families)
         self._publication_triage_config = PublicationTriageConfig(
             enabled=publication_triage_enabled,
             batch_size=publication_triage_batch_size,
@@ -1104,6 +1106,7 @@ class Orchestrator:
                 candidates,
                 state.diff_summary,
                 file_diffs=state.file_diffs or {},
+                extended_families=getattr(self, "_root_cause_extended_families", True),
             )
         except Exception as exc:
             logger.warning("Root-cause clustering failed; passing candidates through: %s", exc, exc_info=True)
@@ -1149,18 +1152,19 @@ class Orchestrator:
     def _dedup_by_root_cause(
         self,
         candidates: list[Finding],
-    ) -> tuple[list[Finding], _DedupStats]:
+    ) -> tuple[list[Finding], list[Finding], _DedupStats]:
         """Collapse findings with the same root cause before triage / gate.
 
-        Returns the deduplicated list and a small stats object so the
-        orchestrator can log or emit a ``publication_gate.dedup`` event.  When
-        the feature flag is disabled the candidates are returned untouched
-        and the stats report zero collapses.
+        Returns ``(kept, absorbed, stats)``.  Callers must transition every
+        absorbed finding out of ``confirmed`` before publication; otherwise a
+        duplicate omitted from the gate would bypass verification and still
+        be posted.  When the feature flag is disabled the candidates are
+        returned untouched and the absorbed list is empty.
         """
 
         stats = _DedupStats()
         if not candidates or not self._publication_gate_dedup:
-            return list(candidates), stats
+            return list(candidates), [], stats
 
         buckets: dict[tuple[str, int, str], Finding] = {}
         order: list[tuple[str, int, str]] = []
@@ -1191,7 +1195,7 @@ class Orchestrator:
 
         stats.collapsed = len(absorbed)
         stats.buckets = len({k for k in order if k[0] != "__unkeyed__"})
-        return [buckets[key] for key in order], stats
+        return [buckets[key] for key in order], absorbed, stats
 
     def _run_publication_policy_pre(self, state: StateStore) -> None:
         """Apply the Stage-1 publication policy before the LLM gate runs."""
@@ -1288,7 +1292,17 @@ class Orchestrator:
         # LLM call is duplicated per duplicate.  Toggle off via env var
         # ``REVIEWFORGE_PUBLICATION_GATE_DEDUP=0`` if a regression appears.
         original_candidate_count = len(candidates)
-        candidates, dedup_stats = self._dedup_by_root_cause(candidates)
+        candidates, absorbed, dedup_stats = self._dedup_by_root_cause(candidates)
+        stats.dedup_input = original_candidate_count
+        stats.dedup_collapsed = dedup_stats.collapsed
+        stats.dedup_output = len(candidates)
+        for duplicate in absorbed:
+            state.update_finding(
+                duplicate.id,
+                status="false_positive",
+                verified_by="publication-gate-dedup",
+                verify_reason="与同文件、同代码行、同问题类别的更高置信候选重复，已在发布门前合并。",
+            )
         if dedup_stats.collapsed:
             logger.info(
                 "publication-gate dedup: %d -> %d candidates (collapsed %d)",

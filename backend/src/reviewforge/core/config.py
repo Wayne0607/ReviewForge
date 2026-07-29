@@ -238,6 +238,10 @@ class ReviewForgeConfig:
     publication_triage_max_candidates: int = 24
     publication_triage_context_lines: int = 12
     publication_triage_max_tokens: int = 4000
+    # Zero-token semantic root-cause families for high-volume security
+    # duplicates. Operational kill switch:
+    # REVIEWFORGE_ROOT_CAUSE_EXTENDED_FAMILIES=0.
+    root_cause_extended_families: bool = True
 
     # Model-agnostic publication policy (Stage 1). Library default is OFF
     # so embedding applications opt in explicitly. Production enables
@@ -562,3 +566,11 @@ class ReviewForgeConfig:
                 self.publication_triage_max_tokens = max(500, int(triage_tokens))
             except (TypeError, ValueError):
                 pass
+        root_cause_extended = os.environ.get("REVIEWFORGE_ROOT_CAUSE_EXTENDED_FAMILIES")
+        if root_cause_extended is not None:
+            self.root_cause_extended_families = root_cause_extended.strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "",
+            )

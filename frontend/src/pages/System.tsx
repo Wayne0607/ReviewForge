@@ -194,6 +194,18 @@ export default function System() {
     }
   }
 
+  const anyRoleDirty = useMemo(
+    () =>
+      ROLE_ORDER.some(
+        (name) =>
+          roleForms[name]?.base_url ||
+          roleForms[name]?.model ||
+          roleForms[name]?.api_key ||
+          roleForms[name]?.reset
+      ),
+    [roleForms]
+  )
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64 text-gray-400">
@@ -209,18 +221,6 @@ export default function System() {
   // Separate built-in and plugin reviewers
   const builtInAgents = Object.entries(agents).filter(
     ([name]) => !name.startsWith('plugin_')
-  )
-
-  const anyRoleDirty = useMemo(
-    () =>
-      ROLE_ORDER.some(
-        (name) =>
-          roleForms[name]?.base_url ||
-          roleForms[name]?.model ||
-          roleForms[name]?.api_key ||
-          roleForms[name]?.reset
-      ),
-    [roleForms]
   )
 
   return (

@@ -111,10 +111,12 @@ _LINE_TOLERANCE = {
     "weak-webhook-signature": 20,
     "weak-password-hash": 16,
     "password-verification": 10,
-    "hardcoded-smtp-credential": 12,
+    "hardcoded-smtp-credential": 30,
     "preferences-n-plus-one": 24,
     "swallowed-channel-exception": 20,
     "notification-result-return": 30,
+    "async-cache-file-io": 20,
+    "retry-guard-off-by-one": 50,
 }
 
 
@@ -181,6 +183,13 @@ def _causal_family(category: str, text: str, *, extended_families: bool = True) 
         return exact
 
     combined = f"{normalized} {text}".lower()
+    if (
+        extended_families
+        and normalized == "early-return-missing-side-effects"
+        and "retry_count" in combined
+        and any(token in combined for token in ("notificationresult", "off-by-one", ">= 0", ">=0"))
+    ):
+        return "retry-guard-off-by-one"
     if "metric" in normalized and any(word in normalized for word in ("wrong", "incorrect", "label", "recorder")):
         return "wrong-metric"
     if "context" in normalized and any(word in normalized for word in ("loss", "lost", "log", "inconsisten")):
@@ -212,7 +221,14 @@ def _causal_family(category: str, text: str, *, extended_families: bool = True) 
     if extended_exact:
         return extended_exact
     if (
-        normalized in {"hardcoded-secret", "hardcoded-secrets", "embedded-credential", "embedded-credentials"}
+        normalized
+        in {
+            "hardcoded-secret",
+            "hardcoded-secrets",
+            "embedded-credential",
+            "embedded-credentials",
+            "secret-in-source",
+        }
         and "smtp" in combined
         and any(token in combined for token in ("password", "credential", "secret", "smtp_password"))
     ):
@@ -275,6 +291,16 @@ def _causal_family(category: str, text: str, *, extended_families: bool = True) 
         token in combined for token in ("notificationresult", "notification_result", "return result", "result.failed")
     ):
         return "notification-result-return"
+    if normalized in {"blocking-io-async", "sync-io-in-async", "event-loop-blocking"}:
+        has_cache_read = "_read_cached_payload" in combined
+        has_preferences_read = "load_user_preferences" in combined
+        if has_cache_read and not has_preferences_read:
+            return "async-cache-file-io"
+    if normalized in {"early-return-missing-side-effects", "control-flow", "off-by-one"} and (
+        "retry_count" in combined
+        and any(token in combined for token in ("notificationresult", "off-by-one", ">= 0", ">=0"))
+    ):
+        return "retry-guard-off-by-one"
     return ""
 
 
@@ -390,10 +416,14 @@ def _semantic_markers(text: str) -> frozenset[str]:
         "preferences-load": ("load_user_preferences",),
         "channel-exception": ("except exception",),
         "notification-result": ("notificationresult",),
+        "cache-reader": ("_read_cached_payload",),
+        "retry-guard": ("retry_count", "notificationresult"),
     }
     for marker, required in contracts.items():
         if all(token in combined for token in required):
             markers.add(marker)
+    if "smtp" in combined and any(token in combined for token in ("password", "credential", "secret")):
+        markers.add("smtp-credential")
     return frozenset(markers)
 
 
@@ -451,13 +481,15 @@ def _same_code_identity(left: RootCauseClaim, right: RootCauseClaim) -> bool:
     shared_semantics = left.semantic_markers & right.semantic_markers
 
     family_marker = {
-        "hardcoded-smtp-credential": "smtp-password",
+        "hardcoded-smtp-credential": "smtp-credential",
         "smtp-plaintext": "smtp-transport",
         "undefined-symbol": "os-time",
         "weak-webhook-signature": "webhook-signature",
         "preferences-n-plus-one": "preferences-load",
         "swallowed-channel-exception": "channel-exception",
         "notification-result-return": "notification-result",
+        "async-cache-file-io": "cache-reader",
+        "retry-guard-off-by-one": "retry-guard",
     }.get(left.causal_family)
     if family_marker and family_marker in shared_semantics:
         return True

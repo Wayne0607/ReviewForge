@@ -582,6 +582,24 @@ def test_hardcoded_smtp_credential_does_not_absorb_missing_tls() -> None:
             126,
             "notification-result-return",
         ),
+        (
+            "blocking-io-async",
+            "dispatch_review_completed_async calls _read_cached_payload for synchronous file I/O",
+            143,
+            "blocking-io-async",
+            "_read_cached_payload uses synchronous open and blocks the async event loop",
+            155,
+            "async-cache-file-io",
+        ),
+        (
+            "early-return-missing-side-effects",
+            "retry_count >= 0 returns an empty NotificationResult before dispatch",
+            47,
+            "control-flow",
+            "The retry_count >=0 off-by-one returns NotificationResult without doing work",
+            92,
+            "retry-guard-off-by-one",
+        ),
     ],
 )
 def test_publication_mechanism_families_cluster_anchor_drift(
@@ -643,6 +661,30 @@ def test_generic_crypto_detector_uses_changed_function_scope() -> None:
 
     assert result.absorbed == (generic,)
     assert result.clusters[0].causal_family == "weak-webhook-signature"
+
+
+def test_combined_async_io_claim_does_not_absorb_distinct_preferences_issue() -> None:
+    combined = _finding(
+        "combined",
+        file="dispatcher.py",
+        line=131,
+        category="sync-io-in-async",
+        message=(
+            "dispatch_review_completed_async calls both _read_cached_payload and load_user_preferences synchronously"
+        ),
+    )
+    cache_only = _finding(
+        "cache-only",
+        file="dispatcher.py",
+        line=143,
+        category="blocking-io-async",
+        message="_read_cached_payload performs synchronous file I/O in the async path",
+    )
+
+    result = cluster_root_causes([combined, cache_only])
+
+    assert result.kept == (combined, cache_only)
+    assert result.absorbed == ()
 
 
 def test_preferred_reported_representative_cannot_be_replaced_by_higher_confidence() -> None:

@@ -380,9 +380,7 @@ def _scope_for_line(patch: str, line: int) -> str:
 def _semantic_markers(text: str) -> frozenset[str]:
     combined = (text or "").lower()
     markers = {
-        marker
-        for marker in ("admin", "owner", "organizer", "attendee")
-        if re.search(rf"\b{marker}\b", combined)
+        marker for marker in ("admin", "owner", "organizer", "attendee") if re.search(rf"\b{marker}\b", combined)
     }
     contracts = {
         "smtp-password": ("smtp_password",),

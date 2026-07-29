@@ -19,6 +19,7 @@ import json
 import logging
 import re
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -175,6 +176,7 @@ class EscalationReviewer:
         confidence_min: float = 0.4,
         confidence_max: float = 0.7,
         event_bus: EventBus | None = None,
+        token_recorder: Callable[[int, int, int], None] | None = None,
     ) -> None:
         self._llm = llm
         self._gateway = gateway
@@ -183,6 +185,12 @@ class EscalationReviewer:
         self._confidence_min = confidence_min
         self._confidence_max = confidence_max
         self._events = event_bus
+        # Phase 3 (perf/gate-dedup-20260729): TrackedChatLLM only writes
+        # token_usage when ``total_tokens > 0``.  Many providers (including
+        # ours) emit zero-usage responses for tool-loop continuations, so
+        # the in-memory TokenBudget is the authoritative token count.  Pass
+        # a synchronous recorder to keep token_usage populated.
+        self._token_recorder = token_recorder
         # Cached tools — keyed by (repo, pr_number, head_sha).
         self._cache_key: tuple[str, int, str] | None = None
         self._cached_tools: list | None = None
@@ -190,6 +198,29 @@ class EscalationReviewer:
         self._cached_bound_llm: Any = None
         self._tool_result_cache: OrderedDict[tuple[str, int, str, str, str], str] = OrderedDict()
         self._tool_result_loads: dict[tuple[str, int, str, str, str], asyncio.Task[Any]] = {}
+
+    def _record_step_tokens(self, response: Any) -> None:
+        """Forward per-step token usage to the orchestrator's recorder.
+
+        The recorder is supplied by the orchestrator as a synchronous
+        callback so the in-memory TokenBudget is the single source of
+        truth.  TrackedChatLLM also writes when ``total_tokens > 0``; this
+        callback fills the gap for providers that omit usage metadata on
+        tool-loop continuations.
+        """
+
+        if not self._token_recorder:
+            return
+        usage = getattr(response, "usage_metadata", None) or {}
+        prompt = int(usage.get("input_tokens", 0) or 0)
+        completion = int(usage.get("output_tokens", 0) or 0)
+        total = int(usage.get("total_tokens", prompt + completion) or 0)
+        if total <= 0:
+            return
+        try:
+            self._token_recorder(prompt, completion, total)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Escalation token_recorder failed: %s", exc)
 
     def _ensure_tools(self, state: StateStore) -> tuple[list, dict, Any]:
         """Build and cache tools + bound LLM. Invalidates when state changes."""
@@ -323,6 +354,7 @@ class EscalationReviewer:
             resp = await llm.ainvoke(chat)
             chat.append(resp)
             budget.add(resp)
+            self._record_step_tokens(resp)
 
             if self._events:
                 self._events.emit(
@@ -380,6 +412,7 @@ class EscalationReviewer:
             # final turn can only return content.
             final = await self._llm.ainvoke(chat)
             budget.add(final)
+            self._record_step_tokens(final)
             result = self._parse_verdict(final.content)
             return self._attach_tool_evidence(result, chat) if result else None
         except Exception as e:

@@ -1433,6 +1433,7 @@ class Orchestrator:
             )
 
         protected: list[Finding] = []
+        prioritized_verification: list[Finding] = []
         needs_verification: list[Finding] = []
         protected_keys: dict[tuple[str, str], str] = {}
         for finding in candidates:
@@ -1470,9 +1471,12 @@ class Orchestrator:
                 if protection.dedup_key:
                     protected_keys[evidence_key] = finding.id
             else:
-                needs_verification.append(finding)
-        candidates = needs_verification
+                if protection.priority:
+                    prioritized_verification.append(finding)
+                else:
+                    needs_verification.append(finding)
         stats.evidence_bypassed = len(protected)
+        stats.consensus_routed = len(prioritized_verification)
         if protected:
             self._events.emit(
                 "publication_gate.evidence_bypassed",
@@ -1482,8 +1486,20 @@ class Orchestrator:
                     "finding_ids": [finding.id for finding in protected],
                 },
             )
+        if prioritized_verification:
+            self._events.emit(
+                "publication_gate.consensus_routed",
+                {
+                    "count": len(prioritized_verification),
+                    "finding_ids": [finding.id for finding in prioritized_verification],
+                },
+            )
 
         if self._publication_triage_config.enabled:
+            # Consensus is useful routing evidence, not source proof.  Send
+            # these findings straight to the tool-using gate: a cheaper
+            # model-only triage must neither publish nor discard them.
+            candidates = needs_verification
             triage_llm = self._publication_gate_llm_raw
             if self._db:
                 triage_llm = TrackedChatLLM(
@@ -1503,8 +1519,9 @@ class Orchestrator:
             triage_stats.dedup_output = stats.dedup_output
             triage_stats.evidence_bypassed = stats.evidence_bypassed
             triage_stats.evidence_collapsed = stats.evidence_collapsed
+            triage_stats.consensus_routed = stats.consensus_routed
             stats = triage_stats
-            needs_tool: list[Finding] = []
+            needs_tool: list[Finding] = list(prioritized_verification)
             for finding in candidates:
                 verdict = verdicts[finding.id]
                 if verdict.verdict == VERDICT_CONFIRMED:
@@ -1528,6 +1545,8 @@ class Orchestrator:
                     )
                     needs_tool.append(state.get_finding(finding.id))
             candidates = needs_tool
+        else:
+            candidates = prioritized_verification + needs_verification
 
         stats.agentic_attempted = len(candidates)
         if not candidates:

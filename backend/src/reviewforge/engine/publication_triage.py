@@ -102,6 +102,7 @@ class TriageStats:
     dedup_output: int = 0
     evidence_bypassed: int = 0
     evidence_collapsed: int = 0
+    consensus_routed: int = 0
     triage_batches: int = 0
     triage_confirmed: int = 0
     triage_filtered: int = 0
@@ -124,6 +125,7 @@ class TriageStats:
             "dedup_output": self.dedup_output,
             "evidence_bypassed": self.evidence_bypassed,
             "evidence_collapsed": self.evidence_collapsed,
+            "consensus_routed": self.consensus_routed,
             "triage_batches": self.triage_batches,
             "triage_confirmed": self.triage_confirmed,
             "triage_filtered": self.triage_filtered,

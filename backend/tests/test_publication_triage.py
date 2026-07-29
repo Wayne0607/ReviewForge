@@ -653,6 +653,149 @@ async def test_model_independent_evidence_bypasses_triage_and_agentic_gate():
 
 
 @pytest.mark.asyncio
+async def test_reviewer_consensus_prioritizes_but_does_not_bypass_agentic_gate():
+    state = _state()
+    consensus = _finding(
+        "consensus-ssrf",
+        category="ssrf",
+        reviewer="security_reviewer",
+        confidence=0.98,
+    )
+    consensus.message = "Unvalidated callback URL enables SSRF"
+    state.add_finding(consensus)
+    state.impact_manifest["publication_evidence"] = {
+        "consensus_ids": [consensus.id],
+    }
+    llm = _StaticLLM(error=AssertionError("consensus must go directly to the tool gate"))
+    registry = build_registry()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        publication_gate_llm=llm,
+        publication_gate_enabled=True,
+        publication_triage_enabled=True,
+        publication_gate_dedup=False,
+    )
+
+    class _Gate:
+        received: list[str] = []
+
+        async def escalate_batch(self, findings, _state, concurrency):
+            self.received = [finding.id for finding in findings]
+            for finding in findings:
+                finding.status = "confirmed"
+                finding.verified_by = "publication-gate"
+            return findings
+
+    gate = _Gate()
+    orchestrator._publication_gate_reviewer = gate
+
+    stats = await orchestrator._run_publication_gate(state)
+
+    assert gate.received == ["consensus-ssrf"]
+    assert state.get_finding("consensus-ssrf").verified_by == "publication-gate"
+    assert stats.evidence_bypassed == 0
+    assert stats.consensus_routed == 1
+    assert stats.triage_batches == 0
+    assert stats.agentic_attempted == 1
+    assert stats.agentic_confirmed == 1
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_dedup_requires_the_same_defect_mechanism():
+    state = StateStore(
+        pr_number=1,
+        repo="owner/repo",
+        head_sha="head",
+        files_changed=["app.py"],
+        diff_summary=(
+            "--- app.py\n"
+            "@@ -0,0 +1,8 @@\n"
+            "+async def dispatch(user_id, payload, target_channels):\n"
+            "+    prefs = load_user_preferences(user_id)\n"
+            "+    blob = _read_cached_payload(user_id)\n"
+            "+    loop = asyncio.get_event_loop()\n"
+            "+    return await loop.run_in_executor(\n"
+            "+        None, dispatch_review_completed, user_id, payload, target_channels\n"
+            "+    )\n"
+            "+\n"
+        ),
+        file_diffs={
+            "app.py": (
+                "@@ -0,0 +1,8 @@\n"
+                "+async def dispatch(user_id, payload, target_channels):\n"
+                "+    prefs = load_user_preferences(user_id)\n"
+                "+    blob = _read_cached_payload(user_id)\n"
+                "+    loop = asyncio.get_event_loop()\n"
+                "+    return await loop.run_in_executor(\n"
+                "+        None, dispatch_review_completed, user_id, payload, target_channels\n"
+                "+    )\n"
+                "+\n"
+            )
+        },
+    )
+    cache = _finding(
+        "cache-blocking",
+        line=3,
+        category="event-loop-blocking",
+    )
+    cache.message = "_read_cached_payload performs blocking cache I/O in the async event loop"
+    executor = _finding(
+        "executor-contract",
+        line=6,
+        category="wrong-return-contract",
+    )
+    executor.message = (
+        "The blocking _read_cached_payload helper is nearby, but this defect is "
+        "dispatch_review_completed receiving target_channels positionally even though "
+        "the parameter is keyword-only, causing TypeError"
+    )
+    state.add_finding(cache)
+    state.add_finding(executor)
+    llm = _StaticLLM()
+    registry = build_registry()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        publication_gate_llm=llm,
+        publication_gate_enabled=True,
+        publication_triage_enabled=False,
+        publication_gate_dedup=False,
+    )
+
+    class _Gate:
+        received: list[str] = []
+
+        async def escalate_batch(self, findings, _state, concurrency):
+            self.received = [finding.id for finding in findings]
+            for finding in findings:
+                finding.status = "confirmed"
+                finding.verified_by = "publication-gate"
+            return findings
+
+    gate = _Gate()
+    orchestrator._publication_gate_reviewer = gate
+
+    stats = await orchestrator._run_publication_gate(state)
+
+    assert state.get_finding("cache-blocking").verified_by == "publication-evidence"
+    assert state.get_finding("executor-contract").verified_by == "publication-gate"
+    assert gate.received == ["executor-contract"]
+    assert stats.evidence_bypassed == 1
+    assert stats.evidence_collapsed == 0
+    assert stats.agentic_attempted == 1
+
+
+@pytest.mark.asyncio
 async def test_changed_source_evidence_collapses_same_proof_before_publication():
     state = StateStore(
         pr_number=1,

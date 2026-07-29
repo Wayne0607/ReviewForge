@@ -1,10 +1,9 @@
-"""Model-independent evidence that an LLM publication gate may not veto.
+"""Model-independent publication evidence and verification priority.
 
 These checks are deliberately narrow.  They protect only findings whose
-claimed failure is visible in the changed source, or whose root cause was
-independently reported by multiple reviewer roles.  The publication gate can
-still format, rank and de-duplicate protected findings, but it is not allowed
-to turn them into false positives based on a model-only judgement.
+claimed failure is visible in the changed source or comes from a deterministic
+detector.  Cross-reviewer consensus raises verification priority, but is not
+source proof and therefore may not bypass the publication gate.
 """
 
 from __future__ import annotations
@@ -24,6 +23,22 @@ _HIGH_SIGNAL = re.compile(
     r"n[\s_+-]*1|quadratic",
     re.IGNORECASE,
 )
+_SYNC_CLAIM = re.compile(
+    r"\b(?:sync|synchronous|synchronously|blocking)\b|"
+    r"event[\s._-]*loop|事件循环|阻塞",
+    re.IGNORECASE,
+)
+_ASYNC_SYNC_CATEGORIES = frozenset(
+    {
+        "async-sync-io",
+        "blocking-call-in-async",
+        "blocking-io",
+        "blocking-io-in-async",
+        "blocking-io-in-loop",
+        "event-loop-blocking",
+        "sync-io-in-async",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +46,7 @@ class EvidenceProtection:
     protected: bool = False
     reason: str = ""
     dedup_key: str = ""
+    priority: bool = False
 
 
 def _source_lines(finding: Finding, state: StateStore) -> list[tuple[int, str]]:
@@ -84,7 +100,10 @@ def _sync_api_for_claim(function: str, claim: str) -> str:
     for api, hints in preferences:
         if api in available and any(hint in claim for hint in hints):
             return api
-    return sorted(available)[0] if available else ""
+    # A generic "blocking I/O" claim in a function containing several
+    # synchronous calls does not identify which mechanism is defective.
+    # Guessing here makes unrelated findings share a dedup key.
+    return next(iter(available)) if len(available) == 1 else ""
 
 
 def _direct_source_proof(finding: Finding, state: StateStore) -> str:
@@ -95,6 +114,7 @@ def _direct_source_proof(finding: Finding, state: StateStore) -> str:
     function = _enclosing_function(finding, state)
     nearby = _nearby_source(finding, state)
     claim = f"{finding.category}\n{finding.message}\n{finding.suggestion}".lower()
+    category = re.sub(r"[\s_]+", "-", (finding.category or "").strip().lower())
 
     if re.search(r"sql[\s_-]*injection|\bsqli\b", claim, re.IGNORECASE) and re.search(
         r"\b(?:execute|executemany)\s*\(\s*f[\"']",
@@ -149,7 +169,8 @@ def _direct_source_proof(finding: Finding, state: StateStore) -> str:
 
     sync_api = _sync_api_for_claim(function, claim)
     if (
-        re.search(r"sync|blocking|event.loop|事件循环|阻塞", claim, re.IGNORECASE)
+        category in _ASYNC_SYNC_CATEGORIES
+        and _SYNC_CLAIM.search(claim)
         and re.search(r"(?m)^\s*async\s+def\s+", function)
         and sync_api
     ):
@@ -190,9 +211,9 @@ def protect_publication_finding(finding: Finding, state: StateStore) -> Evidence
     claim = f"{finding.category}\n{finding.message}"
     if finding.id in consensus_ids and _HIGH_SIGNAL.search(claim):
         return EvidenceProtection(
-            True,
-            "independent reviewer consensus for one anchored root cause",
-            f"consensus:{finding.id}",
+            protected=False,
+            reason="independent reviewer consensus requires prioritized verification",
+            priority=True,
         )
 
     return EvidenceProtection()

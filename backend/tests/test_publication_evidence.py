@@ -174,6 +174,70 @@ def test_two_sync_apis_in_one_async_function_keep_distinct_evidence_keys() -> No
     assert preferences_decision.dedup_key != cache_decision.dedup_key
 
 
+def test_async_contract_claim_is_not_misclassified_as_sync_io() -> None:
+    state = _state(
+        "async def dispatch(user_id, payload, target_channels):\n"
+        "    prefs = load_user_preferences(user_id)\n"
+        "    blob = _read_cached_payload(user_id)\n"
+        "    loop = asyncio.get_event_loop()\n"
+        "    return await loop.run_in_executor(\n"
+        "        None, dispatch_review_completed, user_id, payload, target_channels\n"
+        "    )\n"
+    )
+    finding = _finding(
+        "wrong-return-contract",
+        "dispatch_review_completed_async passes target_channels positionally "
+        "to a keyword-only argument and raises TypeError",
+        6,
+    )
+
+    decision = protect_publication_finding(finding, state)
+
+    assert decision.protected is False
+    assert decision.dedup_key == ""
+
+
+def test_ambiguous_blocking_claim_with_multiple_sync_apis_requires_gate() -> None:
+    state = _state(
+        "async def dispatch(user_id):\n"
+        "    prefs = load_user_preferences(user_id)\n"
+        "    blob = _read_cached_payload(user_id)\n"
+        "    return prefs, blob\n"
+    )
+    finding = _finding(
+        "event-loop-blocking",
+        "blocking I/O freezes the async event loop",
+        2,
+    )
+
+    decision = protect_publication_finding(finding, state)
+
+    assert decision.protected is False
+    assert decision.dedup_key == ""
+
+
+def test_same_sync_api_does_not_merge_a_different_defect_mechanism() -> None:
+    state = _state(
+        "async def dispatch(user_id, payload, target_channels):\n"
+        "    blob = _read_cached_payload(user_id)\n"
+        "    loop = asyncio.get_event_loop()\n"
+        "    return await loop.run_in_executor(\n"
+        "        None, dispatch_review_completed, user_id, payload, target_channels\n"
+        "    )\n"
+    )
+    finding = _finding(
+        "wrong-argument-contract",
+        "The blocking _read_cached_payload helper is nearby, but the defect is "
+        "passing target_channels positionally to a keyword-only parameter",
+        5,
+    )
+
+    decision = protect_publication_finding(finding, state)
+
+    assert decision.protected is False
+    assert decision.dedup_key == ""
+
+
 def test_consensus_requires_high_signal_claim() -> None:
     state = _state("def f():\n    return 1\n")
     state.impact_manifest["publication_evidence"] = {"consensus_ids": ["finding-2"]}
@@ -181,5 +245,10 @@ def test_consensus_requires_high_signal_claim() -> None:
     style = _finding("style", "the name could be clearer", 2)
     style.id = "finding-2"
 
-    assert protect_publication_finding(high_signal, state).protected is True
-    assert protect_publication_finding(style, state).protected is False
+    high_signal_decision = protect_publication_finding(high_signal, state)
+    style_decision = protect_publication_finding(style, state)
+
+    assert high_signal_decision.protected is False
+    assert high_signal_decision.priority is True
+    assert style_decision.protected is False
+    assert style_decision.priority is False

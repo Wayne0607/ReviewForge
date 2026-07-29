@@ -193,6 +193,14 @@ class CommentDeliveryResult:
         }
 
 
+@dataclass
+class _DedupStats:
+    """Phase 2 (perf/gate-dedup-20260729): measurement of gate-input dedup."""
+
+    collapsed: int = 0
+    buckets: int = 0
+
+
 def _should_escalate_finding(
     finding: Finding,
     confidence_min: float,
@@ -232,6 +240,8 @@ class Orchestrator:
         publication_gate_max_steps: int = 4,
         publication_gate_max_tokens: int = 6000,
         publication_gate_concurrency: int = 4,
+        publication_gate_dedup: bool = True,
+        root_cause_extended_families: bool = True,
         publication_triage_enabled: bool = False,
         publication_triage_batch_size: int = 6,
         publication_triage_concurrency: int = 1,
@@ -274,6 +284,8 @@ class Orchestrator:
         self._publication_gate_max_steps = max(1, publication_gate_max_steps)
         self._publication_gate_max_tokens = max(1, publication_gate_max_tokens)
         self._publication_gate_concurrency = max(1, publication_gate_concurrency)
+        self._publication_gate_dedup = bool(publication_gate_dedup)
+        self._root_cause_extended_families = bool(root_cause_extended_families)
         self._publication_triage_config = PublicationTriageConfig(
             enabled=publication_triage_enabled,
             batch_size=publication_triage_batch_size,
@@ -1094,6 +1106,7 @@ class Orchestrator:
                 candidates,
                 state.diff_summary,
                 file_diffs=state.file_diffs or {},
+                extended_families=getattr(self, "_root_cause_extended_families", True),
             )
         except Exception as exc:
             logger.warning("Root-cause clustering failed; passing candidates through: %s", exc, exc_info=True)
@@ -1119,6 +1132,70 @@ class Orchestrator:
             )
         self._events.emit("root_cause_cluster.completed", {**result.stats, "phase": phase})
         return list(result.kept)
+
+    @staticmethod
+    def _dedup_key(finding: Finding) -> tuple[str, int, str] | None:
+        """Stable root-cause key for the gate-input dedup.
+
+        Same ``(file, line, category)`` means the same defect, regardless of
+        which reviewer or closure subround surfaced it.  Findings without a
+        usable file or line are returned as ``None`` to opt out of dedup —
+        the orchestrator keeps them as-is so they still reach the gate.
+        """
+
+        path = (finding.file or "").strip()
+        if not path or finding.line <= 0:
+            return None
+        category = (finding.category or "").strip().lower().replace("_", "-")
+        return path, int(finding.line), category
+
+    def _dedup_by_root_cause(
+        self,
+        candidates: list[Finding],
+    ) -> tuple[list[Finding], list[Finding], _DedupStats]:
+        """Collapse findings with the same root cause before triage / gate.
+
+        Returns ``(kept, absorbed, stats)``.  Callers must transition every
+        absorbed finding out of ``confirmed`` before publication; otherwise a
+        duplicate omitted from the gate would bypass verification and still
+        be posted.  When the feature flag is disabled the candidates are
+        returned untouched and the absorbed list is empty.
+        """
+
+        stats = _DedupStats()
+        if not candidates or not self._publication_gate_dedup:
+            return list(candidates), [], stats
+
+        buckets: dict[tuple[str, int, str], Finding] = {}
+        order: list[tuple[str, int, str]] = []
+        absorbed: list[Finding] = []
+        for finding in candidates:
+            key = self._dedup_key(finding)
+            if key is None:
+                # Keep unkeyed findings in their original order.
+                synthetic_key = ("__unkeyed__", len(order), "")
+                order.append(synthetic_key)
+                buckets[synthetic_key] = finding
+                continue
+            if key not in buckets:
+                buckets[key] = finding
+                order.append(key)
+                continue
+            existing = buckets[key]
+            # Prefer the higher-confidence representative.  The demoted
+            # finding is the one absorbed; the higher-confidence one stays
+            # as the bucket head.  Ties keep the first encountered.
+            if finding.confidence > existing.confidence + 1e-9:
+                absorbed.append(existing)
+                buckets[key] = finding
+                order.remove(key)
+                order.append(key)
+            else:
+                absorbed.append(finding)
+
+        stats.collapsed = len(absorbed)
+        stats.buckets = len({k for k in order if k[0] != "__unkeyed__"})
+        return [buckets[key] for key in order], absorbed, stats
 
     def _run_publication_policy_pre(self, state: StateStore) -> None:
         """Apply the Stage-1 publication policy before the LLM gate runs."""
@@ -1207,6 +1284,41 @@ class Orchestrator:
             )
             self._events.emit("publication_gate.completed", payload)
             return stats
+
+        # Phase 2 (perf/gate-dedup-20260729): collapse same-root-cause findings
+        # before triage / gate.  See ``_dedup_by_root_cause`` for the key.
+        # Multiple reviewers + closure subrounds routinely flag the same
+        # (file, line, category) defect; without this pass each downstream
+        # LLM call is duplicated per duplicate.  Toggle off via env var
+        # ``REVIEWFORGE_PUBLICATION_GATE_DEDUP=0`` if a regression appears.
+        original_candidate_count = len(candidates)
+        candidates, absorbed, dedup_stats = self._dedup_by_root_cause(candidates)
+        stats.dedup_input = original_candidate_count
+        stats.dedup_collapsed = dedup_stats.collapsed
+        stats.dedup_output = len(candidates)
+        for duplicate in absorbed:
+            state.update_finding(
+                duplicate.id,
+                status="false_positive",
+                verified_by="publication-gate-dedup",
+                verify_reason="与同文件、同代码行、同问题类别的更高置信候选重复，已在发布门前合并。",
+            )
+        if dedup_stats.collapsed:
+            logger.info(
+                "publication-gate dedup: %d -> %d candidates (collapsed %d)",
+                original_candidate_count,
+                len(candidates),
+                dedup_stats.collapsed,
+            )
+            self._events.emit(
+                "publication_gate.dedup",
+                {
+                    "input_count": original_candidate_count,
+                    "collapsed": dedup_stats.collapsed,
+                    "output_count": len(candidates),
+                    "enabled": self._publication_gate_dedup,
+                },
+            )
 
         if self._publication_triage_config.enabled:
             triage_llm = self._publication_gate_llm_raw

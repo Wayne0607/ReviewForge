@@ -54,6 +54,8 @@ def _state() -> StateStore:
 def _finding(
     finding_id: str,
     *,
+    file: str = "app.py",
+    line: int = 2,
     reviewer: str = "correctness_reviewer",
     category: str = "logic-error",
     confidence: float = 0.7,
@@ -61,8 +63,8 @@ def _finding(
 ) -> Finding:
     return Finding(
         id=finding_id,
-        file="app.py",
-        line=2,
+        file=file,
+        line=line,
         severity="warning",
         category=category,
         message=f"problem {finding_id}",
@@ -312,6 +314,64 @@ async def test_recall_guard_routes_negative_triage_verdict_to_tools():
 
 
 @pytest.mark.asyncio
+async def test_gate_dedup_filters_absorbed_findings_in_state():
+    state = _state()
+    lower = _finding(
+        "lower",
+        file="src/app.py",
+        line=12,
+        category="sql-injection",
+        confidence=0.80,
+    )
+    higher = _finding(
+        "higher",
+        file="src/app.py",
+        line=12,
+        category="SQL_INJECTION",
+        confidence=0.95,
+    )
+    for finding in (lower, higher):
+        state.add_finding(finding)
+
+    llm = _StaticLLM()
+    registry = build_registry()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        publication_gate_llm=llm,
+        publication_gate_enabled=True,
+        publication_triage_enabled=False,
+        publication_gate_dedup=True,
+    )
+
+    class _Gate:
+        received: list[str] = []
+
+        async def escalate_batch(self, findings, _state, concurrency):
+            self.received = [finding.id for finding in findings]
+            for finding in findings:
+                finding.status = "confirmed"
+                finding.verified_by = "publication-gate"
+            return findings
+
+    gate = _Gate()
+    orchestrator._publication_gate_reviewer = gate
+    stats = await orchestrator._run_publication_gate(state)
+
+    assert gate.received == ["higher"]
+    assert state.get_finding("higher").status == "confirmed"
+    assert state.get_finding("lower").status == "false_positive"
+    assert state.get_finding("lower").verified_by == "publication-gate-dedup"
+    assert stats.dedup_input == 2
+    assert stats.dedup_collapsed == 1
+    assert stats.dedup_output == 1
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_sends_only_needs_tool_to_agentic_gate():
     state = _state()
     direct = _finding(
@@ -343,6 +403,9 @@ async def test_orchestrator_sends_only_needs_tool_to_agentic_gate():
         publication_gate_llm=triage_llm,
         publication_gate_enabled=True,
         publication_triage_enabled=True,
+        # Phase 2 (perf/gate-dedup-20260729): disable dedup so the test
+        # keeps separate findings for the gate to action.
+        publication_gate_dedup=False,
     )
 
     class _Gate:
@@ -392,6 +455,9 @@ async def test_agentic_inconclusive_does_not_block_independent_confirmations():
         publication_gate_llm=triage_llm,
         publication_gate_enabled=True,
         publication_triage_enabled=True,
+        # Phase 2 (perf/gate-dedup-20260729): keep both findings so the
+        # gate can verify and distinguish confirmed vs inconclusive.
+        publication_gate_dedup=False,
     )
 
     class _Gate:
@@ -471,6 +537,16 @@ publication_triage:
     assert config.publication_triage_max_candidates == 18
     assert config.publication_triage_context_lines == 9
     assert config.publication_triage_max_tokens == 2500
+
+
+def test_extended_root_cause_families_env_kill_switch(tmp_path, monkeypatch):
+    config_path = tmp_path / "reviewforge.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("REVIEWFORGE_ROOT_CAUSE_EXTENDED_FAMILIES", "false")
+
+    config = ReviewForgeConfig.load(config_path)
+
+    assert config.root_cause_extended_families is False
 
 
 @pytest.mark.asyncio

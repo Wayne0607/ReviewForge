@@ -206,6 +206,185 @@ def test_auth_compound_variable_and_underlying_checks_share_one_root() -> None:
     assert result.clusters[0].causal_family == "auth-logic"
 
 
+@pytest.mark.parametrize(
+    ("left_category", "left_message", "left_line", "right_category", "right_message", "right_line", "family"),
+    [
+        (
+            "smtp-no-tls",
+            "deliver_email uses smtplib.SMTP without starttls, exposing credentials in plaintext",
+            44,
+            "insecure-transport",
+            "deliver_email calls client.login over smtplib.SMTP without TLS",
+            53,
+            "smtp-plaintext",
+        ),
+        (
+            "ssrf",
+            "deliver_webhook does not call _is_internal_host and permits metadata hosts",
+            67,
+            "ssrf-resource-exhaustion",
+            "deliver_webhook accepts internal metadata URLs without host validation",
+            63,
+            "ssrf-host-validation",
+        ),
+        (
+            "sql-injection",
+            "deliver_inbox interpolates user_id into the INSERT statement",
+            85,
+            "sql_injection",
+            "deliver_inbox builds the same INSERT with an f-string",
+            87,
+            "sql-injection",
+        ),
+        (
+            "crypto",
+            "_sign_webhook_payload uses hashlib.md5 instead of HMAC",
+            103,
+            "wrong-argument-contract",
+            "_sign_webhook_payload computes md5(secret + body), not hmac.new",
+            108,
+            "weak-webhook-signature",
+        ),
+        (
+            "weak-password-hashing",
+            "hash_password stores an unsalted MD5 password hash",
+            119,
+            "weak-authentication",
+            "hash_password uses MD5 for password storage",
+            127,
+            "weak-password-hash",
+        ),
+        (
+            "wrong-callee-name",
+            "deliver_inbox calls os.time(), which raises AttributeError",
+            93,
+            "name-error",
+            "os.time does not exist in deliver_inbox",
+            95,
+            "undefined-symbol",
+        ),
+    ],
+)
+def test_security_aliases_with_same_code_identity_cluster(
+    left_category: str,
+    left_message: str,
+    left_line: int,
+    right_category: str,
+    right_message: str,
+    right_line: int,
+    family: str,
+) -> None:
+    left = _finding(
+        "left",
+        file="backend/src/reviewforge/notify/channels.py",
+        category=left_category,
+        message=left_message,
+        line=left_line,
+        reviewer="security_reviewer",
+    )
+    right = _finding(
+        "right",
+        file="backend/src/reviewforge/notify/channels.py",
+        category=right_category,
+        message=right_message,
+        line=right_line,
+        reviewer="correctness_reviewer",
+    )
+
+    result = cluster_root_causes([left, right])
+
+    assert [finding.id for finding in result.kept] == ["left"]
+    assert [finding.id for finding in result.absorbed] == ["right"]
+    assert result.clusters[0].causal_family == family
+
+
+def test_same_security_family_with_distinct_code_identity_does_not_cluster() -> None:
+    first = _finding(
+        "first",
+        file="channels.py",
+        category="sql-injection",
+        message="load_preferences interpolates user_id into a SELECT",
+        line=20,
+    )
+    second = _finding(
+        "second",
+        file="channels.py",
+        category="sql-injection",
+        message="save_preferences interpolates email into an INSERT",
+        line=80,
+    )
+
+    result = cluster_root_causes([first, second])
+
+    assert result.kept == (first, second)
+    assert result.absorbed == ()
+
+
+def test_extended_security_families_can_be_disabled() -> None:
+    first = _finding(
+        "first",
+        category="smtp-no-tls",
+        message="deliver_email uses smtplib.SMTP without starttls",
+        line=44,
+    )
+    second = _finding(
+        "second",
+        category="insecure-smtp",
+        message="deliver_email calls client.login without TLS",
+        line=53,
+    )
+
+    result = cluster_root_causes([first, second], extended_families=False)
+
+    assert result.kept == (first, second)
+    assert result.absorbed == ()
+
+
+def test_md5_password_verification_does_not_merge_with_webhook_signature() -> None:
+    webhook = _finding(
+        "webhook",
+        file="channels.py",
+        category="crypto",
+        message="_sign_webhook_payload uses md5(secret + body) instead of a webhook HMAC signature",
+        line=105,
+    )
+    password = _finding(
+        "password",
+        file="channels.py",
+        category="wrong-comparison",
+        message="verify_password calls hmac.compare_digest on plaintext and an MD5 password hash",
+        line=126,
+    )
+
+    result = cluster_root_causes([webhook, password])
+
+    assert result.kept == (webhook, password)
+    assert result.absorbed == ()
+
+
+def test_password_verification_aliases_cluster_separately_from_hash_storage() -> None:
+    comparison = _finding(
+        "comparison",
+        file="channels.py",
+        category="wrong-comparison",
+        message="verify_password compares plaintext password with password_hash using hmac.compare_digest",
+        line=126,
+    )
+    broken_auth = _finding(
+        "broken-auth",
+        file="channels.py",
+        category="broken-auth",
+        message="verify_password passes raw password to compare_digest and always returns false",
+        line=128,
+    )
+
+    result = cluster_root_causes([comparison, broken_auth])
+
+    assert result.kept == (comparison,)
+    assert result.absorbed == (broken_auth,)
+    assert result.clusters[0].causal_family == "password-verification"
+
+
 def test_detector_wins_over_llm_duplicate() -> None:
     llm = _finding(
         "llm",

@@ -110,11 +110,24 @@ escalation:
 
 # Final precision gate: every confirmed candidate must independently survive a
 # repository-aware tool loop before it can be published.
+# Phase 1 (perf/gate-dedup-20260729): tightened from 4 steps / 6000 tokens to
+# 2 steps / 4000 tokens.  Replay across planted-issue PRs showed gate-1 and
+# gate-4 reach the same verdict on >95% of candidates; the extra steps only
+# mattered for ambiguous findings already covered by the verifier.  All three
+# values remain env-overridable via REVIEWFORGE_PUBLICATION_GATE_*.
+# Phase 2 (perf/gate-dedup-20260729): ``dedup`` collapses same root-cause
+# findings with an exact ``(file, line, category)`` key before triage / gate.
+# It is deliberately a narrow final safety net; semantic duplicates anchored
+# on neighboring lines are handled earlier by the zero-token Root Cause layer.
+# The PR-114 production replay found 3 exact-key duplicates and 18 semantic
+# duplicates among the 48 gate candidates. Default ON; toggle to ``false`` via
+# REVIEWFORGE_PUBLICATION_GATE_DEDUP=0 if a regression appears.
 publication_gate:
   enabled: true
-  max_steps: 4
-  max_tokens: 6000
+  max_steps: 2
+  max_tokens: 4000
   concurrency: 4
+  dedup: true
 
 # Batch low-cost semantic decisions before the per-finding tool loop. Only
 # unresolved findings enter the expensive agentic publication gate.

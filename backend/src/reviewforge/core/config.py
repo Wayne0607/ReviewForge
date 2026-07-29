@@ -226,12 +226,22 @@ class ReviewForgeConfig:
     publication_gate_max_steps: int = 4
     publication_gate_max_tokens: int = 6000
     publication_gate_concurrency: int = 4
+    # Phase 2 (perf/gate-dedup-20260729): collapse same-root-cause findings
+    # before triage / gate so the LLM call volume matches the unique defect
+    # count instead of the multi-reviewer fan-out.  Default ON; flip to
+    # False via env var ``REVIEWFORGE_PUBLICATION_GATE_DEDUP=0`` if a
+    # regression appears.
+    publication_gate_dedup: bool = True
     publication_triage_enabled: bool = False
     publication_triage_batch_size: int = 6
     publication_triage_concurrency: int = 1
     publication_triage_max_candidates: int = 24
     publication_triage_context_lines: int = 12
     publication_triage_max_tokens: int = 4000
+    # Zero-token semantic root-cause families for high-volume security
+    # duplicates. Operational kill switch:
+    # REVIEWFORGE_ROOT_CAUSE_EXTENDED_FAMILIES=0.
+    root_cause_extended_families: bool = True
 
     # Model-agnostic publication policy (Stage 1). Library default is OFF
     # so embedding applications opt in explicitly. Production enables
@@ -380,6 +390,7 @@ class ReviewForgeConfig:
                 "max_steps": int,
                 "max_tokens": int,
                 "concurrency": int,
+                "dedup": bool,
             }
             for key, value in gate.items():
                 attr = f"publication_gate_{key}"
@@ -512,3 +523,54 @@ class ReviewForgeConfig:
                 self.publication_policy.high_risk_overflow = max(0, int(pp_overflow))
             except (TypeError, ValueError):
                 pass
+        # Phase 1 (perf/gate-dedup-20260729): publication_gate & triage env
+        # overrides.  These were previously yaml-only; promoting them lets
+        # operators tighten the gate without redeploying.  Bad values fall
+        # back to the YAML/default rather than disabling the gate.
+        gate_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_ENABLED")
+        if gate_enabled is not None:
+            self.publication_gate_enabled = gate_enabled.strip().lower() not in ("0", "false", "no", "")
+        gate_steps = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_MAX_STEPS")
+        if gate_steps is not None:
+            try:
+                self.publication_gate_max_steps = max(1, int(gate_steps))
+            except (TypeError, ValueError):
+                pass
+        gate_tokens = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_MAX_TOKENS")
+        if gate_tokens is not None:
+            try:
+                self.publication_gate_max_tokens = max(500, int(gate_tokens))
+            except (TypeError, ValueError):
+                pass
+        gate_conc = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_CONCURRENCY")
+        if gate_conc is not None:
+            try:
+                self.publication_gate_concurrency = max(1, int(gate_conc))
+            except (TypeError, ValueError):
+                pass
+        gate_dedup = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_DEDUP")
+        if gate_dedup is not None:
+            self.publication_gate_dedup = gate_dedup.strip().lower() not in ("0", "false", "no", "")
+        triage_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_ENABLED")
+        if triage_enabled is not None:
+            self.publication_triage_enabled = triage_enabled.strip().lower() not in ("0", "false", "no", "")
+        triage_batch = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_BATCH_SIZE")
+        if triage_batch is not None:
+            try:
+                self.publication_triage_batch_size = max(1, int(triage_batch))
+            except (TypeError, ValueError):
+                pass
+        triage_tokens = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_MAX_TOKENS")
+        if triage_tokens is not None:
+            try:
+                self.publication_triage_max_tokens = max(500, int(triage_tokens))
+            except (TypeError, ValueError):
+                pass
+        root_cause_extended = os.environ.get("REVIEWFORGE_ROOT_CAUSE_EXTENDED_FAMILIES")
+        if root_cause_extended is not None:
+            self.root_cause_extended_families = root_cause_extended.strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "",
+            )

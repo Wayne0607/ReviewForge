@@ -446,59 +446,13 @@ class Database:
         duration_ms: int = 0,
         status: str = "completed",
         error: str = "",
-        prompt_tokens: int = 0,
-        completion_tokens: int = 0,
-        total_tokens: int = 0,
     ) -> None:
-        # Phase 3 (perf/gate-dedup-20260729): reviewer_metrics now records the
-        # same token totals as token_usage so dashboards can join the tables
-        # without a second query.  NULL on missing to keep the column
-        # optional for older writers.
         await self._db.execute(
-            "INSERT INTO reviewer_metrics "
-            "(run_id, reviewer_name, findings_count, duration_ms, status, error, "
-            " prompt_tokens, completion_tokens, total_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                run_id,
-                reviewer_name,
-                findings_count,
-                duration_ms,
-                status,
-                error,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            ),
+            "INSERT INTO reviewer_metrics (run_id, reviewer_name, findings_count, duration_ms, status, error) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, reviewer_name, findings_count, duration_ms, status, error),
         )
         await self._db.commit()
-
-    async def sum_token_usage(
-        self,
-        run_id: str,
-        agent_name: str,
-    ) -> tuple[int, int, int]:
-        """Sum prompt / completion / total tokens for ``(run_id, agent_name)``.
-
-        Used by the orchestrator to populate reviewer_metrics without changing
-        the existing TrackedChatLLM write path.  Returns ``(0, 0, 0)`` when
-        the row is missing so callers can pass the result straight into
-        ``insert_metric`` without a default.
-        """
-
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(prompt_tokens), 0), "
-                "       COALESCE(SUM(completion_tokens), 0), "
-                "       COALESCE(SUM(total_tokens), 0) "
-                "FROM token_usage WHERE run_id = ? AND agent_name = ?",
-                (run_id, agent_name),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-        if not row:
-            return 0, 0, 0
-        return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
 
     async def get_metrics(self, run_id: str | None = None) -> list[dict[str, Any]]:
         if run_id:

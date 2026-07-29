@@ -686,15 +686,11 @@ class Orchestrator:
                         {"reviewer": task.reviewer, "findings_count": len(accepted_task_findings)},
                     )
                     if self._db:
-                        prompt, completion, total = await self._db.sum_token_usage(run_id, task.reviewer)
                         await self._db.insert_metric(
                             run_id,
                             task.reviewer,
                             findings_count=len(accepted_task_findings),
                             duration_ms=int((time.monotonic() - t_start) * 1000),
-                            prompt_tokens=prompt,
-                            completion_tokens=completion,
-                            total_tokens=total,
                         )
                 except Exception as e:
                     state.update_task(task.id, status="failed", error=str(e))
@@ -869,9 +865,6 @@ class Orchestrator:
                     esc_llm = self._escalation_llm_raw
                     if self._db:
                         esc_llm = TrackedChatLLM(inner=esc_llm, ctx=self._token_ctx, agent_name="escalation")
-                    # Phase 3 (perf/gate-dedup-20260729): forward per-step
-                    # tokens from the in-memory TokenBudget to token_usage
-                    # so ReportingCost dashboards see escalation cost.
                     self._escalation_reviewer = EscalationReviewer(
                         llm=esc_llm,
                         gateway=self._gateway,
@@ -880,7 +873,6 @@ class Orchestrator:
                         confidence_min=self._escalation_confidence_min,
                         confidence_max=self._escalation_confidence_max,
                         event_bus=self._events,
-                        token_recorder=self._make_escalation_token_recorder(),
                     )
                 for f in candidates:
                     bucket = (
@@ -1097,44 +1089,6 @@ class Orchestrator:
             if self._db:
                 await self._db.fail_run(run_id, str(e))
             raise
-
-    def _make_escalation_token_recorder(self):
-        """Build a synchronous callback that writes token_usage per escalation step.
-
-        Fire-and-forget via ``asyncio.create_task`` so the sync LLM loop in
-        EscalationReviewer doesn't have to know about the async DB API.
-        """
-
-        def _record(prompt: int, completion: int, total: int) -> None:
-            if not self._db:
-                return
-            run_id = self._token_ctx.run_id
-            if not run_id:
-                return
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return
-            task = loop.create_task(
-                self._db.record_token_usage(
-                    run_id=run_id,
-                    agent_name="escalation",
-                    prompt_tokens=prompt,
-                    completion_tokens=completion,
-                    total_tokens=total,
-                )
-            )
-
-            def _log_failure(task: asyncio.Task) -> None:
-                if task.cancelled():
-                    return
-                exc = task.exception()
-                if exc is not None:
-                    logger.debug("Escalation token recorder failed: %s", exc)
-
-            task.add_done_callback(_log_failure)
-
-        return _record
 
     def _apply_root_cause_clustering(
         self,
@@ -1560,15 +1514,11 @@ class Orchestrator:
                 },
             )
             if self._db:
-                prompt, completion, total = await self._db.sum_token_usage(run_id, "coverage_gap_reviewer")
                 await self._db.insert_metric(
                     run_id,
                     "coverage_gap_reviewer",
                     findings_count=added,
                     duration_ms=duration_ms,
-                    prompt_tokens=prompt,
-                    completion_tokens=completion,
-                    total_tokens=total,
                 )
         except asyncio.CancelledError:
             raise
@@ -1860,18 +1810,12 @@ class Orchestrator:
                         {"unit_id": cell.unit_id, "dimension": dim, "error": str(error)},
                     )
                     if self._db:
-                        prompt, completion, total = await self._db.sum_token_usage(
-                            run_id, f"v3_closure_{reviewer}"
-                        )
                         await self._db.insert_metric(
                             run_id,
                             f"v3_closure_{reviewer}",
                             duration_ms=duration_ms,
                             status="failed",
                             error=str(error)[:200],
-                            prompt_tokens=prompt,
-                            completion_tokens=completion,
-                            total_tokens=total,
                         )
                     continue
 
@@ -1914,17 +1858,11 @@ class Orchestrator:
                     },
                 )
                 if self._db:
-                    prompt, completion, total = await self._db.sum_token_usage(
-                        run_id, f"v3_closure_{reviewer}"
-                    )
                     await self._db.insert_metric(
                         run_id,
                         f"v3_closure_{reviewer}",
                         findings_count=len(accepted_task_findings),
                         duration_ms=duration_ms,
-                        prompt_tokens=prompt,
-                        completion_tokens=completion,
-                        total_tokens=total,
                     )
 
         self._events.emit(

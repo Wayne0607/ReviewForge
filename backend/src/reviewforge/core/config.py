@@ -512,3 +512,43 @@ class ReviewForgeConfig:
                 self.publication_policy.high_risk_overflow = max(0, int(pp_overflow))
             except (TypeError, ValueError):
                 pass
+        # Phase 1 (perf/gate-dedup-20260729): publication_gate & triage env
+        # overrides.  These were previously yaml-only; promoting them lets
+        # operators tighten the gate without redeploying.  Bad values fall
+        # back to the YAML/default rather than disabling the gate.
+        gate_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_ENABLED")
+        if gate_enabled is not None:
+            self.publication_gate_enabled = gate_enabled.strip().lower() not in ("0", "false", "no", "")
+        gate_steps = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_MAX_STEPS")
+        if gate_steps is not None:
+            try:
+                self.publication_gate_max_steps = max(1, int(gate_steps))
+            except (TypeError, ValueError):
+                pass
+        gate_tokens = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_MAX_TOKENS")
+        if gate_tokens is not None:
+            try:
+                self.publication_gate_max_tokens = max(500, int(gate_tokens))
+            except (TypeError, ValueError):
+                pass
+        gate_conc = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_CONCURRENCY")
+        if gate_conc is not None:
+            try:
+                self.publication_gate_concurrency = max(1, int(gate_conc))
+            except (TypeError, ValueError):
+                pass
+        triage_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_ENABLED")
+        if triage_enabled is not None:
+            self.publication_triage_enabled = triage_enabled.strip().lower() not in ("0", "false", "no", "")
+        triage_batch = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_BATCH_SIZE")
+        if triage_batch is not None:
+            try:
+                self.publication_triage_batch_size = max(1, int(triage_batch))
+            except (TypeError, ValueError):
+                pass
+        triage_tokens = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_MAX_TOKENS")
+        if triage_tokens is not None:
+            try:
+                self.publication_triage_max_tokens = max(500, int(triage_tokens))
+            except (TypeError, ValueError):
+                pass

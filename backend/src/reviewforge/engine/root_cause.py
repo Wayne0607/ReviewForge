@@ -204,7 +204,29 @@ def _causal_family(category: str, text: str, *, extended_families: bool = True) 
     extended_exact = _EXTENDED_EXACT_FAMILIES.get(normalized)
     if extended_exact:
         return extended_exact
-    if "smtp" in combined and any(token in combined for token in ("starttls", "plaintext", "明文", "tls")):
+    # "SMTP credential is hardcoded in plaintext" and "SMTP authenticates
+    # without transport encryption" are separate attack surfaces.  Plaintext
+    # alone is storage provenance, not proof of a TLS failure; require an
+    # explicit transport marker before assigning the smtp-plaintext family.
+    if "smtp" in combined and any(
+        token in combined
+        for token in (
+            "starttls",
+            "smtp_ssl",
+            "smtp ssl",
+            "without tls",
+            "without encryption",
+            "insecure transport",
+            "insecure-transport",
+            "cleartext transmission",
+            "network",
+            "中间人",
+            "网络传输",
+            "传输层",
+            "未启用 tls",
+            "未调用 tls",
+        )
+    ):
         return "smtp-plaintext"
     if "ssrf" in combined and any(
         token in combined for token in ("internal", "metadata", "host", "scheme", "内网", "元数据")

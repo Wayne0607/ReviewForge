@@ -85,8 +85,11 @@ _EXACT_FAMILIES = {
 }
 
 _EXTENDED_EXACT_FAMILIES = {
+    "smtp-plaintext": "smtp-plaintext",
     "smtp-no-tls": "smtp-plaintext",
     "insecure-smtp": "smtp-plaintext",
+    "insecure-transport": "smtp-plaintext",
+    "tls-missing": "smtp-plaintext",
     "sql-injection": "sql-injection",
     "ssrf": "ssrf-host-validation",
     "ssrf-protection-bypass": "ssrf-host-validation",
@@ -99,15 +102,19 @@ _LINE_TOLERANCE = {
     "context-loss": 30,
     "incomplete-action": 24,
     "auth-logic": 16,
-    "undefined-symbol": 8,
+    "undefined-symbol": 20,
     "nil-dereference": 8,
     "stored-xss-flow": 0,
     "smtp-plaintext": 45,
-    "sql-injection": 10,
+    "sql-injection": 20,
     "ssrf-host-validation": 45,
-    "weak-webhook-signature": 12,
+    "weak-webhook-signature": 20,
     "weak-password-hash": 16,
     "password-verification": 10,
+    "hardcoded-smtp-credential": 12,
+    "preferences-n-plus-one": 24,
+    "swallowed-channel-exception": 20,
+    "notification-result-return": 30,
 }
 
 
@@ -204,6 +211,12 @@ def _causal_family(category: str, text: str, *, extended_families: bool = True) 
     extended_exact = _EXTENDED_EXACT_FAMILIES.get(normalized)
     if extended_exact:
         return extended_exact
+    if (
+        normalized in {"hardcoded-secret", "hardcoded-secrets", "embedded-credential", "embedded-credentials"}
+        and "smtp" in combined
+        and any(token in combined for token in ("password", "credential", "secret", "smtp_password"))
+    ):
+        return "hardcoded-smtp-credential"
     # "SMTP credential is hardcoded in plaintext" and "SMTP authenticates
     # without transport encryption" are separate attack surfaces.  Plaintext
     # alone is storage provenance, not proof of a TLS failure; require an
@@ -250,6 +263,18 @@ def _causal_family(category: str, text: str, *, extended_families: bool = True) 
         token in combined for token in ("password", "hash_password", "password-hash", "密码", "口令")
     ):
         return "weak-password-hash"
+    if normalized in {"n-plus-one", "n-plus-one-query", "repeated-query", "redundant-query"} and any(
+        token in combined for token in ("load_user_preferences", "preferences", "preference")
+    ):
+        return "preferences-n-plus-one"
+    if normalized in {"bare-except", "exception-swallowing", "swallowed-exception", "silent-exception"} and any(
+        token in combined for token in ("except", "exception", "logger.exception", "failure reason")
+    ):
+        return "swallowed-channel-exception"
+    if normalized in {"wrong-return-value", "missing-return-value", "return-contract", "missing-return"} and any(
+        token in combined for token in ("notificationresult", "notification_result", "return result", "result.failed")
+    ):
+        return "notification-result-return"
     return ""
 
 
@@ -336,6 +361,44 @@ def _anchor_for_line(patch: str, line: int) -> str:
     return ""
 
 
+def _scope_for_line(patch: str, line: int) -> str:
+    """Return the nearest changed Python/JavaScript function at or before a line."""
+
+    scope = ""
+    for right_line, content in iter_right_lines(patch):
+        if right_line > line:
+            break
+        match = re.match(
+            r"\s*(?:async\s+def|def|async\s+function|function)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+            content,
+        )
+        if match:
+            scope = _normalize_identifier(match.group(1))
+    return scope
+
+
+def _semantic_markers(text: str) -> frozenset[str]:
+    combined = (text or "").lower()
+    markers = {
+        marker
+        for marker in ("admin", "owner", "organizer", "attendee")
+        if re.search(rf"\b{marker}\b", combined)
+    }
+    contracts = {
+        "smtp-password": ("smtp_password",),
+        "smtp-transport": ("smtp", "tls"),
+        "os-time": ("os.time",),
+        "webhook-signature": ("webhook", "md5"),
+        "preferences-load": ("load_user_preferences",),
+        "channel-exception": ("except exception",),
+        "notification-result": ("notificationresult",),
+    }
+    for marker, required in contracts.items():
+        if all(token in combined for token in required):
+            markers.add(marker)
+    return frozenset(markers)
+
+
 def _build_claim(
     finding: Finding,
     diff_summary: str,
@@ -348,7 +411,9 @@ def _build_claim(
         patch = _extract_file_patch(diff_summary, finding.file)
     identifiers, strong_identifiers = _extract_identifiers(finding.message)
     anchor_text = _anchor_for_line(patch, finding.line)
+    scope_identifier = _scope_for_line(patch, finding.line)
     anchor_identifiers, _anchor_strong = _extract_identifiers(anchor_text)
+    evidence_text = f"{finding.message}\n{finding.suggestion}\n{anchor_text}\n{scope_identifier}"
     return RootCauseClaim(
         finding_id=finding.id,
         file=finding.file,
@@ -356,7 +421,7 @@ def _build_claim(
         reviewer=finding.reviewer,
         causal_family=_causal_family(
             finding.category,
-            f"{finding.message}\n{finding.suggestion}",
+            evidence_text,
             extended_families=extended_families,
         ),
         identifiers=identifiers,
@@ -364,11 +429,7 @@ def _build_claim(
         anchor_identifiers=anchor_identifiers,
         anchor_text=anchor_text,
         operators=frozenset(_OPERATORS.findall(f"{finding.message}\n{anchor_text}")),
-        semantic_markers=frozenset(
-            marker
-            for marker in ("admin", "owner", "organizer", "attendee")
-            if re.search(rf"\b{marker}\b", finding.message, re.IGNORECASE)
-        ),
+        semantic_markers=_semantic_markers(evidence_text),
         hunk_id=_hunk_for_line(patch, finding.line),
         is_detector=finding.verified_by.startswith("detector"),
         confidence=finding.confidence,
@@ -389,6 +450,19 @@ def _same_code_identity(left: RootCauseClaim, right: RootCauseClaim) -> bool:
     shared_message = left.identifiers & right.identifiers
     shared_strong = left.strong_identifiers & right.strong_identifiers
     shared_anchor = left.anchor_identifiers & right.anchor_identifiers
+    shared_semantics = left.semantic_markers & right.semantic_markers
+
+    family_marker = {
+        "hardcoded-smtp-credential": "smtp-password",
+        "smtp-plaintext": "smtp-transport",
+        "undefined-symbol": "os-time",
+        "weak-webhook-signature": "webhook-signature",
+        "preferences-n-plus-one": "preferences-load",
+        "swallowed-channel-exception": "channel-exception",
+        "notification-result-return": "notification-result",
+    }.get(left.causal_family)
+    if family_marker and family_marker in shared_semantics:
+        return True
 
     if left.causal_family == "auth-logic" and left.operators & right.operators:
         left_roles = left.semantic_markers | {
@@ -447,12 +521,23 @@ def _are_duplicates(left: RootCauseClaim, right: RootCauseClaim) -> bool:
     return _same_code_identity(left, right)
 
 
-def _representative(indices: list[int], findings: Sequence[Finding], claims: Sequence[RootCauseClaim]) -> int:
+def _representative(
+    indices: list[int],
+    findings: Sequence[Finding],
+    claims: Sequence[RootCauseClaim],
+    preferred_representative_ids: frozenset[str],
+) -> int:
     severity = {"info": 0, "warning": 1, "error": 2}
     return max(
         indices,
         key=lambda index: (
+            findings[index].id in preferred_representative_ids,
             claims[index].is_detector,
+            any(
+                marker in identifier
+                for identifier in claims[index].strong_identifiers
+                for marker in ("_", ".", "@", "$")
+            ),
             bool(claims[index].anchor_text),
             len(claims[index].anchor_identifiers),
             findings[index].confidence,
@@ -467,10 +552,12 @@ def cluster_root_causes(
     *,
     file_diffs: Mapping[str, str] | None = None,
     extended_families: bool = True,
+    preferred_representative_ids: frozenset[str] | set[str] | None = None,
 ) -> RootCauseClusterResult:
     """Collapse only high-confidence duplicate descriptions of one code defect."""
 
     source = tuple(findings)
+    preferred_ids = frozenset(preferred_representative_ids or ())
     claims = tuple(
         _build_claim(
             finding,
@@ -502,7 +589,7 @@ def cluster_root_causes(
     cross_reviewer_merged = 0
 
     for group in groups:
-        representative = _representative(group, source, claims)
+        representative = _representative(group, source, claims, preferred_ids)
         representative_indices.add(representative)
         if len(group) == 1:
             continue

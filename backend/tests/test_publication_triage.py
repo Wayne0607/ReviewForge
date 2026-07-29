@@ -924,3 +924,76 @@ async def test_resume_after_gate_provider_error_skips_all_expensive_stages(tmp_p
     runs = await database.get_runs(repo="owner/repo")
     assert runs[0]["status"] == "completed"
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_publication_resume_deduplicates_retry_against_reported_history(tmp_path):
+    database = Database(tmp_path / "reviewforge.db")
+    await database.connect()
+    run_id = "publication-retry-duplicate"
+    await database.create_run(
+        run_id=run_id,
+        repo="owner/repo",
+        pr_number=1,
+        head_sha="head",
+    )
+    reported = _finding(
+        "reported-os-time",
+        file="app.py",
+        line=2,
+        category="wrong-callee",
+        confidence=0.7,
+    )
+    reported.message = "deliver_inbox calls os.time(), which does not exist"
+    reported.status = "reported"
+    await database.insert_finding(run_id, reported.to_dict())
+    retry_finding = _finding(
+        "retry-os-time",
+        file="app.py",
+        line=3,
+        category="wrong-api",
+        confidence=1.0,
+    )
+    retry_finding.message = "os.time raises AttributeError; use time.time"
+    retry_finding.status = "candidate"
+    retry_finding.verified_by = "publication-gate-provider-error"
+    await database.insert_finding(run_id, retry_finding.to_dict())
+    await database.fail_run(run_id, "publication provider rate limited")
+
+    registry = build_registry()
+    llm = MockChatLLM()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=EventBus(),
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        db=database,
+        publication_gate_enabled=True,
+    )
+    state = _state()
+
+    with (
+        patch.object(
+            orchestrator,
+            "_run_publication_gate",
+            new_callable=AsyncMock,
+            return_value=TriageStats(agentic_confirmed=1),
+        ),
+        patch.object(orchestrator, "_post_comments", new_callable=AsyncMock) as post_comments,
+    ):
+        summary = await orchestrator.run(state)
+
+    post_comments.assert_not_awaited()
+    assert summary["publication_global_dedup"] == {
+        "reported_input": 1,
+        "pending_input": 1,
+        "collapsed": 1,
+        "pending_output": 0,
+    }
+    assert state.get_finding("reported-os-time").status == "reported"
+    duplicate = state.get_finding("retry-os-time")
+    assert duplicate.status == "false_positive"
+    assert duplicate.verified_by == "publication-global-dedup"
+    await database.close()

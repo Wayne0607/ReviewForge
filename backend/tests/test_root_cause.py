@@ -525,6 +525,191 @@ def test_hardcoded_smtp_credential_does_not_absorb_missing_tls() -> None:
     assert result.absorbed == ()
 
 
+@pytest.mark.parametrize(
+    ("left_category", "left_message", "left_line", "right_category", "right_message", "right_line", "family"),
+    [
+        (
+            "hardcoded-secrets",
+            "SMTP_PASSWORD is a hardcoded SMTP password",
+            18,
+            "embedded-credential",
+            "The SMTP credential SMTP_PASSWORD is committed in plaintext",
+            22,
+            "hardcoded-smtp-credential",
+        ),
+        (
+            "tls-missing",
+            "SMTP login sends credentials without TLS or starttls",
+            53,
+            "smtp-plaintext",
+            "SMTP transport lacks TLS and exposes credentials",
+            86,
+            "smtp-plaintext",
+        ),
+        (
+            "wrong-callee",
+            "deliver_inbox calls os.time(), which does not exist",
+            97,
+            "wrong-api",
+            "os.time raises AttributeError; use time.time",
+            111,
+            "undefined-symbol",
+        ),
+        (
+            "n-plus-one",
+            "The loop repeatedly calls load_user_preferences(user_id)",
+            76,
+            "n-plus-one-query",
+            "load_user_preferences(user_id) performs the same query per channel",
+            87,
+            "preferences-n-plus-one",
+        ),
+        (
+            "bare-except",
+            "except Exception swallows the channel failure without logging",
+            100,
+            "exception-swallowing",
+            "except Exception loses the original channel failure reason",
+            111,
+            "swallowed-channel-exception",
+        ),
+        (
+            "wrong-return-value",
+            "The bare return produces None instead of NotificationResult",
+            102,
+            "missing-return-value",
+            "Callers receive None rather than the declared NotificationResult",
+            126,
+            "notification-result-return",
+        ),
+    ],
+)
+def test_publication_mechanism_families_cluster_anchor_drift(
+    left_category: str,
+    left_message: str,
+    left_line: int,
+    right_category: str,
+    right_message: str,
+    right_line: int,
+    family: str,
+) -> None:
+    left = _finding(
+        "left",
+        file="backend/src/reviewforge/notify/channels.py",
+        category=left_category,
+        message=left_message,
+        line=left_line,
+    )
+    right = _finding(
+        "right",
+        file=left.file,
+        category=right_category,
+        message=right_message,
+        line=right_line,
+        reviewer="security_reviewer",
+    )
+
+    result = cluster_root_causes([left, right])
+
+    assert result.absorbed == (right,)
+    assert result.clusters[0].causal_family == family
+
+
+def test_generic_crypto_detector_uses_changed_function_scope() -> None:
+    patch = (
+        "@@ -100,0 +100,9 @@\n"
+        "+def _sign_webhook_payload(payload, secret):\n"
+        "+    body = encode(payload)\n"
+        "+    digest = hashlib.md5(secret + body).hexdigest()\n"
+        "+    return digest\n"
+    )
+    detailed = _finding(
+        "detailed",
+        file="channels.py",
+        line=100,
+        category="wrong-signature-contract",
+        message="_sign_webhook_payload uses webhook MD5 instead of HMAC",
+    )
+    generic = _finding(
+        "generic",
+        file="channels.py",
+        line=102,
+        category="crypto",
+        message="Weak hash algorithm found",
+        reviewer="security_reviewer",
+    )
+
+    result = cluster_root_causes([detailed, generic], file_diffs={"channels.py": patch})
+
+    assert result.absorbed == (generic,)
+    assert result.clusters[0].causal_family == "weak-webhook-signature"
+
+
+def test_preferred_reported_representative_cannot_be_replaced_by_higher_confidence() -> None:
+    reported = _finding(
+        "reported",
+        category="wrong-callee",
+        message="deliver_inbox calls os.time(), which does not exist",
+        line=97,
+        confidence=0.7,
+    )
+    pending = _finding(
+        "pending",
+        category="wrong-api",
+        message="os.time raises AttributeError; use time.time",
+        line=111,
+        confidence=1.0,
+    )
+
+    result = cluster_root_causes(
+        [reported, pending],
+        preferred_representative_ids={"reported"},
+    )
+
+    assert result.kept == (reported,)
+    assert result.absorbed_to_representative == (("pending", "reported"),)
+
+
+def test_publication_global_dedup_only_retires_pending_duplicate() -> None:
+    events: list[ReviewEvent] = []
+    orchestrator = _orchestrator_with_events(events)
+    orchestrator._root_cause_extended_families = True
+    reported = _finding(
+        "reported",
+        category="wrong-callee",
+        message="deliver_inbox calls os.time(), which does not exist",
+        line=97,
+        confidence=0.7,
+    )
+    reported.status = "reported"
+    pending = _finding(
+        "pending",
+        category="wrong-api",
+        message="os.time raises AttributeError; use time.time",
+        line=111,
+        confidence=1.0,
+    )
+    pending.status = "confirmed"
+    state = StateStore()
+    state.add_finding(reported)
+    state.add_finding(pending)
+
+    stats = orchestrator._apply_publication_global_dedup(state, phase="test")
+
+    assert state.get_finding("reported").status == "reported"
+    duplicate = state.get_finding("pending")
+    assert duplicate.status == "false_positive"
+    assert duplicate.verified_by == "publication-global-dedup"
+    assert "reported" in duplicate.verify_reason
+    assert stats == {
+        "reported_input": 1,
+        "pending_input": 1,
+        "collapsed": 1,
+        "pending_output": 0,
+    }
+    assert events[-1].event_type == "publication_global_dedup.completed"
+
+
 def test_orchestrator_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[ReviewEvent] = []
     orchestrator = _orchestrator_with_events(events)

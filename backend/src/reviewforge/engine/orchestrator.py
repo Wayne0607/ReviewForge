@@ -1028,6 +1028,11 @@ class Orchestrator:
                 # ``high_risk_overflow`` for detector-backed error findings.
                 self._run_publication_policy_post(state)
 
+            publication_dedup_stats = self._apply_publication_global_dedup(
+                state,
+                phase="normal-publication",
+            )
+
             # Persist all findings to DB
             if self._db:
                 for f in state.findings.values():
@@ -1059,6 +1064,7 @@ class Orchestrator:
                 "tasks_completed": len(state.list_tasks(status="completed")),
                 "tasks_failed": len(state.list_tasks(status="failed")),
                 "comment_delivery": comment_result.to_dict(),
+                "publication_global_dedup": publication_dedup_stats,
             }
 
             # V3: add coverage summary
@@ -1169,6 +1175,69 @@ class Orchestrator:
             )
         self._events.emit("root_cause_cluster.completed", {**result.stats, "phase": phase})
         return list(result.kept)
+
+    def _apply_publication_global_dedup(
+        self,
+        state: StateStore,
+        *,
+        phase: str,
+    ) -> dict[str, int]:
+        """Retire final duplicates across pending and already reported findings.
+
+        Reported findings are immutable representatives. This closes the
+        publication-only resume gap where a provider-retry candidate could
+        repeat a comment posted before the interruption.
+        """
+
+        reported = state.list_findings(status="reported")
+        pending = state.list_findings(status="confirmed")
+        stats = {
+            "reported_input": len(reported),
+            "pending_input": len(pending),
+            "collapsed": 0,
+            "pending_output": len(pending),
+        }
+        if not pending:
+            self._events.emit("publication_global_dedup.completed", {**stats, "phase": phase})
+            return stats
+
+        reported_ids = {finding.id for finding in reported}
+        pending_ids = {finding.id for finding in pending}
+        try:
+            result = cluster_root_causes(
+                [*reported, *pending],
+                state.diff_summary,
+                file_diffs=state.file_diffs or {},
+                extended_families=getattr(self, "_root_cause_extended_families", True),
+                preferred_representative_ids=reported_ids,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Publication global dedup failed; passing pending findings through: %s",
+                exc,
+                exc_info=True,
+            )
+            self._events.emit(
+                "publication_global_dedup.failed",
+                {"error": str(exc)[:200], **stats, "phase": phase},
+            )
+            return stats
+
+        representative_by_id = dict(result.absorbed_to_representative)
+        for absorbed in result.absorbed:
+            if absorbed.id not in pending_ids:
+                continue
+            representative_id = representative_by_id[absorbed.id]
+            state.update_finding(
+                absorbed.id,
+                status="false_positive",
+                verified_by="publication-global-dedup",
+                verify_reason=f"Duplicate of publication representative {representative_id}.",
+            )
+            stats["collapsed"] += 1
+        stats["pending_output"] = len(state.list_findings(status="confirmed"))
+        self._events.emit("publication_global_dedup.completed", {**stats, "phase": phase})
+        return stats
 
     @staticmethod
     def _dedup_key(finding: Finding) -> tuple[str, int, str] | None:
@@ -1331,6 +1400,10 @@ class Orchestrator:
         stats = await self._run_publication_gate(state, candidate_ids=retry_ids)
         if self._publication_policy.enabled:
             self._run_publication_policy_post(state)
+        publication_dedup_stats = self._apply_publication_global_dedup(
+            state,
+            phase="publication-only-resume",
+        )
 
         if self._db:
             for finding in state.findings.values():
@@ -1351,6 +1424,7 @@ class Orchestrator:
             "tasks_failed": len(state.list_tasks(status="failed")),
             "comment_delivery": comment_result.to_dict(),
             "publication_gate": stats.public_summary(),
+            "publication_global_dedup": publication_dedup_stats,
             "resume": {
                 "mode": "publication-only",
                 "retried_findings": len(retry_ids),

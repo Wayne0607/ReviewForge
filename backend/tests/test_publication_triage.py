@@ -343,6 +343,9 @@ async def test_orchestrator_sends_only_needs_tool_to_agentic_gate():
         publication_gate_llm=triage_llm,
         publication_gate_enabled=True,
         publication_triage_enabled=True,
+        # Phase 2 (perf/gate-dedup-20260729): disable dedup so the test
+        # keeps separate findings for the gate to action.
+        publication_gate_dedup=False,
     )
 
     class _Gate:
@@ -392,6 +395,9 @@ async def test_agentic_inconclusive_does_not_block_independent_confirmations():
         publication_gate_llm=triage_llm,
         publication_gate_enabled=True,
         publication_triage_enabled=True,
+        # Phase 2 (perf/gate-dedup-20260729): keep both findings so the
+        # gate can verify and distinguish confirmed vs inconclusive.
+        publication_gate_dedup=False,
     )
 
     class _Gate:

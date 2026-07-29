@@ -226,6 +226,12 @@ class ReviewForgeConfig:
     publication_gate_max_steps: int = 4
     publication_gate_max_tokens: int = 6000
     publication_gate_concurrency: int = 4
+    # Phase 2 (perf/gate-dedup-20260729): collapse same-root-cause findings
+    # before triage / gate so the LLM call volume matches the unique defect
+    # count instead of the multi-reviewer fan-out.  Default ON; flip to
+    # False via env var ``REVIEWFORGE_PUBLICATION_GATE_DEDUP=0`` if a
+    # regression appears.
+    publication_gate_dedup: bool = True
     publication_triage_enabled: bool = False
     publication_triage_batch_size: int = 6
     publication_triage_concurrency: int = 1
@@ -380,6 +386,7 @@ class ReviewForgeConfig:
                 "max_steps": int,
                 "max_tokens": int,
                 "concurrency": int,
+                "dedup": bool,
             }
             for key, value in gate.items():
                 attr = f"publication_gate_{key}"
@@ -537,6 +544,9 @@ class ReviewForgeConfig:
                 self.publication_gate_concurrency = max(1, int(gate_conc))
             except (TypeError, ValueError):
                 pass
+        gate_dedup = os.environ.get("REVIEWFORGE_PUBLICATION_GATE_DEDUP")
+        if gate_dedup is not None:
+            self.publication_gate_dedup = gate_dedup.strip().lower() not in ("0", "false", "no", "")
         triage_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_TRIAGE_ENABLED")
         if triage_enabled is not None:
             self.publication_triage_enabled = triage_enabled.strip().lower() not in ("0", "false", "no", "")

@@ -115,11 +115,18 @@ escalation:
 # gate-4 reach the same verdict on >95% of candidates; the extra steps only
 # mattered for ambiguous findings already covered by the verifier.  All three
 # values remain env-overridable via REVIEWFORGE_PUBLICATION_GATE_*.
+# Phase 2 (perf/gate-dedup-20260729): ``dedup`` collapses same root-cause
+# findings (``(file, line, category)``) before triage / gate so the LLM call
+# volume matches the unique defect count.  Historical replay across the
+# planted-issues PR showed 17 unique findings fed from 66 candidates — a
+# 2.6x duplicate ratio per PR.  Default ON; toggle to ``false`` via
+# REVIEWFORGE_PUBLICATION_GATE_DEDUP=0 if a regression appears.
 publication_gate:
   enabled: true
   max_steps: 2
   max_tokens: 4000
   concurrency: 4
+  dedup: true
 
 # Batch low-cost semantic decisions before the per-finding tool loop. Only
 # unresolved findings enter the expensive agentic publication gate.

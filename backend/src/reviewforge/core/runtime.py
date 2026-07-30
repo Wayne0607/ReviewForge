@@ -103,6 +103,7 @@ class LLMRuntimeManager:
             budget_enabled=cfg.publication_policy.budget_enabled,
             max_comments=cfg.publication_policy.max_comments,
             high_risk_overflow=cfg.publication_policy.high_risk_overflow,
+            empty_review_rescue_enabled=cfg.publication_policy.empty_review_rescue_enabled,
         )
         orchestrator = Orchestrator(
             registry=registry,

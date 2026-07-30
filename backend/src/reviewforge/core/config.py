@@ -68,6 +68,8 @@ def _publication_policy_from_dict(data: dict[str, Any]) -> PublicationPolicyConf
             cfg.high_risk_overflow = max(0, int(data["high_risk_overflow"]))
         except (TypeError, ValueError):
             pass
+    if "empty_review_rescue_enabled" in data:
+        cfg.empty_review_rescue_enabled = _parse_bool(data["empty_review_rescue_enabled"])
     return cfg
 
 
@@ -91,6 +93,7 @@ class PublicationPolicyConfigYAML:
     budget_enabled: bool = True
     max_comments: int = 4
     high_risk_overflow: int = 1
+    empty_review_rescue_enabled: bool = False
 
 
 @dataclass
@@ -505,6 +508,9 @@ class ReviewForgeConfig:
         pp_budget_enabled = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_BUDGET_ENABLED")
         if pp_budget_enabled is not None:
             self.publication_policy.budget_enabled = _parse_bool(pp_budget_enabled)
+        pp_empty_rescue = os.environ.get("REVIEWFORGE_PUBLICATION_POLICY_EMPTY_REVIEW_RESCUE_ENABLED")
+        if pp_empty_rescue is not None:
+            self.publication_policy.empty_review_rescue_enabled = _parse_bool(pp_empty_rescue)
         # REVIEWFORGE_PUBLICATION_POLICY_MAX_COMMENTS — top-N budget.  Must
         # be >= 1; bad values fall back to the YAML/default value rather
         # than disabling the policy.

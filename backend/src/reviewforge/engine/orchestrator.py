@@ -1028,6 +1028,7 @@ class Orchestrator:
                 # ``high_risk_overflow`` for detector-backed error findings.
                 self._run_publication_policy_post(state)
 
+            rescue_stats = self._apply_empty_review_rescue(state)
             publication_dedup_stats = self._apply_publication_global_dedup(
                 state,
                 phase="normal-publication",
@@ -1064,6 +1065,7 @@ class Orchestrator:
                 "tasks_completed": len(state.list_tasks(status="completed")),
                 "tasks_failed": len(state.list_tasks(status="failed")),
                 "comment_delivery": comment_result.to_dict(),
+                "empty_review_rescue": rescue_stats,
                 "publication_global_dedup": publication_dedup_stats,
             }
 
@@ -1375,6 +1377,46 @@ class Orchestrator:
                     finding.id,
                     exc,
                 )
+
+    def _apply_empty_review_rescue(self, state: StateStore) -> dict[str, Any]:
+        """Restore one high-signal late rejection when publication is empty."""
+
+        stats: dict[str, Any] = {
+            "attempted": False,
+            "rescued": 0,
+            "finding_id": "",
+        }
+        if state.list_findings(status="confirmed") or state.list_findings(status="reported"):
+            return stats
+
+        stats["attempted"] = True
+        selected = self._publication_policy.select_empty_review_rescue(
+            state.list_findings(status="false_positive"),
+            state,
+        )
+        if selected is None:
+            self._events.emit("publication_policy.empty_review_rescue.skipped", stats)
+            return stats
+
+        previous_stage = selected.verified_by or "unknown"
+        state.update_finding(
+            selected.id,
+            status="confirmed",
+            verified_by="empty-review-rescue",
+            verify_reason=(
+                "Model-independent zero-review fallback: late semantic rejection "
+                f"({previous_stage}) restored one added-line core finding."
+            ),
+        )
+        stats.update(
+            {
+                "rescued": 1,
+                "finding_id": selected.id,
+                "previous_stage": previous_stage,
+            }
+        )
+        self._events.emit("publication_policy.empty_review_rescue.completed", stats)
+        return stats
 
     async def _resume_publication_only(
         self,

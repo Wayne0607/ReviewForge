@@ -825,6 +825,24 @@ class TestEmptyReviewRescue:
         assert restored.status == "confirmed"
         assert restored.verified_by == "empty-review-rescue"
 
+    def test_rejects_speculative_late_finding(self):
+        state = _make_state({"src/auth.py": _SAMPLE_DIFF})
+        policy = PublicationPolicy(
+            PublicationPolicyConfig(
+                enabled=True,
+                mode="enforce",
+                empty_review_rescue_enabled=True,
+            )
+        )
+        finding = _make_finding(
+            line=5,
+            status="false_positive",
+            verified_by="verifier",
+            message="This helper may be unused if any external callers still exist.",
+        )
+
+        assert policy.select_empty_review_rescue([finding], state) is None
+
 
 class TestPostFinalizeBudget:
     def test_disabled_budget_preserves_all_confirmed_findings(self):

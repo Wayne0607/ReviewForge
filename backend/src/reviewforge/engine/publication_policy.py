@@ -167,6 +167,13 @@ _FAILURE_MECHANISM = re.compile(
     re.IGNORECASE,
 )
 
+_SPECULATIVE_RESCUE = re.compile(
+    r"\b(?:may|might|could|possibly|potentially|if\s+(?:any|there\s+(?:is|are)|"
+    r"callers?\s+exist)|appears?\s+unused|dead\s+code)\b|"
+    r"可能|也许|或许|若有|如果存在|疑似|未被(?:任何)?(?:调用|使用)",
+    re.IGNORECASE,
+)
+
 
 # ── Public dataclasses ───────────────────────────────────────────────────────
 
@@ -570,6 +577,7 @@ class PublicationPolicy:
                 continue
 
             scored = self._score(finding, state)
+            claim = f"{finding.message}\n{finding.suggestion}"
             if (
                 scored.invalid_coordinate
                 or scored.abstained
@@ -577,6 +585,7 @@ class PublicationPolicy:
                 or not scored.on_added_line
                 or scored.is_generic_advice
                 or _is_reviewer_scope_noise(finding)
+                or _SPECULATIVE_RESCUE.search(claim)
             ):
                 continue
             eligible.append((index, scored))

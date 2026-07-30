@@ -36,7 +36,7 @@ class TestV3YAMLLoading:
         project_root = Path(__file__).resolve().parents[2]
         cfg = ReviewForgeConfig.load(project_root / "reviewforge.yaml")
 
-        assert cfg.v3.coverage_max_cells_per_round == 16
+        assert cfg.v3.coverage_max_cells_per_round == 12
         assert cfg.v3.coverage_max_attempts == 1
         assert cfg.v3.evidence_mode == "off"
 

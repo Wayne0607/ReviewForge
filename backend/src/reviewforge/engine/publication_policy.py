@@ -587,9 +587,7 @@ class PublicationPolicy:
         _, selected = max(
             eligible,
             key=lambda item: (
-                self._RESCUE_PROVENANCE_PRIORITY[
-                    (item[1].finding.verified_by or "").strip().lower()
-                ],
+                self._RESCUE_PROVENANCE_PRIORITY[(item[1].finding.verified_by or "").strip().lower()],
                 item[1].score,
                 1 if item[1].finding.severity == "error" else 0,
                 -item[0],

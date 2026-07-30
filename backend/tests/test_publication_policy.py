@@ -1311,10 +1311,7 @@ class TestPublicationPolicyEnvOverrides:
     def test_empty_review_rescue_loads_and_env_can_disable(self, monkeypatch, tmp_path):
         cfg_file = tmp_path / "reviewforge.yaml"
         cfg_file.write_text(
-            "publication_policy:\n"
-            "  enabled: true\n"
-            "  mode: enforce\n"
-            "  empty_review_rescue_enabled: true\n",
+            "publication_policy:\n  enabled: true\n  mode: enforce\n  empty_review_rescue_enabled: true\n",
             encoding="utf-8",
         )
         monkeypatch.setenv("REVIEWFORGE_PUBLICATION_POLICY_EMPTY_REVIEW_RESCUE_ENABLED", "false")

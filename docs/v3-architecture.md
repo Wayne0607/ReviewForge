@@ -100,8 +100,8 @@ failures produce abstain/retry, not false-positive suppression.
 - Every high-risk semantic unit has a terminal coverage reason.
 - Final superiority claims require an unseen holdout and independent judges.
 
-The short-term stable release was validated on a fixed representative 10-PR
-subset with 57.58% precision, 48.72% recall, and 52.78% F1. Qodo v2 scored
-57.14% / 51.28% / 54.05% under the same strict judge. See
-[`benchmark.md`](benchmark.md) for methodology, per-PR results, cost, and
-limitations.
+The short-term stable release was validated on the complete fixed 50-PR
+benchmark with 42.76% precision, 47.45% recall, and 44.98% F1. Qodo v2 scored
+57.94% / 45.26% / 50.82% under the same strict judge. ReviewForge therefore
+has slightly higher recall but does not surpass Qodo on strict precision or F1.
+See [`benchmark.md`](benchmark.md) for methodology, cost, and limitations.

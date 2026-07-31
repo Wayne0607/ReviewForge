@@ -1,73 +1,104 @@
 # ReviewForge v3 benchmark
 
-## Final short-term release result
+## Stable 50-PR baseline
 
-Date: 2026-07-29
+Date: 2026-07-30
 
-ReviewForge commit: `fc7f964`
+Review core tag: `v3-final-50pr-baseline-20260730`
 
-Workload: 10 fixed representative PRs selected from the 50-PR Martian Code Review Benchmark
+Review core commit: `e9827cb944af5e8dd8ef8d9704e8579d7e9ab1c4`
 
-ReviewForge and Qodo v2 were evaluated against the same golden findings. Both candidate sets were passed through the same MiniMax judge and the same strict duplicate policy. Duplicate reports of one root cause count as false positives.
+The workload is the fixed 50-PR Martian Code Review Benchmark with 137 golden
+issues. ReviewForge and Qodo v2 were evaluated by the same MiniMax-M3 judge
+against the same golden set. Under the strict duplicate policy, only the
+strongest candidate for a golden receives credit; additional reports remain
+false positives. One candidate may cover multiple distinct goldens, so TP plus
+FP can be slightly larger than the raw candidate count.
 
-| Metric | ReviewForge v3 | Qodo v2 |
-| --- | ---: | ---: |
-| TP | 19 | 20 |
-| FP | 14 | 15 |
-| FN | 20 | 19 |
-| Precision | **57.58%** | 57.14% |
-| Recall | 48.72% | **51.28%** |
-| F1 | 52.78% | **54.05%** |
-| Candidate comments | 32 | 35 |
-
-ReviewForge has slightly higher precision and one fewer false positive. Qodo has one more true positive, one fewer false negative, and a 1.27 percentage-point F1 advantage. This is a near-peer result on the selected sample, not evidence that either product is universally superior.
-
-## Per-PR outcome
-
-| PR | ReviewForge TP / FP / FN | Qodo TP / FP / FN | ReviewForge comments |
+| Metric | ReviewForge v3 | Qodo v2 | Difference |
 | --- | ---: | ---: | ---: |
-| grafana/grafana#90045 | 3 / 1 / 0 | 2 / 4 / 1 | 4 |
-| keycloak/keycloak#37429 | 3 / 0 / 1 | 1 / 1 / 3 | 3 |
-| keycloak/keycloak#36882 | 0 / 0 / 1 | 0 / 0 / 1 | 0 |
-| getsentry/sentry#93824 | 1 / 1 / 4 | 1 / 1 / 4 | 2 |
-| sentry-greptile#1 | 1 / 0 / 3 | 2 / 1 / 2 | 1 |
-| grafana/grafana#97529 | 1 / 0 / 1 | 2 / 2 / 0 | 1 |
-| discourse-graphite#10 | 0 / 3 / 4 | 2 / 2 / 2 | 3 |
-| discourse-graphite#4 | 4 / 3 / 2 | 4 / 1 / 2 | 7 |
-| cal.com#14740 | 4 / 4 / 1 | 4 / 0 / 1 | 7 |
-| cal.com#10967 | 2 / 2 / 3 | 2 / 3 / 3 | 4 |
+| Evaluated PRs | 50 | 50 | 0 |
+| Candidate comments | 151 | 104 | +47 |
+| TP | 65 | 62 | +3 |
+| FP | 87 | 45 | +42 |
+| FN | 72 | 75 | -3 |
+| Precision | 42.76% | **57.94%** | -15.18 pp |
+| Recall | **47.45%** | 45.26% | +2.19 pp |
+| F1 | 44.98% | **50.82%** | -5.84 pp |
+
+ReviewForge finds slightly more golden issues, but publishes too many unmatched
+or semantically overlapping candidates. It does not surpass Qodo on strict F1
+in this full run.
+
+## Improvement over the previous ReviewForge full run
+
+| Metric | Previous V3 | Stable V3 | Change |
+| --- | ---: | ---: | ---: |
+| Published comments | 252 | 151 | -40.08% |
+| Review tokens | 21,054,909 | 16,577,583 | -21.26% |
+| TP | 66 | 65 | -1 |
+| FP | 180 | 87 | -93 |
+| FN | 71 | 72 | +1 |
+| Precision | 26.83% | 42.76% | +15.93 pp |
+| Recall | 48.18% | 47.45% | -0.73 pp |
+| F1 | 34.46% | 44.98% | +10.52 pp |
+
+The stable baseline substantially improves publication precision and
+efficiency while nearly preserving recall.
+
+## Coverage and reliability
+
+- 11 ReviewForge PRs published no comments; those PRs contain 21 golden issues
+  and account for 29.17% of ReviewForge false negatives.
+- Qodo published no candidates on 2 PRs containing 2 golden issues.
+- ReviewForge produced no byte-identical duplicate comment bodies. Semantic
+  duplicates and non-golden but potentially valid findings are still strict
+  false positives.
+- All 50 PR-level reviews completed. There were 21 failed internal reviewer
+  tasks, so partial agent failure remains a recall risk.
+- Strong clean results include `discourse-graphite#7` (3 TP, 0 FP, 0 FN),
+  `keycloak-greptile#1` (2 TP, 0 FP, 0 FN), and `grafana/grafana#94942`
+  (2 TP, 0 FP, 0 FN).
 
 ## Cost and latency
 
-- Review pipeline tokens: 3,343,534
-- Judge tokens: 27,581
-- MiniMax-M3 tokens: 2,781,889
-- MiniMax-M2.7 tokens: 561,645
-- Three-shard wall time: approximately 67 minutes
-- Slowest PR: approximately 52 minutes
+- Review tokens: 16,577,583
+- Average review tokens per PR: 331,552
+- MiniMax-M3: 14,288,384 tokens (86.19%)
+- MiniMax-M2.7: 2,289,199 tokens (13.81%)
+- Cumulative PR duration: 9.40 agent-hours
+- Active three-shard wall time: approximately 3 hours 45 minutes
+- Judge tokens: 110,329
 
-Largest token consumers:
+Largest review-token consumers:
 
-| Agent | Tokens |
-| --- | ---: |
-| Publication Gate | 1,054,761 |
-| Security Reviewer | 578,145 |
-| Correctness Reviewer | 547,425 |
-| Dynamic Calibrator | 356,553 |
-| Testing Reviewer | 303,686 |
+| Agent | Tokens | Share |
+| --- | ---: | ---: |
+| Security Reviewer | 7,488,045 | 45.17% |
+| Correctness Reviewer | 2,747,622 | 16.57% |
+| Publication Gate | 1,811,137 | 10.93% |
+| Dynamic Calibrator | 1,541,774 | 9.30% |
+| Testing Reviewer | 1,187,031 | 7.16% |
 
 ## Interpretation
 
-The current strength is precision: ReviewForge is conservative enough to keep false positives close to Qodo while still finding substantial correctness, security, race, and cross-file issues.
+The primary remaining gap is publication precision rather than raw discovery.
+The next improvement should target model-independent semantic equivalence,
+abstention, failed-reviewer recovery, and empty-review coverage. Increasing
+reviewer breadth alone is unlikely to beat Qodo because ReviewForge already has
+slightly higher recall.
 
-The remaining quality gap is primarily recall. Hard cross-file data flow, implicit business contracts, and issues that require deep repository context are still missed. The remaining operational weakness is tail latency on large PRs when the provider performs many tool-loop and publication-gate calls.
-
-For a self-hosted tool used asynchronously by a small team, the result is usable. It is not suitable for a product promise of complete detection or sub-minute feedback.
+For a self-hosted tool used asynchronously by a small team, the current result
+is usable. It does not support claims of complete detection, zero false
+positives, sub-minute feedback, or universal superiority over Qodo.
 
 ## Methodology limits
 
-- This final iteration used 10 representative PRs, not the complete 50-PR suite.
-- The selected PRs participated in optimization, so this is not a clean holdout result.
-- LLM judging is probabilistic and can contain correlated model bias.
-- Product-level superiority claims require an unseen holdout set, repeated runs, confidence intervals, and ideally more than one independent judge.
-- Benchmark artifacts and credentials are intentionally not committed to Git. Local artifacts live under ignored `.reviewforge/` directories.
+- LLM judging is probabilistic. The same fixed Qodo candidates have received
+  materially different scores in separate judge runs.
+- The within-run ReviewForge/Qodo comparison is therefore more reliable than
+  comparing absolute scores across dates.
+- Product-level superiority claims require unseen holdout PRs, repeated runs,
+  confidence intervals, and preferably multiple independent judges.
+- Benchmark artifacts and credentials are not committed. Local artifacts live
+  under ignored `.reviewforge/` directories.

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reviewforge.core.config import LLMConfig, ReviewForgeConfig
-from reviewforge.core.specs import SpecRegistry, apply_reviewer_configs, build_registry
+from reviewforge.core.specs import SpecRegistry, build_registry
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.publication_policy import PublicationPolicy, PublicationPolicyConfig
 from reviewforge.tools.gateway import ToolGateway
@@ -65,8 +65,7 @@ class LLMRuntimeManager:
 
     def build(self, llm_config: LLMConfig) -> RuntimeBundle:
         """Build a complete detached runtime; this does not change live state."""
-        cfg = self.config
-        registry = apply_reviewer_configs(build_registry(), cfg.reviewers)
+        registry = build_registry()
         errors = registry.validate()
         if errors:
             raise RuntimeError(f"Spec validation failed: {errors}")
@@ -97,13 +96,13 @@ class LLMRuntimeManager:
             model_router.invalidate_cache()
 
         gateway = ToolGateway(registry, self.github)
+        cfg = self.config
         policy_cfg = PublicationPolicyConfig(
             enabled=cfg.publication_policy.enabled,
             mode=cfg.publication_policy.mode,
             budget_enabled=cfg.publication_policy.budget_enabled,
             max_comments=cfg.publication_policy.max_comments,
             high_risk_overflow=cfg.publication_policy.high_risk_overflow,
-            empty_review_rescue_enabled=cfg.publication_policy.empty_review_rescue_enabled,
         )
         orchestrator = Orchestrator(
             registry=registry,

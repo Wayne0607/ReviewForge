@@ -730,120 +730,6 @@ class TestInvalidCoordinateAndGenericAdvice:
 # ── Final budget ────────────────────────────────────────────────────────────
 
 
-class TestEmptyReviewRescue:
-    def test_selects_one_added_line_late_rejection_without_confidence(self):
-        state = _make_state({"src/auth.py": _SAMPLE_DIFF})
-        policy = PublicationPolicy(
-            PublicationPolicyConfig(
-                enabled=True,
-                mode="enforce",
-                empty_review_rescue_enabled=True,
-            )
-        )
-        verifier = _make_finding(
-            id="verifier",
-            line=5,
-            status="false_positive",
-            verified_by="verifier",
-            confidence=0.2,
-        )
-        gate = _make_finding(
-            id="gate",
-            line=5,
-            status="false_positive",
-            verified_by="publication-gate",
-            confidence=1.0,
-        )
-
-        selected = policy.select_empty_review_rescue([gate, verifier], state)
-
-        assert selected is not None
-        assert selected.id == "verifier"
-
-    @pytest.mark.parametrize(
-        ("verified_by", "reviewer", "line"),
-        [
-            ("judge", "correctness_reviewer", 5),
-            ("publication-policy", "security_reviewer", 5),
-            ("publication-gate", "testing_reviewer", 5),
-            ("publication-gate", "correctness_reviewer", 6),
-        ],
-    )
-    def test_rejects_early_scope_or_non_added_candidates(
-        self,
-        verified_by: str,
-        reviewer: str,
-        line: int,
-    ):
-        state = _make_state({"src/auth.py": _SAMPLE_DIFF})
-        policy = PublicationPolicy(
-            PublicationPolicyConfig(
-                enabled=True,
-                mode="enforce",
-                empty_review_rescue_enabled=True,
-            )
-        )
-        finding = _make_finding(
-            line=line,
-            reviewer=reviewer,
-            status="false_positive",
-            verified_by=verified_by,
-        )
-
-        assert policy.select_empty_review_rescue([finding], state) is None
-
-    def test_orchestrator_restores_selected_finding_once(self):
-        state = _make_state({"src/auth.py": _SAMPLE_DIFF})
-        finding = _make_finding(
-            id="rescue",
-            line=5,
-            status="false_positive",
-            verified_by="publication-gate-ungrounded",
-            reviewer="correctness_reviewer",
-        )
-        state.add_finding(finding)
-        orchestrator = Orchestrator(
-            registry=build_registry(),
-            gateway=MagicMock(spec=ToolGateway),
-            event_bus=MagicMock(),
-            planner_llm=MagicMock(),
-            reviewer_llm=MagicMock(),
-            calibrator_llm=MagicMock(),
-            publication_policy=PublicationPolicy(
-                PublicationPolicyConfig(
-                    enabled=True,
-                    mode="enforce",
-                    empty_review_rescue_enabled=True,
-                )
-            ),
-        )
-
-        stats = orchestrator._apply_empty_review_rescue(state)
-
-        restored = state.get_finding("rescue")
-        assert stats["rescued"] == 1
-        assert restored.status == "confirmed"
-        assert restored.verified_by == "empty-review-rescue"
-
-    def test_rejects_speculative_late_finding(self):
-        state = _make_state({"src/auth.py": _SAMPLE_DIFF})
-        policy = PublicationPolicy(
-            PublicationPolicyConfig(
-                enabled=True,
-                mode="enforce",
-                empty_review_rescue_enabled=True,
-            )
-        )
-        finding = _make_finding(
-            line=5,
-            status="false_positive",
-            verified_by="verifier",
-            message="This helper may be unused if any external callers still exist.",
-        )
-
-        assert policy.select_empty_review_rescue([finding], state) is None
-
-
 class TestPostFinalizeBudget:
     def test_disabled_budget_preserves_all_confirmed_findings(self):
         state = _make_state({"src/auth.py": _SAMPLE_DIFF})
@@ -1325,18 +1211,6 @@ class TestPublicationPolicyEnvOverrides:
         monkeypatch.setenv("REVIEWFORGE_PUBLICATION_POLICY_BUDGET_ENABLED", "false")
         cfg = ReviewForgeConfig.load(cfg_file)
         assert cfg.publication_policy.budget_enabled is False
-
-    def test_empty_review_rescue_loads_and_env_can_disable(self, monkeypatch, tmp_path):
-        cfg_file = tmp_path / "reviewforge.yaml"
-        cfg_file.write_text(
-            "publication_policy:\n  enabled: true\n  mode: enforce\n  empty_review_rescue_enabled: true\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("REVIEWFORGE_PUBLICATION_POLICY_EMPTY_REVIEW_RESCUE_ENABLED", "false")
-
-        cfg = ReviewForgeConfig.load(cfg_file)
-
-        assert cfg.publication_policy.empty_review_rescue_enabled is False
 
     def test_env_max_comments_overrides_yaml(self, monkeypatch, tmp_path):
         cfg_file = tmp_path / "reviewforge.yaml"

@@ -34,9 +34,7 @@ reviewers:
   - name: security_reviewer
     type: security
     enabled: true
-    # Security remains agentic, but six repository reads/searches are enough
-    # for a focused task. The former ten-step loop consumed 45% of all tokens.
-    max_steps: 6
+    max_steps: 10
     confidence_threshold: 0.5
 
   - name: performance_reviewer
@@ -162,9 +160,6 @@ publication_policy:
   budget_enabled: false
   max_comments: 4
   high_risk_overflow: 1
-  # Restore at most one added-line core finding when every normal publication
-  # candidate was filtered. This deterministic fallback uses zero LLM tokens.
-  empty_review_rescue_enabled: true
 
 # 对首轮未覆盖的高风险变更符号做一次受限 correctness 二审。
 # 二审只接受锚定到 Evidence Card 新增行且有足够置信度的具体缺陷。
@@ -181,9 +176,7 @@ coverage_gap:
 v3:
   enabled: true
   coverage_min_risk_score: 0.15
-  # One pass over the twelve highest-risk cells gives the best measured
-  # precision/token trade-off and replaces the former two-wave closure.
-  coverage_max_cells_per_round: 12
-  coverage_max_attempts: 1
+  coverage_max_cells_per_round: 24
+  coverage_max_attempts: 2
   evidence_mode: "off"
   evidence_max_candidates: 5

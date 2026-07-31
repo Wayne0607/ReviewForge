@@ -6,8 +6,7 @@ The Planner prompt auto-generates from these specs.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -79,33 +78,6 @@ class SpecRegistry:
         if name not in self.tools:
             raise KeyError(f"Unknown tool: {name}")
         return self.tools[name]
-
-
-def apply_reviewer_configs(
-    registry: SpecRegistry,
-    reviewer_configs: Iterable[Any],
-) -> SpecRegistry:
-    """Apply enabled/max-step operator settings to built-in reviewer specs.
-
-    AgentSpec is immutable, so overrides replace the registered value instead
-    of mutating a shared object. Unknown custom reviewer names are left for the
-    custom-agent loader.
-    """
-
-    for config in reviewer_configs:
-        name = str(getattr(config, "name", "") or "").strip()
-        spec = registry.agents.get(name)
-        if not name or spec is None or spec.role != "executor":
-            continue
-        if not bool(getattr(config, "enabled", True)):
-            registry.unregister_agent(name)
-            continue
-        try:
-            max_steps = max(1, int(getattr(config, "max_steps", spec.max_steps)))
-        except (TypeError, ValueError):
-            max_steps = spec.max_steps
-        registry.register_agent(replace(spec, max_steps=max_steps))
-    return registry
 
 
 def build_registry() -> SpecRegistry:

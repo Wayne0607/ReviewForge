@@ -1,7 +1,6 @@
 """Tests for spec registry."""
 
-from reviewforge.core.config import ReviewerConfig
-from reviewforge.core.specs import apply_reviewer_configs, build_registry
+from reviewforge.core.specs import build_registry
 
 
 def test_registry_builds():
@@ -51,33 +50,3 @@ def test_unknown_agent_raises():
         assert False, "Should have raised"
     except KeyError:
         pass
-
-
-def test_reviewer_config_overrides_max_steps_and_disabled_agents():
-    registry = build_registry()
-
-    apply_reviewer_configs(
-        registry,
-        [
-            ReviewerConfig(name="security_reviewer", max_steps=6),
-            ReviewerConfig(name="style_reviewer", enabled=False),
-        ],
-    )
-
-    assert registry.get_agent("security_reviewer").max_steps == 6
-    assert "style_reviewer" not in registry.agents
-
-
-def test_reviewer_config_clamps_steps_and_ignores_non_executor():
-    registry = build_registry()
-
-    apply_reviewer_configs(
-        registry,
-        [
-            ReviewerConfig(name="security_reviewer", max_steps=0),
-            ReviewerConfig(name="planner", max_steps=99),
-        ],
-    )
-
-    assert registry.get_agent("security_reviewer").max_steps == 1
-    assert registry.get_agent("planner").max_steps == 1

@@ -167,13 +167,6 @@ _FAILURE_MECHANISM = re.compile(
     re.IGNORECASE,
 )
 
-_SPECULATIVE_RESCUE = re.compile(
-    r"\b(?:may|might|could|possibly|potentially|if\s+(?:any|there\s+(?:is|are)|"
-    r"callers?\s+exist)|appears?\s+unused|dead\s+code)\b|"
-    r"可能|也许|或许|若有|如果存在|疑似|未被(?:任何)?(?:调用|使用)",
-    re.IGNORECASE,
-)
-
 
 # ── Public dataclasses ───────────────────────────────────────────────────────
 
@@ -192,7 +185,6 @@ class PublicationPolicyConfig:
     budget_enabled: bool = True
     max_comments: int = 4
     high_risk_overflow: int = 1
-    empty_review_rescue_enabled: bool = False
 
     def normalized_mode(self) -> str:
         candidate = (self.mode or "").strip().lower()
@@ -513,18 +505,6 @@ class PublicationPolicy:
     _SCORE_CONCRETE_SINK = 6.0
     _SCORE_ACTIONABLE_FIX = 5.0
     _SCORE_GENERIC_PENALTY = -15.0
-    _RESCUE_PROVENANCE_PRIORITY = {
-        "verifier": 3,
-        "publication-gate-ungrounded": 2,
-        "publication-gate": 1,
-    }
-    _RESCUE_REVIEWERS = frozenset(
-        {
-            "correctness_reviewer",
-            "performance_reviewer",
-            "security_reviewer",
-        }
-    )
 
     def __init__(self, config: PublicationPolicyConfig | None = None) -> None:
         self._config = config or PublicationPolicyConfig()
@@ -543,66 +523,6 @@ class PublicationPolicy:
 
     def config(self) -> PublicationPolicyConfig:
         return self._config
-
-    def select_empty_review_rescue(
-        self,
-        rejected: Iterable[Finding],
-        state: StateStore,
-    ) -> Finding | None:
-        """Select at most one evidence-anchored fallback without an LLM call.
-
-        This is deliberately narrower than ordinary publication. It only
-        reconsiders a core runtime/security finding rejected by a late,
-        fallible semantic stage. The finding must point at an added RIGHT-side
-        line; early calibration, policy, actionability and scope rejections are
-        never undone. Self-reported confidence is intentionally ignored.
-        """
-
-        if not self.enabled or not self._config.empty_review_rescue_enabled:
-            return None
-
-        eligible: list[tuple[int, ScoredFinding]] = []
-        for index, finding in enumerate(rejected):
-            provenance = (finding.verified_by or "").strip().lower()
-            reviewers = {
-                value.strip().lower().replace("-", "_")
-                for value in str(finding.reviewer or "").split(",")
-                if value.strip()
-            }
-            if provenance not in self._RESCUE_PROVENANCE_PRIORITY:
-                continue
-            if not reviewers or reviewers.isdisjoint(self._RESCUE_REVIEWERS):
-                continue
-            if finding.severity not in {"warning", "error"}:
-                continue
-
-            scored = self._score(finding, state)
-            claim = f"{finding.message}\n{finding.suggestion}"
-            if (
-                scored.invalid_coordinate
-                or scored.abstained
-                or not scored.right_visible
-                or not scored.on_added_line
-                or scored.is_generic_advice
-                or _is_reviewer_scope_noise(finding)
-                or _SPECULATIVE_RESCUE.search(claim)
-            ):
-                continue
-            eligible.append((index, scored))
-
-        if not eligible:
-            return None
-
-        _, selected = max(
-            eligible,
-            key=lambda item: (
-                self._RESCUE_PROVENANCE_PRIORITY[(item[1].finding.verified_by or "").strip().lower()],
-                item[1].score,
-                1 if item[1].finding.severity == "error" else 0,
-                -item[0],
-            ),
-        )
-        return selected.finding
 
     def pre_filter(
         self,

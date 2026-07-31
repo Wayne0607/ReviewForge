@@ -1,0 +1,4 @@
+# Notification dispatcher runtime deps — planted with unpinned wheels to
+# exercise ReviewForge's dependency detector.
+sendgrid>=6.11.0
+slack-sdk

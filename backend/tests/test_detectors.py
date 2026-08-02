@@ -62,6 +62,68 @@ def test_security_detector_covers_core_languages():
     assert "# Safety" in raw_unsafe.message
 
 
+def test_multiline_fstring_sql_injection_is_detected():
+    """F1 regression: ``conn.execute(`` + interleaved comment + f-string SQL.
+
+    Line-based rules cannot see the ``execute(`` prefix and the f-string on
+    different lines; the multi-line scan must report at the execute line.
+    """
+    diff = """@@ -36,7 +36,7 @@ def authenticate_user(conn, username, password):
+     digest = _hash_password(password)
+-    row = conn.execute("SELECT id FROM users WHERE username = ?", (username,))
++    row = conn.execute(
++        # Planted: SQL injection via f-string on the username parameter.
++        f"SELECT id, password_hash FROM users WHERE username = '{username}'"
++    ).fetchone()
+     if row is None:
+         return False
+"""
+    findings = detect_security_findings({"notifier.py": diff})
+
+    sql = [finding for finding in findings if finding.category == "sql-injection"]
+    assert len(sql) == 1
+    assert sql[0].line == 37  # the conn.execute( line (right-side new-file numbering)
+
+
+def test_multiline_sql_scan_ignores_static_and_parameterized_queries():
+    diff = """@@ -1,6 +1,7 @@
+ def query_user(conn, user_id):
+-    row = conn.execute(
+-        "SELECT id FROM users WHERE id = ?", (user_id,)
+-    ).fetchone()
++    row = conn.execute(
++        "SELECT id, name FROM users WHERE id = ?", (user_id,)
++    ).fetchone()
++    static = conn.execute(f"SELECT COUNT(*) FROM users").fetchone()
++    cur.execute("INSERT INTO audit_log VALUES (?)", (user_id,))
+     return row
+"""
+    findings = detect_security_findings({"app.py": diff})
+
+    assert not any(finding.category == "sql-injection" for finding in findings)
+
+
+def test_multiline_sql_scan_catches_cross_line_concatenation_but_not_comments():
+    risky = """@@ -1,3 +1,4 @@
+-    row = conn.execute("SELECT * FROM t WHERE id = ?", (uid,))
++    row = conn.execute(
++        "SELECT * FROM users WHERE name = " + name
++    ).fetchone()
+"""
+    findings = detect_security_findings({"app.py": risky})
+    assert len([f for f in findings if f.category == "sql-injection"]) == 1
+
+    comment = """@@ -1,3 +1,4 @@
+-    row = conn.execute("SELECT * FROM t WHERE id = ?", (uid,))
++    row = conn.execute(
++        # NOTE: f"SELECT * FROM users WHERE name = {name}" would be bad
++        "SELECT * FROM users WHERE id = ?", (uid,)
++    ).fetchone()
+"""
+    findings = detect_security_findings({"app.py": comment})
+    assert not any(finding.category == "sql-injection" for finding in findings)
+
+
 def test_rust_unsafe_detector_distinguishes_public_contract_and_local_scope_evidence():
     findings = detect_security_findings(
         {

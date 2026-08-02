@@ -1082,3 +1082,137 @@ def test_verifier_keeps_validation_findings_for_distinct_symbols():
 
     assert [finding.id for finding in survivors] == ["raw-token", "grant-type"]
     assert dropped == []
+
+
+def test_issue118_nearby_synonym_duplicates_collapse():
+    """Issue #118: testing_reviewer repeats one planted defect with synonym
+    categories at shifted lines — 40% of inline comments were duplicates."""
+    repeat_1 = _finding(
+        "repeat-1",
+        file="test_notifier.py",
+        line=50,
+        category="missing-assertion",
+        message="test_schedule_digest has no assertion.",
+        confidence=0.85,
+        reviewer="testing_reviewer",
+    )
+    repeat_2 = _finding(
+        "repeat-2",
+        file="test_notifier.py",
+        line=52,
+        category="vacuous-test",
+        message="test_schedule_digest asserts nothing.",
+        confidence=0.9,
+        reviewer="testing_reviewer",
+    )
+    repeat_3 = _finding(
+        "repeat-3",
+        file="test_notifier.py",
+        line=55,
+        category="test-pins-bug",
+        message="test_schedule_digest pins old behavior.",
+        confidence=0.8,
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([repeat_1, repeat_2, repeat_3])
+
+    assert [finding.id for finding in survivors] == ["repeat-2"]
+    assert set(dropped) == {"repeat-1", "repeat-3"}
+
+
+def test_same_category_nearby_lines_collapse_but_far_lines_survive():
+    close_a = _finding(
+        "close-a",
+        file="test_notifier.py",
+        line=30,
+        category="missing-assertion",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+    close_b = _finding(
+        "close-b",
+        file="test_notifier.py",
+        line=31,
+        category="missing-assertion",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+    close_c = _finding(
+        "close-c",
+        file="test_notifier.py",
+        line=33,
+        category="missing-assertion",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+    far = _finding(
+        "far",
+        file="test_notifier.py",
+        line=44,
+        category="missing-assertion",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([close_a, close_b, close_c, far])
+
+    assert len(survivors) == 2
+    assert set(dropped) == {"close-b", "close-c"}
+
+
+def test_nearby_synonym_merge_requires_same_file_and_reviewer():
+    other_file = _finding(
+        "other-file",
+        file="other.py",
+        line=30,
+        category="vacuous-test",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+    other_reviewer = _finding(
+        "other-reviewer",
+        file="test_notifier.py",
+        line=31,
+        category="vacuous-test",
+        message="no assert",
+        reviewer="correctness_reviewer",
+    )
+    base = _finding(
+        "base",
+        file="test_notifier.py",
+        line=30,
+        category="missing-assertion",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([base, other_file, other_reviewer])
+
+    assert [finding.id for finding in survivors] == ["base", "other-file", "other-reviewer"]
+    assert dropped == []
+
+
+def test_nearby_synonym_merge_never_consumes_detector_findings():
+    detector = _finding(
+        "detector",
+        file="test_notifier.py",
+        line=30,
+        category="missing-assertion",
+        message="no assert",
+        reviewer="testing_reviewer",
+        verified_by="detector",
+    )
+    llm = _finding(
+        "llm",
+        file="test_notifier.py",
+        line=31,
+        category="vacuous-test",
+        message="no assert",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([detector, llm])
+
+    assert [finding.id for finding in survivors] == ["detector", "llm"]
+    assert dropped == []

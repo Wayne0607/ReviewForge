@@ -163,9 +163,13 @@ def _planner_mission(ctx: dict[str, Any]) -> str:
   或在重复路径上用线性遍历替代常数时间操作时派发；仅局部少一次分配不必派发
 - Correctness Reviewer：对源代码变更默认派发，只查错误变量/调用、分支、状态、返回值、契约、
   并发和生命周期导致的可观察错误；不查命名、可读性、重构偏好或微优化
-- Style Reviewer：仅在已有仓库/框架规则能证明写法会导致实际 API 或运行时失败时派发
+- Style Reviewer：当 diff 含可从语言语义验证的可读性/维护性缺陷（误导性注释、函数内 import、死代码、
+  魔法数字、命名与实现不符）或会引发 API/运行时失败的写法时派发；纯排版/审美偏好不派发
 - Testing Reviewer：只有测试断言/测试文件被修改或安全修复删除了既有保护时派发
-- Documentation Reviewer：只有文档文件被修改且可能与行为契约矛盾时派发
+- Documentation Reviewer：文档文件被修改且可能与行为契约矛盾时派发；或新增/修改了公共 API 且缺少
+  docstring 时派发（docstring 缺失按低严重度报告）
+- Localization Reviewer：新增了用户可见文本（错误消息、UI 文案、面向用户的通知）且未本地化时派发；
+  修改了 locale 资源文件（.po/.properties/.arb/i18n JSON 等）时派发
 - Dependency Reviewer：修改了依赖文件（requirements.txt, pyproject.toml 等）
 - Accessibility Reviewer：仅为自定义交互、键盘/焦点管理、ARIA 契约、媒体或动画等复杂语义派发
   普通 img 的 missing-alt 已由确定性扫描覆盖；input label 候选仍需上下文校准
@@ -192,7 +196,10 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 按语言重点检查：
 - Java/Kotlin：错误对象或参数的 null 检查、资源生命周期、接口/抽象方法契约
 - Go：错误 recorder/scope/argument、goroutine 同步与取消、错误返回值和竞态窗口
-- Python/Ruby：重复方法覆盖、缺失字典键/nil、回调副作用、异常与状态更新顺序
+- Python：可变默认参数（`def f(x=[])`/`x={}` 会在多次调用间共享同一对象，列表/字典被跨调用修改）；
+  `== None`/`!= None` 应改为 `is None`/`is not None`；检查后使用（TOCTOU：先 `os.path.exists`
+  再 `open(...,"w")` 存在竞态窗口）；重复方法覆盖、缺失字典键/nil、回调副作用、异常与状态更新顺序
+- Ruby：重复方法覆盖、缺失字典键/nil、回调副作用、异常与状态更新顺序
 - JavaScript/TypeScript：错误时间/ID/状态字段、Promise 生命周期、React key 与 stale state
 
 先比较同一文件的 sibling 方法、成功/失败分支和同类调用；Impact Manifest 有调用方或契约事实时必须使用。
@@ -227,7 +234,9 @@ confinement guard 必须验证 sink 实际读取的同一 candidate，且位于 
 
 审查代码中的性能问题：
 - 已有证据表明位于热路径的 O(n²) 或更高复杂度
-- 循环内数据库/网络访问形成 N+1 或无界外部工作
+- 循环内数据库/网络访问形成 N+1 或无界外部工作：每次迭代对同一张表按单条 ID 重复执行查询
+  （ORM 风格 `for x in ids: query(id=x)` 或裸 `conn.execute(... WHERE id = ?)`），
+  本可合并为单条 `IN (...)`/批量查询或 JOIN
 - 无限循环、缺少退出/取消机制、连接池或句柄耗尽
 - 定时器、goroutine、listener、流或大对象持续保留造成资源/内存泄漏
 - 在 async/event-loop 上下文中执行可证实的长时间阻塞 I/O
@@ -248,6 +257,8 @@ confinement guard 必须验证 sink 实际读取的同一 candidate，且位于 
 - 测试使用固定 sleep、未 join/await 的线程或轮询，导致断言先于被测行为完成
 - monkeypatch/mock 覆盖了测试随后依赖的真实 API，或 mock 返回结构与生产契约不一致
 - 重复定义覆盖测试 helper/方法、异常被吞掉、断言了错误对象/字段/时间边界
+- 本次 diff 修改的测试只覆盖 happy path，而被测函数存在明确的分支/错误路径（空输入、None、非法值、异常分支）
+  且缺少对应 negative case——仅当测试文件本身被修改时才报告，不能泛泛建议“补充边界测试”
 
 声称编译失败或符号未定义时，若检索工具可用，必须先用 search_code 在同一包/模块中搜索该精确标识符；
 工具不可用时，只有 diff 或 Impact Manifest 能排除其他声明来源才可报告；
@@ -263,9 +274,11 @@ Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文�
 - 文档示例使用了已失效或危险的调用方式
 - Rust `pub unsafe fn` 缺少可从签名/实现核验的 `# Safety` 前置条件
 - 新增配置/API 改变了明确的外部契约，但已有文档仍描述旧契约
+- 本次 diff 新增的公共函数/类/方法缺少 docstring、JavaDoc、GoDoc、类型说明或参数说明
+  （仅报告新增的公共 API 条目，严重度 info/low；已有函数未补 docstring 不算）
 
-不要仅因公共函数/类缺少 docstring、JavaDoc、GoDoc、参数说明或 README 条目而报告 finding。
-“代码有安全风险，所以还应补一条风险注释”会重复真正的安全 finding，也不要报告；应直接报告可修复的漏洞。""",
+“代码有安全风险，所以还应补一条风险注释”会重复真正的安全 finding，也不要报告；应直接报告可修复的漏洞。
+不要仅因公共函数/类缺少 docstring 就报告，除非该函数/类是本 diff 新增的公共 API 条目。""",
         "localization": """## 任务
 
 审查本地化资源中可验证的用户可见缺陷：
@@ -273,9 +286,12 @@ Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文�
 - 同一条翻译中意外混入另一种自然语言，或明显复制了其他 locale 的完整句子
 - 占位符、ICU MessageFormat 参数、HTML 标签或转义与基准语言条目不一致并会破坏运行时格式化
 - 编码损坏、不可见控制字符或错误转义会导致乱码或资源加载失败
+- 本 diff 新增的用户可见字符串（面向用户的异常消息、UI 文案、通知文本）硬编码在源码中，
+  未提取到 locale 资源文件（严重度 info/low；仅报告本次新增的字符串，逐条锚定行号）
 
 只报告能从新增/修改行直接验证的问题。不要评价翻译文风、措辞偏好或未修改的旧翻译；
 不要把产品名、技术术语、URL、占位符和专有名词误判为语言混用。
+日志消息、面向开发者的调试输出和内部注释不是用户可见文本，不要报告。
 每个 finding 必须说明文件声明的 locale 与实际文本证据。""",
         "dependency": """## 任务
 
@@ -296,6 +312,7 @@ Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文�
 - 动画缺少 prefers-reduced-motion 适配
 - 语义化 HTML 使用不当（用 div 代替 button）
 - 自定义控件的 ARIA 状态与交互行为不一致
+- 仅含图标/emoji 而无可见文本且无 aria-label 或 title 的 button（可访问名称缺失）
 
 普通原生 `<img>` missing-alt 已由确定性扫描负责，不要重复报告；大写 `<Image>` 通常是自定义组件。
 表单控件的外部 `<label>` 可能位于 hunk 外，`title` 也可提供名称，只有上下文足以证明缺失时才报告。
@@ -333,6 +350,8 @@ Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文�
 - 异常处理是否精确（禁止 bare except:、except Exception: pass）
 - 函数复杂度是否可控（>30 行应拆分，嵌套 >3 层是警告）
 - 死代码、未使用的导入
+- 无理由的函数内 import（延迟导入应有明确理由，否则应提升到模块顶层）
+- 与实现不符的误导性注释（例如声称“shadows builtin id”但实际并未遮蔽）
 - 与代码库其他部分的模式不一致""",
         "java": """## 任务
 
@@ -381,6 +400,7 @@ Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文�
 - 命名不清晰、魔法数字
 - 过于复杂的函数
 - 死代码、未使用的导入
+- 与实现不符的误导性注释（例如声称“shadows builtin id”但实际并未遮蔽）
 - 与代码库其他部分的模式不一致
 
 不要把公共 API 缺少文档或测试作为 style finding；文档只有与实际行为矛盾时才可报告。"""
@@ -403,13 +423,21 @@ def _verifier_mission(ctx: dict[str, Any]) -> str:
 
 
 def _anti_patterns(ctx: dict[str, Any]) -> str:
-    return """## 反模式（禁止）
+    docstring_rule = (
+        "- 不要仅因 diff 没附带测试/文档，就报告缺测试、缺注释或缺文档"
+        if ctx.get("reviewer_type") != "documentation"
+        else (
+            "- 缺 docstring 只允许报告本 diff 新增的公共 API 条目（info/low 严重度），"
+            "已有函数未补 docstring 或私有/内部函数缺失不算"
+        )
+    )
+    return f"""## 反模式（禁止）
 
 - 不要编造没有代码依据的发现
 - 不要报告 PR 未改动的行上的问题
 - 不要在不同文件中重复同一个发现
 - 不要建议与 PR 目的无关的重构
-- 不要仅因 diff 没附带测试/文档，就报告缺测试、缺注释或缺文档
+- {docstring_rule}
 - 不要报告纯排版/导入排序偏好、无证据的微优化，或仅凭动态文本更新推断缺少 live region；
   但会导致编译失败的缺失 import、同步 event-loop I/O、未清理 listener 和 diff 内完整可见的新 live carrier 不是偏好
 - 不要在建议中留占位符文本"""

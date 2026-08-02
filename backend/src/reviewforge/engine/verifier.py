@@ -61,6 +61,23 @@ _FUZZY_CATEGORY_PAIRS = {
     frozenset({"command-injection", "ci-security"}),
 }
 _ROOT_CAUSE_LINE_TOLERANCE = 20
+# Reviewer vocabularies emit several near-synonym labels for one planted
+# defect (notably testing_reviewer: missing assertion / vacuous test /
+# assertion pins the bug).  Findings in the same cluster at nearby lines
+# from the same reviewer collapse to one report.
+_CATEGORY_SYNONYM_CLUSTERS: frozenset[frozenset[str]] = frozenset(
+    {
+        frozenset(
+            {
+                "assertion-mismatch",
+                "assertion-pins-bug",
+                "missing-assertion",
+                "test-pins-bug",
+                "vacuous-test",
+            }
+        ),
+    }
+)
 _VALIDATION_ROOT_CATEGORIES = frozenset(
     {
         "incorrect-argument",
@@ -373,6 +390,14 @@ class Verifier:
         out, root_dropped = self._merge_llm_root_duplicates(out)
         dropped.extend(root_dropped)
 
+        # Verbose reviewers (notably testing_reviewer) report one planted
+        # defect several times with synonym categories at shifted lines
+        # (same reviewer, same file, ~3-line window, same category cluster).
+        # The issue-118 planted sample had 40% duplicate inline comments;
+        # this deterministic pass collapses them before triage/calibration.
+        out, synonym_dropped = self._merge_nearby_synonym_duplicates(out)
+        dropped.extend(synonym_dropped)
+
         # Repeated copy/paste metric-recorder swaps are one root cause even when
         # they occur in several sibling methods. Keep opposite swap directions
         # independent (legacy->storage versus storage->legacy).
@@ -404,6 +429,52 @@ class Verifier:
         for finding in findings:
             duplicate_index = next(
                 (index for index, existing in enumerate(consolidated) if cls._same_validation_root(existing, finding)),
+                None,
+            )
+            if duplicate_index is None:
+                consolidated.append(finding)
+                continue
+            winner, loser = cls._merge(consolidated[duplicate_index], finding)
+            consolidated[duplicate_index] = winner
+            dropped.append(loser.id)
+        return consolidated, dropped
+
+    @classmethod
+    def _same_category_cluster(cls, first: str, second: str) -> bool:
+        """Whether two canonical categories denote the same defect family."""
+        if first == second:
+            return True
+        return any(first in cluster and second in cluster for cluster in _CATEGORY_SYNONYM_CLUSTERS)
+
+    @classmethod
+    def _merge_nearby_synonym_duplicates(cls, findings: list[Finding]) -> tuple[list[Finding], list[str]]:
+        """Collapse same-reviewer repeats of one defect at nearby lines.
+
+        Exact identity merging above needs the identical ``(file, line,
+        category)``.  A verbose reviewer instead reports the same defect
+        several times with synonym categories at shifted line numbers.  The
+        duplicate key is ``(reviewer, file, ~3-line window, category cluster)``
+        per issue #118; merging is greedy and chains through the surviving
+        representative, so a 5-line cluster of repeats collapses to one.
+        Detector findings are never consumed here — the detector/LLM fuzzy
+        pass owns that pairing.
+        """
+        consolidated: list[Finding] = []
+        dropped: list[str] = []
+        for finding in findings:
+            if cls._is_detector(finding):
+                consolidated.append(finding)
+                continue
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(consolidated)
+                    if not cls._is_detector(existing)
+                    and existing.file == finding.file
+                    and abs(existing.line - finding.line) <= _NEARBY_LINE_TOLERANCE
+                    and cls._same_category_cluster(existing.category, finding.category)
+                    and set(existing.reviewer.split(",")) & set(finding.reviewer.split(","))
+                ),
                 None,
             )
             if duplicate_index is None:

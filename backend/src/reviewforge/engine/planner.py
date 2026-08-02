@@ -429,8 +429,8 @@ class Planner:
                 "performance_reviewer": "performance_reviewer",
                 "correctness": "correctness_reviewer",
                 "correctness_reviewer": "correctness_reviewer",
-                "style": "correctness_reviewer",
-                "style_reviewer": "correctness_reviewer",
+                "style": "style_reviewer",
+                "style_reviewer": "style_reviewer",
                 "architecture": "correctness_reviewer",
                 "readability": "correctness_reviewer",
                 "testing": "testing_reviewer",
@@ -634,17 +634,15 @@ def _skip_reviewer_for_files(reviewer: str, files: list[str]) -> bool:
 
 
 def _skip_reviewer_for_change(reviewer: str, files: list[str], diff: str) -> bool:
-    """Apply evidence-aware routing for reviewers whose mission needs changed artifacts."""
+    """Apply evidence-aware routing for reviewers whose mission needs changed artifacts.
 
-    if reviewer == "doc_reviewer":
-        normalized = [file_path.replace("\\", "/").lower() for file_path in files]
-        docs_changed = any(
-            path.startswith("docs/")
-            or path.rsplit("/", 1)[-1].startswith(("readme", "changelog", "contributing"))
-            or path.endswith((".md", ".mdx", ".rst", ".adoc"))
-            for path in normalized
-        )
-        return not docs_changed
+    ``doc_reviewer`` deliberately has no hard evidence gate here: its dispatch
+    is governed by the planner mission (docs contradicting behavior, or newly
+    changed public API missing docstrings), so LLM proposals pass through.
+    ``_skip_reviewer_for_files`` still skips it for fixture/example/docs-only
+    changes below.
+    """
+
     if _skip_reviewer_for_files(reviewer, files):
         return True
     if reviewer == "testing_reviewer":

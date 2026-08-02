@@ -152,7 +152,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.94,
         ),
         _Rule(
-            r"\bconn\.execute\s*\(\s*(?:f[\"']|[\"'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\+)",
+            r"\bconn\.execute\s*\(\s*(?:f[\"'][^\n]*\{[^}\n]*\}|[\"'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\+)",
             "sql-injection",
             "error",
             "SQL is built from an interpolated or concatenated string.",
@@ -3188,6 +3188,74 @@ def _java_runtime_exec_is_static(source_line: str) -> bool:
     return bool(items) and all(re.fullmatch(r'"(?:\\.|[^"\\])*"', item) for item in items)
 
 
+def _python_multiline_sql_findings(
+    diff: str,
+    file_path: str,
+    code_by_line: dict[int, str],
+) -> list[DetectorFinding]:
+    """Catch interpolated f-string SQL passed to ``.execute()`` across lines.
+
+    ``match_lines`` matches one added line at a time, so a call shaped like::
+
+        row = conn.execute(
+            # Planted: SQL injection via f-string on the username parameter.
+            f"SELECT id, password_hash FROM users WHERE username = '{username}'"
+        ).fetchone()
+
+    never matches the single-line SQL rules (the ``execute(`` prefix and the
+    f-string are on different lines, possibly with a comment in between).
+    For every added line that opens a ``.execute()`` call, look at the
+    following lines until the call's parentheses close and require an
+    interpolated f-string containing a SQL keyword in code (not a comment).
+    """
+    additions = iter_added_lines(diff)
+    findings: list[DetectorFinding] = []
+    for index, (line_no, content) in enumerate(additions):
+        execute_match = re.search(r"\b\w+\.(?:execute|executemany)\s*\(", content)
+        if execute_match is None or not _match_starts_in_mask(line_no, execute_match, code_by_line):
+            continue
+        window = [(line_no, content)]
+        paren_depth = content.count("(") - content.count(")")
+        for next_line_no, next_content in additions[index + 1 : index + 10]:
+            window.append((next_line_no, next_content))
+            paren_depth += next_content.count("(") - next_content.count(")")
+            if paren_depth <= 0:
+                break
+        for next_line_no, window_line in window:
+            # f-string with SQL keyword and interpolation
+            f_match = re.search(
+                r"f[\"'][^\n]*?(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*?\{[^}\n]*\}",
+                window_line,
+                re.IGNORECASE,
+            )
+            if f_match is not None and _match_starts_in_mask(next_line_no, f_match, code_by_line):
+                findings.append(_sql_finding(file_path, line_no))
+                break
+            # quoted SQL string concatenated with ``+`` (string literals are
+            # masked as non-code, so guard only against comment-only lines)
+            if not _is_comment_only(window_line) and re.search(
+                r"[\"'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*[\"']\s*\+",
+                window_line,
+                re.IGNORECASE,
+            ):
+                findings.append(_sql_finding(file_path, line_no))
+                break
+    return findings
+
+
+def _sql_finding(file_path: str, line_no: int) -> DetectorFinding:
+    """Build the sql-injection DetectorFinding for a multi-line execute() call."""
+    return DetectorFinding(
+        file=file_path,
+        line=line_no,
+        severity="error",
+        category="sql-injection",
+        message="SQL is built from an interpolated f-string passed to execute() across lines.",
+        suggestion="Use parameterized query APIs.",
+        confidence=_detector_confidence(file_path, 0.93),
+    )
+
+
 def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
     """Scan modified file diffs for deterministic security findings."""
 
@@ -3390,6 +3458,7 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                 )
 
         if language == "python":
+            findings.extend(_python_multiline_sql_findings(diff, file_path, code_by_line))
             for line_no in _python_dynamic_path_sinks(diff):
                 findings.append(
                     DetectorFinding(

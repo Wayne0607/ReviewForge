@@ -145,25 +145,19 @@ def test_planner_skips_low_signal_reviewers_for_fixtures():
     assert not _skip_reviewer_for_files("security_reviewer", files)
 
 
-def test_planner_routes_test_and_doc_reviewers_only_with_changed_evidence():
+def test_planner_routes_test_reviewer_only_with_changed_evidence():
     source_files = ["src/service.py"]
     assert _skip_reviewer_for_change("testing_reviewer", source_files, "+def service(): pass")
-    assert _skip_reviewer_for_change("doc_reviewer", source_files, "+def service(): pass")
+    assert not _skip_reviewer_for_change("testing_reviewer", ["tests/test_service.py"], "+def test_service()")
+    # doc_reviewer has no hard evidence gate: the planner mission decides dispatch.
+    assert not _skip_reviewer_for_change("doc_reviewer", source_files, "+def service(): pass")
     assert not _skip_reviewer_for_change(
-        "testing_reviewer",
-        ["tests/test_service.py"],
-        "+def test_service(): assert service()",
-    )
-    assert not _skip_reviewer_for_change(
-        "doc_reviewer",
-        ["README.md"],
-        "+The service returns a result.",
-    )
-    assert _skip_reviewer_for_change(
         "doc_reviewer",
         ["src/raw.rs"],
         "+pub unsafe fn read_raw(ptr: *const u8) -> u8 { *ptr }",
     )
+    # fixture/docs-only changes still gate doc_reviewer via _skip_reviewer_for_files.
+    assert _skip_reviewer_for_change("doc_reviewer", ["test_fixtures/sample.py"], "+value = 1")
 
 
 def test_planner_leaves_simple_alt_and_label_sinks_to_phase0_detector():

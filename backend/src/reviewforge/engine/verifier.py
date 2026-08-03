@@ -61,11 +61,10 @@ _FUZZY_CATEGORY_PAIRS = {
     frozenset({"command-injection", "ci-security"}),
 }
 _ROOT_CAUSE_LINE_TOLERANCE = 20
-# Reviewer vocabularies emit several near-synonym labels for one planted
-# defect (notably testing_reviewer: missing assertion / vacuous test /
-# assertion pins the bug).  Findings in the same cluster at nearby lines
-# from the same reviewer collapse to one report.
-_CATEGORY_SYNONYM_CLUSTERS: frozenset[frozenset[str]] = frozenset(
+# The testing reviewer can describe one test defect with several labels. Keep
+# this allow-list deliberately reviewer-specific: category equality by itself
+# is not evidence that two nearby findings share a root cause.
+_TESTING_CATEGORY_SYNONYM_CLUSTERS: frozenset[frozenset[str]] = frozenset(
     {
         frozenset(
             {
@@ -77,6 +76,24 @@ _CATEGORY_SYNONYM_CLUSTERS: frozenset[frozenset[str]] = frozenset(
             }
         ),
     }
+)
+_TEST_FUNCTION_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9_$])"
+    r"(?P<name>(?:[A-Za-z_$][A-Za-z0-9_$]*[.:])*(?:"
+    r"(?i:test_)[A-Za-z0-9_$]+|test[A-Z][A-Za-z0-9_$]*|Test[A-Z][A-Za-z0-9_$]*"
+    r"))(?![A-Za-z0-9_$])"
+)
+_NAMED_TEST_SYMBOL = re.compile(
+    r"(?:\btest\s+(?:function|method|case)|\u6d4b\u8bd5(?:\u51fd\u6570|\u65b9\u6cd5|\u7528\u4f8b))"
+    r"\s+(?:named|called)\s+[`'\"]?"
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]*(?:[.:][A-Za-z_$][A-Za-z0-9_$]*)*)",
+    re.IGNORECASE,
+)
+_QUOTED_TEST_SYMBOL = re.compile(
+    r"(?:\btest\s+(?:function|method|case)|\u6d4b\u8bd5(?:\u51fd\u6570|\u65b9\u6cd5|\u7528\u4f8b))"
+    r"\s+(?P<quote>[`'\"])(?P<name>[A-Za-z_$][A-Za-z0-9_$]*(?:[.:][A-Za-z_$][A-Za-z0-9_$]*)*)"
+    r"(?P=quote)",
+    re.IGNORECASE,
 )
 _VALIDATION_ROOT_CATEGORIES = frozenset(
     {
@@ -307,6 +324,7 @@ class Verifier:
                     for index, existing in enumerate(survivors)
                     if (existing.file, existing.line, existing.category) == (f.file, f.line, f.category)
                     and self._can_merge_exact(existing, f)
+                    and self._can_merge_exact_testing_root(existing, f)
                 ),
                 None,
             )
@@ -390,11 +408,9 @@ class Verifier:
         out, root_dropped = self._merge_llm_root_duplicates(out)
         dropped.extend(root_dropped)
 
-        # Verbose reviewers (notably testing_reviewer) report one planted
-        # defect several times with synonym categories at shifted lines
-        # (same reviewer, same file, ~3-line window, same category cluster).
-        # The issue-118 planted sample had 40% duplicate inline comments;
-        # this deterministic pass collapses them before triage/calibration.
+        # The testing reviewer can restate one defect at shifted lines. Merge
+        # only explicit testing synonyms with shared, auditable test symbols;
+        # line proximity and category equality are not sufficient evidence.
         out, synonym_dropped = self._merge_nearby_synonym_duplicates(out)
         dropped.extend(synonym_dropped)
 
@@ -440,49 +456,117 @@ class Verifier:
         return consolidated, dropped
 
     @classmethod
-    def _same_category_cluster(cls, first: str, second: str) -> bool:
-        """Whether two canonical categories denote the same defect family."""
-        if first == second:
+    def _same_testing_category_cluster(cls, first: str, second: str) -> bool:
+        """Whether both categories belong to one explicit testing family."""
+
+        return any(first in cluster and second in cluster for cluster in _TESTING_CATEGORY_SYNONYM_CLUSTERS)
+
+    @staticmethod
+    def _testing_root_evidence(finding: Finding) -> frozenset[str]:
+        """Extract conservative, auditable test-symbol anchors."""
+
+        text = f"{finding.message}\n{finding.suggestion}"
+        anchors: set[str] = set()
+        for pattern in (_TEST_FUNCTION_IDENTIFIER, _NAMED_TEST_SYMBOL, _QUOTED_TEST_SYMBOL):
+            for match in pattern.finditer(text):
+                symbol = match.group("name").strip("`'\".,:;()[]{} ")
+                normalized = symbol.replace("::", ".").lower()
+                if normalized:
+                    anchors.add(f"test-symbol:{normalized}")
+        return frozenset(anchors)
+
+    @classmethod
+    def _same_unique_testing_root(cls, first: Finding, second: Finding) -> bool:
+        first_evidence = cls._testing_root_evidence(first)
+        second_evidence = cls._testing_root_evidence(second)
+        return len(first_evidence) == 1 and first_evidence == second_evidence
+
+    @classmethod
+    def _can_merge_exact_testing_root(cls, first: Finding, second: Finding) -> bool:
+        """Protect independent testing findings that point at one source line."""
+
+        if cls._is_detector(first) or cls._is_detector(second):
             return True
-        return any(first in cluster and second in cluster for cluster in _CATEGORY_SYNONYM_CLUSTERS)
+        if not cls._same_testing_category_cluster(first.category, second.category):
+            return True
+        first_reviewers = {name.strip() for name in first.reviewer.split(",")}
+        second_reviewers = {name.strip() for name in second.reviewer.split(",")}
+        if "testing_reviewer" not in first_reviewers or "testing_reviewer" not in second_reviewers:
+            return True
+        return cls._same_unique_testing_root(first, second)
+
+    @classmethod
+    def _same_nearby_testing_root(cls, first: Finding, second: Finding) -> bool:
+        if cls._is_detector(first) or cls._is_detector(second):
+            return False
+        if first.file != second.file or abs(first.line - second.line) > _NEARBY_LINE_TOLERANCE:
+            return False
+        if not cls._same_testing_category_cluster(first.category, second.category):
+            return False
+        first_reviewers = {name.strip() for name in first.reviewer.split(",")}
+        second_reviewers = {name.strip() for name in second.reviewer.split(",")}
+        if "testing_reviewer" not in first_reviewers or "testing_reviewer" not in second_reviewers:
+            return False
+        return cls._same_unique_testing_root(first, second)
 
     @classmethod
     def _merge_nearby_synonym_duplicates(cls, findings: list[Finding]) -> tuple[list[Finding], list[str]]:
-        """Collapse same-reviewer repeats of one defect at nearby lines.
+        """Collapse connected restatements of one explicitly named test root.
 
-        Exact identity merging above needs the identical ``(file, line,
-        category)``.  A verbose reviewer instead reports the same defect
-        several times with synonym categories at shifted line numbers.  The
-        duplicate key is ``(reviewer, file, ~3-line window, category cluster)``
-        per issue #118; merging is greedy and chains through the surviving
-        representative, so a 5-line cluster of repeats collapses to one.
+        Edges require an explicit testing category family and shared test
+        symbol evidence. Connected components make a 50/52/55 chain stable
+        regardless of which line has the highest-confidence representative.
         Detector findings are never consumed here — the detector/LLM fuzzy
         pass owns that pairing.
         """
-        consolidated: list[Finding] = []
+        parent = list(range(len(findings)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(first: int, second: int) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        for first_index, first in enumerate(findings):
+            for second_index in range(first_index + 1, len(findings)):
+                if cls._same_nearby_testing_root(first, findings[second_index]):
+                    union(first_index, second_index)
+
+        components: dict[int, list[int]] = {}
+        for index in range(len(findings)):
+            components.setdefault(find(index), []).append(index)
+
+        replacements: dict[int, Finding] = {}
+        consumed: set[int] = set()
         dropped: list[str] = []
-        for finding in findings:
-            if cls._is_detector(finding):
-                consolidated.append(finding)
+        for component in components.values():
+            if len(component) == 1:
                 continue
-            duplicate_index = next(
-                (
-                    index
-                    for index, existing in enumerate(consolidated)
-                    if not cls._is_detector(existing)
-                    and existing.file == finding.file
-                    and abs(existing.line - finding.line) <= _NEARBY_LINE_TOLERANCE
-                    and cls._same_category_cluster(existing.category, finding.category)
-                    and set(existing.reviewer.split(",")) & set(finding.reviewer.split(","))
-                ),
-                None,
-            )
-            if duplicate_index is None:
+            winner_index = min(component, key=lambda index: (-findings[index].confidence, findings[index].id))
+            winner = findings[winner_index]
+            for index in component:
+                if index == winner_index:
+                    continue
+                winner.reviewer = cls._union_reviewers(winner.reviewer, findings[index].reviewer)
+                consumed.add(index)
+                dropped.append(findings[index].id)
+            insertion_index = min(component)
+            replacements[insertion_index] = winner
+            if insertion_index != winner_index:
+                consumed.add(winner_index)
+
+        consolidated: list[Finding] = []
+        for index, finding in enumerate(findings):
+            if index in replacements:
+                consolidated.append(replacements[index])
+            elif index not in consumed:
                 consolidated.append(finding)
-                continue
-            winner, loser = cls._merge(consolidated[duplicate_index], finding)
-            consolidated[duplicate_index] = winner
-            dropped.append(loser.id)
         return consolidated, dropped
 
     @classmethod

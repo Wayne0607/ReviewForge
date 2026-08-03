@@ -1093,7 +1093,7 @@ def test_issue118_nearby_synonym_duplicates_collapse():
         line=50,
         category="missing-assertion",
         message="test_schedule_digest has no assertion.",
-        confidence=0.85,
+        confidence=0.95,
         reviewer="testing_reviewer",
     )
     repeat_2 = _finding(
@@ -1117,8 +1117,8 @@ def test_issue118_nearby_synonym_duplicates_collapse():
 
     survivors, dropped = Verifier().verify([repeat_1, repeat_2, repeat_3])
 
-    assert [finding.id for finding in survivors] == ["repeat-2"]
-    assert set(dropped) == {"repeat-1", "repeat-3"}
+    assert [finding.id for finding in survivors] == ["repeat-1"]
+    assert set(dropped) == {"repeat-2", "repeat-3"}
 
 
 def test_same_category_nearby_lines_collapse_but_far_lines_survive():
@@ -1127,7 +1127,7 @@ def test_same_category_nearby_lines_collapse_but_far_lines_survive():
         file="test_notifier.py",
         line=30,
         category="missing-assertion",
-        message="no assert",
+        message="test_schedule_digest has no assert",
         reviewer="testing_reviewer",
     )
     close_b = _finding(
@@ -1135,7 +1135,7 @@ def test_same_category_nearby_lines_collapse_but_far_lines_survive():
         file="test_notifier.py",
         line=31,
         category="missing-assertion",
-        message="no assert",
+        message="test_schedule_digest has no assert",
         reviewer="testing_reviewer",
     )
     close_c = _finding(
@@ -1143,7 +1143,7 @@ def test_same_category_nearby_lines_collapse_but_far_lines_survive():
         file="test_notifier.py",
         line=33,
         category="missing-assertion",
-        message="no assert",
+        message="test_schedule_digest has no assert",
         reviewer="testing_reviewer",
     )
     far = _finding(
@@ -1151,7 +1151,7 @@ def test_same_category_nearby_lines_collapse_but_far_lines_survive():
         file="test_notifier.py",
         line=44,
         category="missing-assertion",
-        message="no assert",
+        message="test_schedule_digest has no assert",
         reviewer="testing_reviewer",
     )
 
@@ -1159,6 +1159,143 @@ def test_same_category_nearby_lines_collapse_but_far_lines_survive():
 
     assert len(survivors) == 2
     assert set(dropped) == {"close-b", "close-c"}
+
+
+def test_nearby_testing_findings_without_shared_test_symbol_survive():
+    first = _finding(
+        "first",
+        file="test_notifier.py",
+        line=30,
+        category="missing-assertion",
+        message="This test has no assertion.",
+        reviewer="testing_reviewer",
+    )
+    independent = _finding(
+        "independent",
+        file="test_notifier.py",
+        line=31,
+        category="missing-assertion",
+        message="The adjacent test has no assertion either.",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([first, independent])
+
+    assert [finding.id for finding in survivors] == ["first", "independent"]
+    assert dropped == []
+
+
+def test_nearby_testing_findings_for_different_test_functions_survive():
+    first = _finding(
+        "first",
+        file="test_notifier.py",
+        line=30,
+        category="missing-assertion",
+        message="test_schedule_digest has no assertion.",
+        reviewer="testing_reviewer",
+    )
+    independent = _finding(
+        "independent",
+        file="test_notifier.py",
+        line=31,
+        category="vacuous-test",
+        message="test_send_digest makes no observable assertion.",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([first, independent])
+
+    assert [finding.id for finding in survivors] == ["first", "independent"]
+    assert dropped == []
+
+
+def test_exact_testing_findings_for_different_test_functions_survive():
+    first = _finding(
+        "first",
+        file="test_notifier.py",
+        line=40,
+        category="missing-assertion",
+        message="test_alpha has no assertion.",
+        reviewer="testing_reviewer",
+    )
+    independent = _finding(
+        "independent",
+        file="test_notifier.py",
+        line=40,
+        category="missing-assertion",
+        message="test_beta has no assertion.",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([first, independent])
+
+    assert [finding.id for finding in survivors] == ["first", "independent"]
+    assert dropped == []
+
+
+def test_multi_symbol_finding_cannot_bridge_independent_test_roots():
+    alpha = _finding(
+        "alpha",
+        file="test_notifier.py",
+        line=50,
+        category="missing-assertion",
+        message="test_alpha has no assertion.",
+        reviewer="testing_reviewer",
+    )
+    bridge = _finding(
+        "bridge",
+        file="test_notifier.py",
+        line=52,
+        category="vacuous-test",
+        message="test_alpha repeats this, while test_beta is also vacuous.",
+        reviewer="testing_reviewer",
+    )
+    beta = _finding(
+        "beta",
+        file="test_notifier.py",
+        line=55,
+        category="test-pins-bug",
+        message="test_beta pins old behavior.",
+        reviewer="testing_reviewer",
+    )
+
+    survivors, dropped = Verifier().verify([alpha, bridge, beta])
+
+    assert [finding.id for finding in survivors] == ["alpha", "bridge", "beta"]
+    assert dropped == []
+
+
+def test_testing_root_evidence_requires_direct_or_explicitly_named_symbol():
+    direct = _finding(
+        "direct",
+        line=10,
+        category="missing-assertion",
+        message="test_digest_retries has no assertion.",
+    )
+    named = _finding(
+        "named",
+        line=11,
+        category="missing-assertion",
+        message="The test case named digest_retries has no assertion.",
+    )
+    quoted = _finding(
+        "quoted",
+        line=12,
+        category="missing-assertion",
+        message="The test method `digest_retries` has no assertion.",
+    )
+    bare_language = _finding(
+        "bare",
+        line=13,
+        category="missing-assertion",
+        message="The test case should validate retries.",
+    )
+
+    expected = frozenset({"test-symbol:digest_retries"})
+    assert Verifier._testing_root_evidence(direct) == frozenset({"test-symbol:test_digest_retries"})
+    assert Verifier._testing_root_evidence(named) == expected
+    assert Verifier._testing_root_evidence(quoted) == expected
+    assert Verifier._testing_root_evidence(bare_language) == frozenset()
 
 
 def test_nearby_synonym_merge_requires_same_file_and_reviewer():

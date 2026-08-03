@@ -63,26 +63,35 @@ def test_security_detector_covers_core_languages():
 
 
 def test_multiline_fstring_sql_injection_is_detected():
-    """F1 regression: ``conn.execute(`` + interleaved comment + f-string SQL.
-
-    Line-based rules cannot see the ``execute(`` prefix and the f-string on
-    different lines; the multi-line scan must report at the execute line.
-    """
-    diff = """@@ -36,7 +36,7 @@ def authenticate_user(conn, username, password):
+    """An added dynamic argument is detected even when the opener is context."""
+    diff = """@@ -36,5 +36,5 @@ def authenticate_user(conn, username, password):
      digest = _hash_password(password)
--    row = conn.execute("SELECT id FROM users WHERE username = ?", (username,))
-+    row = conn.execute(
-+        # Planted: SQL injection via f-string on the username parameter.
+     row = conn.execute(
+-        "SELECT id, password_hash FROM users WHERE username = ?", (username,)
 +        f"SELECT id, password_hash FROM users WHERE username = '{username}'"
-+    ).fetchone()
+     ).fetchone()
      if row is None:
-         return False
 """
     findings = detect_security_findings({"notifier.py": diff})
 
     sql = [finding for finding in findings if finding.category == "sql-injection"]
     assert len(sql) == 1
-    assert sql[0].line == 37  # the conn.execute( line (right-side new-file numbering)
+    assert sql[0].line == 38
+
+
+def test_multiline_sql_scan_does_not_cross_hunks():
+    diff = """@@ -10,2 +10,2 @@ def first_query(conn, user_id):
+     row = conn.execute(
+-        "SELECT id FROM users WHERE id = ?", (user_id,)
++        "SELECT id, name FROM users WHERE id = ?", (user_id,)
+@@ -200,2 +200,2 @@ def unrelated(username):
+-    return username
++    f"SELECT id FROM users WHERE username = '{username}'"
+     return username
+"""
+    findings = detect_security_findings({"app.py": diff})
+
+    assert not any(finding.category == "sql-injection" for finding in findings)
 
 
 def test_multiline_sql_scan_ignores_static_and_parameterized_queries():
@@ -122,6 +131,60 @@ def test_multiline_sql_scan_catches_cross_line_concatenation_but_not_comments():
 """
     findings = detect_security_findings({"app.py": comment})
     assert not any(finding.category == "sql-injection" for finding in findings)
+
+
+def test_multiline_sql_scan_ignores_static_literal_concatenation():
+    diff = """@@ -1,1 +1,3 @@
+-    row = conn.execute("SELECT 1")
++    row = conn.execute(
++        "SELECT " + "1"
++    )
+"""
+    findings = detect_security_findings({"app.py": diff})
+
+    assert not any(finding.category == "sql-injection" for finding in findings)
+
+
+def test_multiline_sql_scan_ignores_escaped_fstring_braces():
+    diff = """@@ -1,1 +1,3 @@
+-    row = conn.execute("SELECT '{}' ")
++    row = conn.execute(
++        f"SELECT '{{literal}}'"
++    )
+"""
+    findings = detect_security_findings({"app.py": diff})
+
+    assert not any(finding.category == "sql-injection" for finding in findings)
+
+
+def test_multiline_sql_scan_catches_added_dynamic_concat_operand():
+    diff = """@@ -1,3 +1,4 @@
+     row = conn.execute(
+         "SELECT * FROM users WHERE name = "
+-    )
++        + username
++    )
+"""
+    findings = detect_security_findings({"app.py": diff})
+
+    sql = [finding for finding in findings if finding.category == "sql-injection"]
+    assert len(sql) == 1
+    assert sql[0].line == 3
+
+
+def test_multiline_sql_scan_catches_operand_after_context_plus():
+    diff = """@@ -1,4 +1,4 @@
+     row = conn.execute(
+         "SELECT * FROM users WHERE name = " +
+-        "guest"
++        username
+     )
+"""
+    findings = detect_security_findings({"app.py": diff})
+
+    sql = [finding for finding in findings if finding.category == "sql-injection"]
+    assert len(sql) == 1
+    assert sql[0].line == 3
 
 
 def test_rust_unsafe_detector_distinguishes_public_contract_and_local_scope_evidence():

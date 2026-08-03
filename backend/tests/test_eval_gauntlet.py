@@ -10,7 +10,9 @@ def test_default_gauntlet_has_92_expected_findings():
     expected_total = sum(int(item.get("count", 1)) for case in golden["cases"] for item in case["expected"])
 
     assert expected_total == 92
-    assert golden["metadata"]["baseline_detected_hint"] == 62
+    assert "baseline_detected_hint" not in golden["metadata"]
+    assert "deterministic" in golden["metadata"]["notes"]
+    assert "does not claim" in golden["metadata"]["notes"]
 
 
 def test_scanner_eval_reports_security_and_supply_chain_metrics():
@@ -26,9 +28,8 @@ def test_scanner_eval_reports_security_and_supply_chain_metrics():
     assert result["token_total"] == 0
 
 
-def test_issue118_planted_notifier_sample_is_fully_detected():
-    """Issue #118 smoke: the planted notifier sample must be caught by the
-    deterministic scanners, including the multi-line f-string SQL injection."""
+def test_issue118_deterministic_scanner_subset_is_detected():
+    """This zero-token smoke covers seven scanner findings, not all planted issues."""
     repo_root = Path(__file__).resolve().parents[2]
     golden = load_golden(repo_root / "backend" / "eval" / "golden_expected_findings.json")
     planted = {

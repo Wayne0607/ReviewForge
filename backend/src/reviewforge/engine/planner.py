@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.json_output import extract_json_value
+from reviewforge.core.scheduler import DEFAULT_PRIORITY
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import TASK_RATIONALE_MAX_LENGTH, ReviewTask, StateStore
 from reviewforge.engine.context_engine import render_impact_manifest
@@ -24,10 +25,12 @@ from reviewforge.engine.symbol_extractor import detect_language
 logger = logging.getLogger(__name__)
 
 _MAX_LLM_TASKS = 6
+_MAX_FINAL_TASKS = 6
 _MAX_REVIEWER_NAME_LENGTH = 100
 _MAX_FILE_PATH_LENGTH = 1024
 _MAX_RATIONALE_INPUT_LENGTH = TASK_RATIONALE_MAX_LENGTH * 10
 _MAX_LOCALIZATION_FILES = 16
+_MAX_DOCUMENTATION_FILES = 16
 
 # ── 通用安全模式（不限语言）────────────────────────────────────────────
 _UNIVERSAL_SECURITY = [
@@ -183,10 +186,23 @@ class Planner:
         forced_reviewers = {
             r
             for r in (self._detect_patterns(state.files_changed, state.diff_summary) - done_reviewers)
-            if not _skip_reviewer_for_change(r, state.files_changed, state.diff_summary)
+            if not _skip_reviewer_for_change(
+                r,
+                state.files_changed,
+                state.diff_summary,
+                file_diffs=state.file_diffs,
+            )
         }
-        if _localization_files(state.files_changed) and "localization_reviewer" not in done_reviewers:
+        localization_files = _localization_files(
+            state.files_changed,
+            state.diff_summary,
+            file_diffs=state.file_diffs,
+        )
+        if localization_files and "localization_reviewer" not in done_reviewers:
             forced_reviewers.add("localization_reviewer")
+        documentation_files = _documentation_files(state.files_changed)
+        if documentation_files and "doc_reviewer" not in done_reviewers:
+            forced_reviewers.add("doc_reviewer")
 
         # Detect language summary for the planner prompt
         file_langs = self._detect_file_languages(state.files_changed)
@@ -228,7 +244,16 @@ class Planner:
             t
             for t in self._parse_response(response.content, allowed_files=state.files_changed)
             if t.reviewer not in done_reviewers
-            and not _skip_reviewer_for_change(t.reviewer, t.files or state.files_changed, state.diff_summary)
+            and not _skip_reviewer_for_change(
+                t.reviewer,
+                (
+                    state.files_changed
+                    if t.reviewer in {"doc_reviewer", "localization_reviewer"}
+                    else t.files or state.files_changed
+                ),
+                state.diff_summary,
+                file_diffs=state.file_diffs,
+            )
             and not (cross_pr_wrapper and _is_low_signal_reviewer(t.reviewer))
         ]
 
@@ -239,6 +264,8 @@ class Planner:
             state.files_changed,
             first_round,
             style_fallback=not cross_pr_wrapper,
+            diff=state.diff_summary,
+            file_diffs=state.file_diffs,
         )
 
     @staticmethod
@@ -324,6 +351,8 @@ class Planner:
         files: list[str],
         first_round: bool = True,
         style_fallback: bool = True,
+        diff: str = "",
+        file_diffs: dict[str, str] | None = None,
     ) -> list[ReviewTask]:
         """Merge forced reviewers with LLM decisions.
 
@@ -334,54 +363,65 @@ class Planner:
         result is valid (it signals convergence — nothing more to dispatch).
         """
         correctness_files = _correctness_files(files)
+        specialist_files = {
+            "doc_reviewer": _documentation_files(files),
+            "localization_reviewer": _localization_files(files, diff, file_diffs=file_diffs),
+        }
         normalized_tasks: list[ReviewTask] = []
-        correctness_added = False
-        for task in llm_tasks:
-            if task.reviewer == "correctness_reviewer":
-                if correctness_added or not correctness_files:
-                    continue
-                normalized_tasks.append(
-                    ReviewTask(
-                        reviewer="correctness_reviewer",
-                        files=correctness_files,
-                        rationale=task.rationale,
-                    )
-                )
-                correctness_added = True
-                continue
+        task_by_reviewer: dict[str, ReviewTask] = {}
+
+        def add_task(reviewer: str, task_files: list[str], rationale: str) -> None:
+            bounded_files = list(dict.fromkeys(task_files))
+            if not bounded_files:
+                return
+            existing = task_by_reviewer.get(reviewer)
+            if existing is not None:
+                existing.files = list(dict.fromkeys([*existing.files, *bounded_files]))
+                return
+            task = ReviewTask(reviewer=reviewer, files=bounded_files, rationale=rationale)
+            task_by_reviewer[reviewer] = task
             normalized_tasks.append(task)
 
-        normalized_tasks = [task for task in normalized_tasks if task.files]
-        llm_reviewers = {t.reviewer for t in normalized_tasks}
-        merged = list(normalized_tasks)
+        for task in llm_tasks:
+            if task.reviewer == "correctness_reviewer":
+                add_task("correctness_reviewer", correctness_files, task.rationale)
+                continue
+            scoped_files = specialist_files.get(task.reviewer, task.files)
+            add_task(task.reviewer, scoped_files, task.rationale)
 
         for reviewer in sorted(forced):
-            if reviewer not in llm_reviewers:
-                task_files = _localization_files(files) if reviewer == "localization_reviewer" else files
-                merged.append(
-                    ReviewTask(
-                        reviewer=reviewer,
-                        files=task_files,
-                        rationale="自动检测到安全/性能模式",
-                    )
-                )
-                logger.info(f"Forced reviewer added: {reviewer}")
+            if reviewer in task_by_reviewer and reviewer not in specialist_files:
+                continue
+            task_files = specialist_files.get(reviewer, files)
+            before = reviewer in task_by_reviewer
+            add_task(reviewer, task_files, f"deterministic evidence for {reviewer}")
+            if not before and reviewer in task_by_reviewer:
+                logger.info("Forced reviewer added: %s", reviewer)
 
-        if (
-            first_round
-            and style_fallback
-            and correctness_files
-            and "correctness_reviewer" not in {task.reviewer for task in merged}
-        ):
-            merged.append(
-                ReviewTask(
-                    reviewer="correctness_reviewer",
-                    files=correctness_files,
-                    rationale="default observable-correctness review",
-                )
+        if first_round and style_fallback and correctness_files and "correctness_reviewer" not in task_by_reviewer:
+            add_task(
+                "correctness_reviewer",
+                correctness_files,
+                "default observable-correctness review",
             )
 
-        return merged
+        if len(normalized_tasks) <= _MAX_FINAL_TASKS:
+            return normalized_tasks
+
+        mandatory = {"security_reviewer", "correctness_reviewer"}
+        selected = {task.reviewer for task in normalized_tasks if task.reviewer in mandatory}
+        ranked = sorted(
+            enumerate(normalized_tasks),
+            key=lambda item: (-DEFAULT_PRIORITY.get(item[1].reviewer, 10), item[0]),
+        )
+        for _index, task in ranked:
+            if len(selected) >= _MAX_FINAL_TASKS:
+                break
+            selected.add(task.reviewer)
+        dropped = [task.reviewer for task in normalized_tasks if task.reviewer not in selected]
+        if dropped:
+            logger.info("Planner final task cap dropped lower-priority reviewers: %s", ", ".join(dropped))
+        return [task for task in normalized_tasks if task.reviewer in selected]
 
     def _parse_response(self, content: str, allowed_files: list[str] | None = None) -> list[ReviewTask]:
         """Parse untrusted LLM JSON into bounded, schema-valid tasks.
@@ -563,27 +603,146 @@ def _is_test_file(file_path: str) -> bool:
     ) or name.startswith(("test_", "spec/", "tests/", "__tests__/", "test/"))
 
 
-def _localization_files(files: list[str]) -> list[str]:
-    """Select bounded production locale resources for dedicated semantic review."""
+def _localization_files(
+    files: list[str],
+    diff: str = "",
+    *,
+    file_diffs: dict[str, str] | None = None,
+) -> list[str]:
+    """Select only locale resources and source files with per-file UI evidence."""
 
     selected: list[str] = []
-    locale_suffixes = (".properties", ".po", ".pot", ".arb", ".strings", ".resx", ".ftl")
+    locale_suffixes = (".po", ".pot", ".arb", ".strings", ".resx", ".ftl")
     locale_directories = ("/i18n/", "/l10n/", "/locale/", "/locales/", "/translations/")
-    excluded_directories = ("/src/test/", "/test/", "/tests/", "/testdata/", "/fixtures/")
+    excluded_directories = (
+        "/src/test/",
+        "/test/",
+        "/tests/",
+        "/testdata/",
+        "/fixtures/",
+        "/generated/",
+        "/vendor/",
+    )
     for file_path in files:
         normalized = "/" + file_path.replace("\\", "/").lower().lstrip("/")
         if any(marker in normalized for marker in excluded_directories):
             continue
-        is_locale_resource = normalized.endswith(locale_suffixes) or (
-            normalized.endswith((".json", ".yaml", ".yml"))
-            and any(marker in normalized for marker in locale_directories)
+        is_locale_resource = (
+            normalized.endswith(locale_suffixes)
+            or (
+                normalized.endswith((".json", ".yaml", ".yml"))
+                and any(marker in normalized for marker in locale_directories)
+            )
+            or (
+                normalized.endswith(".properties")
+                and (
+                    any(marker in normalized for marker in locale_directories)
+                    or re.search(
+                        r"/(?:[a-z0-9.-]*messages|labels|strings|translations?)"
+                        r"(?:[_-][a-z]{2,3}(?:[_-][a-z]{2,4})?)?\.properties$",
+                        normalized,
+                    )
+                    is not None
+                    or re.search(r"[_-][a-z]{2,3}(?:[_-][a-z]{2,4})?\.properties$", normalized) is not None
+                )
+            )
         )
         if not is_locale_resource:
             continue
         selected.append(file_path)
         if len(selected) >= _MAX_LOCALIZATION_FILES:
+            return selected
+
+    source_suffixes = (".html", ".js", ".jsx", ".py", ".svelte", ".ts", ".tsx", ".vue")
+    for file_path in files:
+        normalized = "/" + file_path.replace("\\", "/").lower().lstrip("/")
+        if (
+            file_path in selected
+            or any(marker in normalized for marker in excluded_directories)
+            or not normalized.endswith(source_suffixes)
+        ):
+            continue
+        if file_diffs is not None:
+            file_diff = file_diffs.get(file_path, "")
+        else:
+            file_diff = diff if len(files) == 1 else ""
+        if _has_localization_source_evidence(file_diff, file_path):
+            selected.append(file_path)
+        if len(selected) >= _MAX_LOCALIZATION_FILES:
             break
     return selected
+
+
+def _documentation_files(files: list[str]) -> list[str]:
+    """Select bounded human-authored documentation artifacts."""
+
+    selected: list[str] = []
+    for file_path in files:
+        if _is_documentation_file(file_path):
+            selected.append(file_path)
+        if len(selected) >= _MAX_DOCUMENTATION_FILES:
+            break
+    return selected
+
+
+def _has_localization_source_evidence(diff: str, file_path: str = "") -> bool:
+    """Recognize only explicit UI literals or calls into an i18n API."""
+
+    added = "\n".join(
+        line[1:] for line in (diff or "").splitlines() if line.startswith("+") and not line.startswith("+++")
+    )
+    if re.search(r"(?:\$t|\bi18n\.t|\bgettext|\bformatMessage)\s*\(", added):
+        return True
+
+    normalized = file_path.replace("\\", "/").lower()
+    if not normalized.endswith((".html", ".jsx", ".svelte", ".tsx", ".vue")):
+        return False
+    return bool(
+        re.search(r"<[A-Za-z][^>\n]*>\s*[^\W\d_][^<{\n]{1,}\s*</", added)
+        or re.search(
+            r"<[^>\n]+\b(?:aria-label|caption|label|placeholder|text|title|tooltip)\s*=\s*"
+            r"['\"][^'{\"]{2,}['\"]",
+            added,
+        )
+    )
+
+
+def _has_style_evidence(diff: str) -> bool:
+    """Conservative style prefilter; avoid a general-purpose extra reviewer task."""
+
+    return bool(
+        re.search(r"(?m)^\+(?!\+\+)\s{2,}(?:from\s+[\w.]+\s+import\s+|import\s+[\w.]+)", diff or "")
+        or re.search(r"(?mi)^\+(?!\+\+).*except\s+(?:exception\s*)?:\s*pass\s*$", diff or "")
+    )
+
+
+def _is_fixture_or_example(path: str) -> bool:
+    normalized = "/" + path.replace("\\", "/").lower().lstrip("/")
+    return any(marker in normalized for marker in ("/examples/", "/fixtures/", "/test_fixtures/"))
+
+
+def _is_documentation_file(path: str) -> bool:
+    normalized = "/" + path.replace("\\", "/").lower().lstrip("/")
+    if _is_fixture_or_example(normalized) or any(
+        marker in normalized
+        for marker in (
+            "/generated/",
+            "/node_modules/",
+            "/snapshots/",
+            "/test/",
+            "/testdata/",
+            "/tests/",
+            "/vendor/",
+            "/__snapshots__/",
+        )
+    ):
+        return False
+    name = normalized.rsplit("/", 1)[-1]
+    return normalized.endswith((".adoc", ".md", ".mdx", ".rst")) or name in {
+        "changelog",
+        "contributing",
+        "readme",
+    }
 
 
 def _correctness_files(files: list[str]) -> list[str]:
@@ -629,18 +788,23 @@ def _skip_reviewer_for_files(reviewer: str, files: list[str]) -> bool:
         return False
     if not files:
         return False
-    fixture_prefixes = ("test_fixtures/", "examples/", "docs/")
-    return all(f.replace("\\", "/").startswith(fixture_prefixes) for f in files)
+    if reviewer == "doc_reviewer":
+        return all(_is_fixture_or_example(file_path) for file_path in files)
+    return all(_is_fixture_or_example(file_path) or _is_documentation_file(file_path) for file_path in files)
 
 
-def _skip_reviewer_for_change(reviewer: str, files: list[str], diff: str) -> bool:
+def _skip_reviewer_for_change(
+    reviewer: str,
+    files: list[str],
+    diff: str,
+    *,
+    file_diffs: dict[str, str] | None = None,
+) -> bool:
     """Apply evidence-aware routing for reviewers whose mission needs changed artifacts.
 
-    ``doc_reviewer`` deliberately has no hard evidence gate here: its dispatch
-    is governed by the planner mission (docs contradicting behavior, or newly
-    changed public API missing docstrings), so LLM proposals pass through.
-    ``_skip_reviewer_for_files`` still skips it for fixture/example/docs-only
-    changes below.
+    Low-signal specialist tasks must have cheap, changed-line evidence before
+    they consume an LLM call. Documentation files are valid evidence; fixtures
+    and examples remain excluded.
     """
 
     if _skip_reviewer_for_files(reviewer, files):
@@ -651,6 +815,12 @@ def _skip_reviewer_for_change(reviewer: str, files: list[str], diff: str) -> boo
         )
     if reviewer == "accessibility_reviewer":
         return not _has_complex_accessibility_evidence(diff)
+    if reviewer == "doc_reviewer":
+        return not _documentation_files(files)
+    if reviewer == "localization_reviewer":
+        return not _localization_files(files, diff, file_diffs=file_diffs)
+    if reviewer == "style_reviewer":
+        return not _has_style_evidence(diff)
     return False
 
 

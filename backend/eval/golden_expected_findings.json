@@ -2,8 +2,7 @@
   "metadata": {
     "name": "ReviewForge eval gauntlet",
     "expected_planted_findings": 92,
-    "baseline_detected_hint": 62,
-    "notes": "Counts intentionally exclude documentation/style/testing findings from security metrics. planted-issues-20260731-r2 adds the issue-118 notifier sample."
+    "notes": "The gauntlet measures only deterministic security and dependency scanner coverage at zero LLM tokens. It does not claim full Issue #118 reviewer or 33-item coverage."
   },
   "cases": [
     {
@@ -126,7 +125,7 @@
         {"file": "planted_issues_r2/notifier.py", "category": "code-injection", "count": 1},
         {"kind": "dependency", "file": "planted_issues_r2/requirements.txt", "category": "dependency-version-range", "count": 2}
       ],
-      "notes": "Issue #118 planted sample (PR #117, branch test/planted-issues-20260731-r2). Deterministic smoke: the multi-line f-string SQLi in authenticate_user (F1) must be caught by the execute() window scan."
+      "notes": "Issue #118 deterministic subset only: five security findings and two dependency-version findings. Documentation, style, testing, localization, correctness, performance, duplicate rate, and LLM recall are outside this scanner evaluation."
     }
   ],
   "cross_pr_cases": [

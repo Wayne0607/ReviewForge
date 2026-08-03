@@ -8,7 +8,6 @@ from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.planner import (
     Planner,
     _correctness_files,
-    _documentation_files,
     _localization_files,
     _looks_like_cross_pr_wrapper,
     _skip_reviewer_for_change,
@@ -146,27 +145,25 @@ def test_planner_skips_low_signal_reviewers_for_fixtures():
     assert not _skip_reviewer_for_files("security_reviewer", files)
 
 
-def test_planner_routes_low_signal_reviewers_only_with_changed_evidence():
+def test_planner_routes_test_and_doc_reviewers_only_with_changed_evidence():
     source_files = ["src/service.py"]
     assert _skip_reviewer_for_change("testing_reviewer", source_files, "+def service(): pass")
-    assert not _skip_reviewer_for_change("testing_reviewer", ["tests/test_service.py"], "+def test_service()")
-    assert _skip_reviewer_for_change("doc_reviewer", source_files, "+value = 1")
-    assert not _skip_reviewer_for_change("doc_reviewer", ["docs/api.md"], "+The service returns a result.")
+    assert _skip_reviewer_for_change("doc_reviewer", source_files, "+def service(): pass")
+    assert not _skip_reviewer_for_change(
+        "testing_reviewer",
+        ["tests/test_service.py"],
+        "+def test_service(): assert service()",
+    )
+    assert not _skip_reviewer_for_change(
+        "doc_reviewer",
+        ["README.md"],
+        "+The service returns a result.",
+    )
     assert _skip_reviewer_for_change(
         "doc_reviewer",
         ["src/raw.rs"],
         "+pub unsafe fn read_raw(ptr: *const u8) -> u8 { *ptr }",
     )
-    assert _skip_reviewer_for_change("doc_reviewer", ["test_fixtures/sample.py"], "+value = 1")
-    assert _skip_reviewer_for_change("doc_reviewer", ["examples/guide.md"], "+Example text")
-    assert _skip_reviewer_for_change("style_reviewer", ["docs/api.md"], "+    import requests")
-
-    assert _skip_reviewer_for_change("localization_reviewer", ["src/service.py"], '+logger.info("ready")')
-    assert not _skip_reviewer_for_change(
-        "localization_reviewer", ["web/save-button.tsx"], "+return <button>Save changes</button>"
-    )
-    assert _skip_reviewer_for_change("style_reviewer", source_files, "+value = 1")
-    assert not _skip_reviewer_for_change("style_reviewer", source_files, "+    import requests")
 
 
 def test_planner_leaves_simple_alt_and_label_sinks_to_phase0_detector():
@@ -214,46 +211,6 @@ def test_localization_routing_selects_production_resources_and_bounds_scope():
     assert all("src/test" not in path for path in selected)
 
 
-def test_localization_source_routing_is_scoped_to_each_file_diff():
-    files = ["web/save-button.tsx", "src/jobs.py", "ml/model.py"]
-    file_diffs = {
-        "web/save-button.tsx": "+return <button>Save changes</button>",
-        "src/jobs.py": '+title = "Internal batch job"',
-        "ml/model.py": '+label = "positive"',
-    }
-
-    selected = _localization_files(files, "\n".join(file_diffs.values()), file_diffs=file_diffs)
-
-    assert selected == ["web/save-button.tsx"]
-
-
-def test_documentation_routing_includes_docs_but_excludes_examples_and_fixtures():
-    files = [
-        "docs/api.md",
-        "README",
-        "examples/guide.md",
-        "test_fixtures/docs/sample.md",
-        "docs/logo.png",
-        "src/readme_parser.py",
-        "src/changelog_service.ts",
-        "docs/generated/api.md",
-        "tests/snapshots/rendered.md",
-        "testdata/cases/output.md",
-    ]
-
-    assert _documentation_files(files) == ["docs/api.md", "README"]
-
-
-def test_localization_routing_excludes_generic_properties_and_supports_non_latin_ui():
-    files = ["gradle.properties", "web/save-button.tsx"]
-    file_diffs = {
-        "gradle.properties": "+org.gradle.parallel=true",
-        "web/save-button.tsx": "+return <button>保存</button>",
-    }
-
-    assert _localization_files(files, file_diffs=file_diffs) == ["web/save-button.tsx"]
-
-
 def test_correctness_routing_keeps_only_production_source_files():
     files = [
         "src/service.java",
@@ -281,100 +238,6 @@ async def test_planner_forces_localization_reviewer_for_locale_resources():
     task = next(item for item in tasks if item.reviewer == "localization_reviewer")
 
     assert task.files == ["themes/messages/messages_lt.properties"]
-
-
-async def test_planner_routes_explicit_ui_text_without_an_empty_localization_task():
-    planner = Planner(MockChatLLM(), build_registry())
-    state = StateStore(
-        pr_number=2,
-        repo="o/r",
-        files_changed=["web/save-button.tsx"],
-        diff_summary="+export const SaveLabel = () => <p>Save changes</p>",
-        file_diffs={"web/save-button.tsx": "+export const SaveLabel = () => <p>Save changes</p>"},
-    )
-
-    tasks = await planner.plan(state)
-
-    assert [task.reviewer for task in tasks] == ["localization_reviewer", "correctness_reviewer"]
-    assert tasks[0].files == ["web/save-button.tsx"]
-    assert all(task.files for task in tasks)
-
-
-async def test_planner_routes_docs_as_one_bounded_specialist_task():
-    planner = Planner(MockChatLLM(), build_registry())
-    state = StateStore(
-        pr_number=3,
-        repo="o/r",
-        files_changed=["docs/api.md", "examples/demo.md"],
-        diff_summary="+The endpoint now returns 202.",
-    )
-
-    tasks = await planner.plan(state)
-
-    assert [task.reviewer for task in tasks] == ["doc_reviewer"]
-    assert tasks[0].files == ["docs/api.md"]
-
-
-def test_merge_unions_forced_doc_and_localization_evidence_with_llm_subsets():
-    planner = Planner(MockChatLLM(), build_registry())
-    files = ["docs/api.md", "web/save-button.tsx", "locales/en.json", "src/api.py"]
-    file_diffs = {
-        "docs/api.md": "+The API returns 202.",
-        "web/save-button.tsx": "+return <button>Save changes</button>",
-        "locales/en.json": '+{"save": "Save changes"}',
-        "src/api.py": "+def save(): pass",
-    }
-    tasks = planner._merge_tasks(
-        {"doc_reviewer", "localization_reviewer"},
-        [
-            ReviewTask(reviewer="doc_reviewer", files=["src/api.py"], rationale="LLM doc subset"),
-            ReviewTask(
-                reviewer="localization_reviewer",
-                files=["web/save-button.tsx"],
-                rationale="LLM locale subset",
-            ),
-        ],
-        files,
-        diff="\n".join(file_diffs.values()),
-        file_diffs=file_diffs,
-    )
-
-    by_reviewer = {task.reviewer: task for task in tasks}
-    assert by_reviewer["doc_reviewer"].files == ["docs/api.md"]
-    assert set(by_reviewer["localization_reviewer"].files) == {
-        "locales/en.json",
-        "web/save-button.tsx",
-    }
-
-
-def test_merge_enforces_final_task_cap_without_dropping_security_or_correctness():
-    planner = Planner(MockChatLLM(), build_registry())
-    files = ["src/app.py", "web/view.tsx", "locales/en.json", "docs/api.md", "tests/test_app.py"]
-    file_diffs = {
-        "web/view.tsx": "+return <button>Save</button>",
-        "locales/en.json": '+{"save": "Save"}',
-    }
-    reviewers = [
-        "style_reviewer",
-        "doc_reviewer",
-        "testing_reviewer",
-        "localization_reviewer",
-        "accessibility_reviewer",
-        "performance_reviewer",
-        "dependency_reviewer",
-        "security_reviewer",
-        "correctness_reviewer",
-    ]
-    tasks = planner._merge_tasks(
-        set(),
-        [ReviewTask(reviewer=name, files=files, rationale=name) for name in reviewers],
-        files,
-        diff="\n".join(file_diffs.values()),
-        file_diffs=file_diffs,
-    )
-
-    assert len(tasks) == 6
-    assert {"security_reviewer", "correctness_reviewer"} <= {task.reviewer for task in tasks}
 
 
 def test_cross_pr_wrapper_changes_skip_style_fallback():

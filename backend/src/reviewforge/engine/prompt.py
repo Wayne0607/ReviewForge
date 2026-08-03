@@ -163,13 +163,9 @@ def _planner_mission(ctx: dict[str, Any]) -> str:
   或在重复路径上用线性遍历替代常数时间操作时派发；仅局部少一次分配不必派发
 - Correctness Reviewer：对源代码变更默认派发，只查错误变量/调用、分支、状态、返回值、契约、
   并发和生命周期导致的可观察错误；不查命名、可读性、重构偏好或微优化
-- Style Reviewer：仅当 changed lines 含明确的语言级反模式，且可能造成误导、异常、循环依赖或维护风险时派发；
-  import 位置、命名、排版和 docstring 缺失本身都不足以派发
+- Style Reviewer：仅在已有仓库/框架规则能证明写法会导致实际 API 或运行时失败时派发
 - Testing Reviewer：只有测试断言/测试文件被修改或安全修复删除了既有保护时派发
-- Documentation Reviewer：仅当真实文档文件被修改且可能与行为/外部契约矛盾时派发；
-  fixtures/examples、仅源码变更、公共 API/docstring 缺失都不派发
-- Localization Reviewer：修改了 locale 资源，或 changed lines 明确包含 UI 字面量/翻译 API 契约时派发；
-  日志、开发者调试输出、内部异常和注释不派发
+- Documentation Reviewer：只有文档文件被修改且可能与行为契约矛盾时派发
 - Dependency Reviewer：修改了依赖文件（requirements.txt, pyproject.toml 等）
 - Accessibility Reviewer：仅为自定义交互、键盘/焦点管理、ARIA 契约、媒体或动画等复杂语义派发
   普通 img 的 missing-alt 已由确定性扫描覆盖；input label 候选仍需上下文校准
@@ -196,9 +192,7 @@ def _reviewer_mission(ctx: dict[str, Any]) -> str:
 按语言重点检查：
 - Java/Kotlin：错误对象或参数的 null 检查、资源生命周期、接口/抽象方法契约
 - Go：错误 recorder/scope/argument、goroutine 同步与取消、错误返回值和竞态窗口
-- Python：可变默认参数在多次调用间共享对象并被修改；只有外部可控路径或并发竞争会造成可观察覆盖时，
-  才把检查后使用视为 TOCTOU；另检查重复定义、缺失字典键、回调副作用、异常与状态更新顺序
-- Ruby：重复方法覆盖、缺失字典键/nil、回调副作用、异常与状态更新顺序
+- Python/Ruby：重复方法覆盖、缺失字典键/nil、回调副作用、异常与状态更新顺序
 - JavaScript/TypeScript：错误时间/ID/状态字段、Promise 生命周期、React key 与 stale state
 
 先比较同一文件的 sibling 方法、成功/失败分支和同类调用；Impact Manifest 有调用方或契约事实时必须使用。
@@ -233,8 +227,7 @@ confinement guard 必须验证 sink 实际读取的同一 candidate，且位于 
 
 审查代码中的性能问题：
 - 已有证据表明位于热路径的 O(n²) 或更高复杂度
-- 循环内数据库/网络访问形成 N+1 或无界外部工作；必须能证明循环规模和每次迭代都执行外部 I/O，
-  且存在等价的批量查询、JOIN 或聚合调用
+- 循环内数据库/网络访问形成 N+1 或无界外部工作
 - 无限循环、缺少退出/取消机制、连接池或句柄耗尽
 - 定时器、goroutine、listener、流或大对象持续保留造成资源/内存泄漏
 - 在 async/event-loop 上下文中执行可证实的长时间阻塞 I/O
@@ -265,31 +258,25 @@ Go 测试文件会与同包的其他 `_test.go` 文件一起编译，其他文�
 仅建议“为正常/异常/安全场景添加测试”不是可操作的行内缺陷。""",
         "documentation": """## 任务
 
-只审查本次 PR 实际修改的文档：
-- changed docs 描述的行为、默认值、参数、返回值或错误语义与可验证的实现/外部契约不一致
-- changed docs 中的示例使用了已失效、不可运行或会引入明确风险的调用方式
+审查代码的文档完整性：
+- 本次修改使已有文档与实际行为、默认值或错误语义不一致
+- 文档示例使用了已失效或危险的调用方式
+- Rust `pub unsafe fn` 缺少可从签名/实现核验的 `# Safety` 前置条件
+- 新增配置/API 改变了明确的外部契约，但已有文档仍描述旧契约
 
-“代码有安全风险，所以还应补一条风险注释”会重复真正的安全 finding，也不要报告；应直接报告可修复的漏洞。
-不要仅因公共函数/类缺少 docstring、JavaDoc 或 GoDoc 就报告；也不要报告未修改文档、缺少 README 条目或
-泛泛的补文档建议。""",
+不要仅因公共函数/类缺少 docstring、JavaDoc、GoDoc、参数说明或 README 条目而报告 finding。
+“代码有安全风险，所以还应补一条风险注释”会重复真正的安全 finding，也不要报告；应直接报告可修复的漏洞。""",
         "localization": """## 任务
 
-按文件类型审查可验证的本地化缺陷：
-
-Locale 资源文件：
-- 文本语言或文字体系与文件声明的 locale 明显不符
-- 同一条翻译意外混入另一种自然语言，或明显复制了其他 locale 的完整句子
+审查本地化资源中可验证的用户可见缺陷：
+- 文本语言或文字体系与文件 locale 明显不符（包括在简体中文资源中混入繁体中文）
+- 同一条翻译中意外混入另一种自然语言，或明显复制了其他 locale 的完整句子
 - 占位符、ICU MessageFormat 参数、HTML 标签或转义与基准语言条目不一致并会破坏运行时格式化
 - 编码损坏、不可见控制字符或错误转义会导致乱码或资源加载失败
-- 资源 finding 必须说明文件声明的 locale，以及基准条目或格式契约证据
 
-源代码 UI：
-- 本 diff 新增、且明确会渲染给最终用户的 UI 文本被直接硬编码而未提取到本地化机制
-- 本 diff 修改的翻译 API key、参数或 placeholder 与可验证的资源/调用契约不一致
-
-只报告能从新增/修改行和可验证契约直接证明的问题。不要评价翻译文风、措辞偏好或未修改的旧翻译；
-不要把产品名、技术术语、URL、placeholder 和专有名词误判为语言混用。
-日志、开发者调试输出、内部异常、测试文本和注释不是用户可见 UI，不要报告。""",
+只报告能从新增/修改行直接验证的问题。不要评价翻译文风、措辞偏好或未修改的旧翻译；
+不要把产品名、技术术语、URL、占位符和专有名词误判为语言混用。
+每个 finding 必须说明文件声明的 locale 与实际文本证据。""",
         "dependency": """## 任务
 
 审查代码的依赖风险：
@@ -309,7 +296,6 @@ Locale 资源文件：
 - 动画缺少 prefers-reduced-motion 适配
 - 语义化 HTML 使用不当（用 div 代替 button）
 - 自定义控件的 ARIA 状态与交互行为不一致
-- 仅含图标/emoji 而无可见文本且无 aria-label 或 title 的 button（可访问名称缺失）
 
 普通原生 `<img>` missing-alt 已由确定性扫描负责，不要重复报告；大写 `<Image>` 通常是自定义组件。
 表单控件的外部 `<label>` 可能位于 hunk 外，`title` 也可提供名称，只有上下文足以证明缺失时才报告。
@@ -347,8 +333,6 @@ Locale 资源文件：
 - 异常处理是否精确（禁止 bare except:、except Exception: pass）
 - 函数复杂度是否可控（>30 行应拆分，嵌套 >3 层是警告）
 - 死代码、未使用的导入
-- import/初始化位置只有能证明循环依赖、重复热路径开销或初始化时序错误时才报告
-- 与实现不符并会误导维护者或调用方的注释
 - 与代码库其他部分的模式不一致""",
         "java": """## 任务
 
@@ -397,7 +381,6 @@ Locale 资源文件：
 - 命名不清晰、魔法数字
 - 过于复杂的函数
 - 死代码、未使用的导入
-- 与实现不符并会误导维护者或调用方的注释
 - 与代码库其他部分的模式不一致
 
 不要把公共 API 缺少文档或测试作为 style finding；文档只有与实际行为矛盾时才可报告。"""
@@ -420,18 +403,13 @@ def _verifier_mission(ctx: dict[str, Any]) -> str:
 
 
 def _anti_patterns(ctx: dict[str, Any]) -> str:
-    docstring_rule = (
-        "不要仅因 diff 没附带测试/文档，就报告缺测试、缺注释或缺文档"
-        if ctx.get("reviewer_type") != "documentation"
-        else "不要仅因公共 API 缺 docstring 就报告；必须指出 changed docs 与实际外部契约的矛盾"
-    )
-    return f"""## 反模式（禁止）
+    return """## 反模式（禁止）
 
 - 不要编造没有代码依据的发现
 - 不要报告 PR 未改动的行上的问题
 - 不要在不同文件中重复同一个发现
 - 不要建议与 PR 目的无关的重构
-- {docstring_rule}
+- 不要仅因 diff 没附带测试/文档，就报告缺测试、缺注释或缺文档
 - 不要报告纯排版/导入排序偏好、无证据的微优化，或仅凭动态文本更新推断缺少 live region；
   但会导致编译失败的缺失 import、同步 event-loop I/O、未清理 listener 和 diff 内完整可见的新 live carrier 不是偏好
 - 不要在建议中留占位符文本"""

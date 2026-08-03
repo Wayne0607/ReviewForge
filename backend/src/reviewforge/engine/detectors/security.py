@@ -152,7 +152,7 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.94,
         ),
         _Rule(
-            r"\bconn\.execute\s*\(\s*(?:f[\"'][^\n]*\{[^}\n]*\}|[\"'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\+)",
+            r"\bconn\.execute\s*\(\s*(?:f[\"']|[\"'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\+)",
             "sql-injection",
             "error",
             "SQL is built from an interpolated or concatenated string.",
@@ -3188,189 +3188,6 @@ def _java_runtime_exec_is_static(source_line: str) -> bool:
     return bool(items) and all(re.fullmatch(r'"(?:\\.|[^"\\])*"', item) for item in items)
 
 
-_PYTHON_SQL_KEYWORD = re.compile(r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
-
-
-def _python_string_nodes(source_line: str) -> list[ast.expr]:
-    """Parse standalone Python string tokens without requiring a full call."""
-
-    try:
-        tree = ast.parse(source_line.strip(), mode="exec")
-    except (IndentationError, SyntaxError):
-        tree = None
-    if tree is not None:
-        return [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
-        ]
-
-    try:
-        tokens = tokenize.generate_tokens(io.StringIO(source_line).readline)
-        string_tokens = [item.string for item in tokens if item.type == token.STRING]
-    except (IndentationError, SyntaxError, tokenize.TokenError):
-        return []
-
-    nodes: list[ast.expr] = []
-    for value in string_tokens:
-        try:
-            parsed = ast.parse(value, mode="eval").body
-        except SyntaxError:
-            continue
-        nodes.append(parsed)
-    return nodes
-
-
-def _python_node_contains_sql(node: ast.AST) -> bool:
-    return any(
-        isinstance(child, ast.Constant) and isinstance(child.value, str) and _PYTHON_SQL_KEYWORD.search(child.value)
-        for child in ast.walk(node)
-    )
-
-
-def _python_line_has_sql_string(source_line: str) -> bool:
-    return any(_python_node_contains_sql(node) for node in _python_string_nodes(source_line))
-
-
-def _python_line_has_dynamic_sql_f_string(source_line: str) -> bool:
-    return any(
-        isinstance(node, ast.JoinedStr)
-        and _python_node_contains_sql(node)
-        and any(isinstance(child, ast.FormattedValue) for child in ast.walk(node))
-        for node in _python_string_nodes(source_line)
-    )
-
-
-def _python_expression_is_static(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant):
-        return True
-    if isinstance(node, ast.JoinedStr):
-        return not any(isinstance(child, ast.FormattedValue) for child in ast.walk(node))
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _python_expression_is_static(node.left) and _python_expression_is_static(node.right)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        return _python_expression_is_static(node.operand)
-    return False
-
-
-def _python_line_has_dynamic_sql_concat(source_line: str) -> bool:
-    try:
-        expression = ast.parse(source_line.strip(), mode="eval").body
-    except (IndentationError, SyntaxError):
-        return False
-    return any(
-        isinstance(node, ast.BinOp)
-        and isinstance(node.op, ast.Add)
-        and _python_node_contains_sql(node)
-        and not _python_expression_is_static(node)
-        for node in ast.walk(expression)
-    )
-
-
-def _python_dynamic_concat_continuation(source_line: str, *, operator_on_previous_line: bool = False) -> bool:
-    stripped = source_line.strip()
-    if stripped.startswith("+"):
-        stripped = stripped[1:].strip()
-    elif not operator_on_previous_line:
-        return False
-    try:
-        operand = ast.parse(stripped, mode="eval").body
-    except (IndentationError, SyntaxError):
-        return False
-    return not _python_expression_is_static(operand)
-
-
-def _python_multiline_sql_findings(
-    diff: str,
-    file_path: str,
-) -> list[DetectorFinding]:
-    """Catch added dynamic SQL arguments in visible multiline execute calls.
-
-    Calls are examined within one valid right-side hunk only. Context lines may
-    provide the ``execute`` opener, but the dynamic SQL expression itself must
-    be an addition and the finding is anchored to that added line.
-    """
-    findings: list[DetectorFinding] = []
-
-    raw_hunks: list[list[str]] = []
-    current: list[str] | None = None
-    valid_header = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?:.*)$")
-    for raw_line in (diff or "").splitlines():
-        if raw_line.startswith("@@"):
-            if current:
-                raw_hunks.append(current)
-            current = [raw_line] if valid_header.match(raw_line) else None
-        elif raw_line.startswith("diff --git "):
-            if current:
-                raw_hunks.append(current)
-            current = None
-        elif current is not None:
-            current.append(raw_line)
-    if current:
-        raw_hunks.append(current)
-
-    for raw_hunk in raw_hunks:
-        hunk_diff = "\n".join(raw_hunk)
-        added_lines = {line_no for line_no, _content in iter_added_lines(hunk_diff)}
-        rows = iter_right_lines(hunk_diff)
-        groups: list[list[tuple[int, str]]] = []
-        for row in rows:
-            if not groups or row[0] != groups[-1][-1][0] + 1:
-                groups.append([])
-            groups[-1].append(row)
-
-        for group in groups:
-            source = "\n".join(content for _line_no, content in group)
-            code_lines = mask_non_code(source, "python").split("\n")
-            uncommented_lines = mask_comments(source, "python").split("\n")
-            for index, (line_no, _content) in enumerate(group):
-                execute_match = re.search(
-                    r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.(?:execute|executemany)\s*\(",
-                    code_lines[index],
-                )
-                if execute_match is None:
-                    continue
-
-                depth = 0
-                sql_string_seen = False
-                sql_concat_pending = False
-                for window_index in range(index, min(len(group), index + 10)):
-                    code = code_lines[window_index]
-                    if window_index == index:
-                        code = code[execute_match.end() - 1 :]
-                    depth += code.count("(") - code.count(")")
-                    risky_line_no = group[window_index][0]
-                    candidate = uncommented_lines[window_index]
-                    if risky_line_no in added_lines:
-                        dynamic_f_string = _python_line_has_dynamic_sql_f_string(candidate)
-                        dynamic_concat = _python_line_has_dynamic_sql_concat(candidate)
-                        continued_dynamic_concat = sql_string_seen and _python_dynamic_concat_continuation(
-                            candidate,
-                            operator_on_previous_line=sql_concat_pending,
-                        )
-                        if dynamic_f_string or dynamic_concat or continued_dynamic_concat:
-                            findings.append(_sql_finding(file_path, risky_line_no))
-                            break
-                    sql_string_seen = sql_string_seen or _python_line_has_sql_string(candidate)
-                    sql_concat_pending = sql_string_seen and candidate.rstrip().endswith("+")
-                    if depth <= 0:
-                        break
-    return findings
-
-
-def _sql_finding(file_path: str, line_no: int) -> DetectorFinding:
-    """Build the sql-injection DetectorFinding for a multi-line execute() call."""
-    return DetectorFinding(
-        file=file_path,
-        line=line_no,
-        severity="error",
-        category="sql-injection",
-        message="A SQL statement passed to execute() is built from a dynamic expression across lines.",
-        suggestion="Use parameterized query APIs.",
-        confidence=_detector_confidence(file_path, 0.93),
-    )
-
-
 def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
     """Scan modified file diffs for deterministic security findings."""
 
@@ -3573,7 +3390,6 @@ def detect_security_findings(diffs: dict[str, str]) -> list[DetectorFinding]:
                 )
 
         if language == "python":
-            findings.extend(_python_multiline_sql_findings(diff, file_path))
             for line_no in _python_dynamic_path_sinks(diff):
                 findings.append(
                     DetectorFinding(

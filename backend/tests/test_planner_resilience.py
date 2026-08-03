@@ -7,7 +7,6 @@ from langchain_core.messages import AIMessage
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import TASK_RATIONALE_MAX_LENGTH, StateStore
 from reviewforge.engine.planner import Planner
-from reviewforge.engine.prompt import build_planner_prompt, build_reviewer_prompt
 
 
 class _StaticPlannerLLM:
@@ -137,47 +136,3 @@ def test_planner_contract_advertises_runtime_bounds() -> None:
 
     assert tasks_contract["maxItems"] == 6
     assert tasks_contract["items"]["properties"]["rationale"]["maxLength"] == TASK_RATIONALE_MAX_LENGTH
-
-
-def test_prompts_do_not_encode_style_nits_as_behavioral_defects() -> None:
-    registry = build_registry()
-    planner_text = "\n".join(
-        message["content"]
-        for message in build_planner_prompt(
-            {
-                "registry": registry,
-                "repo": "owner/repo",
-                "pr_number": 118,
-                "files_changed": ["src/service.py"],
-                "diff_summary": "+value = None",
-            }
-        )
-    )
-    correctness_text = "\n".join(
-        message["content"]
-        for message in build_reviewer_prompt(
-            {
-                "registry": registry,
-                "reviewer_type": "correctness",
-                "agent_name": "correctness_reviewer",
-                "files_to_review": ["src/service.py"],
-                "diffs": {"src/service.py": "+value = None"},
-            }
-        )
-    )
-    documentation_text = "\n".join(
-        message["content"]
-        for message in build_reviewer_prompt(
-            {
-                "registry": registry,
-                "reviewer_type": "documentation",
-                "agent_name": "doc_reviewer",
-                "files_to_review": ["docs/api.md"],
-                "diffs": {"docs/api.md": "+Returns 202."},
-            }
-        )
-    )
-
-    assert "== None" not in correctness_text
-    assert "公共 API/docstring 缺失都不派发" in planner_text
-    assert "\n- -" not in documentation_text

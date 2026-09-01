@@ -18,6 +18,7 @@ from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.json_output import extract_json_value, strip_reasoning_blocks
+from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.budget import MAX_TOOL_CALLS_PER_FILE, MAX_TOOL_OUTPUT_CHARS, TokenBudget
@@ -117,15 +118,7 @@ def build_reviewer_tools(
 # Per-reviewer-type cap on findings, to cut low-value nitpick noise. Keep the top-N
 # by severity then confidence. Security/perf are allowed more; doc/style capped low.
 _MAX_FINDINGS_BY_TYPE = {
-    "security": 15,
-    "performance": 10,
-    "dependency": 10,
-    "accessibility": 6,
-    "testing": 6,
-    "documentation": 4,
-    "style": 5,
-    "correctness": 6,
-    "localization": 6,
+    definition.reviewer_type: definition.max_findings for definition in REVIEWER_CATALOG.definitions
 }
 _SEVERITY_RANK = {"error": 3, "warning": 2, "info": 1}
 
@@ -152,6 +145,12 @@ class BaseReviewer:
         max_tokens: int = 20000,
         event_bus: Any = None,
     ) -> None:
+        definition = REVIEWER_CATALOG.get(name)
+        if definition is not None and reviewer_type != definition.reviewer_type:
+            raise RuntimeError(
+                f"Reviewer prompt type/catalog mismatch for {name}: "
+                f"runtime={reviewer_type!r}, catalog={definition.reviewer_type!r}"
+            )
         self.name = name
         self.reviewer_type = reviewer_type
         self._llm = llm
@@ -760,3 +759,7 @@ REVIEWER_MAP: dict[str, type[BaseReviewer]] = {
     "dependency_reviewer": DependencyReviewer,
     "accessibility_reviewer": AccessibilityReviewer,
 }
+
+# A missing implementation or a stale factory-only key is a startup error,
+# not a late orchestration surprise.
+REVIEWER_CATALOG.assert_factory_keys(REVIEWER_MAP)

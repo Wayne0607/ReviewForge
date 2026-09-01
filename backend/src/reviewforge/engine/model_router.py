@@ -14,9 +14,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
-from langchain_openai import ChatOpenAI
 
 from reviewforge.core.config import ROLE_NAMES, LLMConfig, RoleOverride
+from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
+from reviewforge.engine.openai_compat import ReasoningContentChatOpenAI as ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +26,8 @@ logger = logging.getLogger(__name__)
 # Kept for backward compatibility with the v1 fast/accurate YAML config.
 DEFAULT_PROFILE_MAP = {
     "planner": "fast",
-    "security_reviewer": "accurate",
-    "performance_reviewer": "fast",
-    "style_reviewer": "fast",
-    # correctness outputs 6 structured findings — needs accurate's 8192-token
-    # ceiling to avoid JSON truncation and costly full-prompt retries
-    "correctness_reviewer": "accurate",
+    **dict(REVIEWER_CATALOG.model_profiles),
     "coverage_gap_reviewer": "accurate",
-    "localization_reviewer": "fast",
-    "testing_reviewer": "fast",
-    "doc_reviewer": "fast",
-    "dependency_reviewer": "fast",
-    "accessibility_reviewer": "fast",
     "verifier": "accurate",
     "commenter": "fast",
 }
@@ -48,17 +39,7 @@ DEFAULT_PROFILE_MAP = {
 # global config wins.
 ROLE_MAP: dict[str, str] = {
     "planner": "planner",
-    # Fast reviewers
-    "performance_reviewer": "fast_review",
-    "style_reviewer": "fast_review",
-    "localization_reviewer": "fast_review",
-    "testing_reviewer": "fast_review",
-    "doc_reviewer": "fast_review",
-    "dependency_reviewer": "fast_review",
-    "accessibility_reviewer": "fast_review",
-    # Deep reviewers — security / correctness need a larger context
-    "security_reviewer": "deep_review",
-    "correctness_reviewer": "deep_review",
+    **dict(REVIEWER_CATALOG.model_roles),
     "coverage_gap_reviewer": "deep_review",
     # Verifier / calibrator / cross-PR / evidence
     "verifier": "verifier",
@@ -108,7 +89,14 @@ def _build_llm(
             anthropic_api_key=api_key,
             **common,
         )
-    return ChatOpenAI(base_url=base_url, api_key=api_key, **common)
+    return ChatOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        streaming=False,
+        timeout=120,
+        max_retries=2,
+        **common,
+    )
 
 
 def _temperature_for(config: LLMConfig, agent_name: str) -> float:

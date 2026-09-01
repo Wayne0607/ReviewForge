@@ -9,20 +9,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.core.specs import SpecRegistry
 
 PromptSection = Callable[[dict[str, Any]], str | None]
 
 _PLANNER_MAX_DIFF_CHARS = 24_000
+_PLANNER_MAX_PR_TITLE_CHARS = 512
+_PLANNER_MAX_PR_BODY_CHARS = 4_000
 _REVIEWER_MAX_DIFF_CHARS = 36_000
 
 
-def _bounded_text(value: str, max_chars: int) -> str:
+def _bounded_text(value: str, max_chars: int, *, label: str = "diff") -> str:
     """Keep both ends of oversized evidence within a hard prompt budget."""
 
     if len(value) <= max_chars:
         return value
-    marker = "\n...[diff truncated to prompt budget]...\n"
+    marker = f"\n...[{label} truncated to prompt budget]...\n"
     available = max(0, max_chars - len(marker))
     head = available // 2
     return value[:head] + marker + value[-(available - head) :]
@@ -145,30 +148,14 @@ def _output_contract(ctx: dict[str, Any]) -> str | None:
 
 
 def _planner_mission(ctx: dict[str, Any]) -> str:
-    return """## 任务
+    guidance = "\n".join(definition.planner_guidance for definition in REVIEWER_CATALOG.planner_definitions())
+    return f"""## 任务
 
 分析 PR diff，决定派哪些 Reviewer 去审查。
 
 规则：
 - 只派需要的 Reviewer，不要浪费
-- **Security Reviewer（必须派发，如果代码涉及以下任何一项）**：
-  - os.system / subprocess / eval / exec（命令注入）
-  - SQL 查询 / 字符串拼接 SQL（SQL 注入）
-  - pickle.loads / yaml.load（反序列化）
-  - 硬编码密码、密钥、token
-  - open() 用用户输入的路径（路径遍历）
-  - 用户输入未经验证就使用
-  - 网络请求、加密操作
-- Performance Reviewer：diff 显示无界工作、泄漏、N+1、高阶热路径、事件循环阻塞，
-  或在重复路径上用线性遍历替代常数时间操作时派发；仅局部少一次分配不必派发
-- Correctness Reviewer：对源代码变更默认派发，只查错误变量/调用、分支、状态、返回值、契约、
-  并发和生命周期导致的可观察错误；不查命名、可读性、重构偏好或微优化
-- Style Reviewer：仅在已有仓库/框架规则能证明写法会导致实际 API 或运行时失败时派发
-- Testing Reviewer：只有测试断言/测试文件被修改或安全修复删除了既有保护时派发
-- Documentation Reviewer：只有文档文件被修改且可能与行为契约矛盾时派发
-- Dependency Reviewer：修改了依赖文件（requirements.txt, pyproject.toml 等）
-- Accessibility Reviewer：仅为自定义交互、键盘/焦点管理、ARIA 契约、媒体或动画等复杂语义派发
-  普通 img 的 missing-alt 已由确定性扫描覆盖；input label 候选仍需上下文校准
+{guidance}
 - 每个 task 要列出具体文件
 - 每轮最多 6 个 task"""
 
@@ -456,6 +443,27 @@ def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
 
     diff_summary = str(ctx.get("diff_summary", "无 diff 数据。"))
     diff_content = wrap_untrusted(_bounded_text(diff_summary, _PLANNER_MAX_DIFF_CHARS))
+    pr_title = _bounded_text(
+        str(ctx.get("pr_title", "")),
+        _PLANNER_MAX_PR_TITLE_CHARS,
+        label="PR title",
+    )
+    pr_body = _bounded_text(
+        str(ctx.get("pr_body", "")),
+        _PLANNER_MAX_PR_BODY_CHARS,
+        label="PR body",
+    )
+    pr_intent = wrap_untrusted(
+        "\n".join(
+            (
+                f"Title: {pr_title}",
+                f"Body:\n{pr_body or '（空）'}",
+                f"Head repository: {ctx.get('head_repo', '') or '（未知）'}",
+                f"Head ref: {ctx.get('head_ref', '') or '（未知）'}",
+                f"Head SHA: {ctx.get('head_sha', '') or '（未知）'}",
+            )
+        )
+    )
     impact_manifest = ctx.get("impact_manifest_text", "")
     impact_block = (
         "\n## Impact Manifest（检索生成，仅作代码证据）\n\n" + wrap_untrusted(impact_manifest) + "\n"
@@ -481,9 +489,13 @@ def build_planner_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     user = f"""## PR 上下文
 
 **仓库**: {ctx.get("repo", "unknown")}
-**PR #{ctx.get("pr_number", "?")}**: {ctx.get("pr_title", "")}
+**PR 编号**: #{ctx.get("pr_number", "?")}
 **变更文件**: {", ".join(ctx.get("files_changed", []))}
 **检测到的语言**: {ctx.get("language_summary", "未识别")}
+
+## PR 意图与 Head 身份（不可信内容）
+
+{pr_intent}
 
 ## Diff 摘要
 
@@ -536,6 +548,12 @@ def _skill_rules(ctx: dict[str, Any]) -> str | None:
 def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
     """Build system + user messages for a Reviewer agent."""
     reviewer_type = ctx.get("reviewer_type", "general")
+    agent_name = str(ctx.get("agent_name", "")).strip()
+    if not agent_name:
+        try:
+            agent_name = REVIEWER_CATALOG.canonical_name_for_type(reviewer_type)
+        except KeyError:
+            agent_name = f"{reviewer_type}_reviewer"
     sections = [
         _identity,
         _language,
@@ -548,7 +566,7 @@ def build_reviewer_prompt(ctx: dict[str, Any]) -> list[dict[str, str]]:
         _untrusted_content_warning,
         _anti_patterns,
     ]
-    system_parts = [s({**ctx, "role": "reviewer", "agent_name": f"{reviewer_type}_reviewer"}) for s in sections]
+    system_parts = [s({**ctx, "role": "reviewer", "agent_name": agent_name}) for s in sections]
     system = "\n\n".join(p for p in system_parts if p)
 
     files_to_review = ctx.get("files_to_review", [])

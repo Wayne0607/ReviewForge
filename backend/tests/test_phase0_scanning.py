@@ -76,6 +76,21 @@ class _NeverCalledLLM:
         raise AssertionError("Planner/reviewer LLM must not be invoked")
 
 
+class _EmptyReviewerLLM(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "empty-reviewer"
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content='{"findings": []}'))])
+
+
 class _ConfirmingCalibratorLLM(BaseChatModel):
     calls: int = 0
 
@@ -260,11 +275,14 @@ async def test_planner_exception_delivers_phase0_but_run_remains_retryable(tmp_p
     assert await db.has_active_run_for_head("owner/repo", 11, "head") is True
 
 
-async def test_phase0_survives_reviewer_llm_failure():
+async def test_phase0_survives_reviewer_llm_failure(tmp_path, db_factory):
+    db = await db_factory(tmp_path / "reviewer-retry.db")
     github = _DiffGitHub({"app.py": _diff("import os\nos.system(user_command)")})
-    orchestrator, _ = _orchestrator(github)
+    orchestrator, events = _orchestrator(github, db=db)
     orchestrator._planner = _SecurityOnlyPlanner()
     state = _state(["app.py"])
+    seen = []
+    events.subscribe(seen.append)
 
     summary = await orchestrator.run(state)
 
@@ -273,6 +291,44 @@ async def test_phase0_survives_reviewer_llm_failure():
     assert command_findings[0].status == "reported"
     assert summary["confirmed"] == 1
     assert summary["tasks_failed"] == 1
+    assert summary["status"] == "partial"
+    assert summary["retryable"] is True
+    run = (await db.get_runs(repo="owner/repo"))[0]
+    assert run["status"] == "failed"
+    event_types = [event.event_type for event in seen]
+    assert event_types.index("review.partial") < event_types.index("review.completed")
+    telemetry = next(event.data for event in seen if event.event_type == "evaluation.telemetry")
+    assert telemetry["schema_version"] == 1
+    assert telemetry["failures"] == {
+        "tasks_failed": 1,
+        "planner": 0,
+        "publication": 0,
+        "delivery": 0,
+        "operationally_incomplete": True,
+    }
+    assert telemetry["coverage"] == {
+        "available": False,
+        "threshold": 0.15,
+        "status": "unavailable",
+        "high_risk": {"total": 0, "resolved": 0, "unresolved": 0, "status": "unavailable"},
+    }
+    assert telemetry["funnel"]["findings_reported"] == 1
+
+    orchestrator._planner = _NoTaskPlanner()
+    resumed = await orchestrator.run(_state(["app.py"]))
+    assert resumed["status"] == "partial", "an empty plan must not silently supersede a persisted task failure"
+    assert len(github.posted_comments) == 1, "reported finding must not be posted twice on task retry"
+    assert (await db.get_run(run["run_id"]))["status"] == "failed"
+
+    orchestrator._planner = _SecurityOnlyPlanner()
+    orchestrator._reviewer_llm = _EmptyReviewerLLM()
+    recovered = await orchestrator.run(_state(["app.py"]))
+    assert recovered["tasks_failed"] == 0
+    recovered_telemetry = [event.data for event in seen if event.event_type == "evaluation.telemetry"][-1]
+    assert recovered_telemetry["failures"]["operationally_incomplete"] is False, recovered_telemetry
+    assert recovered.get("status") != "partial", recovered
+    assert len(github.posted_comments) == 1
+    assert (await db.get_run(run["run_id"]))["status"] == "completed"
 
 
 async def test_reviewer_detector_overlap_is_ingested_once():

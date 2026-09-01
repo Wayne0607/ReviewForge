@@ -44,6 +44,7 @@ from reviewforge.engine.publication_policy import (
     PublicationPolicyConfig,
     format_verify_reason,
 )
+from reviewforge.engine.publication_triage import TriageStats
 from reviewforge.tools.gateway import ToolGateway
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -1185,7 +1186,11 @@ class TestOrchestratorIntegration:
                         file_errors={},
                         scanner_errors={},
                     )
-                    with patch.object(orch, "_run_publication_gate", new=AsyncMock()):
+                    with patch.object(
+                        orch,
+                        "_run_publication_gate",
+                        new=AsyncMock(return_value=TriageStats()),
+                    ):
                         # We don't need the LLM gate to run — we only want to
                         # confirm wiring.
                         await orch.run(state)

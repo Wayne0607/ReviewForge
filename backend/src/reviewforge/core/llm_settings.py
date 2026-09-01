@@ -158,18 +158,42 @@ class EncryptedLLMSettingsStore:
         self.path.unlink(missing_ok=True)
 
 
+_ROLE_PROFILE_FALLBACK: dict[str, str | None] = {
+    "planner": "fast",
+    "fast_review": "fast",
+    "deep_review": "accurate",
+    "verifier": "accurate",
+    "publication_gate": "default",
+}
+
+
 def _effective_role_config(base: LLMConfig, role: str, override: RoleOverride | None) -> dict[str, str]:
-    """Resolve the effective (base_url, api_key, model) for a single role."""
-    if override is None:
+    """Mirror ModelRouter's role-override then legacy-profile resolution.
+
+    An empty ``RoleOverride`` is a request to use the normal fallback; it is
+    not itself an override.  Keeping this helper aligned with the runtime
+    router prevents the admin console from displaying the global model while
+    a legacy fast/accurate profile is actually being called.
+    """
+    if override is not None and (override.base_url or override.api_key or override.model):
         return {
-            "base_url": base.base_url,
-            "api_key": base.api_key,
-            "model": base.model,
+            "base_url": override.base_url or base.base_url,
+            "api_key": override.api_key or base.api_key,
+            "model": override.model or base.model,
+        }
+
+    profile_name = _ROLE_PROFILE_FALLBACK.get(role)
+    profile = base.profiles.get(profile_name) if profile_name is not None else None
+    if profile is not None:
+        return {
+            "base_url": profile.base_url or base.base_url,
+            "api_key": profile.api_key or base.api_key,
+            "model": profile.model or base.model,
         }
     return {
-        "base_url": override.base_url or base.base_url,
-        "api_key": override.api_key or base.api_key,
-        "model": override.model or base.model,
+        "base_url": base.base_url,
+        "api_key": base.api_key,
+        "model": base.model,
     }
 
 
@@ -183,13 +207,20 @@ def apply_override(base: LLMConfig, override: LLMSettingsOverride | None) -> LLM
     cfg.base_url = override.base_url
     cfg.api_key = override.api_key
     cfg.model = override.model
-    for profile_name, model in (("fast", override.fast_model), ("accurate", override.accurate_model)):
+    for profile_name, model in (
+        ("default", ""),
+        ("fast", override.fast_model),
+        ("accurate", override.accurate_model),
+    ):
         profile = cfg.profiles.get(profile_name)
         if profile is None:
             profile = ModelProfile()
             cfg.profiles[profile_name] = profile
-        if model:
-            profile.model = model
+        # In console-managed settings, a blank profile means "use the global
+        # model".  Retaining a startup/YAML model here makes a global model
+        # change look successful in the UI while the runtime keeps dialing the
+        # old provider for most roles.
+        profile.model = model
         # Console base URL/API key are deliberately global. Clear legacy profile
         # secrets so a hidden YAML value cannot silently win.
         profile.base_url = ""
@@ -368,7 +399,7 @@ async def test_llm_connection(config: LLMConfig, timeout: float = 15.0) -> dict[
                     "model": config.model,
                     "messages": [{"role": "user", "content": "Reply with OK."}],
                     "temperature": 0,
-                    "max_tokens": 8,
+                    "max_tokens": 128,
                 },
             )
     except httpx.TimeoutException as exc:
@@ -381,12 +412,28 @@ async def test_llm_connection(config: LLMConfig, timeout: float = 15.0) -> dict[
         body = response.json()
     except ValueError as exc:
         raise LLMSettingsError("模型服务返回了无效响应") from exc
-    if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
+    if not isinstance(body, dict) or not isinstance(body.get("choices"), list) or not body["choices"]:
         raise LLMSettingsError("模型服务响应不兼容 OpenAI Chat Completions")
+    first_choice = body["choices"][0]
+    if not isinstance(first_choice, dict):
+        raise LLMSettingsError("模型服务响应不兼容 OpenAI Chat Completions")
+    finish_reason = first_choice.get("finish_reason")
+    if finish_reason == "length":
+        raise LLMSettingsError("模型服务测试响应被截断，请检查输出预算或思考模式")
+    if not isinstance(finish_reason, str) or not finish_reason:
+        raise LLMSettingsError("模型服务响应缺少有效的 finish_reason")
+    message = first_choice.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise LLMSettingsError("模型服务未返回可用的最终文本")
+    actual_model = body.get("model")
+    if not isinstance(actual_model, str) or not actual_model.strip():
+        raise LLMSettingsError("模型服务响应缺少实际模型标识")
     return {
         "ok": True,
         "latency_ms": round((time.perf_counter() - started) * 1000),
-        "model": config.model,
+        "model": actual_model.strip(),
+        "requested_model": config.model,
     }
 
 

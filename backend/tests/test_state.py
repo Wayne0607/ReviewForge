@@ -77,11 +77,51 @@ def test_state_notes_consumed():
 
 
 def test_state_snapshot():
-    state = StateStore(pr_number=42, repo="owner/repo")
+    state = StateStore(
+        pr_number=42,
+        repo="owner/repo",
+        pr_title="Add review context",
+        pr_body="Carries signed webhook metadata.",
+        head_repo="contributor/fork",
+        head_ref="feature/review-context",
+        linked_issues=[{"number": 123}],
+    )
     state.add_finding(Finding(file="test.py", status="candidate", message="test finding"))
     state.add_task(ReviewTask(reviewer="security_reviewer"))
 
     snap = state.snapshot()
     assert snap["pr_number"] == 42
+    assert snap["pr_title"] == "Add review context"
+    assert snap["pr_body"] == "Carries signed webhook metadata."
+    assert snap["head_repo"] == "contributor/fork"
+    assert snap["head_ref"] == "feature/review-context"
+    assert snap["linked_issues"] == [{"number": 123}]
+    snap["linked_issues"][0]["number"] = 999
+    assert state.linked_issues == [{"number": 123}]
     assert len(snap["findings"]) == 1
     assert len(snap["tasks"]) == 1
+
+
+def test_state_pr_context_defaults_keep_existing_callers_compatible():
+    state = StateStore(pr_number=42, repo="owner/repo", head_sha="head")
+
+    assert state.pr_title == ""
+    assert state.pr_body == ""
+    assert state.head_repo == ""
+    assert state.head_ref == ""
+    assert state.linked_issues == []
+
+    snap = state.snapshot()
+    assert snap["pr_title"] == ""
+    assert snap["pr_body"] == ""
+    assert snap["head_repo"] == ""
+    assert snap["head_ref"] == ""
+    assert snap["linked_issues"] == []
+
+
+def test_state_pr_context_fields_do_not_shift_legacy_positional_arguments():
+    state = StateStore(42, "owner/repo", "head", "base", ["src/app.py"], "diff")
+
+    assert state.files_changed == ["src/app.py"]
+    assert state.diff_summary == "diff"
+    assert state.pr_title == ""

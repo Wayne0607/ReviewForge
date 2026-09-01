@@ -8,7 +8,8 @@ import os
 
 import pytest
 
-from reviewforge.core.config import LLMConfig, ModelProfile
+import reviewforge.core.llm_settings as llm_settings_module
+from reviewforge.core.config import LLMConfig, ModelProfile, RoleOverride
 from reviewforge.core.llm_settings import (
     EncryptedLLMSettingsStore,
     LLMSettingsError,
@@ -18,6 +19,9 @@ from reviewforge.core.llm_settings import (
     safe_settings,
     validate_endpoint_security,
     validate_llm_profiles,
+)
+from reviewforge.core.llm_settings import (
+    test_llm_connection as check_llm_connection,
 )
 
 
@@ -79,6 +83,34 @@ def test_apply_override_is_detached_and_clears_profile_credentials():
     assert base.profiles["fast"].api_key == "hidden"
 
 
+def test_blank_console_profile_models_clear_startup_fallbacks_to_global():
+    base = LLMConfig(
+        model="startup-global",
+        profiles={
+            "default": ModelProfile(model="startup-default"),
+            "fast": ModelProfile(model="startup-fast"),
+            "accurate": ModelProfile(model="startup-accurate"),
+        },
+    )
+    override = LLMSettingsOverride(
+        base_url="https://console.example/v1",
+        api_key="console-key",
+        model="console-global",
+        fast_model="",
+        accurate_model="",
+    )
+
+    effective = apply_override(base, override)
+
+    assert effective.profiles["default"].model == ""
+    assert effective.profiles["fast"].model == ""
+    assert effective.profiles["accurate"].model == ""
+    roles = safe_settings(effective, "console")["roles"]
+    assert roles["planner"]["model"] == "console-global"
+    assert roles["verifier"]["model"] == "console-global"
+    assert roles["publication_gate"]["model"] == "console-global"
+
+
 def test_make_override_keeps_existing_key_and_safe_output_never_returns_it():
     current = LLMConfig(api_key="sk-existing", profiles={"fast": ModelProfile(model="fast")})
     override = make_override(
@@ -95,6 +127,59 @@ def test_make_override_keeps_existing_key_and_safe_output_never_returns_it():
     assert "sk-existing" not in json.dumps(data)
     assert "api_key" not in data
     assert safe_settings(LLMConfig(api_key="short"), "startup")["api_key_last4"] == "****"
+
+
+def test_safe_role_settings_match_legacy_profile_fallback_and_explicit_override():
+    config = LLMConfig(
+        base_url="https://global.example/v1",
+        api_key="global-secret",
+        model="global-model",
+        profiles={
+            "fast": ModelProfile(
+                base_url="https://fast.example/v1",
+                api_key="fast-secret",
+                model="fast-model",
+            ),
+            "accurate": ModelProfile(model="accurate-model"),
+        },
+        role_overrides={
+            "planner": RoleOverride(),
+            "deep_review": RoleOverride(model="deep-override"),
+        },
+    )
+
+    roles = safe_settings(config, "startup")["roles"]
+
+    assert roles["planner"]["model"] == "fast-model"
+    assert roles["planner"]["base_url"] == "https://fast.example/v1"
+    assert roles["fast_review"]["model"] == "fast-model"
+    assert roles["verifier"]["model"] == "accurate-model"
+    assert roles["verifier"]["base_url"] == "https://global.example/v1"
+    assert roles["deep_review"]["model"] == "deep-override"
+    assert roles["deep_review"]["base_url"] == "https://global.example/v1"
+    assert roles["publication_gate"]["model"] == "global-model"
+    assert "fast-secret" not in json.dumps(roles)
+
+
+def test_publication_gate_safe_settings_match_default_profile_fallback():
+    config = LLMConfig(
+        base_url="https://global.example/v1",
+        api_key="global-secret",
+        model="global-model",
+        profiles={
+            "default": ModelProfile(
+                base_url="https://default.example/v1",
+                api_key="default-secret",
+                model="default-model",
+            )
+        },
+    )
+
+    role = safe_settings(config, "startup")["roles"]["publication_gate"]
+
+    assert role["model"] == "default-model"
+    assert role["base_url"] == "https://default.example/v1"
+    assert role["api_key_last4"] == "cret"
 
 
 def test_endpoint_security_rejects_metadata_and_private_dns(monkeypatch):
@@ -141,6 +226,106 @@ async def test_profile_test_checks_each_distinct_routed_model(monkeypatch):
     assert checked == ["default", "fast"]
     assert result["latency_ms"] == 14
     assert result["tested_models"] == ["default", "fast"]
+
+
+async def test_profile_test_includes_default_profile_used_by_publication_gate(monkeypatch):
+    checked = []
+
+    async def fake_test(config, timeout=15.0):
+        checked.append(config.model)
+        return {"ok": True, "latency_ms": 7, "model": config.model}
+
+    monkeypatch.setattr("reviewforge.core.llm_settings.test_llm_connection", fake_test)
+    config = LLMConfig(
+        model="global-model",
+        profiles={"default": ModelProfile(model="gate-default")},
+    )
+
+    result = await validate_llm_profiles(config)
+
+    assert checked == ["global-model", "gate-default"]
+    assert result["tested_models"] == ["global-model", "gate-default"]
+
+
+class _ConnectionResponse:
+    status_code = 200
+
+    def __init__(self, body):
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+class _ConnectionClient:
+    def __init__(self, response, captured):
+        self._response = response
+        self._captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def post(self, endpoint, *, headers, json):
+        self._captured.update(endpoint=endpoint, headers=headers, json=json)
+        return self._response
+
+
+async def test_connection_requires_final_text_and_reports_actual_model(monkeypatch):
+    captured = {}
+    response = _ConnectionResponse(
+        {
+            "model": "provider-resolved-model",
+            "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+        }
+    )
+    monkeypatch.setattr(llm_settings_module, "validate_endpoint_security", lambda _url: None)
+    monkeypatch.setattr(
+        llm_settings_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _ConnectionClient(response, captured),
+    )
+
+    result = await check_llm_connection(
+        LLMConfig(base_url="https://provider.example/v1", api_key="secret", model="requested-alias")
+    )
+
+    assert captured["json"]["max_tokens"] == 128
+    assert result["model"] == "provider-resolved-model"
+    assert result["requested_model"] == "requested-alias"
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            {"model": "resolved", "choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+            "最终文本",
+        ),
+        (
+            {"model": "resolved", "choices": [{"message": {"content": "OK"}, "finish_reason": "length"}]},
+            "截断",
+        ),
+        (
+            {"model": "", "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]},
+            "模型标识",
+        ),
+    ],
+)
+async def test_connection_rejects_incomplete_success_responses(monkeypatch, body, message):
+    monkeypatch.setattr(llm_settings_module, "validate_endpoint_security", lambda _url: None)
+    monkeypatch.setattr(
+        llm_settings_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _ConnectionClient(_ConnectionResponse(body), {}),
+    )
+
+    with pytest.raises(LLMSettingsError, match=message):
+        await check_llm_connection(
+            LLMConfig(base_url="https://provider.example/v1", api_key="secret", model="requested-alias")
+        )
 
 
 def test_admin_llm_settings_hot_swap_and_reset(tmp_path, monkeypatch):

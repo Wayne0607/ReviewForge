@@ -11,17 +11,12 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-# Reviewer dispatch priority (higher starts first). Security leads; style trails.
-DEFAULT_PRIORITY: dict[str, int] = {
-    "security_reviewer": 100,
-    "dependency_reviewer": 80,
-    "performance_reviewer": 70,
-    "accessibility_reviewer": 50,
-    "testing_reviewer": 40,
-    "doc_reviewer": 30,
-    "correctness_reviewer": 25,
-    "style_reviewer": 20,
-}
+from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
+
+# Backward-compatible public mapping, derived from the immutable catalog.
+# Higher values start first; localization's former implicit fallback is now an
+# explicit priority between accessibility and testing.
+DEFAULT_PRIORITY: dict[str, int] = dict(REVIEWER_CATALOG.priorities)
 
 
 class Scheduler:

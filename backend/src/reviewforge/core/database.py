@@ -7,6 +7,7 @@ so the dashboard can query historical data.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -27,7 +28,8 @@ CREATE TABLE IF NOT EXISTS review_runs (
     status       TEXT NOT NULL DEFAULT 'running',
     started_at   TEXT NOT NULL,
     completed_at TEXT DEFAULT NULL,
-    summary_json TEXT DEFAULT '{}'
+    summary_json TEXT DEFAULT '{}',
+    task_checkpoint_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS review_findings (
@@ -57,6 +59,41 @@ CREATE TABLE IF NOT EXISTS reviewer_metrics (
     prompt_tokens     INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     total_tokens      INTEGER DEFAULT 0,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+-- Durable task identity/checkpoint history.  reviewer_metrics remains a
+-- dashboard/usage table; it is deliberately not a recovery source because a
+-- reviewer can own several file chunks and some failures never emit metrics.
+CREATE TABLE IF NOT EXISTS review_task_checkpoints (
+    run_id        TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    attempt       INTEGER NOT NULL DEFAULT 1,
+    round_id      TEXT NOT NULL DEFAULT '',
+    reviewer_name TEXT NOT NULL,
+    files_json    TEXT NOT NULL DEFAULT '[]',
+    task_signature TEXT NOT NULL,
+    task_kind     TEXT NOT NULL DEFAULT 'reviewer',
+    rationale     TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    error         TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (run_id, task_id, attempt),
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+-- Planner proposals are a round-level decision.  The sealed envelope proves
+-- that every task in the proposal was checkpointed in the same transaction.
+CREATE TABLE IF NOT EXISTS review_task_rounds (
+    run_id        TEXT NOT NULL,
+    round_id      TEXT NOT NULL,
+    task_count    INTEGER NOT NULL,
+    task_hash     TEXT NOT NULL,
+    sealed        INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    sealed_at     TEXT DEFAULT NULL,
+    PRIMARY KEY (run_id, round_id),
     FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
 );
 
@@ -132,6 +169,8 @@ CREATE INDEX IF NOT EXISTS idx_findings_run ON review_findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_file ON review_findings(file);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON review_findings(category);
 CREATE INDEX IF NOT EXISTS idx_metrics_run ON reviewer_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_run ON review_task_checkpoints(run_id, task_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_round ON review_task_checkpoints(run_id, round_id);
 CREATE INDEX IF NOT EXISTS idx_runs_repo ON review_runs(repo);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON code_symbols(file_path);
 CREATE INDEX IF NOT EXISTS idx_symbols_risk ON code_symbols(risk_level);
@@ -174,6 +213,20 @@ class Database:
     async def _migrate_schema(self) -> None:
         """Apply additive schema migrations for existing SQLite databases."""
 
+        cursor = await self._db.execute("PRAGMA table_info(review_runs)")
+        run_columns = {row["name"] for row in await cursor.fetchall()}
+        if "task_checkpoint_version" not in run_columns:
+            # Existing runs get version 0 and are intentionally treated as
+            # untrusted for resume.  Metrics cannot reconstruct task chunks.
+            await self._db.execute(
+                "ALTER TABLE review_runs ADD COLUMN task_checkpoint_version INTEGER NOT NULL DEFAULT 0"
+            )
+
+        cursor = await self._db.execute("PRAGMA table_info(review_task_checkpoints)")
+        checkpoint_columns = {row["name"] for row in await cursor.fetchall()}
+        if "round_id" not in checkpoint_columns:
+            await self._db.execute("ALTER TABLE review_task_checkpoints ADD COLUMN round_id TEXT NOT NULL DEFAULT ''")
+
         cursor = await self._db.execute("PRAGMA table_info(code_relations)")
         columns = {row["name"] for row in await cursor.fetchall()}
         if "source_symbol" not in columns:
@@ -208,6 +261,12 @@ class Database:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_relations_source_symbol ON code_relations(source_file, source_symbol)"
         )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_checkpoints_run ON review_task_checkpoints(run_id, task_id, attempt)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_checkpoints_round ON review_task_checkpoints(run_id, round_id)"
+        )
 
     # ── Review Runs ──────────────────────────────────────────────
 
@@ -221,29 +280,42 @@ class Database:
     ) -> None:
         now = datetime.now(UTC).isoformat()
         await self._db.execute(
-            "INSERT INTO review_runs (run_id, repo, pr_number, head_sha, base_sha, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, 'running', ?)",
+            "INSERT INTO review_runs "
+            "(run_id, repo, pr_number, head_sha, base_sha, status, started_at, task_checkpoint_version) "
+            "VALUES (?, ?, ?, ?, ?, 'running', ?, 2)",
             (run_id, repo, pr_number, head_sha, base_sha, now),
         )
         await self._db.commit()
 
     async def complete_run(self, run_id: str, summary: dict[str, Any]) -> None:
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "UPDATE review_runs SET status='completed', completed_at=?, summary_json=? WHERE run_id=?",
-            (now, json.dumps(summary, ensure_ascii=False), run_id),
-        )
-        await self._db.commit()
+        try:
+            cursor = await self._db.execute(
+                "UPDATE review_runs SET status='completed', completed_at=?, summary_json=? WHERE run_id=?",
+                (now, json.dumps(summary, ensure_ascii=False), run_id),
+            )
+            if (cursor.rowcount or 0) != 1:
+                raise LookupError(f"review run not found: {run_id}")
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
 
     async def fail_run(self, run_id: str, error: str, summary: dict[str, Any] | None = None) -> None:
         now = datetime.now(UTC).isoformat()
         payload = dict(summary or {})
         payload["error"] = error
-        await self._db.execute(
-            "UPDATE review_runs SET status='failed', completed_at=?, summary_json=? WHERE run_id=?",
-            (now, json.dumps(payload, ensure_ascii=False), run_id),
-        )
-        await self._db.commit()
+        try:
+            cursor = await self._db.execute(
+                "UPDATE review_runs SET status='failed', completed_at=?, summary_json=? WHERE run_id=?",
+                (now, json.dumps(payload, ensure_ascii=False), run_id),
+            )
+            if (cursor.rowcount or 0) != 1:
+                raise LookupError(f"review run not found: {run_id}")
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
 
     async def restart_run(self, run_id: str) -> bool:
         """Atomically claim a failed/stale run for retry.
@@ -464,6 +536,328 @@ class Database:
             cursor = await self._db.execute("SELECT * FROM reviewer_metrics ORDER BY id DESC LIMIT 500")
         rows = await cursor.fetchall()
         return [self._row_to_dict(r) for r in rows]
+
+    # ── Review Task Checkpoints ──────────────────────────────────
+
+    @staticmethod
+    def task_signature(reviewer_name: str, files: list[str]) -> str:
+        """Return a collision-resistant signature for reviewer + file-set identity.
+
+        File ordering and duplicates do not create a distinct review workload;
+        the original ordered list is still retained separately in ``files_json``
+        for faithful execution/presentation.
+        """
+
+        canonical = json.dumps(
+            {"reviewer": reviewer_name, "files": sorted(set(files))},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def task_round_hash(cls, tasks: list[dict[str, Any]]) -> str:
+        """Hash a complete planner proposal independently of insertion order."""
+
+        identities = [
+            {
+                "task_id": str(task["task_id"]),
+                "reviewer_name": str(task["reviewer_name"]),
+                "task_signature": cls.task_signature(
+                    str(task["reviewer_name"]),
+                    list(task["files"]),
+                ),
+                "task_kind": str(task.get("task_kind", "reviewer")),
+                "rationale": str(task.get("rationale", "")),
+            }
+            for task in tasks
+        ]
+        identities.sort(key=lambda item: item["task_id"])
+        canonical = json.dumps(
+            identities,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    async def checkpoint_task_round(
+        self,
+        *,
+        run_id: str,
+        round_id: str,
+        tasks: list[dict[str, Any]],
+    ) -> str:
+        """Atomically checkpoint and seal one complete Planner proposal."""
+
+        if not run_id or not round_id:
+            raise ValueError("run_id and round_id are required")
+        task_ids: set[str] = set()
+        normalized: list[dict[str, Any]] = []
+        for task in tasks:
+            task_id = str(task.get("task_id", ""))
+            reviewer_name = str(task.get("reviewer_name", ""))
+            files = task.get("files")
+            if not task_id or not reviewer_name:
+                raise ValueError("planner round tasks require task_id and reviewer_name")
+            if task_id in task_ids:
+                raise ValueError(f"duplicate task id in planner round: {task_id}")
+            if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+                raise ValueError("planner round task files must be a list of strings")
+            task_ids.add(task_id)
+            normalized.append(
+                {
+                    "task_id": task_id,
+                    "reviewer_name": reviewer_name,
+                    "files": list(files),
+                    "task_kind": str(task.get("task_kind", "reviewer")),
+                    "rationale": str(task.get("rationale", "")),
+                }
+            )
+
+        task_hash = self.task_round_hash(normalized)
+        now = datetime.now(UTC).isoformat()
+        try:
+            await self._db.execute("BEGIN IMMEDIATE")
+            await self._db.execute(
+                "INSERT INTO review_task_rounds "
+                "(run_id, round_id, task_count, task_hash, sealed, created_at) "
+                "VALUES (?, ?, ?, ?, 0, ?)",
+                (run_id, round_id, len(normalized), task_hash, now),
+            )
+            for task in normalized:
+                files_json = json.dumps(task["files"], ensure_ascii=False, separators=(",", ":"))
+                signature = self.task_signature(task["reviewer_name"], task["files"])
+                await self._db.execute(
+                    "INSERT INTO review_task_checkpoints "
+                    "(run_id, task_id, attempt, round_id, reviewer_name, files_json, task_signature, "
+                    "task_kind, rationale, status, error, created_at, updated_at) "
+                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)",
+                    (
+                        run_id,
+                        task["task_id"],
+                        round_id,
+                        task["reviewer_name"],
+                        files_json,
+                        signature,
+                        task["task_kind"],
+                        task["rationale"],
+                        now,
+                        now,
+                    ),
+                )
+            cursor = await self._db.execute(
+                "UPDATE review_task_rounds SET sealed=1, sealed_at=? WHERE run_id=? AND round_id=? AND sealed=0",
+                (now, run_id, round_id),
+            )
+            if (cursor.rowcount or 0) != 1:
+                raise RuntimeError(f"could not seal planner task round {run_id}/{round_id}")
+            await self._db.commit()
+            return task_hash
+        except Exception:
+            await self._db.rollback()
+            raise
+
+    async def upsert_task_checkpoint(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        reviewer_name: str,
+        files: list[str],
+        status: str,
+        error: str = "",
+        rationale: str = "",
+        task_kind: str = "reviewer",
+        round_id: str = "",
+    ) -> int:
+        """Persist one task transition and return its current attempt number.
+
+        A retry preserves ``task_id`` and opens a new attempt only when a
+        previously failed or orphaned claimed attempt is claimed again.  Other
+        transitions update the latest attempt in place.  Identity drift for an
+        existing ``(run_id, task_id)`` is rejected instead of silently turning
+        one checkpoint into a different task.
+        """
+
+        allowed_statuses = {"pending", "claimed", "completed", "failed"}
+        if status not in allowed_statuses:
+            raise ValueError(f"invalid task checkpoint status: {status}")
+        if not run_id or not task_id or not reviewer_name:
+            raise ValueError("run_id, task_id and reviewer_name are required")
+        if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+            raise ValueError("task checkpoint files must be a list of strings")
+
+        files_json = json.dumps(files, ensure_ascii=False, separators=(",", ":"))
+        signature = self.task_signature(reviewer_name, files)
+        now = datetime.now(UTC).isoformat()
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM review_task_checkpoints WHERE run_id=? AND task_id=? ORDER BY attempt DESC LIMIT 1",
+                (run_id, task_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                attempt = 1
+                await self._db.execute(
+                    "INSERT INTO review_task_checkpoints "
+                    "(run_id, task_id, attempt, round_id, reviewer_name, files_json, task_signature, "
+                    "task_kind, rationale, status, error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        task_id,
+                        attempt,
+                        round_id,
+                        reviewer_name,
+                        files_json,
+                        signature,
+                        task_kind,
+                        rationale,
+                        status,
+                        error,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                previous = self._row_to_dict(row)
+                if (
+                    previous["reviewer_name"] != reviewer_name
+                    or previous["task_signature"] != signature
+                    or previous["task_kind"] != task_kind
+                    or previous["rationale"] != rationale
+                    or (round_id and previous["round_id"] != round_id)
+                ):
+                    raise ValueError(f"task checkpoint identity drift for {run_id}/{task_id}")
+                if previous["status"] == "completed" and status != "completed":
+                    raise ValueError(f"completed task checkpoint is immutable for {run_id}/{task_id}")
+                attempt = int(previous["attempt"])
+                if status == "claimed" and previous["status"] in {"failed", "claimed"}:
+                    attempt += 1
+                    await self._db.execute(
+                        "INSERT INTO review_task_checkpoints "
+                        "(run_id, task_id, attempt, round_id, reviewer_name, files_json, task_signature, "
+                        "task_kind, rationale, status, error, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            run_id,
+                            task_id,
+                            attempt,
+                            previous["round_id"],
+                            reviewer_name,
+                            files_json,
+                            signature,
+                            task_kind,
+                            rationale,
+                            status,
+                            error,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    await self._db.execute(
+                        "UPDATE review_task_checkpoints SET status=?, error=?, updated_at=? "
+                        "WHERE run_id=? AND task_id=? AND attempt=?",
+                        (status, error, now, run_id, task_id, attempt),
+                    )
+            await self._db.commit()
+            return attempt
+        except Exception:
+            await self._db.rollback()
+            raise
+
+    async def get_task_checkpoints(
+        self,
+        run_id: str,
+        *,
+        latest_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return decoded task checkpoints, latest attempt per task by default."""
+
+        if latest_only:
+            await self._validate_sealed_task_rounds(run_id)
+            sql = """
+                SELECT checkpoint.*
+                FROM review_task_checkpoints AS checkpoint
+                JOIN (
+                    SELECT run_id, task_id, MAX(attempt) AS attempt
+                    FROM review_task_checkpoints
+                    WHERE run_id=?
+                    GROUP BY run_id, task_id
+                ) AS latest
+                 ON checkpoint.run_id=latest.run_id
+                 AND checkpoint.task_id=latest.task_id
+                 AND checkpoint.attempt=latest.attempt
+                WHERE (checkpoint.round_id='' AND checkpoint.task_kind!='reviewer') OR EXISTS (
+                    SELECT 1 FROM review_task_rounds AS task_round
+                    WHERE task_round.run_id=checkpoint.run_id
+                      AND task_round.round_id=checkpoint.round_id
+                      AND task_round.sealed=1
+                )
+                ORDER BY checkpoint.created_at, checkpoint.task_id
+            """
+        else:
+            sql = "SELECT * FROM review_task_checkpoints WHERE run_id=? ORDER BY task_id, attempt"
+        cursor = await self._db.execute(sql, (run_id,))
+        checkpoints: list[dict[str, Any]] = []
+        for row in await cursor.fetchall():
+            checkpoint = self._row_to_dict(row)
+            try:
+                files = json.loads(checkpoint.pop("files_json"))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"invalid task checkpoint files for {run_id}/{checkpoint.get('task_id', '')}") from exc
+            if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+                raise ValueError(f"invalid task checkpoint files for {run_id}/{checkpoint.get('task_id', '')}")
+            expected_signature = self.task_signature(str(checkpoint["reviewer_name"]), files)
+            if checkpoint["task_signature"] != expected_signature:
+                raise ValueError(f"invalid task checkpoint signature for {run_id}/{checkpoint['task_id']}")
+            checkpoint["files"] = files
+            checkpoints.append(checkpoint)
+        return checkpoints
+
+    async def get_task_rounds(self, run_id: str) -> list[dict[str, Any]]:
+        cursor = await self._db.execute(
+            "SELECT * FROM review_task_rounds WHERE run_id=? ORDER BY created_at, round_id",
+            (run_id,),
+        )
+        return [self._row_to_dict(row) for row in await cursor.fetchall()]
+
+    async def _validate_sealed_task_rounds(self, run_id: str) -> None:
+        cursor = await self._db.execute(
+            "SELECT * FROM review_task_rounds WHERE run_id=? AND sealed=1",
+            (run_id,),
+        )
+        for row in await cursor.fetchall():
+            envelope = self._row_to_dict(row)
+            task_cursor = await self._db.execute(
+                "SELECT * FROM review_task_checkpoints WHERE run_id=? AND round_id=? AND attempt=1 ORDER BY task_id",
+                (run_id, envelope["round_id"]),
+            )
+            tasks: list[dict[str, Any]] = []
+            for task_row in await task_cursor.fetchall():
+                task = self._row_to_dict(task_row)
+                try:
+                    files = json.loads(task["files_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"invalid sealed task round files for {run_id}/{envelope['round_id']}") from exc
+                if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+                    raise ValueError(f"invalid sealed task round files for {run_id}/{envelope['round_id']}")
+                tasks.append(
+                    {
+                        "task_id": task["task_id"],
+                        "reviewer_name": task["reviewer_name"],
+                        "files": files,
+                        "task_kind": task["task_kind"],
+                        "rationale": task["rationale"],
+                    }
+                )
+            if len(tasks) != int(envelope["task_count"]):
+                raise ValueError(f"sealed task round count mismatch for {run_id}/{envelope['round_id']}")
+            if self.task_round_hash(tasks) != envelope["task_hash"]:
+                raise ValueError(f"sealed task round hash mismatch for {run_id}/{envelope['round_id']}")
 
     # ── Aggregates (for dashboard) ───────────────────────────────
 

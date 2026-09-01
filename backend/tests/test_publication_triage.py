@@ -876,10 +876,13 @@ async def test_resume_after_gate_provider_error_skips_all_expensive_stages(tmp_p
 
     registry = build_registry()
     llm = MockChatLLM()
+    events = EventBus()
+    seen = []
+    events.subscribe(seen.append)
     orchestrator = Orchestrator(
         registry=registry,
         gateway=ToolGateway(registry, MockGitHubClient()),
-        event_bus=EventBus(),
+        event_bus=events,
         planner_llm=llm,
         reviewer_llm=llm,
         calibrator_llm=llm,
@@ -923,6 +926,69 @@ async def test_resume_after_gate_provider_error_skips_all_expensive_stages(tmp_p
     assert summary.get("retryable") is None
     runs = await database.get_runs(repo="owner/repo")
     assert runs[0]["status"] == "completed"
+    event_types = [event.event_type for event in seen]
+    assert "review.partial" not in event_types
+    assert "review.completed" in event_types
+    telemetry = next(event.data for event in seen if event.event_type == "evaluation.telemetry")
+    assert telemetry["schema_version"] == 1
+    assert telemetry["resume_mode"] == "publication-only"
+    assert telemetry["failures"]["operationally_incomplete"] is False
+    assert telemetry["coverage"]["available"] is False
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_publication_only_retry_failure_uses_shared_partial_finalizer(tmp_path):
+    database = Database(tmp_path / "publication-resume-failed.db")
+    await database.connect()
+    run_id = "publication-retry-failed"
+    await database.create_run(
+        run_id=run_id,
+        repo="owner/repo",
+        pr_number=1,
+        head_sha="head",
+    )
+    state = _state()
+    retry_finding = _finding("retry-still-failing")
+    retry_finding.status = "candidate"
+    retry_finding.verified_by = "publication-gate-provider-error"
+    state.add_finding(retry_finding)
+    registry = build_registry()
+    events = EventBus()
+    seen = []
+    events.subscribe(seen.append)
+    llm = MockChatLLM()
+    orchestrator = Orchestrator(
+        registry=registry,
+        gateway=ToolGateway(registry, MockGitHubClient()),
+        event_bus=events,
+        planner_llm=llm,
+        reviewer_llm=llm,
+        calibrator_llm=llm,
+        db=database,
+        publication_gate_enabled=True,
+    )
+    failed_stats = TriageStats(provider_errors=1, retryable=True, errors=["provider unavailable"])
+
+    with (
+        patch.object(orchestrator, "_run_publication_gate", new_callable=AsyncMock, return_value=failed_stats),
+        patch.object(
+            orchestrator,
+            "_post_comments",
+            new_callable=AsyncMock,
+            return_value=CommentDeliveryResult(reported=1),
+        ),
+    ):
+        summary = await orchestrator._resume_publication_only(state, run_id, {retry_finding.id})
+
+    assert summary["status"] == "partial"
+    assert summary["retryable"] is True
+    assert (await database.get_run(run_id))["status"] == "failed"
+    event_types = [event.event_type for event in seen]
+    assert event_types[-3:] == ["evaluation.telemetry", "review.partial", "review.completed"]
+    telemetry = seen[-3].data
+    assert telemetry["failures"]["publication"] == 1
+    assert telemetry["failures"]["operationally_incomplete"] is True
     await database.close()
 
 

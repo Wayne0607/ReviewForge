@@ -51,7 +51,8 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
             pr = payload["pull_request"]
             repo = payload["repository"]["full_name"]
             pr_number = pr["number"]
-            head_sha = pr["head"]["sha"]
+            head = pr["head"]
+            head_sha = head["sha"]
 
             # S6: 校验 repo 格式
             if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
@@ -120,6 +121,10 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                             repo=repo,
                             head_sha=head_sha,
                             base_sha=pr["base"]["sha"],
+                            pr_title=pr.get("title") or "",
+                            pr_body=pr.get("body") or "",
+                            head_repo=(head.get("repo") or {}).get("full_name") or "",
+                            head_ref=head.get("ref") or "",
                             files_changed=file_paths,
                             diff_summary=diff_summary,
                             file_diffs={f["filename"]: f.get("patch") or "" for f in files_data},

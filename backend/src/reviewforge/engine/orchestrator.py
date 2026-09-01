@@ -17,8 +17,10 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.database import Database
+from reviewforge.core.evaluation_telemetry import build_evaluation_telemetry
 from reviewforge.core.events import EventBus
 from reviewforge.core.loop_detector import LoopDetector
+from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.core.scheduler import Scheduler
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, Note, ReviewTask, StateStore
@@ -67,6 +69,7 @@ from reviewforge.engine.publication_triage import (
 )
 from reviewforge.engine.reviewers import REVIEWER_MAP, BaseReviewer
 from reviewforge.engine.root_cause import cluster_root_causes
+from reviewforge.engine.run_health import RunHealth
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticUnit, compile_semantic_changeset
 from reviewforge.engine.sibling_invariants import findings_from_sibling_invariants
@@ -194,6 +197,24 @@ class CommentDeliveryResult:
         }
 
 
+@dataclass(frozen=True)
+class _TaskRecovery:
+    """Trusted task identities restored from one persisted run."""
+
+    checkpoint_version: int = 0
+    incomplete_task_ids: frozenset[str] = frozenset()
+    runnable_task_ids: frozenset[str] = frozenset()
+    planner_rounds_complete: bool = False
+
+    @property
+    def publication_only_safe(self) -> bool:
+        return self.checkpoint_version >= 2 and self.planner_rounds_complete and not self.incomplete_task_ids
+
+
+class _RunFinalizationError(RuntimeError):
+    """Raised after a terminal database transition could not be made reliable."""
+
+
 @dataclass
 class _DedupStats:
     """Phase 2 (perf/gate-dedup-20260729): measurement of gate-input dedup."""
@@ -319,6 +340,10 @@ class Orchestrator:
         self._v3_evidence_max_candidates = max(1, v3_evidence_max_candidates)
 
         # V3 runtime tracking (populated per-run)
+        # TODO(architecture): these mutable fields belong to a per-run context.
+        # Add a same-Orchestrator concurrent-run isolation test before enabling
+        # V3 on a singleton runtime; moving them is intentionally out of scope
+        # for the RunHealth/finalization change.
         self._v3_change_set = None
         self._v3_ledger: CoverageLedger | None = None
         self._v3_task_dimensions: dict[str, list[str]] = {}  # task_id → [dimension, ...]
@@ -516,10 +541,244 @@ class Orchestrator:
 
         return None
 
+    @staticmethod
+    def _task_checkpoint_kind(task: ReviewTask) -> str:
+        if task.rationale.startswith("v3 targeted closure:"):
+            return "v3_closure"
+        if task.reviewer == "coverage_gap_reviewer":
+            return "coverage_gap"
+        return "reviewer"
+
+    @staticmethod
+    def _stable_specialized_task_id(kind: str, *identity_parts: str) -> str:
+        identity = "\x00".join((kind, *identity_parts))
+        return f"task_{kind}_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
+
+    async def _checkpoint_task(self, run_id: str, task: ReviewTask) -> None:
+        """Persist one task state without using reviewer metrics as recovery data."""
+
+        if not self._db:
+            return
+        await self._db.upsert_task_checkpoint(
+            run_id=run_id,
+            task_id=task.id,
+            reviewer_name=task.reviewer,
+            files=task.files,
+            status=task.status,
+            error=task.error,
+            rationale=task.rationale,
+            task_kind=self._task_checkpoint_kind(task),
+        )
+
+    async def _add_task_checkpointed(self, state: StateStore, run_id: str, task: ReviewTask) -> None:
+        state.add_task(task)
+        await self._checkpoint_task(run_id, task)
+
+    async def _add_planner_round_checkpointed(
+        self,
+        state: StateStore,
+        run_id: str,
+        tasks: list[ReviewTask],
+    ) -> tuple[str, str]:
+        """Atomically seal a complete Planner proposal before exposing tasks."""
+
+        round_id = f"planner_{uuid.uuid4().hex}"
+        task_hash = ""
+        if self._db:
+            task_hash = await self._db.checkpoint_task_round(
+                run_id=run_id,
+                round_id=round_id,
+                tasks=[
+                    {
+                        "task_id": task.id,
+                        "reviewer_name": task.reviewer,
+                        "files": task.files,
+                        "task_kind": self._task_checkpoint_kind(task),
+                        "rationale": task.rationale,
+                    }
+                    for task in tasks
+                ],
+            )
+        for task in tasks:
+            state.add_task(task)
+        return round_id, task_hash
+
+    async def _update_task_checkpointed(
+        self,
+        state: StateStore,
+        run_id: str,
+        task_id: str,
+        **updates: Any,
+    ) -> None:
+        state.update_task(task_id, **updates)
+        await self._checkpoint_task(run_id, state.get_task(task_id))
+
+    async def _flush_task_checkpoints(self, state: StateStore, run_id: str) -> None:
+        """Flush terminal task states after their findings are durable.
+
+        Completed tasks are intentionally not checkpointed as completed in the
+        worker callback: review findings are persisted later in the pipeline.
+        Retaining ``claimed`` across that crash window forces a safe retry
+        instead of skipping a task whose output was never stored.
+        """
+
+        for task in state.list_tasks():
+            await self._checkpoint_task(run_id, task)
+
+    def _evaluation_coverage(self, *, available: bool) -> dict[str, Any]:
+        """Return a bounded, explicit coverage snapshot for evaluation."""
+        if not available or not self._v3_enabled or self._v3_ledger is None:
+            high_risk = {"total": 0, "resolved": 0, "unresolved": 0, "status": "unavailable"}
+            return {
+                "available": False,
+                "threshold": self._v3_coverage_min_risk_score,
+                "status": "unavailable",
+                "high_risk": high_risk,
+            }
+
+        high_risk_cells = [cell for cell in self._v3_ledger.cells if cell.risk >= self._v3_coverage_min_risk_score]
+        # Operational terminality is not evidence of coverage: ABSTAINED and
+        # FAILED remain visible as unresolved evaluation gaps. They do not,
+        # however, directly fail RunHealth (NO_ISSUE closure is not wired yet).
+        resolved = sum(cell.status in (CoverageStatus.COVERED, CoverageStatus.NO_ISSUE) for cell in high_risk_cells)
+        unresolved = len(high_risk_cells) - resolved
+        status = "complete" if unresolved == 0 else "incomplete"
+        return {
+            "available": True,
+            "threshold": self._v3_coverage_min_risk_score,
+            "status": status,
+            "high_risk": {
+                "total": len(high_risk_cells),
+                "resolved": resolved,
+                "unresolved": unresolved,
+                "status": status,
+            },
+        }
+
+    @staticmethod
+    def _evaluation_funnel(
+        state: StateStore,
+        summary: dict[str, Any],
+        publication: TriageStats | None,
+        delivery: CommentDeliveryResult,
+    ) -> dict[str, int]:
+        """Capture only counters that are authoritative at finalization."""
+        findings = state.list_findings()
+        status_counts = {status: 0 for status in ("candidate", "confirmed", "false_positive", "reported")}
+        for finding in findings:
+            if finding.status not in status_counts:
+                raise ValueError(f"unsupported final finding status for telemetry: {finding.status!r}")
+            status_counts[finding.status] += 1
+        delivery_attempted = delivery.reported + delivery.permanent_rejections + delivery.transient_failures
+        return {
+            "findings_detected": len(findings),
+            "findings_confirmed": status_counts["confirmed"] + status_counts["reported"],
+            "findings_filtered": status_counts["false_positive"],
+            "findings_reported": status_counts["reported"],
+            "publication_candidates": publication.dedup_input if publication is not None else 0,
+            "delivery_attempted": delivery_attempted,
+            "delivery_reported": delivery.reported,
+            "tasks_completed": int(summary.get("tasks_completed", 0)),
+            "tasks_failed": int(summary.get("tasks_failed", 0)),
+        }
+
+    @staticmethod
+    def _evaluation_validation_funnel(state: StateStore) -> list[dict[str, int | str]]:
+        """Partition every final finding status exactly once, failing closed on drift."""
+        counts = {status: 0 for status in ("candidate", "confirmed", "false_positive", "reported")}
+        for finding in state.list_findings():
+            if finding.status not in counts:
+                raise ValueError(f"unsupported final finding status for telemetry: {finding.status!r}")
+            counts[finding.status] += 1
+        total = sum(counts.values())
+        return [
+            {
+                "stage": "finding_status",
+                "input": total,
+                "added": 0,
+                "kept": counts["confirmed"] + counts["reported"],
+                "filtered": counts["false_positive"],
+                "merged": 0,
+                "inconclusive": counts["candidate"],
+                "failed": 0,
+            }
+        ]
+
+    async def _finalize_run(
+        self,
+        *,
+        run_id: str,
+        state: StateStore,
+        summary: dict[str, Any],
+        health: RunHealth,
+        publication: TriageStats | None,
+        delivery: CommentDeliveryResult,
+        coverage_available: bool,
+        failure_prefix: str,
+        resume_mode: str = "normal",
+    ) -> dict[str, Any]:
+        """Apply one health/event/DB policy to every successful exit path.
+
+        A terminal event is an assertion that the matching database mutation
+        committed.  Build/validate telemetry first, commit the database second,
+        and only then publish telemetry and terminal events.
+        """
+        health.apply_to_summary(summary)
+        telemetry = build_evaluation_telemetry(
+            resume_mode=resume_mode,
+            failures=health.failures_payload(),
+            coverage=self._evaluation_coverage(available=coverage_available),
+            funnel=self._evaluation_funnel(state, summary, publication, delivery),
+            validation_funnel=self._evaluation_validation_funnel(state),
+        )
+
+        if self._db:
+            intended_status = "failed" if health.operationally_incomplete else "completed"
+            try:
+                if health.operationally_incomplete:
+                    await self._db.fail_run(
+                        run_id,
+                        failure_prefix + "; ".join(health.errors),
+                        summary=summary,
+                    )
+                else:
+                    await self._db.complete_run(run_id, summary)
+            except Exception as exc:
+                fallback_status = "unknown"
+                fallback_error = ""
+                if intended_status == "completed":
+                    try:
+                        await self._db.fail_run(
+                            run_id,
+                            f"finalization failed before completion event: {exc}",
+                            summary=summary,
+                        )
+                        fallback_status = "failed"
+                    except Exception as fallback_exc:
+                        fallback_error = str(fallback_exc)
+                self._events.emit(
+                    "review.finalization_failed",
+                    {
+                        "run_id": run_id,
+                        "intended_status": intended_status,
+                        "persisted_status": fallback_status,
+                        "error": str(exc),
+                        "fallback_error": fallback_error,
+                    },
+                )
+                raise _RunFinalizationError(f"could not finalize review run {run_id}: {exc}") from exc
+
+        self._events.emit("evaluation.telemetry", telemetry)
+        if health.operationally_incomplete:
+            self._events.emit("review.partial", {**summary, "errors": health.errors})
+        self._events.emit("review.completed", summary)
+        return summary
+
     async def run(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
         loop_detector = LoopDetector()  # B4: per-run instance
         self._v3_evidence_summary = None
+        task_recovery = _TaskRecovery()
 
         # Resume (可恢复): if a prior run for this exact (repo, pr, head_sha) didn't
         # complete, reuse its run_id and rehydrate findings + completed reviewers from
@@ -539,7 +798,11 @@ class Orchestrator:
                     "tasks_completed": 0,
                     "tasks_failed": 0,
                 }
-            await self._rehydrate(state, run_id)
+            task_recovery = await self._rehydrate(
+                state,
+                run_id,
+                checkpoint_version=int(resumed.get("task_checkpoint_version", 0)),
+            )
             self._events.set_run_id(run_id)
             self._events.emit(
                 "review.resumed",
@@ -587,7 +850,7 @@ class Orchestrator:
                 for finding in state.list_findings()
                 if finding.status == "candidate" and finding.verified_by == "publication-gate-provider-error"
             }
-            if resumed and publication_retry_ids:
+            if resumed and publication_retry_ids and task_recovery.publication_only_safe:
                 return await self._resume_publication_only(
                     state,
                     run_id,
@@ -660,7 +923,13 @@ class Orchestrator:
                 try:
                     reviewer = self._create_reviewer(task.reviewer)
                     if not reviewer:
-                        state.update_task(task.id, status="failed", error=f"unknown reviewer: {task.reviewer}")
+                        await self._update_task_checkpointed(
+                            state,
+                            run_id,
+                            task.id,
+                            status="failed",
+                            error=f"unknown reviewer: {task.reviewer}",
+                        )
                         if self._db:
                             await self._db.insert_metric(
                                 run_id, task.reviewer, status="failed", error=f"unknown reviewer: {task.reviewer}"
@@ -688,6 +957,9 @@ class Orchestrator:
                             continue
                         state.add_finding(f)
                         accepted_task_findings.append(f)
+                    # Completion is flushed only after findings are persisted;
+                    # until then the durable task stays claimed and is safely
+                    # retried after a crash.
                     state.update_task(task.id, status="completed")
                     if self._v3_enabled:
                         self._track_broad_pass_coverage(
@@ -708,7 +980,13 @@ class Orchestrator:
                             duration_ms=int((time.monotonic() - t_start) * 1000),
                         )
                 except Exception as e:
-                    state.update_task(task.id, status="failed", error=str(e))
+                    await self._update_task_checkpointed(
+                        state,
+                        run_id,
+                        task.id,
+                        status="failed",
+                        error=str(e),
+                    )
                     self._events.emit("reviewer.failed", {"reviewer": task.reviewer, "error": str(e)})
                     if self._db:
                         await self._db.insert_metric(
@@ -720,32 +998,52 @@ class Orchestrator:
                         )
 
             for round_no in range(max_rounds):
-                self._events.emit("planner.started", {"round": round_no})
-                notes = state.consume_notes()  # #3: feed prior-round hints to the planner
-                planner_succeeded = True
-                try:
-                    proposed = await self._planner.plan(state, notes=notes)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    # Phase 0 findings remain actionable when the planner model or
-                    # provider is unavailable. Continue through verification and
-                    # commenting instead of failing the whole review.
-                    logger.error("Planner failed in round %d: %s", round_no, e, exc_info=True)
-                    self._events.emit("planner.failed", {"round": round_no, "error": str(e)})
-                    planner_errors.append(f"round {round_no}: {e}")
-                    planner_succeeded = False
-                    proposed = []
-                # Slice oversized correctness tasks before they enter
-                # StateStore/Scheduler so each chunk fits the reviewer
-                # prompt's 36k-char diff budget.
-                proposed = _split_oversized_correctness_tasks(proposed, state.file_diffs or {})
-                for task in proposed:
-                    state.add_task(task)
-                if planner_succeeded:
-                    self._events.emit("planner.completed", {"round": round_no, "task_count": len(proposed)})
-
                 pending = state.list_tasks(status="pending")
+                if pending:
+                    # Recovered exact task identities run before re-planning.
+                    # This avoids creating a duplicate all-files task when only
+                    # one chunk of a multi-chunk reviewer failed.
+                    self._events.emit(
+                        "reviewer.checkpoints_resumed",
+                        {"round": round_no, "task_ids": [task.id for task in pending]},
+                    )
+                else:
+                    self._events.emit("planner.started", {"round": round_no})
+                    notes = state.consume_notes()  # #3: feed prior-round hints to the planner
+                    planner_succeeded = True
+                    try:
+                        proposed = await self._planner.plan(state, notes=notes)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # Phase 0 findings remain actionable when the planner model or
+                        # provider is unavailable. Continue through verification and
+                        # commenting instead of failing the whole review.
+                        logger.error("Planner failed in round %d: %s", round_no, e, exc_info=True)
+                        self._events.emit("planner.failed", {"round": round_no, "error": str(e)})
+                        planner_errors.append(f"round {round_no}: {e}")
+                        planner_succeeded = False
+                        proposed = []
+                    # Slice oversized correctness tasks before they enter
+                    # StateStore/Scheduler so each chunk fits the reviewer
+                    # prompt's 36k-char diff budget.
+                    proposed = _split_oversized_correctness_tasks(proposed, state.file_diffs or {})
+                    if planner_succeeded:
+                        round_id, task_hash = await self._add_planner_round_checkpointed(
+                            state,
+                            run_id,
+                            proposed,
+                        )
+                        self._events.emit(
+                            "planner.completed",
+                            {
+                                "round": round_no,
+                                "round_id": round_id,
+                                "task_count": len(proposed),
+                                "task_hash": task_hash,
+                            },
+                        )
+                    pending = state.list_tasks(status="pending")
                 if not pending:
                     break  # planner proposed nothing new → converged
 
@@ -755,10 +1053,22 @@ class Orchestrator:
                     sig = LoopDetector.make_signature(task.reviewer, task.files)
                     loop_result = loop_detector.check(sig)
                     if loop_result == "stall":
-                        state.update_task(task.id, status="failed", error="loop_stalled")
+                        await self._update_task_checkpointed(
+                            state,
+                            run_id,
+                            task.id,
+                            status="failed",
+                            error="loop_stalled",
+                        )
                         self._events.emit("reviewer.stalled", {"task_id": task.id, "signature": sig})
                     elif loop_result == "rescue":
-                        state.update_task(task.id, status="failed", error="rescue_drain")
+                        await self._update_task_checkpointed(
+                            state,
+                            run_id,
+                            task.id,
+                            status="failed",
+                            error="rescue_drain",
+                        )
                         self._events.emit("reviewer.rescued", {"task_id": task.id})
                         # #3: hint the Planner that this reviewer/file combo is looping
                         state.add_note(
@@ -769,7 +1079,7 @@ class Orchestrator:
                             )
                         )
                     else:
-                        state.update_task(task.id, status="claimed")
+                        await self._update_task_checkpointed(state, run_id, task.id, status="claimed")
                         runnable.append(task)
 
                 if runnable:
@@ -1037,6 +1347,10 @@ class Orchestrator:
             if self._db:
                 for f in state.findings.values():
                     await self._db.insert_finding(run_id, f.to_dict())
+                # A completed task becomes resumable only after all of its
+                # outputs are durable.  If the process dies before this flush,
+                # its latest checkpoint remains claimed and will be retried.
+                await self._flush_task_checkpoints(state, run_id)
 
             # Phase 4: Comment
             confirmed = state.list_findings(status="confirmed")
@@ -1057,12 +1371,22 @@ class Orchestrator:
                 comment_result = await self._post_comments(confirmed, state)
                 self._events.emit("commenter.completed", comment_result.to_dict())
 
+            failed_tasks = state.list_tasks(status="failed")
+            failed_task_ids = {task.id for task in failed_tasks}
+            durable_incomplete_task_ids: set[str] = set()
+            if self._db and (not resumed or task_recovery.checkpoint_version >= 2):
+                durable_incomplete_task_ids = {
+                    str(checkpoint["task_id"])
+                    for checkpoint in await self._db.get_task_checkpoints(run_id)
+                    if checkpoint["status"] != "completed"
+                }
+            failed_task_ids.update(durable_incomplete_task_ids)
             summary = {
                 "total_findings": len(state.findings),
                 "confirmed": len(state.list_findings(status="confirmed")) + len(state.list_findings(status="reported")),
                 "false_positives": len(state.list_findings(status="false_positive")),
                 "tasks_completed": len(state.list_tasks(status="completed")),
-                "tasks_failed": len(state.list_tasks(status="failed")),
+                "tasks_failed": len(failed_task_ids),
                 "comment_delivery": comment_result.to_dict(),
                 "publication_global_dedup": publication_dedup_stats,
             }
@@ -1076,37 +1400,58 @@ class Orchestrator:
                     summary["v3_evidence"] = self._v3_evidence_summary
             if publication_gate_stats is not None:
                 summary["publication_gate"] = publication_gate_stats.public_summary()
-            retryable_errors = list(planner_errors)
-            if publication_gate_stats and publication_gate_stats.retryable:
-                retryable_errors.extend(publication_gate_stats.errors)
-            if comment_result.retryable:
-                retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
-            if retryable_errors:
-                summary.update({"status": "partial", "retryable": True})
-                self._events.emit(
-                    "review.partial",
-                    {**summary, "errors": retryable_errors},
+            publication_errors = (
+                tuple(publication_gate_stats.errors)
+                if publication_gate_stats is not None and publication_gate_stats.retryable
+                else ()
+            )
+            publication_failures = (
+                max(
+                    publication_gate_stats.provider_errors,
+                    publication_gate_stats.triage_failed,
+                    len(publication_errors),
+                    int(publication_gate_stats.retryable),
                 )
-            self._events.emit("review.completed", summary)
+                if publication_gate_stats is not None
+                else 0
+            )
+            delivery_errors = (
+                tuple(comment_result.errors or ("Transient comment delivery failure",))
+                if comment_result.retryable
+                else ()
+            )
+            health = RunHealth.build(
+                tasks_failed=summary["tasks_failed"],
+                planner_errors=tuple(planner_errors),
+                publication_failures=publication_failures,
+                publication_errors=publication_errors,
+                publication_retryable=bool(publication_gate_stats and publication_gate_stats.retryable),
+                delivery_failures=comment_result.transient_failures,
+                delivery_errors=delivery_errors,
+                delivery_retryable=comment_result.retryable,
+            )
 
-            # A Planner/provider or transient comment-delivery outage must not
-            # permanently de-duplicate this head as reviewed. Keep the same run
-            # resumable; already-reported findings will not be posted twice.
-            if self._db:
-                if retryable_errors:
-                    await self._db.fail_run(
-                        run_id,
-                        "Review incomplete and retryable: " + "; ".join(retryable_errors),
-                        summary=summary,
-                    )
-                else:
-                    await self._db.complete_run(run_id, summary)
-
-            return summary
+            # Failed tasks, Planner/provider outages, and transient delivery
+            # errors all leave this same run resumable. Rehydration preserves
+            # reported findings, so a retry does not post them twice.
+            return await self._finalize_run(
+                run_id=run_id,
+                state=state,
+                summary=summary,
+                health=health,
+                publication=publication_gate_stats,
+                delivery=comment_result,
+                coverage_available=self._v3_enabled and self._v3_ledger is not None,
+                failure_prefix="Review incomplete and retryable: ",
+            )
 
         except asyncio.CancelledError:
             if self._db:
                 await self._db.fail_run(run_id, "review task cancelled")
+            raise
+        except _RunFinalizationError:
+            # _finalize_run already attempted a reliable failed fallback and
+            # emitted the sole terminal-failure event for this exit path.
             raise
         except Exception as e:
             if self._db:
@@ -1430,24 +1775,38 @@ class Orchestrator:
                 "retried_findings": len(retry_ids),
             },
         }
-        retryable_errors = list(stats.errors) if stats.retryable else []
-        if comment_result.retryable:
-            retryable_errors.extend(comment_result.errors or ("Transient comment delivery failure",))
-        if retryable_errors:
-            summary.update({"status": "partial", "retryable": True})
-            self._events.emit("review.partial", {**summary, "errors": retryable_errors})
-        self._events.emit("review.completed", summary)
-
-        if self._db:
-            if retryable_errors:
-                await self._db.fail_run(
-                    run_id,
-                    "Publication retry incomplete: " + "; ".join(retryable_errors),
-                    summary=summary,
-                )
-            else:
-                await self._db.complete_run(run_id, summary)
-        return summary
+        publication_errors = tuple(stats.errors) if stats.retryable else ()
+        delivery_errors = (
+            tuple(comment_result.errors or ("Transient comment delivery failure",)) if comment_result.retryable else ()
+        )
+        health = RunHealth.build(
+            tasks_failed=summary["tasks_failed"],
+            publication_failures=max(
+                stats.provider_errors,
+                stats.triage_failed,
+                len(publication_errors),
+                int(stats.retryable),
+            ),
+            publication_errors=publication_errors,
+            publication_retryable=stats.retryable,
+            delivery_failures=comment_result.transient_failures,
+            delivery_errors=delivery_errors,
+            delivery_retryable=comment_result.retryable,
+        )
+        # Publication-only recovery has no rehydrated V3 ledger checkpoint, so
+        # coverage is explicitly unavailable instead of borrowing singleton
+        # state from another run.
+        return await self._finalize_run(
+            run_id=run_id,
+            state=state,
+            summary=summary,
+            health=health,
+            publication=stats,
+            delivery=comment_result,
+            coverage_available=False,
+            failure_prefix="Publication retry incomplete: ",
+            resume_mode="publication-only",
+        )
 
     async def _run_publication_gate(
         self,
@@ -1729,20 +2088,38 @@ class Orchestrator:
             return
 
         files = list(dict.fromkeys(card.file for card in cards))
+        task_id = self._stable_specialized_task_id("coverage_gap", *sorted(set(files)))
+        if self._db:
+            durable = {
+                checkpoint["task_id"]: checkpoint for checkpoint in await self._db.get_task_checkpoints(run_id)
+            }.get(task_id)
+            if durable is not None and durable["status"] == "completed":
+                self._events.emit(
+                    "coverage_gap.skipped",
+                    {"reason": "durable completed checkpoint", "task_id": task_id},
+                )
+                return
         task = ReviewTask(
+            id=task_id,
             reviewer="coverage_gap_reviewer",
             files=files,
             rationale="selective high-risk uncovered-symbol correctness pass",
             status="claimed",
         )
-        state.add_task(task)
+        await self._add_task_checkpointed(state, run_id, task)
         reviewer = self._create_reviewer(
             "correctness_reviewer",
             model_agent_name="coverage_gap_reviewer",
             force_agentic=False,
         )
         if reviewer is None:
-            state.update_task(task.id, status="failed", error="correctness reviewer unavailable")
+            await self._update_task_checkpointed(
+                state,
+                run_id,
+                task.id,
+                status="failed",
+                error="correctness reviewer unavailable",
+            )
             self._events.emit("coverage_gap.failed", {"error": "correctness reviewer unavailable"})
             return
 
@@ -1799,7 +2176,13 @@ class Orchestrator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            state.update_task(task.id, status="failed", error=str(exc))
+            await self._update_task_checkpointed(
+                state,
+                run_id,
+                task.id,
+                status="failed",
+                error=str(exc),
+            )
             self._events.emit("coverage_gap.failed", {"error": str(exc)})
             if self._db:
                 await self._db.insert_metric(
@@ -1970,6 +2353,11 @@ class Orchestrator:
 
         existing_keys = {finding_identity(f) for f in state.list_findings()}
         scheduler = Scheduler(concurrency=4)
+        durable_checkpoints = (
+            {checkpoint["task_id"]: checkpoint for checkpoint in await self._db.get_task_checkpoints(run_id)}
+            if self._db
+            else {}
+        )
 
         # Run one attempt per eligible cell in each wave. Reviewer calls are
         # independent and expensive, so they may overlap; all shared-state
@@ -1992,6 +2380,12 @@ class Orchestrator:
                 unit = self._find_unit_by_id(cell.unit_id)
                 dim = cell.dimension.value
                 reviewer = self._dimension_reviewer(dim)
+                task_id = self._stable_specialized_task_id(
+                    "v3_closure",
+                    cell.unit_id,
+                    dim,
+                    str(_wave),
+                )
                 focus = self._build_review_focus(
                     path=cell.path,
                     symbol=getattr(unit, "symbol", "") if unit else "",
@@ -2003,17 +2397,55 @@ class Orchestrator:
                 )
 
                 task = ReviewTask(
+                    id=task_id,
                     reviewer=reviewer,
                     files=[cell.path],
                     rationale=f"v3 targeted closure: {dim} for {cell.unit_id}",
                     status="claimed",
                 )
-                state.add_task(task)
+                durable = durable_checkpoints.get(task_id)
+                if durable is not None and durable["status"] == "completed":
+                    task.status = "completed"
+                    state.add_task(task)
+                    self._v3_closure_task_ids.add(task.id)
+                    cell.transition(CoverageStatus.ASSIGNED, task_id=task.id)
+                    matching = [
+                        finding for finding in state.list_findings() if self._finding_matches_unit(finding, unit)
+                    ]
+                    if matching:
+                        cell.transition(
+                            CoverageStatus.COVERED,
+                            terminal_reason=f"restored finding:{matching[0].id}",
+                        )
+                        cell.add_finding(matching[0].id)
+                    else:
+                        cell.transition(
+                            CoverageStatus.ABSTAINED,
+                            terminal_reason="restored completed closure produced no unit-specific finding",
+                        )
+                    self._events.emit(
+                        "v3.coverage.cell_restored",
+                        {
+                            "unit_id": cell.unit_id,
+                            "dimension": dim,
+                            "task_id": task.id,
+                            "findings": len(matching),
+                        },
+                    )
+                    continue
+                await self._add_task_checkpointed(state, run_id, task)
                 self._v3_closure_task_ids.add(task.id)
 
                 try:
                     cell.transition(CoverageStatus.ASSIGNED, task_id=task.id)
                 except ValueError:
+                    await self._update_task_checkpointed(
+                        state,
+                        run_id,
+                        task.id,
+                        status="failed",
+                        error="invalid cell state",
+                    )
                     self._events.emit(
                         "v3.coverage.cell_failed",
                         {"unit_id": cell.unit_id, "dimension": dim, "error": "invalid cell state"},
@@ -2023,7 +2455,13 @@ class Orchestrator:
                 reviewer_obj = self._create_reviewer(reviewer)
                 if not reviewer_obj:
                     error = f"unknown reviewer: {reviewer}"
-                    state.update_task(task.id, status="failed", error=error)
+                    await self._update_task_checkpointed(
+                        state,
+                        run_id,
+                        task.id,
+                        status="failed",
+                        error=error,
+                    )
                     try:
                         cell.transition(CoverageStatus.FAILED, terminal_reason=error)
                     except ValueError:
@@ -2076,7 +2514,13 @@ class Orchestrator:
                 dim = cell.dimension.value
                 reviewer = task.reviewer
                 if error is not None:
-                    state.update_task(task.id, status="failed", error=str(error))
+                    await self._update_task_checkpointed(
+                        state,
+                        run_id,
+                        task.id,
+                        status="failed",
+                        error=str(error),
+                    )
                     try:
                         cell.transition(CoverageStatus.FAILED, terminal_reason=str(error)[:200])
                     except ValueError:
@@ -2430,25 +2874,13 @@ class Orchestrator:
     @staticmethod
     def _reviewer_dimensions(reviewer: str) -> list[str]:
         """Map a reviewer name to the coverage dimensions it addresses."""
-        _reviewer_dim_map = {
-            "security_reviewer": ["security"],
-            "testing_reviewer": ["testing"],
-            "localization_reviewer": ["localization"],
-            "performance_reviewer": ["performance"],
-            "correctness_reviewer": ["correctness"],
-        }
-        return _reviewer_dim_map.get(reviewer, ["correctness"])
+        definition = REVIEWER_CATALOG.get(reviewer)
+        return list(definition.broad_dimensions) if definition is not None else []
 
     @staticmethod
     def _dimension_reviewer(dimension: str) -> str:
         """Map a coverage dimension to its reviewer."""
-        _dim_reviewer_map = {
-            "security": "security_reviewer",
-            "testing": "testing_reviewer",
-            "localization": "localization_reviewer",
-            "performance": "performance_reviewer",
-        }
-        return _dim_reviewer_map.get(dimension, "correctness_reviewer")
+        return REVIEWER_CATALOG.reviewer_for_closure_dimension(dimension)
 
     @staticmethod
     def _finding_matches_unit(finding: Finding, unit: SemanticUnit | None) -> bool:
@@ -2614,9 +3046,26 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Skill load failed for {meta.name}: {e}")
 
-    async def _rehydrate(self, state: StateStore, run_id: str) -> None:
-        """Resume: load a prior run's persisted findings + completed reviewers into state,
-        so the re-planning loop skips finished reviewers and keeps their findings."""
+    async def _rehydrate(
+        self,
+        state: StateStore,
+        run_id: str,
+        *,
+        checkpoint_version: int,
+    ) -> _TaskRecovery:
+        """Restore findings and stable task identities for a failed run.
+
+        Pre-v2 runs intentionally restore no task completion from
+        ``reviewer_metrics``.  Metrics are lossy when one reviewer owns several
+        chunks, V3 prefixes the metric name, or a task fails before a metric is
+        written.  Legacy runs therefore re-plan and can never take the
+        publication-only shortcut.
+
+        Specialized coverage tasks need phase-specific context that is not yet
+        serialized.  Their incomplete identities still block publication-only
+        recovery, but they are rerun by their owning phase rather than being
+        disguised as restored coverage in StateStore.
+        """
         for fd in await self._db.get_findings(run_id=run_id, limit=10000):
             try:
                 state.add_finding(
@@ -2632,18 +3081,45 @@ class Orchestrator:
                         reviewer=fd.get("reviewer", ""),
                         status=fd.get("status", "candidate"),
                         verified_by=fd.get("verified_by", ""),
+                        verify_reason=fd.get("verify_reason", ""),
                     )
                 )
             except Exception as e:
                 logger.warning(f"resume: skip finding {fd.get('id')}: {e}")
-        for m in await self._db.get_metrics(run_id=run_id):
-            if m.get("status") == "completed":
-                try:
-                    state.add_task(
-                        ReviewTask(reviewer=m["reviewer_name"], files=state.files_changed, status="completed")
-                    )
-                except Exception:
-                    pass
+        if checkpoint_version < 2:
+            return _TaskRecovery(checkpoint_version=checkpoint_version)
+
+        planner_rounds_complete = not any(
+            int(task_round["sealed"]) != 1 for task_round in await self._db.get_task_rounds(run_id)
+        )
+        incomplete: set[str] = set()
+        runnable: set[str] = set()
+        for checkpoint in await self._db.get_task_checkpoints(run_id):
+            task_id = str(checkpoint["task_id"])
+            status = str(checkpoint["status"])
+            task_kind = str(checkpoint.get("task_kind", "reviewer"))
+            if status != "completed":
+                incomplete.add(task_id)
+            if task_kind != "reviewer":
+                continue
+            restored_status = "completed" if status == "completed" else "pending"
+            state.add_task(
+                ReviewTask(
+                    id=task_id,
+                    reviewer=str(checkpoint["reviewer_name"]),
+                    files=list(checkpoint["files"]),
+                    rationale=str(checkpoint.get("rationale", "")),
+                    status=restored_status,
+                )
+            )
+            if restored_status == "pending":
+                runnable.add(task_id)
+        return _TaskRecovery(
+            checkpoint_version=checkpoint_version,
+            incomplete_task_ids=frozenset(incomplete),
+            runnable_task_ids=frozenset(runnable),
+            planner_rounds_complete=planner_rounds_complete,
+        )
 
     async def _post_comments(self, findings: list[Finding], state: StateStore) -> CommentDeliveryResult:
         """Post confirmed findings in serialized, bounded GitHub reviews.

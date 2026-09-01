@@ -91,7 +91,24 @@ async def test_resume_skips_completed_reviewers_and_keeps_findings(tmp_path):
             "status": "confirmed",
         },
     )
-    await db.insert_metric("r1", "security_reviewer", findings_count=1, status="completed")
+    await db.checkpoint_task_round(
+        run_id="r1",
+        round_id="planner-round-security",
+        tasks=[
+            {
+                "task_id": "task-security-a",
+                "reviewer_name": "security_reviewer",
+                "files": ["a.py"],
+            }
+        ],
+    )
+    await db.upsert_task_checkpoint(
+        run_id="r1",
+        task_id="task-security-a",
+        reviewer_name="security_reviewer",
+        files=["a.py"],
+        status="completed",
+    )
     await db.fail_run("r1", "simulated crash")  # mark failed → resumable (not an active run)
 
     assert (await db.get_resumable_run("o/r", 5, "HEAD"))["run_id"] == "r1"

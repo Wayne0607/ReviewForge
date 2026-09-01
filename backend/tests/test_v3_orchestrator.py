@@ -916,10 +916,10 @@ class TestReviewerDimensionMapping:
         dims = orch._reviewer_dimensions("correctness_reviewer")
         assert dims == ["correctness"]
 
-    def test_unknown_reviewer_maps_to_correctness(self):
+    def test_unknown_reviewer_does_not_claim_coverage(self):
         orch = _orchestrator(v3_enabled=True)
         dims = orch._reviewer_dimensions("custom_reviewer")
-        assert dims == ["correctness"]
+        assert dims == []
 
 
 class TestFindUnitById:

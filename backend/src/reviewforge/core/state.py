@@ -183,6 +183,15 @@ class StateStore:
     repo: str = ""
     head_sha: str = ""
     base_sha: str = ""
+    # Keyword-only fields preserve the positional constructor contract used by
+    # older callers while extending the PR context.
+    pr_title: str = field(default="", kw_only=True)
+    pr_body: str = field(default="", kw_only=True)
+    head_repo: str = field(default="", kw_only=True)
+    head_ref: str = field(default="", kw_only=True)
+    # Reserved for issue metadata returned by a later authoritative API call.
+    # Do not infer issue links from free-form PR text at ingestion time.
+    linked_issues: list[dict[str, Any]] = field(default_factory=list, kw_only=True)
     files_changed: list[str] = field(default_factory=list)
     diff_summary: str = ""
     # Per-run patch cache. ``None`` means the PR file list has not been loaded;
@@ -260,6 +269,11 @@ class StateStore:
             "pr_number": self.pr_number,
             "repo": self.repo,
             "head_sha": self.head_sha,
+            "pr_title": self.pr_title,
+            "pr_body": self.pr_body,
+            "head_repo": self.head_repo,
+            "head_ref": self.head_ref,
+            "linked_issues": copy.deepcopy(self.linked_issues),
             "files_changed": self.files_changed,
             "impact_manifest": copy.deepcopy(self.impact_manifest),
             "findings": {k: v.to_dict() for k, v in self.findings.items()},

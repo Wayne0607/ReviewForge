@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from reviewforge.core.json_output import extract_json_value
+from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import TASK_RATIONALE_MAX_LENGTH, ReviewTask, StateStore
 from reviewforge.engine.context_engine import render_impact_manifest
@@ -196,7 +197,11 @@ class Planner:
             "registry": self._registry,
             "repo": state.repo,
             "pr_number": state.pr_number,
-            "pr_title": "",
+            "pr_title": state.pr_title,
+            "pr_body": state.pr_body,
+            "head_repo": state.head_repo,
+            "head_ref": state.head_ref,
+            "head_sha": state.head_sha,
             "files_changed": state.files_changed,
             "diff_summary": state.diff_summary,
             "language_summary": file_langs,
@@ -420,39 +425,8 @@ class Planner:
                 logger.warning("Planner task %d has an overlong reviewer; skipping", index)
                 continue
 
-            reviewer = raw_reviewer.strip()
-            reviewer = reviewer.lower().replace(" ", "_").replace("-", "_")
-            reviewer_map = {
-                "security": "security_reviewer",
-                "security_reviewer": "security_reviewer",
-                "performance": "performance_reviewer",
-                "performance_reviewer": "performance_reviewer",
-                "correctness": "correctness_reviewer",
-                "correctness_reviewer": "correctness_reviewer",
-                "style": "correctness_reviewer",
-                "style_reviewer": "correctness_reviewer",
-                "architecture": "correctness_reviewer",
-                "readability": "correctness_reviewer",
-                "testing": "testing_reviewer",
-                "testing_reviewer": "testing_reviewer",
-                "test": "testing_reviewer",
-                "documentation": "doc_reviewer",
-                "documentation_reviewer": "doc_reviewer",
-                "doc": "doc_reviewer",
-                "doc_reviewer": "doc_reviewer",
-                "dependency": "dependency_reviewer",
-                "dependency_reviewer": "dependency_reviewer",
-                "deps": "dependency_reviewer",
-                "accessibility": "accessibility_reviewer",
-                "accessibility_reviewer": "accessibility_reviewer",
-                "a11y": "accessibility_reviewer",
-                "localization": "localization_reviewer",
-                "localisation": "localization_reviewer",
-                "i18n": "localization_reviewer",
-                "l10n": "localization_reviewer",
-                "localization_reviewer": "localization_reviewer",
-            }
-            reviewer = reviewer_map.get(reviewer, reviewer)
+            normalized_reviewer = raw_reviewer.strip().lower().replace(" ", "_").replace("-", "_")
+            reviewer = REVIEWER_CATALOG.resolve_planner_name(normalized_reviewer) or normalized_reviewer
 
             if reviewer not in self._registry.agents:
                 # Provider models occasionally invent a narrower role such as

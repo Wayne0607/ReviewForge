@@ -150,6 +150,7 @@ class LLMRuntimeManager:
             v3_coverage_max_attempts=cfg.v3.coverage_max_attempts,
             v3_evidence_mode=cfg.v3.evidence_mode,
             v3_evidence_max_candidates=cfg.v3.evidence_max_candidates,
+            output_language=cfg.output_language,
         )
 
         if os.environ.get("REVIEWFORGE_ENABLE_PLUGINS") == "1":

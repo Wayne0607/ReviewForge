@@ -19,6 +19,7 @@ from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import TASK_RATIONALE_MAX_LENGTH, ReviewTask, StateStore
 from reviewforge.engine.context_engine import render_impact_manifest
+from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.prompt import build_planner_prompt
 from reviewforge.engine.symbol_extractor import detect_language
 
@@ -161,9 +162,10 @@ _COMPLEX_A11Y_PATTERNS = [
 class Planner:
     """Single-shot planner with deterministic, language-aware pattern detection."""
 
-    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry) -> None:
+    def __init__(self, llm: ChatOpenAI, registry: SpecRegistry, output_language: str = "zh-CN") -> None:
         self._llm = llm
         self._registry = registry
+        self._output_language = output_language
 
     async def plan(self, state: StateStore, notes: list | None = None) -> list[ReviewTask]:
         """Analyze the PR and return task proposals (re-planning aware).
@@ -208,6 +210,9 @@ class Planner:
             "done_reviewers": sorted(done_reviewers),
             "notes": [{"from": n.from_agent, "type": n.type, "content": n.content} for n in (notes or [])],
             "impact_manifest_text": render_impact_manifest(state.impact_manifest, max_chars=4_500),
+            # Resolve at the planner boundary from this PR state and the
+            # runtime setting so prompt construction cannot drift from review.
+            "output_language": resolve_output_language(state, {"output_language": self._output_language}),
         }
         messages = build_planner_prompt(ctx)
 

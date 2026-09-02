@@ -1,0 +1,674 @@
+[
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/37634",
+    "repo": "keycloak/keycloak",
+    "pr_number": 37634,
+    "golden_comments": [
+      {
+        "comment": "Wrong parameter in null check (grantType vs. rawTokenId)",
+        "severity": "Critical"
+      },
+      {
+        "comment": "In isAccessTokenId, the substring for the grant shortcut and the equality check look inverted: the grant shortcut occupies indices 4–5 (substring(4,6)), and a match should return true (combined with UUID check), not false.",
+        "severity": "High"
+      },
+      {
+        "comment": "Javadoc mentions \"usually like 3-letters shortcut\" but some implementations use 2-letter shortcuts (\"ac\", \"cc\", \"rt\", \"te\", \"pc\", \"ci\", \"ro\"). Consider updating documentation to reflect actual usage pattern.",
+        "severity": "Low"
+      },
+      {
+        "comment": " Catching generic RuntimeException is too broad. The implementation throws IllegalArgumentException specifically - catch that instead for more precise testing.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/38446",
+    "repo": "keycloak/keycloak",
+    "pr_number": 38446,
+    "golden_comments": [
+      {
+        "comment": "Unsafe raw List deserialization without type safety. Calling Optional.get() directly on the Optional returned by RecoveryAuthnCodesUtils.getCredential(user) without checking isPresent() can lead to a NoSuchElementException if the Optional is empty.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "After creating the RecoveryAuthnCodesCredentialModel, consider setting its id from the stored credential (e.g., myUser.recoveryCodes.getId()); otherwise getId() will be null and downstream removal by id (e.g., removeStoredCredentialById in the authenticator flow) may not work.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/36880",
+    "repo": "keycloak/keycloak",
+    "pr_number": 36880,
+    "golden_comments": [
+      {
+        "comment": "Inconsistent feature flag bug causing orphaned permissions. The AdminPermissions event listener, responsible for cleaning up permissions upon role, client, or group removal, is incorrectly guarded by the ADMIN_FINE_GRAINED_AUTHZ (V1) feature flag. This is inconsistent with other methods in the class that use ADMIN_FINE_GRAINED_AUTHZ_V2. Consequently, if ADMIN_FINE_GRAINED_AUTHZ_V2 is enabled but V1 is not, the permission cleanup logic will not execute, leading to orphaned permission data. Cleanup should occur regardless of which fine-grained authorization version is enabled.",
+        "severity": "High"
+      },
+      {
+        "comment": "In hasPermission(ClientModel client, String scope), the resource lookup uses findByName(server, client.getId(), server.getId()), but AdminPermissionsSchema.getOrCreateResource creates per-client resources with the owner set to resourceServer.getClientId(), so this lookup will never find those resources and will always fall back to the 'all-clients' resource, effectively ignoring client-specific permissions.",
+        "severity": "High"
+      },
+      {
+        "comment": "In getClientsWithPermission(String scope), iterating resourceStore.findByType(server, AdminPermissionsSchema.CLIENTS_RESOURCE_TYPE) and returning resource.getName() will only ever consider the type-level 'Clients' resource (per-client resources have no type) and return its name, while AvailableRoleMappingResource#getRoleIdsWithPermissions expects actual client IDs to pass to realm.getClientById, which can lead to incorrect behavior or a null client and subsequent failures.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/37038",
+    "repo": "keycloak/keycloak",
+    "pr_number": 37038,
+    "golden_comments": [
+      {
+        "comment": "Incorrect permission check in canManage() method",
+        "severity": "High"
+      },
+      {
+        "comment": "In getGroupIdsWithViewPermission, hasPermission is called with groupResource.getId() and the same groupResource.getId() is added to granted, but hasPermission resolves resources by name (treating the argument as a group id) and the GroupPermissionEvaluator contract says this method returns group IDs that are later used as UserModel.GROUPS and in getUsersCount group filters. This mismatch means per-group VIEW_MEMBERS/MANAGE_MEMBERS permissions may not yield the expected group IDs for filtering and counts, and evaluation may effectively only look at the type-level 'all-groups' resource; consider revisiting whether this should operate on the underlying group ids (resource names) instead so it aligns with the JPA queries and the interface contract.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/33832",
+    "repo": "keycloak/keycloak",
+    "pr_number": 33832,
+    "golden_comments": [
+      {
+        "comment": "Returns wrong provider (default keystore instead of BouncyCastle)",
+        "severity": "High"
+      },
+      {
+        "comment": "Dead code exists where ASN1Encoder instances are created and written to, but their results are immediately discarded. The actual encoding is performed by new ASN1Encoder instances created in the subsequent return statement, rendering the earlier operations useless.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/40940",
+    "repo": "keycloak/keycloak",
+    "pr_number": 40940,
+    "golden_comments": [
+      {
+        "comment": "Returning null from getSubGroupsCount() violates the GroupModel contract (Javadoc says it never returns null) and may lead to NPEs in callers that expect a non-null count.",
+        "severity": "Critical"
+      },
+      {
+        "comment": "The reader thread isn’t waited for; flipping deletedAll to true and asserting immediately can race and miss exceptions added just after the flag change, making this test flaky.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/keycloak-greptile/pull/1",
+    "repo": "ai-code-review-evaluation/keycloak-greptile",
+    "pr_number": 1,
+    "golden_comments": [
+      {
+        "comment": "ConditionalPasskeysEnabled() called without UserModel parameter",
+        "severity": "Medium"
+      },
+      {
+        "comment": "With isConditionalPasskeysEnabled(UserModel user) requiring user != null, authenticate(...) will not call webauthnAuth.fillContextForm(context) on the initial login page where context.getUser() is still null, so conditional passkey UI will not be set up for first-time passkey login. Consider whether this should also be enabled when no user has been selected yet so ID-less passkey authentication on the initial login form continues to work.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/sentry-greptile/pull/5",
+    "repo": "ai-code-review-evaluation/sentry-greptile",
+    "pr_number": 5,
+    "golden_comments": [
+      {
+        "comment": "Breaking changes in error response format",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Detector validator uses wrong key when updating type",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Using zip(error_ids, events.values()) assumes the get_multi result preserves the input order; dict value order is not guaranteed to match error_ids, so event data can be paired with the wrong ID (missing nodes also shift alignment).",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/getsentry/sentry/pull/80168",
+    "repo": "getsentry/sentry",
+    "pr_number": 80168,
+    "golden_comments": [
+      {
+        "comment": "MetricAlertDetectorHandler inherits from StatefulDetectorHandler but only contains pass, failing to implement its required abstract methods: counter_names (property), get_dedupe_value(), get_group_key_values(), and build_occurrence_and_event_data(). This will cause a TypeError at runtime when the class is instantiated.",
+        "severity": "High"
+      },
+      {
+        "comment": "Docstring says this returns a list of DetectorEvaluationResult, but the method now returns a dict keyed by DetectorGroupKey. Consider updating the docstring to match the new return type.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/getsentry/sentry/pull/80528",
+    "repo": "getsentry/sentry",
+    "pr_number": 80528,
+    "golden_comments": [
+      {
+        "comment": "The function modifies the config variable to include display values but then returns the original monitor.config instead of the modified version.",
+        "severity": "High"
+      },
+      {
+        "comment": "The code fetches MonitorCheckIn objects by ID when the required data already exists in previous_checkins. This creates an unnecessary database query.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/getsentry/sentry/pull/77754",
+    "repo": "getsentry/sentry",
+    "pr_number": 77754,
+    "golden_comments": [
+      {
+        "comment": "Shared mutable default in dataclass timestamp",
+        "severity": "Medium"
+      },
+      {
+        "comment": "The method name has a typo: test_from_dict_inalid_data should be test_from_dict_invalid_data.",
+        "severity": "Low"
+      },
+      {
+        "comment": "Method name says 'empty_array' but tests empty dict - consider renaming to 'test_from_dict_empty_dict' for clarity.",
+        "severity": "Low"
+      },
+      {
+        "comment": "to_dict() returns a datetime for queued; if this dict is passed in task kwargs (e.g., via apply_async), JSON serialization may fail depending on the serializer, which can cause enqueue errors.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/getsentry/sentry/pull/95633",
+    "repo": "getsentry/sentry",
+    "pr_number": 95633,
+    "golden_comments": [
+      {
+        "comment": "The queue.shutdown() method with 'immediate=False' parameter may not exist in the standard Python queue module. This could cause AttributeError at runtime. Verify the correct API or implement a custom shutdown mechanism.",
+        "severity": "High"
+      },
+      {
+        "comment": "The magic number 50 for max_wait is used repeatedly throughout the tests. Consider extracting this as a named constant to improve maintainability.",
+        "severity": "Low"
+      },
+      {
+        "comment": "The test test_thread_queue_parallel_error_handling has a docstring that doesn't match the test implementation.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/sentry-greptile/pull/2",
+    "repo": "ai-code-review-evaluation/sentry-greptile",
+    "pr_number": 2,
+    "golden_comments": [
+      {
+        "comment": "OptimizedCursorPaginator negative-offset branch slices QuerySet with a negative start index",
+        "severity": "Critical"
+      },
+      {
+        "comment": "BasePaginator negative-offset branch slices QuerySet with a negative start index",
+        "severity": "High"
+      },
+      {
+        "comment": "OptimizedCursorPaginator.get_item_key uses floor/ceil on a datetime key (order_by='-datetime'), causing TypeError.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/sentry-greptile/pull/3",
+    "repo": "ai-code-review-evaluation/sentry-greptile",
+    "pr_number": 3,
+    "golden_comments": [
+      {
+        "comment": "sample_rate = 0.0 is falsy and skipped",
+        "severity": "Low"
+      },
+      {
+        "comment": "Using Python’s built-in hash() to build cache keys is non-deterministic across processes (hash randomization), so keys won’t match across workers and invalidate_upsampling_cache may fail to delete them. Use a deterministic serialization of project_ids for the cache key.",
+        "severity": "Low"
+      },
+      {
+        "comment": "The upsampling eligibility check passes the outer dataset instead of the actual dataset used by scoped_dataset. In paths where the query ultimately runs against discover (e.g., dashboard split) while the original dataset is metrics, upsampling may be skipped even when all projects are allowlisted.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/103633",
+    "repo": "grafana/grafana",
+    "pr_number": 103633,
+    "golden_comments": [
+      {
+        "comment": "The Check operation exhibits asymmetric cache trust logic: cached permission grants are trusted and returned immediately, but cached denials from the same permission cache are ignored, leading to a fresh database lookup. This allows stale cached grants to provide access to revoked resources, posing a security risk. ",
+        "severity": "High"
+      },
+      {
+        "comment": "The test comment says the cached permissions 'allow access', but the map stores false for dashboards:uid:dash1, so checkPermission will still treat this scope as not allowed.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/getsentry/sentry/pull/67876",
+    "repo": "getsentry/sentry",
+    "pr_number": 67876,
+    "golden_comments": [
+      {
+        "comment": "Null reference if github_authenticated_user state is missing",
+        "severity": "Medium"
+      },
+      {
+        "comment": "OAuth state uses pipeline.signature (static) instead of a per-request random value",
+        "severity": "Medium"
+      },
+      {
+        "comment": "The code attempts to access integration.metadata[sender][login] without checking for the existence of the sender key. This causes a KeyError for integrations where the sender metadata was not set during creation",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/keycloak/keycloak/pull/32918",
+    "repo": "keycloak/keycloak",
+    "pr_number": 32918,
+    "golden_comments": [
+      {
+        "comment": "Recursive caching call using session instead of delegate",
+        "severity": "Critical"
+      },
+      {
+        "comment": "Cleanup reference uses incorrect alias - should be 'idp-alias-' + i instead of 'alias'.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/94942",
+    "repo": "grafana/grafana",
+    "pr_number": 94942,
+    "golden_comments": [
+      {
+        "comment": "The enableSqlExpressions function has flawed logic that always returns false, effectively disabling SQL expressions unconditionally:",
+        "severity": "Critical"
+      },
+      {
+        "comment": "Several methods such as NewInMemoryDB().RunCommands and db.QueryFramesInto return 'not implemented'.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/90939",
+    "repo": "grafana/grafana",
+    "pr_number": 90939,
+    "golden_comments": [
+      {
+        "comment": "The GetWebAssets function implements an incomplete double-checked locking pattern for caching web assets. The function first checks if the cache is populated using a read lock (RLock), and if the cache is empty, it acquires a write lock to populate it. However, it fails to re-check whether the cache was populated by another goroutine while waiting to acquire the write lock.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "In addition to the missing double-check, the function has a critical flaw in its error handling: it unconditionally assigns the fetch result to the cache (line 69: entryPointAssetsCache = result) regardless of whether the fetch succeeded or failed. When an error occurs during asset fetching, result is nil, and this nil value overwrites any previously valid cache entry.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/80329",
+    "repo": "grafana/grafana",
+    "pr_number": 80329,
+    "golden_comments": [
+      {
+        "comment": "The code uses Error log level for what appears to be debugging information. This will pollute error logs in production. Consider using Debug or Info level instead.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/106778",
+    "repo": "grafana/grafana",
+    "pr_number": 106778,
+    "golden_comments": [
+      {
+        "comment": "The rendered GrafanaRuleListItem is missing the required key prop for React list items. This can cause rendering issues when the list order changes.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "RuleActionsButtons is invoked with only promRule, but SilenceGrafanaRuleDrawer inside RuleActionsButtons still depends on a Grafana Ruler rule being present, so for Grafana rules coming from list views the 'Silence notifications' menu entry (now driven by Grafana Prom abilities) will toggle showSilenceDrawer without ever rendering the drawer. This means clicking 'Silence notifications' for these rules has no visible effect, even when abilities indicate silencing is allowed.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/107534",
+    "repo": "grafana/grafana",
+    "pr_number": 107534,
+    "golden_comments": [
+      {
+        "comment": "The applyTemplateVariables method is called with request.filters as the third parameter, but this parameter is not used in the corresponding test setup.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/79265",
+    "repo": "grafana/grafana",
+    "pr_number": 79265,
+    "golden_comments": [
+      {
+        "comment": "Race condition: Multiple concurrent requests could pass the device count check simultaneously and create devices beyond the limit. Consider using a database transaction or lock.",
+        "severity": "High"
+      },
+      {
+        "comment": "Anonymous authentication now fails entirely if anonDeviceService.TagDevice returns ErrDeviceLimitReached. Previously, device tagging was asynchronous and non-blocking. This change prevents anonymous users from authenticating when the device limit is reached.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "This call won’t compile: dbSession.Exec(args...) is given a []interface{} where the first element is the query, but Exec’s signature requires a first parameter of type string (not an interface{} splat).",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Returning ErrDeviceLimitReached when no rows were updated is misleading; the device might not exist.",
+        "severity": "Low"
+      },
+      {
+        "comment": "Time window calculation inconsistency: Using device.UpdatedAt.UTC().Add(-anonymousDeviceExpiration) as the lower bound but device.UpdatedAt as the current time may not match the intended logic. Consider using time.Now().UTC() consistently.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/9",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 9,
+    "golden_comments": [
+      {
+        "comment": "Thread-safety issue with lazy @loaded_locales",
+        "severity": "Low"
+      },
+      {
+        "comment": "Consider normalizing the input locale (e.g., to a symbol) when checking/loading here to avoid double-loading if the same locale is passed as a String vs Symbol (also applies to other locations in the PR).",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/grafana/grafana/pull/76186",
+    "repo": "grafana/grafana",
+    "pr_number": 76186,
+    "golden_comments": [
+      {
+        "comment": "The ContextualLoggerMiddleware methods (QueryData, CallResource, CheckHealth, CollectMetrics) panic when a nil request is received. This occurs because they directly access req.PluginContext (via the instrumentContext function) without first checking if req is nil. This is a regression, as previous middleware layers gracefully handled nil requests.",
+        "severity": "High"
+      },
+      {
+        "comment": "The traceID is no longer logged for plugin requests. During a refactoring, the tracing import and the logic to extract and add traceID from the context to log parameters were removed from the LoggerMiddleware. The newly introduced ContextualLoggerMiddleware does not add this information, resulting in missing traceID in plugin request logs and impacting debugging and request tracing capabilities.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/7",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 7,
+    "golden_comments": [
+      {
+        "comment": "In .topic-meta-data h5 a, the original code had color: scale-color($primary, $lightness: 30%) but was changed to dark-light-choose(scale-color($primary, $lightness: 70%), scale-color($secondary, $lightness: 30%)). The lightness for the light theme changed from 30% to 70%, which is a dramatic inversion",
+        "severity": "Low"
+      },
+      {
+        "comment": "This change for desktop/user.css changes $primary from 30% to 50% for the light theme; most other changes preserve the original $primary value and move the complement to $secondary for dark. Consider reviewing this (also applies to a similar .name change in the mobile variant).",
+        "severity": "Low"
+      },
+      {
+        "comment": "In topic-post.css the original code used $lightness: 70% but the replacement uses $lightness: 30% for the light theme. This makes the text significantly darker than intended.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/8",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 8,
+    "golden_comments": [
+      {
+        "comment": " The findMembers() call is now asynchronous and unhandled. The controller may not have member data immediately available, creating a race condition.",
+        "severity": "High"
+      },
+      {
+        "comment": "In the next action, capping the next offset at user_count can produce an empty page (e.g., total equal to limit results in offset == total, showing 2/2 with no members). This can cause confusing UX on the last page.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "HTTP method mismatch in .remove_member - test uses PUT but remove_member action expects DELETE",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/3",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 3,
+    "golden_comments": [
+      {
+        "comment": "BlockedEmail.should_block_email? method has side effects during a read operation - it updates statistics even when just checking if an email should be blocked. This could cause race conditions in concurrent environments and makes the method name misleading.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Regex pattern @(#{domains}) only matches domain suffixes, not full domains. evil.example.com would match whitelist entry example.com.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/5",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 5,
+    "golden_comments": [
+      {
+        "comment": "Mixing float: left with flexbox causes layout issues. Further this PR removes the float-based right alignment for .d-header .panel, which may cause the login panel in the non-Ember/noscript header (where .panel is nested inside .row and not a flex item) to stack under the title instead of remaining right-aligned.",
+        "severity": "Low"
+      },
+      {
+        "comment": "-ms-align-items never existed in any version of IE/Edge; the correct legacy property is -ms-flex-align.",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/6",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 6,
+    "golden_comments": [
+      {
+        "comment": "The include_website_name method is missing the required ? suffix. Rails serializers expect include_ methods to end with ? for conditional attribute inclusion, a convention followed by other methods in this serializer. Without it, the website_name attribute may not be conditionally included as intended. Additionally, the '.' << website_host string concatenation should be replaced with '.' + website_host or '.#{website_host}' to avoid mutating string literals, which can lead to issues.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/1",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 1,
+    "golden_comments": [
+      {
+        "comment": "The downsize method is defined twice. The second definition, which expects a single dimensions string parameter, overrides the first, which expected separate max_width and max_height parameters. This makes the original method unreachable and breaks existing code that calls it with separate width and height arguments.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Hardcoding maxSizeKB = 10 * 1024 ignores Discourse.SiteSettings['max_' + type + '_size_kb'], so the client-side limit can diverge from server-side and per-type settings (also applies to the 413 handler below).",
+        "severity": "Low"
+      },
+      {
+        "comment": "Passing 80% as the dimensions can fail for animated GIFs when allow_animated_thumbnails is true, since the animated path uses gifsicle --resize-fit which expects WxH geometry, not a percentage; downsizing would then silently fail.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/2",
+    "repo": "ai-code-review-evaluation/discourse-graphite",
+    "pr_number": 2,
+    "golden_comments": [
+      {
+        "comment": "logic: Potential nil pointer exception - if no TopicUser record exists, tu will be nil and calling methods on it will crash",
+        "severity": "High"
+      },
+      {
+        "comment": "Typo in property name: 'stopNotificiationsText' should be 'stopNotificationsText' (missing 'n' in 'Notifications')",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/22532",
+    "repo": "calcom/cal.com",
+    "pr_number": 22532,
+    "golden_comments": [
+      {
+        "comment": "The updateManyByCredentialId call uses an empty data object, which prevents Prisma's @updatedAt decorator from updating the updatedAt timestamp. This results in inaccurate cache status tracking, as the timestamp isn't updated when the cache is refreshed. To fix this, explicitly set the updatedAt field.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "logic: macOS-specific sed syntax with empty string after -i flag will fail on Linux systems",
+        "severity": "Low"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/8330",
+    "repo": "calcom/cal.com",
+    "pr_number": 8330,
+    "golden_comments": [
+      {
+        "comment": "Incorrect end time calculation using slotStartTime instead of slotEndTime",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Using === for dayjs object comparison will always return false as it compares object references, not values. Use .isSame() method instead: dayjs(date.start).add(utcOffset, 'minutes').isSame(dayjs(date.end).add(utcOffset, minutes))",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/14943",
+    "repo": "calcom/cal.com",
+    "pr_number": 14943,
+    "golden_comments": [
+      {
+        "comment": "Using retryCount: reminder.retryCount + 1 reads a possibly stale value and can lose increments under concurrency; consider an atomic increment via Prisma (increment: 1) to avoid race conditions (also applies to the similar update in the catch block).",
+        "severity": "High"
+      },
+      {
+        "comment": "The deletion logic in scheduleSMSReminders.ts incorrectly deletes non-SMS workflow reminders (e.g., Email, WhatsApp) that have retryCount > 1. This occurs because the retryCount condition within the OR clause for deletion lacks a method: WorkflowMethods.SMS filter, causing it to apply to all reminder types instead of only SMS reminders, which is the intended scope of this function.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/22345",
+    "repo": "calcom/cal.com",
+    "pr_number": 22345,
+    "golden_comments": [
+      {
+        "comment": "In getBaseConditions(), the else if (filterConditions) and final else branches are unreachable. This is because getAuthorizationConditions() always returns a non-null Prisma.Sql object, making authConditions always truthy, which means only the first two if/else if conditions are ever evaluated.",
+        "severity": "Low"
+      },
+      {
+        "comment": "Fetching userIdsFromOrg only when teamsFromOrg.length > 0 can exclude org-level members for orgs without child teams; consider deriving from teamIds (which includes orgId) or removing the guard so org-only orgs still include member user bookings.",
+        "severity": "Medium"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/11059",
+    "repo": "calcom/cal.com",
+    "pr_number": 11059,
+    "golden_comments": [
+      {
+        "comment": "The parseRefreshTokenResponse function incorrectly sets refresh_token to the hardcoded string 'refresh_token' when it's missing from the OAuth refresh token response. This invalidates the token, breaking subsequent token refreshes and causing authentication failures.",
+        "severity": "High"
+      },
+      {
+        "comment": "Invalid Zod schema syntax. Computed property keys like [z.string().toString()] are not valid in Zod object schemas and will cause runtime errors. ",
+        "severity": "High"
+      },
+      {
+        "comment": "parseRefreshTokenResponse returns a Zod safeParse result ({ success, data, error }), not the credential key object. Persisting that as key stores the wrapper instead of the token payload; we should store the parsed data or use schema parse.",
+        "severity": "High"
+      },
+      {
+        "comment": "When APP_CREDENTIAL_SHARING_ENABLED and CALCOM_CREDENTIAL_SYNC_ENDPOINT are set, the refreshFunction helper returns the fetch Response, but several callers (for example GoogleCalendarService.refreshAccessToken expecting res.data, and HubspotCalendarService.refreshAccessToken expecting a HubspotToken) assume it returns the integration-specific token object. That mismatch will cause runtime errors in the sync-enabled path unless the return type or those call sites are adjusted.",
+        "severity": "High"
+      },
+      {
+        "comment": "When the sync endpoint path is used, res is a fetch Response and has no .data; res?.data will be undefined and token.access_token will throw at runtime. This relies on a consistent return shape from refreshOAuthTokens, which isn’t guaranteed currently.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/7232",
+    "repo": "calcom/cal.com",
+    "pr_number": 7232,
+    "golden_comments": [
+      {
+        "comment": "Asynchronous functions deleteScheduledEmailReminder and deleteScheduledSMSReminder are called without await inside forEach loops. This occurs during booking rescheduling/cancellation, and workflow/workflow step deletion/updates. Consequently, scheduled workflow reminders may not be reliably cancelled, potentially leaving them active.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "When immediateDelete is true, the deleteScheduledEmailReminder function cancels the SendGrid email but fails to delete the corresponding WorkflowReminder record from the database. This creates orphaned database entries and is inconsistent with the immediateDelete: false path, which marks the record as cancelled. The SendGrid DELETE API call is also omitted in this path.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/10600",
+    "repo": "calcom/cal.com",
+    "pr_number": 10600,
+    "golden_comments": [
+      {
+        "comment": "The exported function TwoFactor handles backup codes and is in BackupCode.tsx. Inconsistent naming.",
+        "severity": "Low"
+      },
+      {
+        "comment": "Error message mentions 'backup code login' but this is a disable endpoint, not login",
+        "severity": "Low"
+      },
+      {
+        "comment": "Backup code validation is case-sensitive due to the use of indexOf(). This causes validation to fail if a user enters uppercase hex characters, as backup codes should be case-insensitive for a better user experience.",
+        "severity": "Medium"
+      },
+      {
+        "comment": "Because backupCodes are decrypted and mutated in memory before being written back, two concurrent login requests using the same backupCode could both pass this check and update, so a single backup code may effectively be accepted more than once if used concurrently, weakening the intended one-time-use semantics.",
+        "severity": "High"
+      }
+    ]
+  },
+  {
+    "golden_url": "https://github.com/calcom/cal.com/pull/8087",
+    "repo": "calcom/cal.com",
+    "pr_number": 8087,
+    "golden_comments": [
+      {
+        "comment": "Consider adding try-catch around the await to handle import failures gracefully",
+        "severity": "Low"
+      },
+      {
+        "comment": "The code uses forEach with async callbacks, which causes asynchronous operations (e.g., calendar/video event deletions, payment refunds) to run concurrently without being awaited. This 'fire-and-forget' behavior leads to unhandled promise rejections, race conditions, and incomplete cleanup, as surrounding try-catch blocks cannot properly handle errors from these unawaited promises. Replace forEach with for...of loops or Promise.all() with map() to ensure proper sequential execution and error handling.",
+        "severity": "Critical"
+      }
+    ]
+  }
+]

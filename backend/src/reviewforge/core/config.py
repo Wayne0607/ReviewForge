@@ -14,6 +14,7 @@ import yaml
 
 _VALID_EVIDENCE_MODES = frozenset({"off", "shadow", "enforce"})
 _VALID_PUBLICATION_POLICY_MODES = _VALID_EVIDENCE_MODES
+_VALID_OUTPUT_LANGUAGES = frozenset({"auto", "en", "zh-CN"})
 
 
 def _normalize_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -46,6 +47,28 @@ def _normalize_publication_policy_mode(value: Any) -> str:
     if isinstance(value, str) and value.strip().lower() in _VALID_PUBLICATION_POLICY_MODES:
         return value.strip().lower()
     return "off"
+
+
+def _normalize_output_language(value: Any, default: str = "zh-CN") -> str:
+    """Return one of the supported output languages.
+
+    The legacy reviewer path has historically emitted Simplified Chinese, so
+    its default is deliberately different from the new pipeline's ``auto``
+    default.  Invalid values retain the current config value instead of
+    silently switching an existing deployment to another language.
+    """
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.lower() == "zh-cn":
+            return "zh-CN"
+        if candidate in {"auto", "en"}:
+            return candidate
+    if default == "auto":
+        return "auto"
+    if default == "en":
+        return "en"
+    return "zh-CN"
 
 
 def _publication_policy_from_dict(data: dict[str, Any]) -> PublicationPolicyConfigYAML:
@@ -204,6 +227,11 @@ class ReviewForgeConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     reviewers: list[ReviewerConfig] = field(default_factory=list)
+    # Keep the legacy path's historical Chinese output unless an operator
+    # explicitly selects another language.  PipelineV4Config (added by T4)
+    # owns the new pipeline's ``auto`` default; this field is the compatibility
+    # bridge for existing planner/reviewer calls and benchmark runners.
+    output_language: str = "zh-CN"
     skills_dir: str = "skills"
     events_dir: str = ".reviewforge/events"
     confidence_threshold: float = 0.5
@@ -351,6 +379,15 @@ class ReviewForgeConfig:
                     setattr(self.github, k, v)
         if "reviewers" in data:
             self.reviewers = [ReviewerConfig(**r) for r in data["reviewers"]]
+        if "output_language" in data:
+            self.output_language = _normalize_output_language(data["output_language"], self.output_language)
+        # The architecture spec names this setting ``review.output_language``
+        # while the current top-level config has no ReviewConfig object.  Read
+        # the namespaced form as a compatibility alias without changing the
+        # existing config shape.
+        review = data.get("review")
+        if isinstance(review, dict) and "output_language" in review:
+            self.output_language = _normalize_output_language(review["output_language"], self.output_language)
         if "skills_dir" in data:
             self.skills_dir = data["skills_dir"]
         if "events_dir" in data:
@@ -469,6 +506,9 @@ class ReviewForgeConfig:
         self.llm.base_url = os.environ.get("LLM_BASE_URL", self.llm.base_url)
         self.llm.api_key = os.environ.get("LLM_API_KEY", self.llm.api_key)
         self.llm.model = os.environ.get("REVIEWFORGE_MODEL", self.llm.model)
+        output_language = os.environ.get("REVIEWFORGE_OUTPUT_LANGUAGE")
+        if output_language is not None:
+            self.output_language = _normalize_output_language(output_language, self.output_language)
         self.server.host = os.environ.get("REVIEWFORGE_HOST", self.server.host)
         port = os.environ.get("REVIEWFORGE_PORT")
         if port:

@@ -16,6 +16,7 @@ from typing import Any
 
 from langchain_openai import ChatOpenAI
 
+from reviewforge.core.config import PipelineV4Config
 from reviewforge.core.database import Database
 from reviewforge.core.evaluation_telemetry import build_evaluation_telemetry
 from reviewforge.core.events import EventBus
@@ -49,6 +50,7 @@ from reviewforge.engine.finding_anchors import (
 )
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
+from reviewforge.engine.pipeline_v4 import run_hypothesis_pipeline
 from reviewforge.engine.planner import Planner
 from reviewforge.engine.publication_evidence import protect_publication_finding
 from reviewforge.engine.publication_policy import (
@@ -288,6 +290,7 @@ class Orchestrator:
         v3_evidence_mode: str = "shadow",
         v3_evidence_max_candidates: int = 20,
         output_language: str = "zh-CN",
+        pipeline_v4_config: PipelineV4Config | None = None,
     ) -> None:
         self._registry = registry
         self._gateway = gateway
@@ -295,6 +298,7 @@ class Orchestrator:
         self._db = db
         self._model_router = model_router  # D6: 多模型路由
         self._output_language = output_language
+        self._pipeline_v4_config = pipeline_v4_config or PipelineV4Config()
         self._agentic_reviewers = set(agentic_reviewers or [])  # W1: agentic 显式 allowlist
         self._agentic_default = agentic_default  # #1: 无 allowlist 时所有 reviewer 默认走工具循环
 
@@ -777,6 +781,31 @@ class Orchestrator:
         return summary
 
     async def run(self, state: StateStore) -> dict[str, Any]:
+        """Dispatch without changing the legacy execution contract."""
+
+        mode = self._pipeline_v4_config.mode
+        if mode == "legacy":
+            return await self._run_legacy(state)
+        if mode == "hypothesis":
+            # T4 is only the deterministic skeleton.  Publishing from a
+            # half-built primary pipeline would be a false-success mode.
+            raise RuntimeError("hypothesis pipeline is not publishable before T9")
+        if mode != "shadow":
+            raise ValueError(f"unsupported pipeline mode: {mode!r}")
+
+        summary = await self._run_legacy(state)
+        if summary.get("status") == "duplicate_skipped":
+            return summary
+        try:
+            await run_hypothesis_pipeline(self, state)
+        except Exception as exc:
+            logger.exception("Hypothesis shadow pipeline failed")
+            self._events.emit("pipeline_v4.failed", {"mode": "shadow", "error_type": type(exc).__name__})
+        finally:
+            await self._gateway.cleanup_workspace(state)
+        return summary
+
+    async def _run_legacy(self, state: StateStore) -> dict[str, Any]:
         """Execute the full review pipeline. Returns summary."""
         loop_detector = LoopDetector()  # B4: per-run instance
         self._v3_evidence_summary = None
@@ -3071,6 +3100,7 @@ class Orchestrator:
         recovery, but they are rerun by their owning phase rather than being
         disguised as restored coverage in StateStore.
         """
+        state.ledger = await self._db.load_hypothesis_ledger(run_id)
         for fd in await self._db.get_findings(run_id=run_id, limit=10000):
             try:
                 state.add_finding(

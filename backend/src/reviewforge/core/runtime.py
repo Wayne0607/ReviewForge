@@ -95,8 +95,13 @@ class LLMRuntimeManager:
             # build does not reuse stale instances after a hot-swap.
             model_router.invalidate_cache()
 
-        gateway = ToolGateway(registry, self.github)
         cfg = self.config
+        gateway = ToolGateway(
+            registry,
+            self.github,
+            pipeline_mode=cfg.pipeline_v4.mode,
+            workspace_max_bytes=cfg.pipeline_v4.workspace_max_bytes,
+        )
         policy_cfg = PublicationPolicyConfig(
             enabled=cfg.publication_policy.enabled,
             mode=cfg.publication_policy.mode,
@@ -151,6 +156,7 @@ class LLMRuntimeManager:
             v3_evidence_mode=cfg.v3.evidence_mode,
             v3_evidence_max_candidates=cfg.v3.evidence_max_candidates,
             output_language=cfg.output_language,
+            pipeline_v4_config=cfg.pipeline_v4,
         )
 
         if os.environ.get("REVIEWFORGE_ENABLE_PLUGINS") == "1":

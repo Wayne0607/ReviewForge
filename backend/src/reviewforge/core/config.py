@@ -15,6 +15,7 @@ import yaml
 _VALID_EVIDENCE_MODES = frozenset({"off", "shadow", "enforce"})
 _VALID_PUBLICATION_POLICY_MODES = _VALID_EVIDENCE_MODES
 _VALID_OUTPUT_LANGUAGES = frozenset({"auto", "en", "zh-CN"})
+_VALID_PIPELINE_MODES = frozenset({"legacy", "shadow", "hypothesis"})
 
 
 def _normalize_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -69,6 +70,12 @@ def _normalize_output_language(value: Any, default: str = "zh-CN") -> str:
     if default == "en":
         return "en"
     return "zh-CN"
+
+
+def _normalize_pipeline_mode(value: Any, default: str = "legacy") -> str:
+    if isinstance(value, str) and value.strip().lower() in _VALID_PIPELINE_MODES:
+        return value.strip().lower()
+    return default if default in _VALID_PIPELINE_MODES else "legacy"
 
 
 def _publication_policy_from_dict(data: dict[str, Any]) -> PublicationPolicyConfigYAML:
@@ -126,6 +133,53 @@ class V3Config:
     coverage_max_attempts: int = 2
     evidence_mode: str = "shadow"
     evidence_max_candidates: int = 20
+
+
+@dataclass
+class PipelineV4Config:
+    """Hypothesis-pipeline limits and kill switch.
+
+    ``legacy`` is deliberately the library and YAML default until the holdout
+    gate in T11 passes.
+    """
+
+    mode: str = "legacy"
+    output_language: str = "auto"
+    workspace_max_bytes: int = 200_000_000
+    context_pack_max_slices: int = 12
+    context_pack_max_chars: int = 40_000
+    generator_max_input_chars: int = 120_000
+    generator_max_hypotheses: int = 12
+    max_lenses: int = 3
+    investigator_concurrency: int = 4
+    investigator_max_hypotheses_per_pr: int = 12
+    publish_max_inline: int = 5
+    publish_max_inline_overflow: int = 8
+
+
+def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
+    cfg = PipelineV4Config()
+    if not isinstance(data, dict):
+        return cfg
+    if "mode" in data:
+        cfg.mode = _normalize_pipeline_mode(data["mode"], cfg.mode)
+    if "output_language" in data:
+        cfg.output_language = _normalize_output_language(data["output_language"], cfg.output_language)
+    for name in (
+        "workspace_max_bytes",
+        "context_pack_max_slices",
+        "context_pack_max_chars",
+        "generator_max_input_chars",
+        "generator_max_hypotheses",
+        "max_lenses",
+        "investigator_concurrency",
+        "investigator_max_hypotheses_per_pr",
+        "publish_max_inline",
+        "publish_max_inline_overflow",
+    ):
+        if name in data:
+            setattr(cfg, name, _normalize_int(data[name], getattr(cfg, name), 0 if name.endswith("overflow") else 1))
+    return cfg
 
 
 @dataclass
@@ -287,6 +341,7 @@ class ReviewForgeConfig:
 
     # V3 coverage-driven pipeline
     v3: V3Config = field(default_factory=V3Config)
+    pipeline_v4: PipelineV4Config = field(default_factory=PipelineV4Config)
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> ReviewForgeConfig:
@@ -496,6 +551,8 @@ class ReviewForgeConfig:
             v3 = data["v3"]
             if isinstance(v3, dict):
                 self.v3 = _v3_from_dict(v3)
+        if "pipeline_v4" in data:
+            self.pipeline_v4 = _pipeline_v4_from_dict(data["pipeline_v4"])
         if "publication_policy" in data:
             self.publication_policy = _publication_policy_from_dict(data["publication_policy"])
 
@@ -509,6 +566,12 @@ class ReviewForgeConfig:
         output_language = os.environ.get("REVIEWFORGE_OUTPUT_LANGUAGE")
         if output_language is not None:
             self.output_language = _normalize_output_language(output_language, self.output_language)
+            self.pipeline_v4.output_language = _normalize_output_language(
+                output_language, self.pipeline_v4.output_language
+            )
+        pipeline_mode = os.environ.get("REVIEWFORGE_PIPELINE")
+        if pipeline_mode is not None:
+            self.pipeline_v4.mode = _normalize_pipeline_mode(pipeline_mode, self.pipeline_v4.mode)
         self.server.host = os.environ.get("REVIEWFORGE_HOST", self.server.host)
         port = os.environ.get("REVIEWFORGE_PORT")
         if port:

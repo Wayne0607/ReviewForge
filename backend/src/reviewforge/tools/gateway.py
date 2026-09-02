@@ -45,9 +45,18 @@ _JSON_PY_TYPES: dict[str, Any] = {
 class ToolGateway:
     """Executes tools with permission and schema checks."""
 
-    def __init__(self, registry: SpecRegistry, github: GitHubClient) -> None:
+    def __init__(
+        self,
+        registry: SpecRegistry,
+        github: GitHubClient,
+        *,
+        pipeline_mode: str | None = None,
+        workspace_max_bytes: int | None = None,
+    ) -> None:
         self._registry = registry
         self._github = github
+        self._pipeline_mode = pipeline_mode
+        self._workspace_max_bytes = workspace_max_bytes
         self._handlers: dict[str, Any] = {
             "read_diff": self._read_diff,
             "read_file": self._read_file,
@@ -209,8 +218,7 @@ class ToolGateway:
             return "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in hits) or "No results"
         return await self._github.search_code(state.repo, params["pattern"], params.get("file_glob", ""))
 
-    @staticmethod
-    def _pipeline_requires_workspace() -> bool:
+    def _pipeline_requires_workspace(self) -> bool:
         """Use the pinned workspace only for non-legacy pipeline modes.
 
         T4 will add the typed PipelineV4Config.  Reading the kill switch here
@@ -218,7 +226,10 @@ class ToolGateway:
         default remains byte-for-byte compatible with the legacy path.
         """
 
-        return os.environ.get("REVIEWFORGE_PIPELINE", "legacy").strip().lower() != "legacy"
+        mode = self._pipeline_mode
+        if mode is None:
+            mode = os.environ.get("REVIEWFORGE_PIPELINE", "legacy")
+        return str(mode).strip().lower() != "legacy"
 
     async def _workspace_for(self, state: StateStore) -> PRHeadWorkspace:
         state_key = id(state)
@@ -239,7 +250,9 @@ class ToolGateway:
                 PRHeadWorkspace.build(
                     state,
                     self._github,
-                    max_bytes=_workspace_max_bytes(),
+                    max_bytes=(
+                        self._workspace_max_bytes if self._workspace_max_bytes is not None else _workspace_max_bytes()
+                    ),
                 )
             )
             self._workspace_loads[state_key] = load
@@ -256,6 +269,11 @@ class ToolGateway:
         finally:
             if self._workspace_loads.get(state_key) is load:
                 self._workspace_loads.pop(state_key, None)
+
+    async def workspace_for(self, state: StateStore) -> PRHeadWorkspace:
+        """Return the run-scoped immutable workspace used by pipeline stages."""
+
+        return await self._workspace_for(state)
 
     async def cleanup_workspace(self, state: StateStore) -> None:
         """Release exactly the workspace associated with one review state.

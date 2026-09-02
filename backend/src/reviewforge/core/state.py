@@ -10,9 +10,12 @@ from __future__ import annotations
 import copy
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field, field_validator
+
+if TYPE_CHECKING:
+    from reviewforge.engine.hypothesis import HypothesisLedger
 
 TASK_RATIONALE_MAX_LENGTH = 500
 FINDING_VERIFY_REASON_MAX_LENGTH = 500
@@ -205,6 +208,7 @@ class StateStore:
     findings: dict[str, Finding] = field(default_factory=dict)
     tasks: dict[str, ReviewTask] = field(default_factory=dict)
     notes: list[Note] = field(default_factory=list)
+    ledger: HypothesisLedger | None = field(default=None, repr=False)
 
     def add_finding(self, finding: Finding) -> str:
         self.findings[finding.id] = finding

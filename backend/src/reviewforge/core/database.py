@@ -97,6 +97,29 @@ CREATE TABLE IF NOT EXISTS review_task_rounds (
     FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
 );
 
+-- Append-only hypothesis history.  Resume selects the latest revision for
+-- each identity; prior revisions remain available for audit.
+CREATE TABLE IF NOT EXISTS hypotheses (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL,
+    identity      TEXT NOT NULL,
+    hypothesis_json TEXT NOT NULL,
+    head_sha      TEXT NOT NULL DEFAULT '',
+    workspace_digest TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          TEXT NOT NULL,
+    hypothesis_id   TEXT NOT NULL,
+    observation_id  TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
 -- Token usage tracking per agent per run
 CREATE TABLE IF NOT EXISTS token_usage (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,6 +194,8 @@ CREATE INDEX IF NOT EXISTS idx_findings_category ON review_findings(category);
 CREATE INDEX IF NOT EXISTS idx_metrics_run ON reviewer_metrics(run_id);
 CREATE INDEX IF NOT EXISTS idx_task_checkpoints_run ON review_task_checkpoints(run_id, task_id, attempt);
 CREATE INDEX IF NOT EXISTS idx_task_checkpoints_round ON review_task_checkpoints(run_id, round_id);
+CREATE INDEX IF NOT EXISTS idx_hypotheses_run_identity ON hypotheses(run_id, identity, id);
+CREATE INDEX IF NOT EXISTS idx_observations_run_hypothesis ON observations(run_id, hypothesis_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_repo ON review_runs(repo);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON code_symbols(file_path);
 CREATE INDEX IF NOT EXISTS idx_symbols_risk ON code_symbols(risk_level);
@@ -1075,6 +1100,73 @@ class Database:
         if hasattr(row, "keys"):
             return {k: row[k] for k in row.keys()}
         return dict(row) if row else {}
+
+    # ── Hypothesis ledger ────────────────────────────────────────
+
+    async def append_hypothesis(
+        self,
+        run_id: str,
+        hypothesis: Any,
+        *,
+        head_sha: str = "",
+        workspace_digest: str = "",
+    ) -> None:
+        """Append one immutable hypothesis revision and its observations."""
+
+        payload = hypothesis.to_dict() if hasattr(hypothesis, "to_dict") else dict(hypothesis)
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "INSERT INTO hypotheses "
+            "(run_id, identity, hypothesis_json, head_sha, workspace_digest, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                str(payload["identity"]),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                head_sha,
+                workspace_digest,
+                now,
+            ),
+        )
+        for observation in payload.get("observations", []):
+            await self._db.execute(
+                "INSERT INTO observations "
+                "(run_id, hypothesis_id, observation_id, observation_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    str(payload["id"]),
+                    str(observation["id"]),
+                    json.dumps(observation, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+        await self._db.commit()
+
+    async def load_hypothesis_ledger(self, run_id: str):
+        """Rebuild a ledger from the latest append-only revision per identity."""
+
+        from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger
+
+        cursor = await self._db.execute(
+            "SELECT h.hypothesis_json, h.head_sha, h.workspace_digest "
+            "FROM hypotheses h JOIN ("
+            " SELECT identity, MAX(id) AS max_id FROM hypotheses WHERE run_id = ? GROUP BY identity"
+            ") latest ON latest.max_id = h.id ORDER BY h.identity",
+            (run_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+        ledger = HypothesisLedger(
+            run_id=run_id,
+            head_sha=str(rows[0]["head_sha"]),
+            workspace_digest=str(rows[0]["workspace_digest"]),
+        )
+        for row in rows:
+            hypothesis = Hypothesis.from_dict(json.loads(row["hypothesis_json"]))
+            ledger.items[hypothesis.identity] = hypothesis
+        return ledger
 
     # ── Token Usage ──────────────────────────────────────────────
 

@@ -52,6 +52,14 @@ ROLE_MAP: dict[str, str] = {
     # Publication gate is its own role so it can run a stronger model.
     "publication_gate": "publication_gate",
     "commenter": "fast_review",
+    "hypothesis_generator": "deep_review",
+    "lens_security": "fast_review",
+    "lens_localization": "fast_review",
+    "lens_accessibility": "fast_review",
+    "lens_concurrency": "fast_review",
+    "lens_dependency": "fast_review",
+    "investigator": "verifier",
+    "editor": "publication_gate",
 }
 
 
@@ -109,8 +117,9 @@ def _temperature_for(config: LLMConfig, agent_name: str) -> float:
         "evidence_prover",
         "evidence_refuter",
         "evidence_arbiter",
+        "investigator",
     }
-    if agent_name in verifier_agents or agent_name == "publication_gate":
+    if agent_name in verifier_agents or agent_name in {"publication_gate", "editor"}:
         return config.temperature_verifier
     return config.temperature_reviewer
 

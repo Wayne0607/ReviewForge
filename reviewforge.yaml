@@ -172,6 +172,21 @@ coverage_gap:
   max_cards: 3
   min_confidence: 0.65
 
+# Hypothesis pipeline remains opt-in through the holdout gate (T11).
+pipeline_v4:
+  mode: "legacy"
+  output_language: "auto"
+  workspace_max_bytes: 200000000
+  context_pack_max_slices: 12
+  context_pack_max_chars: 40000
+  generator_max_input_chars: 120000
+  generator_max_hypotheses: 12
+  max_lenses: 3
+  investigator_concurrency: 4
+  investigator_max_hypotheses_per_pr: 12
+  publish_max_inline: 5
+  publish_max_inline_overflow: 8
+
 # V3 coverage-driven pipeline. Evidence remains shadow-only until benchmarked.
 v3:
   enabled: true

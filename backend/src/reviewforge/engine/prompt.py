@@ -11,6 +11,7 @@ from typing import Any
 
 from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.core.specs import SpecRegistry
+from reviewforge.engine.language import normalize_output_language, resolve_output_language
 
 PromptSection = Callable[[dict[str, Any]], str | None]
 
@@ -114,8 +115,51 @@ def _identity(ctx: dict[str, Any]) -> str:
     return identities.get(role, identities["reviewer"])
 
 
+_LEGACY_LANGUAGE_REQUIREMENT = (
+    "## 语言要求\n\n所有 message、suggestion、reason 字段必须使用中文。category 和 severity 使用英文。"
+    "代码标识符、路径、API 名称保留英文。"
+)
+_ENGLISH_LANGUAGE_REQUIREMENT = (
+    "## Language requirement\n\nAll message, suggestion, and reason fields MUST be written in English. "
+    "Keep category and severity in English. Preserve code identifiers, paths, and API names exactly."
+)
+
+
+def _prompt_output_language(ctx: dict[str, Any]) -> str:
+    """Resolve prompt language without changing the legacy no-context path."""
+
+    # New pipeline callers can provide a resolved value; accepting both names
+    # makes the hand-off explicit and avoids re-running auto detection.
+    explicit = ctx.get("resolved_output_language", ctx.get("output_language"))
+    if explicit is not None:
+        language = normalize_output_language(explicit)
+        if language != "auto":
+            return language
+        state = ctx.get("state")
+        config = ctx.get("config")
+        if state is not None and config is not None:
+            return resolve_output_language(state, config)
+        return "en"
+
+    state = ctx.get("state")
+    config = ctx.get("config")
+    if state is not None and config is not None:
+        return resolve_output_language(state, config)
+
+    # Existing legacy callers do not carry config into prompt construction.
+    # Honor the operator kill switch at this boundary while retaining the
+    # byte-for-byte Chinese default when it is absent.
+    import os
+
+    env_language = os.environ.get("REVIEWFORGE_OUTPUT_LANGUAGE")
+    if env_language is not None:
+        language = normalize_output_language(env_language)
+        return "en" if language == "auto" else language
+    return "zh-CN"
+
+
 def _language(ctx: dict[str, Any]) -> str:
-    return "## 语言要求\n\n所有 message、suggestion、reason 字段必须使用中文。category 和 severity 使用英文。代码标识符、路径、API 名称保留英文。"  # noqa: E501
+    return _ENGLISH_LANGUAGE_REQUIREMENT if _prompt_output_language(ctx) == "en" else _LEGACY_LANGUAGE_REQUIREMENT
 
 
 def _available_tools(ctx: dict[str, Any]) -> str | None:
@@ -415,6 +459,17 @@ def wrap_untrusted(content: str) -> str:
 
 
 def _findings_format(ctx: dict[str, Any]) -> str:
+    if _prompt_output_language(ctx) == "en":
+        return """## Finding format
+
+Each finding MUST include:
+- `file`: exact file path in the diff
+- `line`: exact line number in the changed file
+- `severity`: "info" | "warning" | "error"
+- `category`: short label (for example "sql-injection", "n-plus-one", "naming")
+- `message`: what the problem is (1–2 sentences, in English)
+- `suggestion`: a concrete code fix (in English)
+- `confidence`: 0.0–1.0 (your confidence in this finding)"""
     return """## 发现格式
 
 每个发现必须包含：

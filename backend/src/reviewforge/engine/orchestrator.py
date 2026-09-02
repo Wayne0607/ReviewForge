@@ -287,12 +287,14 @@ class Orchestrator:
         v3_coverage_max_attempts: int = 2,
         v3_evidence_mode: str = "shadow",
         v3_evidence_max_candidates: int = 20,
+        output_language: str = "zh-CN",
     ) -> None:
         self._registry = registry
         self._gateway = gateway
         self._events = event_bus
         self._db = db
         self._model_router = model_router  # D6: 多模型路由
+        self._output_language = output_language
         self._agentic_reviewers = set(agentic_reviewers or [])  # W1: agentic 显式 allowlist
         self._agentic_default = agentic_default  # #1: 无 allowlist 时所有 reviewer 默认走工具循环
 
@@ -363,13 +365,13 @@ class Orchestrator:
         if db:
             tracked_planner = TrackedChatLLM(inner=planner_llm, ctx=self._token_ctx, agent_name="planner")
             tracked_calibrator = TrackedChatLLM(inner=calibrator_llm, ctx=self._token_ctx, agent_name="calibrator")
-            self._planner = Planner(tracked_planner, registry)
+            self._planner = Planner(tracked_planner, registry, output_language=self._output_language)
             self._calibrator = DynamicCalibrator(tracked_calibrator, registry)
             self._reviewer_llm = TrackedChatLLM(inner=reviewer_llm, ctx=self._token_ctx, agent_name="reviewer")
             if cross_pr_llm:
                 cross_pr_llm = TrackedChatLLM(inner=cross_pr_llm, ctx=self._token_ctx, agent_name="cross_pr_analyzer")
         else:
-            self._planner = Planner(planner_llm, registry)
+            self._planner = Planner(planner_llm, registry, output_language=self._output_language)
             self._calibrator = DynamicCalibrator(calibrator_llm, registry)
             self._reviewer_llm = reviewer_llm
 
@@ -2957,6 +2959,9 @@ class Orchestrator:
             reviewer = cls(llm, self._registry, self._gateway)
             reviewer._agentic = agentic
             reviewer._events = self._events
+            # Keep custom plugin constructors on their historical three-arg
+            # contract while still wiring output language into base prompts.
+            reviewer._output_language = self._output_language
             return reviewer
         return None
 

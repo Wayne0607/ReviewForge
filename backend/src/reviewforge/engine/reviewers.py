@@ -23,6 +23,7 @@ from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import Finding, ReviewTask, StateStore
 from reviewforge.engine.budget import MAX_TOOL_CALLS_PER_FILE, MAX_TOOL_OUTPUT_CHARS, TokenBudget
 from reviewforge.engine.detectors import detect_dependency_findings, detect_security_findings
+from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.prompt import build_reviewer_prompt
 from reviewforge.engine.security_categories import is_security_category, normalize_category
 from reviewforge.tools.gateway import ToolGateway
@@ -144,6 +145,7 @@ class BaseReviewer:
         agentic: bool = False,
         max_tokens: int = 20000,
         event_bus: Any = None,
+        output_language: str = "zh-CN",
     ) -> None:
         definition = REVIEWER_CATALOG.get(name)
         if definition is not None and reviewer_type != definition.reviewer_type:
@@ -160,6 +162,7 @@ class BaseReviewer:
         self._agentic = agentic
         self._max_tokens = max_tokens
         self._events = event_bus
+        self._output_language = output_language
         # Progressive skill loading — set post-construction by the orchestrator
         self._skill_body: str = ""
         self._skill_name: str = ""
@@ -191,6 +194,7 @@ class BaseReviewer:
             "target_framework": getattr(self, "_target_framework", ""),
             "impact_manifest": state.impact_manifest,
             "review_focus": getattr(self, "_review_focus", ""),
+            "output_language": resolve_output_language(state, {"output_language": self._output_language}),
         }
         messages = build_reviewer_prompt(ctx)
 
@@ -241,6 +245,7 @@ class BaseReviewer:
             "target_framework": getattr(self, "_target_framework", ""),
             "impact_manifest": state.impact_manifest,
             "review_focus": getattr(self, "_review_focus", ""),
+            "output_language": resolve_output_language(state, {"output_language": self._output_language}),
         }
         messages = build_reviewer_prompt(ctx)
         chat = [

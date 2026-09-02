@@ -8,13 +8,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import StateStore
 from reviewforge.tools.github_api import MAX_REVIEW_COMMENTS_PER_REQUEST, GitHubClient
+from reviewforge.tools.workspace import DEFAULT_MAX_BYTES, PRHeadWorkspace, WorkspaceUnavailable
 
 logger = logging.getLogger(__name__)
+
+
+def _workspace_max_bytes() -> int:
+    """Read the temporary T2 limit override without changing legacy config."""
+
+    raw = os.environ.get("REVIEWFORGE_WORKSPACE_MAX_BYTES")
+    if raw is None:
+        return DEFAULT_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_BYTES
+
 
 # JSON Schema type → Python type(s), for lightweight param validation (no jsonschema dep).
 _JSON_PY_TYPES: dict[str, Any] = {
@@ -45,6 +60,18 @@ class ToolGateway:
         # request. Entries live only while the bulk request is in flight; the
         # resulting patches are owned by the per-run StateStore.
         self._diff_loads: dict[int, asyncio.Task[dict[str, str]]] = {}
+        # Hypothesis/shadow tool reads share one pinned workspace per run.  The
+        # map is intentionally keyed by StateStore identity because StateStore
+        # is mutable and therefore not hashable.
+        self._workspaces: dict[int, PRHeadWorkspace] = {}
+        self._workspace_loads: dict[int, asyncio.Task[PRHeadWorkspace]] = {}
+        # Keep the StateStore object alongside id(state): retaining the object
+        # prevents Python id reuse from aliasing a later PR to an old snapshot.
+        self._workspace_states: dict[int, StateStore] = {}
+        # A generation makes cleanup safe when it races a build that is still
+        # being awaited by another tool invocation.
+        self._workspace_generations: dict[int, int] = {}
+        self._workspace_cleaning: set[int] = set()
 
     async def invoke(self, tool_name: str, params: dict[str, Any], state: StateStore, agent_name: str = "") -> Any:
         """Execute a tool with full gating.
@@ -138,7 +165,21 @@ class ToolGateway:
             if isinstance(item, dict) and item.get("filename")
         }
 
-    async def _read_file(self, params: dict[str, Any], state: StateStore) -> str:
+    async def _read_file(self, params: dict[str, Any], state: StateStore) -> str | None:
+        if self._pipeline_requires_workspace():
+            workspace = await self._workspace_for(state)
+            if workspace.source == "api-fallback":
+                return await workspace.read_async(
+                    params["file_path"],
+                    start=params.get("start_line"),
+                    end=params.get("end_line"),
+                )
+            return workspace.read(
+                params["file_path"],
+                start=params.get("start_line"),
+                end=params.get("end_line"),
+            )
+
         content = await self._github.get_file_content(
             state.repo,
             state.head_sha,
@@ -157,7 +198,105 @@ class ToolGateway:
         return "\n".join(f"{line_no}: {lines[line_no - 1]}" for line_no in range(start, end + 1))
 
     async def _search_code(self, params: dict[str, Any], state: StateStore) -> str:
+        if self._pipeline_requires_workspace():
+            workspace = await self._workspace_for(state)
+            file_glob = params.get("file_glob", "")
+            hits = workspace.grep(
+                params["pattern"],
+                globs=[file_glob] if file_glob else None,
+                max_hits=10,
+            )
+            return "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in hits) or "No results"
         return await self._github.search_code(state.repo, params["pattern"], params.get("file_glob", ""))
+
+    @staticmethod
+    def _pipeline_requires_workspace() -> bool:
+        """Use the pinned workspace only for non-legacy pipeline modes.
+
+        T4 will add the typed PipelineV4Config.  Reading the kill switch here
+        keeps T2's gateway wiring independent of that later module while the
+        default remains byte-for-byte compatible with the legacy path.
+        """
+
+        return os.environ.get("REVIEWFORGE_PIPELINE", "legacy").strip().lower() != "legacy"
+
+    async def _workspace_for(self, state: StateStore) -> PRHeadWorkspace:
+        state_key = id(state)
+        if state_key in self._workspace_cleaning:
+            raise WorkspaceUnavailable("workspace cleanup in progress", reason="workspace-cleaned")
+        known_state = self._workspace_states.get(state_key)
+        if known_state is not None and known_state is not state:
+            raise WorkspaceUnavailable("workspace state identity collision")
+        self._workspace_states.setdefault(state_key, state)
+        generation = self._workspace_generations.get(state_key, 0)
+        workspace = self._workspaces.get(state_key)
+        if workspace is not None:
+            return workspace
+
+        load = self._workspace_loads.get(state_key)
+        if load is None:
+            load = asyncio.create_task(
+                PRHeadWorkspace.build(
+                    state,
+                    self._github,
+                    max_bytes=_workspace_max_bytes(),
+                )
+            )
+            self._workspace_loads[state_key] = load
+        try:
+            workspace = await load
+            if self._workspace_generations.get(state_key, 0) != generation:
+                workspace.cleanup()
+                raise WorkspaceUnavailable("workspace cleaned before use", reason="workspace-cleaned")
+            if self._workspace_states.get(state_key) is not state:
+                workspace.cleanup()
+                raise WorkspaceUnavailable("workspace state no longer active", reason="workspace-cleaned")
+            self._workspaces[state_key] = workspace
+            return workspace
+        finally:
+            if self._workspace_loads.get(state_key) is load:
+                self._workspace_loads.pop(state_key, None)
+
+    async def cleanup_workspace(self, state: StateStore) -> None:
+        """Release exactly the workspace associated with one review state.
+
+        If a build is in flight, wait for it to finish so the just-created
+        temporary directory is cleaned as well.  A concurrent waiter observes
+        the generation change and cannot reinsert the closed workspace.
+        """
+
+        state_key = id(state)
+        known_state = self._workspace_states.get(state_key)
+        if known_state is not None and known_state is not state:
+            return
+        self._workspace_generations[state_key] = self._workspace_generations.get(state_key, 0) + 1
+        self._workspace_cleaning.add(state_key)
+        try:
+            workspace = self._workspaces.pop(state_key, None)
+            load = self._workspace_loads.pop(state_key, None)
+            if load is not None:
+                try:
+                    built = await load
+                except asyncio.CancelledError:
+                    built = None
+                except Exception:
+                    built = None
+                if built is not None:
+                    workspace = built if workspace is None else workspace
+            if workspace is not None:
+                workspace.cleanup()
+            if self._workspace_states.get(state_key) is state:
+                self._workspace_states.pop(state_key, None)
+        finally:
+            self._workspace_cleaning.discard(state_key)
+
+    def cleanup_workspaces(self) -> None:
+        """Release temporary snapshots owned by this gateway instance."""
+
+        for workspace in self._workspaces.values():
+            workspace.cleanup()
+        self._workspaces.clear()
+        self._workspace_states.clear()
 
     async def _get_change_context(self, params: dict[str, Any], state: StateStore) -> str:
         """Return the precomputed Impact Manifest, optionally narrowed."""

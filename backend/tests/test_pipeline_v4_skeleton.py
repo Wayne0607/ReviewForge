@@ -10,6 +10,7 @@ from reviewforge.core.events import EventBus
 from reviewforge.core.state import StateStore
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.pipeline_v4 import run_hypothesis_pipeline
+from reviewforge.engine.run_health import RunHealth
 from reviewforge.tools.workspace import WorkspaceInfo
 
 
@@ -99,3 +100,25 @@ async def test_skeleton_emits_complete_workspace_and_context_events(tmp_path) ->
     assert seen[2].event_type == "pipeline_v4.completed"
     assert state.ledger is not None
     assert state.ledger.run_id == "run"
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_dispatch_runs_new_path_and_cleans_up(monkeypatch) -> None:
+    cleanup = AsyncMock()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pipeline_v4_config = PipelineV4Config(mode="hypothesis")
+    orchestrator._events = EventBus()
+    orchestrator._gateway = SimpleNamespace(cleanup_workspace=cleanup)
+    orchestrator._db = None
+    monkeypatch.setattr(
+        "reviewforge.engine.orchestrator.run_hypothesis_pipeline",
+        AsyncMock(return_value=RunHealth.build()),
+    )
+    state = StateStore(repo="owner/repo", pr_number=1, head_sha="abc")
+
+    summary = await orchestrator.run(state)
+
+    assert summary["mode"] == "hypothesis"
+    assert summary["status"] == "completed"
+    assert summary["confirmed"] == 0
+    cleanup.assert_awaited_once_with(state)

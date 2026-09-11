@@ -16,7 +16,7 @@ from typing import Any
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
-from reviewforge.engine.editor import Editor, Publication
+from reviewforge.engine.editor import Editor, Publication, render_review_body
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
@@ -227,16 +227,20 @@ async def _persist_ledger(orchestrator: Any, ledger: HypothesisLedger) -> None:
         await database.append_hypothesis(run_id, hypothesis)
 
 
-async def deliver_publication(gateway: Any, state: StateStore, publication: Publication) -> tuple[int, int]:
+async def deliver_publication(
+    gateway: Any,
+    state: StateStore,
+    publication: Publication,
+    *,
+    review_body: str = "",
+) -> tuple[int, int]:
     """Coordinate-validate and deliver inline comments (mirrors ``_post_comments``).
 
     Comments whose line is not a visible RIGHT-side diff coordinate are dropped;
-    the survivors are delivered as one bounded ``post_review`` batch.  Returns
+    the survivors are delivered as one bounded ``post_review`` batch carrying the
+    optional review ``body`` (the rendered ``<details>`` summary).  Returns
     ``(delivered, rejected)``.
     """
-
-    if not publication.comments:
-        return (0, 0)
 
     right_lines: dict[str, set[int]] = {}
     for comment in publication.comments:
@@ -253,9 +257,12 @@ async def deliver_publication(gateway: Any, state: StateStore, publication: Publ
             continue
         payload_comments.append({"file_path": comment.path, "line": comment.line, "body": comment.body})
 
-    if not payload_comments:
+    if not payload_comments and not review_body:
         return (0, rejected)
-    await gateway.invoke("post_review", {"comments": payload_comments}, state, agent_name="orchestrator")
+    params: dict[str, Any] = {"comments": payload_comments}
+    if review_body:
+        params["body"] = review_body
+    await gateway.invoke("post_review", params, state, agent_name="orchestrator")
     return (len(payload_comments), rejected)
 
 
@@ -323,15 +330,18 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             logger.warning("detector seeding skipped: %s", exc)
 
     publication = Publication(comments=[], summary_items=[], merged=[], unknown_ids=[], fallback=False)
+    language = resolve_output_language(state, config)
     if getattr(orchestrator, "_model_router", None) is not None and changeset.units:
-        language = resolve_output_language(state, config)
         publication = await _run_llm_stages(orchestrator, state, changeset, pack, ledger, workspace, config, language)
 
     await _persist_ledger(orchestrator, ledger)
 
     delivered = 0
     if config.mode == "hypothesis":
-        delivered, _rejected = await deliver_publication(orchestrator._gateway, state, publication)
+        review_body = render_review_body(publication, ledger, output_language=language)
+        delivered, _rejected = await deliver_publication(
+            orchestrator._gateway, state, publication, review_body=review_body
+        )
 
     hypotheses = list(ledger.items.values())
     unknown_error = sum(

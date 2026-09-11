@@ -225,6 +225,10 @@ def build_registry() -> SpecRegistry:
             input_schema={
                 "type": "object",
                 "properties": {
+                    "body": {
+                        "type": "string",
+                        "description": "Optional Markdown PR review body (summary <details>)",
+                    },
                     "comments": {
                         "type": "array",
                         "minItems": 1,
@@ -238,7 +242,7 @@ def build_registry() -> SpecRegistry:
                             },
                             "required": ["file_path", "line", "body"],
                         },
-                    }
+                    },
                 },
                 "required": ["comments"],
             },

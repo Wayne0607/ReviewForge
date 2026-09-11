@@ -335,9 +335,16 @@ class ToolGateway:
         )
 
     async def _post_review(self, params: dict[str, Any], state: StateStore) -> dict[str, Any]:
-        comments = params["comments"]
-        if not comments or len(comments) > MAX_REVIEW_COMMENTS_PER_REQUEST:
+        comments = params.get("comments", [])
+        body = params.get("body", "")
+        if not isinstance(body, str):
+            raise ValueError("post_review body must be a string")
+        if not comments and not body:
             raise ValueError(f"post_review requires between 1 and {MAX_REVIEW_COMMENTS_PER_REQUEST} comments")
+        if len(comments) > MAX_REVIEW_COMMENTS_PER_REQUEST:
+            raise ValueError(
+                f"post_review requires between 1 and {MAX_REVIEW_COMMENTS_PER_REQUEST} comments and a body"
+            )
         for index, item in enumerate(comments):
             if not isinstance(item, dict):
                 raise ValueError(f"post_review comment {index} must be an object")
@@ -355,6 +362,7 @@ class ToolGateway:
                 pr_number=state.pr_number,
                 commit_sha=state.head_sha,
                 comments=comments,
+                body=body,
             )
             return {"delivered_indexes": list(range(len(comments))), "review": review, "compatibility": False}
 

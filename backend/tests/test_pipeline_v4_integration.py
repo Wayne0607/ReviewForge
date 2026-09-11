@@ -236,3 +236,25 @@ async def test_deliver_publication_validates_right_side_coordinates() -> None:
     assert calls[0][0] == "post_review"
     assert [comment["file_path"] for comment in calls[0][1]["comments"]] == ["app.py"]
     assert calls[0][1]["comments"][0]["line"] == 2
+
+
+@pytest.mark.asyncio
+async def test_deliver_publication_passes_review_body() -> None:
+    state = StateStore(repo="o/r", pr_number=1, head_sha="abc", file_diffs={})
+    publication = Publication(comments=[], summary_items=[], merged=[])
+    calls: list = []
+
+    async def invoke(name, params, state_, agent_name=""):
+        calls.append((name, params))
+        return {"ok": True}
+
+    gateway = SimpleNamespace(invoke=invoke)
+
+    delivered, rejected = await deliver_publication(
+        gateway, state, publication, review_body="<details>summary</details>"
+    )
+
+    assert (delivered, rejected) == (0, 0)
+    assert calls[0][0] == "post_review"
+    assert calls[0][1]["comments"] == []
+    assert calls[0][1]["body"] == "<details>summary</details>"

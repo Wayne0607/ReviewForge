@@ -805,19 +805,48 @@ class Orchestrator:
         return summary
 
     async def _run_hypothesis(self, state: StateStore) -> dict[str, Any]:
-        """Primary hypothesis pipeline: run the new path and publish it."""
+        """Primary hypothesis pipeline: run the new path and publish it.
 
-        run_id = uuid.uuid4().hex[:12]
-        self._events.set_run_id(run_id)
-        self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
-        if self._db:
-            await self._db.create_run(
-                run_id=run_id,
-                repo=state.repo,
-                pr_number=state.pr_number,
-                head_sha=state.head_sha,
-                base_sha=state.base_sha,
-            )
+        Mirrors the legacy resume gate: a failed / stale run for the same PR head
+        is resumed (reusing its run_id and a restored ledger so CONFIRMED/REFUTED
+        hypotheses are not re-investigated), a freshly-active run is skipped, and
+        otherwise a fresh run is created.
+        """
+
+        resumed = await self._db.get_resumable_run(state.repo, state.pr_number, state.head_sha) if self._db else None
+        if resumed:
+            run_id = resumed["run_id"]
+            if not await self._db.restart_run(run_id):
+                logger.info(
+                    "Hypothesis run for %s/%s@%s was already claimed",
+                    state.repo,
+                    state.pr_number,
+                    state.head_sha,
+                )
+                return {"status": "duplicate_skipped", "mode": "hypothesis"}
+            state.ledger = await self._db.load_hypothesis_ledger(run_id)
+            self._events.set_run_id(run_id)
+            self._events.emit("review.resumed", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+        else:
+            if self._db and await self._db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha):
+                logger.info(
+                    "Hypothesis run for %s/%s@%s is already active/completed",
+                    state.repo,
+                    state.pr_number,
+                    state.head_sha,
+                )
+                return {"status": "duplicate_skipped", "mode": "hypothesis"}
+            run_id = uuid.uuid4().hex[:12]
+            self._events.set_run_id(run_id)
+            self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+            if self._db:
+                await self._db.create_run(
+                    run_id=run_id,
+                    repo=state.repo,
+                    pr_number=state.pr_number,
+                    head_sha=state.head_sha,
+                    base_sha=state.base_sha,
+                )
 
         try:
             health = await run_hypothesis_pipeline(self, state)

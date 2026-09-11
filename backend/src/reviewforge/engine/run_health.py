@@ -8,7 +8,7 @@ pipeline stages.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -43,6 +43,8 @@ class RunHealth:
     planner: StageResult
     publication: StageResult
     delivery: StageResult
+    hypothesis: StageResult = field(default_factory=lambda: StageResult(name="hypothesis"))
+    investigation: StageResult = field(default_factory=lambda: StageResult(name="investigation"))
 
     @classmethod
     def build(
@@ -56,6 +58,8 @@ class RunHealth:
         delivery_failures: int = 0,
         delivery_errors: tuple[str, ...] = (),
         delivery_retryable: bool = False,
+        hypothesis_failures: int = 0,
+        investigation_unknown_errors: int = 0,
     ) -> RunHealth:
         return cls(
             tasks=StageResult(
@@ -83,6 +87,17 @@ class RunHealth:
                 retryable=delivery_retryable,
                 errors=delivery_errors,
             ),
+            hypothesis=StageResult(
+                name="hypothesis",
+                failures=max(0, hypothesis_failures),
+                # Generation failures are safe to retry: they are recorded as
+                # unresolved units and re-attempted on resume.
+                retryable=hypothesis_failures > 0,
+            ),
+            investigation=StageResult(
+                name="investigation",
+                failures=max(0, investigation_unknown_errors),
+            ),
         )
 
     @property
@@ -90,12 +105,17 @@ class RunHealth:
         return any(stage.operationally_incomplete for stage in self.stages)
 
     @property
+    def completed(self) -> bool:
+        """True when no error-severity claim remains UNKNOWN (§4.8)."""
+        return not self.operationally_incomplete
+
+    @property
     def retryable(self) -> bool:
         return any(stage.retryable for stage in self.stages)
 
     @property
     def stages(self) -> tuple[StageResult, ...]:
-        return (self.tasks, self.planner, self.publication, self.delivery)
+        return (self.tasks, self.planner, self.publication, self.delivery, self.hypothesis, self.investigation)
 
     @property
     def errors(self) -> list[str]:
@@ -108,11 +128,18 @@ class RunHealth:
         return summary
 
     def failures_payload(self) -> dict[str, int | bool]:
-        """Stable failure counters for the append-only evaluation event."""
+        """Stable failure counters for the append-only evaluation event.
+
+        The v1 ``evaluation.telemetry.failures`` block is the legacy four-stage
+        contract; hypothesis/investigation health is reported through the
+        ``pipeline_v4`` telemetry block instead.
+        """
+
+        legacy_stages = (self.tasks, self.planner, self.publication, self.delivery)
         return {
             "tasks_failed": self.tasks.failures,
             "planner": self.planner.failures,
             "publication": self.publication.failures,
             "delivery": self.delivery.failures,
-            "operationally_incomplete": self.operationally_incomplete,
+            "operationally_incomplete": any(stage.operationally_incomplete for stage in legacy_stages),
         }

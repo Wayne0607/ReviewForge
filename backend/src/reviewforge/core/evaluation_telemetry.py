@@ -36,6 +36,7 @@ class EvaluationTelemetryV1:
     coverage: dict[str, Any]
     funnel: dict[str, int]
     validation_funnel: tuple[dict[str, Any], ...]
+    pipeline_v4: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -46,6 +47,8 @@ class EvaluationTelemetryV1:
             "funnel": copy.deepcopy(self.funnel),
         }
         payload["validation_funnel"] = copy.deepcopy(list(self.validation_funnel))
+        if self.pipeline_v4 is not None:
+            payload["pipeline_v4"] = copy.deepcopy(self.pipeline_v4)
         return payload
 
 
@@ -53,8 +56,9 @@ def parse_evaluation_telemetry(payload: Any) -> EvaluationTelemetryV1:
     """Parse telemetry v1 and reject missing, extra, inconsistent, or loose-typed data."""
 
     root = _object(payload, "telemetry")
-    allowed = {"schema_version", "resume_mode", "failures", "coverage", "funnel", "validation_funnel"}
-    _exact_keys(root, allowed, allowed, "telemetry")
+    required = {"schema_version", "resume_mode", "failures", "coverage", "funnel", "validation_funnel"}
+    allowed = required | {"pipeline_v4"}
+    _exact_keys(root, allowed, required, "telemetry")
     version = root.get("schema_version")
     if type(version) is not int or version != 1:
         raise EvaluationTelemetryError("telemetry.schema_version must be integer 1")
@@ -68,7 +72,8 @@ def parse_evaluation_telemetry(payload: Any) -> EvaluationTelemetryV1:
         raise EvaluationTelemetryError("telemetry.funnel.tasks_failed must equal telemetry.failures.tasks_failed")
     validation_funnel = _parse_validation_funnel(root.get("validation_funnel"))
     _validate_finding_status_stage(funnel, validation_funnel)
-    return EvaluationTelemetryV1(resume_mode, failures, coverage, funnel, validation_funnel)
+    pipeline_v4 = _parse_pipeline_v4(root.get("pipeline_v4")) if "pipeline_v4" in root else None
+    return EvaluationTelemetryV1(resume_mode, failures, coverage, funnel, validation_funnel, pipeline_v4)
 
 
 def build_evaluation_telemetry(
@@ -78,6 +83,7 @@ def build_evaluation_telemetry(
     coverage: Mapping[str, Any],
     funnel: Mapping[str, Any],
     validation_funnel: list[Mapping[str, Any]],
+    pipeline_v4: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build telemetry through the same strict parser used by offline evaluation."""
 
@@ -89,6 +95,8 @@ def build_evaluation_telemetry(
         "funnel": dict(funnel),
     }
     payload["validation_funnel"] = copy.deepcopy(validation_funnel)
+    if pipeline_v4 is not None:
+        payload["pipeline_v4"] = copy.deepcopy(dict(pipeline_v4))
     return parse_evaluation_telemetry(payload).to_dict()
 
 
@@ -198,6 +206,28 @@ def _parse_validation_funnel(raw: Any) -> tuple[dict[str, Any], ...]:
             )
         stages.append(normalized)
     return tuple(stages)
+
+
+def _parse_pipeline_v4(raw: Any) -> dict[str, Any]:
+    block = _object(raw, "telemetry.pipeline_v4")
+    required = {"mode", "hypotheses_total", "confirmed", "refuted", "unknown", "published", "tokens_by_agent"}
+    _exact_keys(block, required, required, "telemetry.pipeline_v4")
+    mode = _string(block.get("mode"), "telemetry.pipeline_v4.mode")
+    if mode not in {"shadow", "hypothesis"}:
+        raise EvaluationTelemetryError("telemetry.pipeline_v4.mode must be shadow or hypothesis")
+    counters = {}
+    for key in ("hypotheses_total", "confirmed", "refuted", "unknown", "published"):
+        counters[key] = _non_negative_int(block.get(key), f"telemetry.pipeline_v4.{key}")
+    if counters["confirmed"] + counters["refuted"] + counters["unknown"] > counters["hypotheses_total"]:
+        raise EvaluationTelemetryError(
+            "telemetry.pipeline_v4 confirmed + refuted + unknown cannot exceed hypotheses_total"
+        )
+    tokens = _object(block.get("tokens_by_agent"), "telemetry.pipeline_v4.tokens_by_agent")
+    normalized_tokens = {
+        str(agent): _non_negative_int(value, f"telemetry.pipeline_v4.tokens_by_agent.{agent}")
+        for agent, value in tokens.items()
+    }
+    return {**counters, "mode": mode, "tokens_by_agent": normalized_tokens}
 
 
 def _validate_finding_status_stage(funnel: Mapping[str, int], validation_funnel: tuple[dict[str, Any], ...]) -> None:

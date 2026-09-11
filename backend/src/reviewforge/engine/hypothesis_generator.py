@@ -106,10 +106,10 @@ def _render_unchecked(pack: ContextPack) -> str:
 
 
 def _render_existing(ledger: HypothesisLedger) -> str:
-    items = [hypothesis for hypothesis in ledger.items.values() if hypothesis.source == "generator"]
+    items = sorted(ledger.items.values(), key=lambda hypothesis: hypothesis.identity)
     if not items:
         return "（无）/(none)"
-    lines = [f"- {hypothesis.identity} :: {hypothesis.claim}" for hypothesis in sorted(items, key=lambda h: h.identity)]
+    lines = [f"- {hypothesis.identity} :: {hypothesis.claim}" for hypothesis in items]
     return "\n".join(lines)
 
 
@@ -185,12 +185,29 @@ class HypothesisGenerator:
         max_hypotheses: int = 12,
         context_max_chars: int = 40_000,
         output_language: str = "en",
+        source: str = "generator",
+        prompt_template: str = "generator",
+        skill_body: str = "",
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
         self._max_hypotheses = max(1, int(max_hypotheses))
         self._context_max_chars = max(1, int(context_max_chars))
         self._output_language = output_language
+        self._source = source
+        self._prompt_template = prompt_template
+        self._skill_body = skill_body
+
+    def _system_prompt(self) -> str:
+        lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
+        prompt = load_prompt(
+            self._prompt_template,
+            output_language=_language_directive(self._output_language),
+            lens=lens_name,
+        )
+        if self._skill_body:
+            prompt = f"{prompt}\n\n## 本维度专项规则\n{self._skill_body}"
+        return prompt
 
     async def run(
         self,
@@ -267,7 +284,7 @@ class HypothesisGenerator:
 
     async def _invoke_once(self, user: str) -> dict[str, Any] | None:
         messages = [
-            SystemMessage(content=load_prompt("generator", output_language=_language_directive(self._output_language))),
+            SystemMessage(content=self._system_prompt()),
             HumanMessage(content=user),
         ]
         response = await self._llm.ainvoke(messages)
@@ -275,7 +292,7 @@ class HypothesisGenerator:
 
     async def _invoke_repair(self, user: str) -> dict[str, Any] | None:
         messages = [
-            SystemMessage(content=load_prompt("generator", output_language=_language_directive(self._output_language))),
+            SystemMessage(content=self._system_prompt()),
             HumanMessage(content=user),
             HumanMessage(
                 content=(
@@ -327,7 +344,7 @@ class HypothesisGenerator:
                 refutation=payload["refutation"],
                 sites=[Site(path=path, line=line, excerpt=excerpt) for path, line, excerpt in sites],
                 severity=payload["severity"],
-                source="generator",
+                source=self._source,
             )
             ledger.upsert(hypothesis)
             result.accepted += 1

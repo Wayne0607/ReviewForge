@@ -8,6 +8,7 @@ by the model, so an ungrounded "confirmed" can never reach the editor.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -394,8 +395,14 @@ class Investigator:
         *,
         changed_paths: set[str] | None = None,
         max_hypotheses_per_pr: int = 12,
+        concurrency: int = 1,
     ) -> list[InvestigationResult]:
-        """Investigate every OPEN hypothesis, apply verdicts, and mark overflow."""
+        """Investigate every OPEN hypothesis concurrently, then apply verdicts.
+
+        Each hypothesis gets its own investigator instance so per-call state
+        (observation list, counter) cannot race across concurrent jobs; the LLM
+        and tool executor are shared and read-only.
+        """
 
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
         targets = sorted(
@@ -406,18 +413,43 @@ class Investigator:
                 hypothesis.identity,
             ),
         )
-        results: list[InvestigationResult] = []
-        for index, hypothesis in enumerate(targets):
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def _investigate(index: int, hypothesis: Hypothesis) -> InvestigationResult:
             if index >= max(0, max_hypotheses_per_pr):
-                ledger.apply_verdict(
-                    hypothesis.identity,
-                    status="unknown",
-                    evidence_strength="none",
-                    verdict_reason="budget-exhausted",
+                return self._result(verdict="unknown", reason="budget-exhausted", severity=hypothesis.severity)
+            async with semaphore:
+                worker = Investigator(
+                    self._llm,
+                    self._executor,
+                    output_language=self._output_language,
+                    max_steps=self._max_steps,
                 )
-                results.append(self._result(verdict="unknown", reason="budget-exhausted", severity=hypothesis.severity))
-                continue
-            result = await self.investigate(hypothesis, state, pack, changed_paths=changed)
+                try:
+                    return await worker.investigate(hypothesis, state, pack, changed_paths=changed)
+                except Exception as exc:
+                    logger.warning("investigation failed for %s: %s", hypothesis.identity, exc)
+                    return self._result(
+                        verdict="unknown",
+                        reason=f"investigation error: {exc}",
+                        severity=hypothesis.severity,
+                        retryable=True,
+                    )
+
+        gathered = await asyncio.gather(*(_investigate(index, hypothesis) for index, hypothesis in enumerate(targets)))
+
+        results: list[InvestigationResult] = []
+        for hypothesis, raw in zip(targets, gathered):
+            result = (
+                raw
+                if isinstance(raw, InvestigationResult)
+                else self._result(
+                    verdict="unknown",
+                    reason="investigation error",
+                    severity=hypothesis.severity,
+                    retryable=True,
+                )
+            )
             ledger.apply_verdict(
                 hypothesis.identity,
                 status=result.verdict,

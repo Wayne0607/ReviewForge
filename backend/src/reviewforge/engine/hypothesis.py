@@ -162,6 +162,51 @@ class HypothesisLedger:
             current.attempts = max(current.attempts, hypothesis.attempts)
             return copy.deepcopy(current), False
 
+    def apply_verdict(
+        self,
+        identity: str,
+        *,
+        status: HypothesisStatus | str,
+        evidence_strength: str = "none",
+        verdict_reason: str = "",
+        observations: list[Observation] | None = None,
+        severity: str | None = None,
+        additional_sites: list[Site] | None = None,
+    ) -> Hypothesis:
+        """Apply an investigation verdict to one hypothesis.
+
+        The investigator is the only writer of status transitions: OPEN becomes
+        CONFIRMED / REFUTED / UNKNOWN.  Severity may be corrected explicitly,
+        and additional sites discovered through tool evidence are merged without
+        ever dropping a previously recorded site.
+        """
+
+        with self._lock:
+            current = self.items.get(identity)
+            if current is None:
+                raise KeyError(f"unknown hypothesis identity: {identity!r}")
+            status_value = status if isinstance(status, HypothesisStatus) else HypothesisStatus(str(status))
+            current.status = status_value
+            current.evidence_strength = evidence_strength if evidence_strength in {"none", "weak", "strong"} else "none"
+            current.verdict_reason = str(verdict_reason)
+            if severity in _SEVERITY_RANK:
+                current.severity = severity
+            current.attempts += 1
+            if observations:
+                known = {observation.id for observation in current.observations}
+                for observation in observations:
+                    if observation.id not in known:
+                        current.observations.append(copy.deepcopy(observation))
+                        known.add(observation.id)
+            if additional_sites:
+                seen = {(site.path, site.line, site.excerpt) for site in current.sites}
+                for site in additional_sites:
+                    key = (site.path, site.line, site.excerpt)
+                    if key not in seen:
+                        current.sites.append(copy.deepcopy(site))
+                        seen.add(key)
+            return copy.deepcopy(current)
+
     def open(self) -> list[Hypothesis]:
         with self._lock:
             return [copy.deepcopy(item) for item in self.items.values() if item.status == HypothesisStatus.OPEN]

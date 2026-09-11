@@ -56,3 +56,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# `uv run pytest` runs the `pytest` console script, which does not put the
+# project root on sys.path; without this the top-level `scripts` namespace
+# package (imported by tests/test_probe_tool_calling.py) cannot be resolved.
+pythonpath = ["."]

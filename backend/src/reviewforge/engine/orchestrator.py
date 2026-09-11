@@ -48,6 +48,7 @@ from reviewforge.engine.finding_anchors import (
     reanchor_security_detector_duplicates,
     unsupported_python_open_redirect_findings,
 )
+from reviewforge.engine.hypothesis import HypothesisStatus
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.pipeline_v4 import run_hypothesis_pipeline
@@ -787,9 +788,7 @@ class Orchestrator:
         if mode == "legacy":
             return await self._run_legacy(state)
         if mode == "hypothesis":
-            # T4 is only the deterministic skeleton.  Publishing from a
-            # half-built primary pipeline would be a false-success mode.
-            raise RuntimeError("hypothesis pipeline is not publishable before T9")
+            return await self._run_hypothesis(state)
         if mode != "shadow":
             raise ValueError(f"unsupported pipeline mode: {mode!r}")
 
@@ -803,6 +802,75 @@ class Orchestrator:
             self._events.emit("pipeline_v4.failed", {"mode": "shadow", "error_type": type(exc).__name__})
         finally:
             await self._gateway.cleanup_workspace(state)
+        return summary
+
+    async def _run_hypothesis(self, state: StateStore) -> dict[str, Any]:
+        """Primary hypothesis pipeline: run the new path and publish it.
+
+        Mirrors the legacy resume gate: a failed / stale run for the same PR head
+        is resumed (reusing its run_id and a restored ledger so CONFIRMED/REFUTED
+        hypotheses are not re-investigated), a freshly-active run is skipped, and
+        otherwise a fresh run is created.
+        """
+
+        resumed = await self._db.get_resumable_run(state.repo, state.pr_number, state.head_sha) if self._db else None
+        if resumed:
+            run_id = resumed["run_id"]
+            if not await self._db.restart_run(run_id):
+                logger.info(
+                    "Hypothesis run for %s/%s@%s was already claimed",
+                    state.repo,
+                    state.pr_number,
+                    state.head_sha,
+                )
+                return {"status": "duplicate_skipped", "mode": "hypothesis"}
+            state.ledger = await self._db.load_hypothesis_ledger(run_id)
+            self._events.set_run_id(run_id)
+            self._events.emit("review.resumed", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+        else:
+            if self._db and await self._db.has_active_run_for_head(state.repo, state.pr_number, state.head_sha):
+                logger.info(
+                    "Hypothesis run for %s/%s@%s is already active/completed",
+                    state.repo,
+                    state.pr_number,
+                    state.head_sha,
+                )
+                return {"status": "duplicate_skipped", "mode": "hypothesis"}
+            run_id = uuid.uuid4().hex[:12]
+            self._events.set_run_id(run_id)
+            self._events.emit("review.started", {"repo": state.repo, "pr": state.pr_number, "run_id": run_id})
+            if self._db:
+                await self._db.create_run(
+                    run_id=run_id,
+                    repo=state.repo,
+                    pr_number=state.pr_number,
+                    head_sha=state.head_sha,
+                    base_sha=state.base_sha,
+                )
+
+        try:
+            health = await run_hypothesis_pipeline(self, state)
+        finally:
+            await self._gateway.cleanup_workspace(state)
+
+        ledger = state.ledger
+        hypotheses = list(ledger.items.values()) if ledger else []
+        summary = {
+            "status": "completed" if health.completed else "partial",
+            "mode": "hypothesis",
+            "confirmed": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.CONFIRMED),
+            "refuted": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.REFUTED),
+            "unknown": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.UNKNOWN),
+            "retryable": health.retryable,
+        }
+        if self._db:
+            try:
+                if health.operationally_incomplete:
+                    await self._db.fail_run(run_id, "; ".join(health.errors), summary=summary)
+                else:
+                    await self._db.complete_run(run_id, summary)
+            except Exception as exc:
+                logger.warning("hypothesis run finalization failed for %s: %s", run_id, exc)
         return summary
 
     async def _run_legacy(self, state: StateStore) -> dict[str, Any]:

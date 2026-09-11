@@ -15,8 +15,8 @@ from typing import Any
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.detectors.unified_diff import iter_added_lines
-from reviewforge.engine.editor import Editor
+from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
+from reviewforge.engine.editor import Editor, Publication, render_review_body
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
@@ -125,7 +125,7 @@ async def _run_llm_stages(
     workspace: Any,
     config: Any,
     language: str,
-) -> dict[str, Any]:
+) -> Publication:
     """Generator → lenses → investigator → editor for one run."""
 
     router = orchestrator._model_router
@@ -215,7 +215,7 @@ async def _run_llm_stages(
                     "strength": item.evidence_strength,
                 },
             )
-    return editor_stats
+    return publication
 
 
 async def _persist_ledger(orchestrator: Any, ledger: HypothesisLedger) -> None:
@@ -225,6 +225,45 @@ async def _persist_ledger(orchestrator: Any, ledger: HypothesisLedger) -> None:
     run_id = ledger.run_id
     for hypothesis in ledger.items.values():
         await database.append_hypothesis(run_id, hypothesis)
+
+
+async def deliver_publication(
+    gateway: Any,
+    state: StateStore,
+    publication: Publication,
+    *,
+    review_body: str = "",
+) -> tuple[int, int]:
+    """Coordinate-validate and deliver inline comments (mirrors ``_post_comments``).
+
+    Comments whose line is not a visible RIGHT-side diff coordinate are dropped;
+    the survivors are delivered as one bounded ``post_review`` batch carrying the
+    optional review ``body`` (the rendered ``<details>`` summary).  Returns
+    ``(delivered, rejected)``.
+    """
+
+    right_lines: dict[str, set[int]] = {}
+    for comment in publication.comments:
+        if comment.path in right_lines:
+            continue
+        patch = (state.file_diffs or {}).get(comment.path)
+        right_lines[comment.path] = {line for line, _content in iter_right_lines(patch or "")}
+
+    payload_comments: list[dict[str, Any]] = []
+    rejected = 0
+    for comment in publication.comments:
+        if comment.line <= 0 or comment.line not in right_lines.get(comment.path, set()):
+            rejected += 1
+            continue
+        payload_comments.append({"file_path": comment.path, "line": comment.line, "body": comment.body})
+
+    if not payload_comments and not review_body:
+        return (0, rejected)
+    params: dict[str, Any] = {"comments": payload_comments}
+    if review_body:
+        params["body"] = review_body
+    await gateway.invoke("post_review", params, state, agent_name="orchestrator")
+    return (len(payload_comments), rejected)
 
 
 async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
@@ -290,12 +329,19 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         except Exception as exc:
             logger.warning("detector seeding skipped: %s", exc)
 
-    editor_stats: dict[str, Any] = {"inline": 0, "summary": 0, "merged": 0, "fallback": False}
+    publication = Publication(comments=[], summary_items=[], merged=[], unknown_ids=[], fallback=False)
+    language = resolve_output_language(state, config)
     if getattr(orchestrator, "_model_router", None) is not None and changeset.units:
-        language = resolve_output_language(state, config)
-        editor_stats = await _run_llm_stages(orchestrator, state, changeset, pack, ledger, workspace, config, language)
+        publication = await _run_llm_stages(orchestrator, state, changeset, pack, ledger, workspace, config, language)
 
     await _persist_ledger(orchestrator, ledger)
+
+    delivered = 0
+    if config.mode == "hypothesis":
+        review_body = render_review_body(publication, ledger, output_language=language)
+        delivered, _rejected = await deliver_publication(
+            orchestrator._gateway, state, publication, review_body=review_body
+        )
 
     hypotheses = list(ledger.items.values())
     unknown_error = sum(
@@ -313,7 +359,7 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             "refuted": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.REFUTED),
             "unknown": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.UNKNOWN),
             "generated": len(generated),
-            "published": editor_stats["inline"] if config.mode == "hypothesis" else 0,
+            "published": delivered,
             "tokens_by_agent": {},
         },
     )

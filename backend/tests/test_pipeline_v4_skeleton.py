@@ -8,8 +8,10 @@ import pytest
 from reviewforge.core.config import PipelineV4Config
 from reviewforge.core.events import EventBus
 from reviewforge.core.state import StateStore
+from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.pipeline_v4 import run_hypothesis_pipeline
+from reviewforge.engine.run_health import RunHealth
 from reviewforge.tools.workspace import WorkspaceInfo
 
 
@@ -99,3 +101,75 @@ async def test_skeleton_emits_complete_workspace_and_context_events(tmp_path) ->
     assert seen[2].event_type == "pipeline_v4.completed"
     assert state.ledger is not None
     assert state.ledger.run_id == "run"
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_dispatch_runs_new_path_and_cleans_up(monkeypatch) -> None:
+    cleanup = AsyncMock()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pipeline_v4_config = PipelineV4Config(mode="hypothesis")
+    orchestrator._events = EventBus()
+    orchestrator._gateway = SimpleNamespace(cleanup_workspace=cleanup)
+    orchestrator._db = None
+    monkeypatch.setattr(
+        "reviewforge.engine.orchestrator.run_hypothesis_pipeline",
+        AsyncMock(return_value=RunHealth.build()),
+    )
+    state = StateStore(repo="owner/repo", pr_number=1, head_sha="abc")
+
+    summary = await orchestrator.run(state)
+
+    assert summary["mode"] == "hypothesis"
+    assert summary["status"] == "completed"
+    assert summary["confirmed"] == 0
+    cleanup.assert_awaited_once_with(state)
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_dispatch_resumes_restored_ledger(monkeypatch) -> None:
+    restored = HypothesisLedger("resume123", "abc", "digest")
+    cleanup = AsyncMock()
+
+    class _DB:
+        def __init__(self) -> None:
+            self.create_run = AsyncMock()
+
+        async def get_resumable_run(self, repo, pr_number, head_sha):
+            return {"run_id": "resume123"}
+
+        async def restart_run(self, run_id):
+            return True
+
+        async def load_hypothesis_ledger(self, run_id):
+            return restored
+
+        async def has_active_run_for_head(self, repo, pr_number, head_sha):
+            return False
+
+        async def complete_run(self, run_id, summary):
+            return None
+
+        async def fail_run(self, run_id, message, summary=None):
+            return None
+
+    db = _DB()
+    events = EventBus()
+    seen = []
+    events.subscribe(seen.append)
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pipeline_v4_config = PipelineV4Config(mode="hypothesis")
+    orchestrator._events = events
+    orchestrator._gateway = SimpleNamespace(cleanup_workspace=cleanup)
+    orchestrator._db = db
+    monkeypatch.setattr(
+        "reviewforge.engine.orchestrator.run_hypothesis_pipeline",
+        AsyncMock(return_value=RunHealth.build()),
+    )
+    state = StateStore(repo="owner/repo", pr_number=1, head_sha="abc")
+
+    summary = await orchestrator.run(state)
+
+    assert summary["status"] == "completed"
+    assert state.ledger is restored
+    db.create_run.assert_not_awaited()
+    assert seen[-1].event_type == "review.resumed"

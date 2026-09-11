@@ -58,6 +58,20 @@ def test_run_health_aggregates_stage_errors_without_losing_counts():
     assert health.errors == ["planner unavailable", "provider limited", "github unavailable"]
 
 
+def test_hypothesis_investigation_stages_drive_completion():
+    assert RunHealth.build().completed is True
+    partial = RunHealth.build(investigation_unknown_errors=1)
+    assert partial.completed is False
+    assert partial.operationally_incomplete is True
+    assert partial.investigation.failures == 1
+
+
+def test_hypothesis_failures_are_retryable():
+    health = RunHealth.build(hypothesis_failures=2)
+    assert health.retryable is True
+    assert health.hypothesis.failures == 2
+
+
 def test_evaluation_coverage_does_not_treat_abstained_as_resolved():
     orchestrator = object.__new__(Orchestrator)
     orchestrator._v3_enabled = True

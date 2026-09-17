@@ -40,6 +40,16 @@ jobs:
             BUNDLE_PATH="/tmp/reviewforge-${{ github.sha }}.bundle"
             git fetch "$BUNDLE_PATH" main
             git reset --hard FETCH_HEAD
+            # Allow HTTP / private-network LLM endpoints (self-hosted model
+            # gateway).  .env is gitignored and preserved across deploys, so the
+            # deploy step keeps this flag pinned instead of requiring a manual
+            # server edit.  Set the value to 0 to re-enable the SSRF guard.
+            touch .env
+            if grep -q '^REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=' .env; then
+              sed -i 's|^REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=.*|REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=1|' .env
+            else
+              printf 'REVIEWFORGE_ALLOW_PRIVATE_LLM_ENDPOINTS=1\n' >> .env
+            fi
             REVIEWFORGE_BUNDLE_PATH="$BUNDLE_PATH" bash scripts/deploy.sh
 
   lint:

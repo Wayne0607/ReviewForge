@@ -15,6 +15,10 @@ pytest.importorskip("fcntl", reason="benchmark search coordination uses Linux fl
 def runner(monkeypatch):
     root = Path(__file__).resolve().parents[2]
     monkeypatch.setenv("REVIEWFORGE_REPO_ROOT", str(root))
+    # The runner intentionally sets process-local overrides. Register them
+    # with pytest's environment restoration before invoking its bootstrap.
+    monkeypatch.setenv("REVIEWFORGE_PIPELINE", "legacy")
+    monkeypatch.setenv("REVIEWFORGE_OUTPUT_LANGUAGE", "en")
     spec = importlib.util.spec_from_file_location("martian_runner", root / "scripts/benchmarks/martian_runner.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

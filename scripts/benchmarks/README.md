@@ -43,6 +43,13 @@ matching and duplicate penalties. Its settings-path adapter permits use of the
 same existing provider from an isolated checkout. Record its SHA256 with each
 paired report. Do not use holdout results for tuning.
 
+`context_snapshot.py --repo keycloak/keycloak --pr 36880 --output context.json`
+captures a pinned workspace, semantic units, every collected source slice and the
+bounded rendered pack without invoking an LLM. It records omitted context kinds,
+source/head/script hashes and checks repeat rendering for determinism. Use the
+same isolated environment variables as the runner; cleanup always releases the
+workspace. The snapshot describes supplied context, not review quality.
+
 The v4 delivery recovery protocol matches the hidden marker against submitted
 reviews at the same commit, following the [GitHub review listing API](https://docs.github.com/en/rest/pulls/reviews?apiVersion=2022-11-28).
 An absent marker after an ambiguous write does not authorize another POST.

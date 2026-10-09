@@ -82,6 +82,8 @@ Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复�
 
 新增 hunk/证据边界回归后，Windows 全量测试 `1440 passed, 1 skipped, 6 warnings`；ruff / format 均通过。
 
+新增只读 `context_snapshot.py`，记录固定 PR head 的语义单元、原始 ContextSlice、渲染与截断方向；不调用模型，重复渲染检查一致性。用于 SPEC 指定的三个大仓库实例抽查。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

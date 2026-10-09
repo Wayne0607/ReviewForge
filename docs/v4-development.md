@@ -72,6 +72,10 @@ Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复�
 
 同一服务商的探测证明 `thinking.type=disabled` 可用（reasoning tokens=0）。后续开发对照统一采用 DeepSeek 非思考模式和跨进程 30 秒限速；与默认思考模式诊断结果分开，不能混算或冒充原 MiniMax-M3 验收。该参数格式参考 [DeepSeek 官方说明](https://api-docs.deepseek.com/guides/thinking_mode/)，实际可用性以此服务器探测回执验证。
 
+`96827a3` 的非思考单 PR 诊断仍为 partial：两个生成回执分别开始了 29 / 28 条假设，重复同一 unit/机制/anchor，耗尽 8192 输出预算；代码只在消费阶段截取最多 12 条，未把配置上限交付给模型。补齐 generator/lens 的动态数量约束及简洁、同身份合并要求。原格式修复未收到原响应而重复生成；改为仅交付原响应修复格式，缺事实或截断要求返回 null，不能用空数组冒充成功。仍保留一次修复、RIGHT 原文校验、severity 溢出处理，不增加候选过滤门槛。
+
+本轮 Windows 全量测试：`1438 passed, 1 skipped, 6 warnings`，新增 3 项生成契约回归。此前 `96827a3` Linux dev CI 为 1438 项通过。本轮限流回执包含 `inference exceeds tpm/rpm limit`，30 秒间隔不足；下次开发诊断及正式配对均显式用 60 秒请求间隔，与前一轮结果分开保存。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

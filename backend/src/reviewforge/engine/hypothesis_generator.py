@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
@@ -241,6 +241,7 @@ class HypothesisGenerator:
             self._prompt_template,
             output_language=_language_directive(self._output_language),
             lens=lens_name,
+            max_hypotheses=self._max_hypotheses,
         )
         if self._skill_body:
             prompt = f"{prompt}\n\n## 本维度专项规则\n{self._skill_body}"
@@ -289,9 +290,9 @@ class HypothesisGenerator:
                 failure = f"{self._source} input-too-large"
             else:
                 try:
-                    parsed = await self._invoke_once(user)
+                    parsed, original = await self._invoke_once(user)
                     if parsed is None:
-                        parsed = await self._invoke_repair(user)
+                        parsed = await self._invoke_repair(original)
                 except Exception as exc:
                     parsed = None
                     failure = f"{self._source} provider error: {type(exc).__name__}"
@@ -359,25 +360,29 @@ class HypothesisGenerator:
         sections.append("## Existing hypotheses\n" + _render_existing(ledger))
         return "\n\n".join(sections)
 
-    async def _invoke_once(self, user: str) -> dict[str, Any] | None:
+    async def _invoke_once(self, user: str) -> tuple[dict[str, Any] | None, str]:
         messages = [
             SystemMessage(content=self._system_prompt()),
             HumanMessage(content=user),
         ]
         response = await self._llm.ainvoke(messages, max_tokens=8192)
-        return self._parse_response(getattr(response, "content", "") or "")
+        content = getattr(response, "content", "") or ""
+        return self._parse_response(content), content
 
-    async def _invoke_repair(self, user: str) -> dict[str, Any] | None:
+    async def _invoke_repair(self, original: str) -> dict[str, Any] | None:
         messages = [
-            SystemMessage(content=self._system_prompt()),
-            HumanMessage(content=user),
-            HumanMessage(
+            SystemMessage(
                 content=(
-                    "Your previous response was not valid hypotheses JSON. "
-                    'Return only JSON with a "hypotheses" array and a "no_issue_units" array; '
-                    "use an empty array when there is nothing to report."
+                    "Repair the JSON formatting of the supplied response only. "
+                    'The schema is an object with "hypotheses" and "no_issue_units" arrays. '
+                    "Preserve every entry and its facts verbatim; do not review code again, "
+                    "add hypotheses, invent missing field values, or discard incomplete entries. "
+                    "If the response is truncated or lacks enough information for a faithful repair, "
+                    "return null. Output only the repaired JSON or null."
                 )
             ),
+            AIMessage(content=original),
+            HumanMessage(content="Repair the supplied response without changing its contents."),
         ]
         response = await self._llm.ainvoke(messages, max_tokens=8192)
         return self._parse_response(getattr(response, "content", "") or "")

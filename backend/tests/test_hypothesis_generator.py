@@ -226,6 +226,39 @@ async def test_parse_failure_marks_the_units_unresolved() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("template", ["generator", "lens"])
+async def test_generation_prompt_delivers_configured_output_bound(template: str) -> None:
+    llm = _ScriptedLLM(responses=['{"hypotheses": [], "no_issue_units": []}'])
+    await HypothesisGenerator(llm, max_hypotheses=2, prompt_template=template).run(
+        StateStore(file_diffs=_server_diff()),
+        ContextPack(),
+        _changeset(_unit("service.py", "get_or_create_resource")),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+    prompt = llm.calls[0][0].content
+    assert "2 条不同的假设" in prompt
+    assert "{{max_hypotheses}}" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_format_repair_receives_original_instead_of_repeating_code_review() -> None:
+    payload = {"hypotheses": [_hypothesis("wrong-argument")], "no_issue_units": []}
+    malformed = json.dumps(payload)[:-1] + ",}"
+    llm = _ScriptedLLM(responses=[malformed, json.dumps(payload)])
+    result = await HypothesisGenerator(llm).run(
+        StateStore(file_diffs=_server_diff()),
+        ContextPack(),
+        _changeset(_unit("service.py", "get_or_create_resource")),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+    assert result.accepted == 1
+    repair = llm.calls[1]
+    assert repair[1].type == "ai" and repair[1].content == malformed
+    assert "return null" in repair[0].content
+    assert all("## Changes" not in message.content for message in repair)
+
+
+@pytest.mark.asyncio
 async def test_invalid_mechanism_is_dropped() -> None:
     llm = _ScriptedLLM(responses=[json.dumps({"hypotheses": [_hypothesis("banana")], "no_issue_units": []})])
     generator = HypothesisGenerator(llm)

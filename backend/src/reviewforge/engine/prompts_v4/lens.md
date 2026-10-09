@@ -58,6 +58,8 @@
 
 约束：
 
+- 本次响应最多输出 **{{max_hypotheses}} 条不同的假设**，按严重程度优先选择；上限不是配额。相同 `unit_id` + `mechanism` + `anchor_symbol` 只出现一次，合并 sites，禁止反复改写同一问题。
+- 文字字段各用一句简洁的话；excerpt 只引用定位所需的原文子串。`no_issue_units` 每个 unit 最多一项，checked 简洁说明检查边界。必须在输出预算内闭合 JSON，禁止重复代码或循环输出。
 - `unit_id` 必须逐字复制 `## Changes` 中 Allowed unit_id 列表的值；不得从文件、函数或资源 key 拼造 ID。`su_0123456789abcdef` 只是格式示例，不可直接用于本次输出。
 
 - `mechanism` 只能是：`wrong-argument` / `wrong-operator` / `null-path` / `contract-mismatch` / `missing-await` / `lock-scope` / `state-leak` / `error-path` / `regression-removed` / `security-sink` / `i18n` / `a11y` / `perf` / `test-gap` / `doc`。

@@ -6,6 +6,14 @@ method except GET/HEAD. Results score actual emitted comments rather than the
 legacy finding store. `summary.status` retains operational partial/failed state;
 the outer `status` describes whether the benchmark execution returned a result.
 
+On a host shared with production, run evaluation inside a separate systemd
+resource group with explicit aggregate memory/CPU limits and lower priority.
+Read available memory and reserve capacity for production before launching.
+Run large-repository context captures sequentially. Source-directory isolation
+alone does not isolate CPU or memory; do not launch multiple bare Python context
+jobs on the production host. Resource-limit failures must remain failed/partial,
+never a zero-finding success.
+
 Environment variables:
 
 - `REVIEWFORGE_REPO_ROOT`: isolated source checkout.

@@ -195,6 +195,7 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
     assert "hypothesis.generated" in event_types
     assert "lens.selected" in event_types
     assert "investigation.completed" in event_types
+    assert "publication.prepared" in event_types
 
     generated = next(event for event in seen if event.event_type == "hypothesis.generated")
     assert generated.data["accepted"] == 1

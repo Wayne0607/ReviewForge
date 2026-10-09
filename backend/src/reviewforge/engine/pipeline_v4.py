@@ -16,6 +16,7 @@ from typing import Any
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines
+from reviewforge.engine.editor import Editor
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
@@ -180,6 +181,23 @@ async def _run_llm_stages(
         pack,
         max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
         concurrency=config.investigator_concurrency,
+    )
+
+    editor = Editor(
+        router.get_llm("editor"),
+        output_language=language,
+        max_inline=config.publish_max_inline,
+        max_inline_overflow=config.publish_max_inline_overflow,
+    )
+    publication = await editor.run(ledger, pack)
+    events.emit(
+        "publication.prepared",
+        {
+            "comments": len(publication.comments),
+            "summary_items": len(publication.summary_items),
+            "unknown_ids": len(publication.unknown_ids),
+            "fallback": publication.fallback,
+        },
     )
 
     for item in ledger.items.values():

@@ -14,6 +14,7 @@ from reviewforge.engine.editor import (
     PublicationComment,
     cluster_confirmed,
     order_clusters,
+    render_review_body,
     split_for_publication,
     validate_comments,
 )
@@ -158,3 +159,29 @@ async def test_editor_parses_valid_comments() -> None:
     assert publication.fallback is False
     assert len(publication.comments) == 1
     assert publication.comments[0].path == "a.py"
+
+
+def test_render_review_body_lists_summary_and_unknown() -> None:
+    ledger = _ledger(_hyp(1, Mechanism.NULL_PATH, "f", "error", "strong"))
+    publication = Publication(
+        comments=[],
+        summary_items=[("h_1", "one-line summary")],
+        merged=[],
+        unknown_ids=["h_1"],
+    )
+
+    body = render_review_body(publication, ledger, output_language="en")
+
+    assert "<details>" in body
+    assert "one-line summary" in body
+    assert "could not be confirmed within budget" in body
+    assert "claim 1" in body  # UNKNOWN claim text resolved from the ledger
+
+
+def test_render_review_body_uses_fixed_zh_wording() -> None:
+    ledger = _ledger(_hyp(1, Mechanism.NULL_PATH, "f", "error", "strong"))
+    publication = Publication(comments=[], summary_items=[], merged=[], unknown_ids=["h_1"])
+
+    body = render_review_body(publication, ledger, output_language="zh-CN")
+
+    assert "未能在预算内确认" in body

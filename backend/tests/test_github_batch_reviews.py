@@ -83,6 +83,62 @@ async def test_post_review_comments_sends_create_review_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_review_comments_includes_review_body() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(201, json={"id": 456})
+
+    client = await _client_with_transport(handler)
+    try:
+        result = await client.post_review_comments(
+            "acme/widget",
+            17,
+            "deadbeef",
+            [{"path": "src/a.py", "line": 7, "body": "Issue"}],
+            body="<details>\n<summary>Review summary</summary>\n</details>",
+        )
+    finally:
+        await client.close()
+
+    assert result == {"id": 456}
+    assert captured["payload"]["body"] == "<details>\n<summary>Review summary</summary>\n</details>"
+    assert captured["payload"]["comments"][0]["path"] == "src/a.py"
+
+
+@pytest.mark.asyncio
+async def test_post_review_comments_allows_body_only_review() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(201, json={"id": 789})
+
+    client = await _client_with_transport(handler)
+    try:
+        result = await client.post_review_comments(
+            "acme/widget", 17, "deadbeef", [], body="<details>only summary</details>"
+        )
+    finally:
+        await client.close()
+
+    assert result == {"id": 789}
+    assert captured["payload"]["body"] == "<details>only summary</details>"
+    assert "comments" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_post_review_comments_requires_comment_or_body() -> None:
+    client = await _client_with_transport(lambda _request: httpx.Response(201, json={"id": 1}))
+    try:
+        with pytest.raises(ValueError, match="at least one inline comment or a body"):
+            await client.post_review_comments("acme/widget", 17, "deadbeef", [])
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_plain_422_is_validation_error_without_retry() -> None:
     requests = 0
     sleeps: list[float] = []

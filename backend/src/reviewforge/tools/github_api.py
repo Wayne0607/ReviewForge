@@ -141,11 +141,17 @@ class GitHubClient:
         pr_number: int,
         commit_sha: str,
         comments: list[dict[str, Any]],
+        body: str = "",
     ) -> dict[str, Any]:
-        """Create one COMMENT review containing a bounded set of inline comments."""
+        """Create one COMMENT review carrying a bounded set of inline comments.
 
-        if not comments:
-            raise ValueError("A review requires at least one inline comment")
+        ``body`` is the optional Markdown review summary rendered into the PR
+        review ``<details>``; when only a body is supplied a body-only review is
+        created.
+        """
+
+        if not comments and not body:
+            raise ValueError("A review requires at least one inline comment or a body")
         if len(comments) > MAX_REVIEW_COMMENTS_PER_REQUEST:
             raise ValueError(f"Review comment batch exceeds {MAX_REVIEW_COMMENTS_PER_REQUEST}: {len(comments)}")
 
@@ -158,11 +164,14 @@ class GitHubClient:
             }
             for item in comments
         ]
-        payload = {
+        payload: dict[str, Any] = {
             "commit_id": commit_sha,
             "event": "COMMENT",
-            "comments": review_comments,
         }
+        if body:
+            payload["body"] = body
+        if review_comments:
+            payload["comments"] = review_comments
         async with _REVIEW_WRITE_LOCK:
             return await self._post_json_with_retry(
                 f"/repos/{repo}/pulls/{int(pr_number)}/reviews",

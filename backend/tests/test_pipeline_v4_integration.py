@@ -14,8 +14,9 @@ from reviewforge.core.config import PipelineV4Config
 from reviewforge.core.events import EventBus
 from reviewforge.core.state import StateStore
 from reviewforge.engine.detectors.base import DetectorFinding
+from reviewforge.engine.editor import Publication, PublicationComment
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus
-from reviewforge.engine.pipeline_v4 import _seed_detector_hypotheses, run_hypothesis_pipeline
+from reviewforge.engine.pipeline_v4 import _seed_detector_hypotheses, deliver_publication, run_hypothesis_pipeline
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 from reviewforge.tools.workspace import WorkspaceInfo
 
@@ -205,3 +206,55 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
     hypothesis = state.ledger.items["su_test_f::null-path::f"]
     assert hypothesis.status == HypothesisStatus.UNKNOWN
     assert hypothesis.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_deliver_publication_validates_right_side_coordinates() -> None:
+    diff = _diff("def f(x):", "    return x.name")
+    state = StateStore(repo="o/r", pr_number=1, head_sha="abc", file_diffs={"app.py": diff})
+    publication = Publication(
+        comments=[
+            PublicationComment(hypothesis_ids=["h_1"], path="app.py", line=2, title="t", body="visible"),
+            PublicationComment(hypothesis_ids=["h_2"], path="app.py", line=999, title="t", body="off-diff"),
+            PublicationComment(hypothesis_ids=["h_3"], path="missing.py", line=1, title="t", body="no-patch"),
+        ],
+        summary_items=[],
+        merged=[],
+    )
+    calls: list = []
+
+    async def invoke(name, params, state_, agent_name=""):
+        calls.append((name, params))
+        return {"ok": True}
+
+    gateway = SimpleNamespace(invoke=invoke)
+
+    delivered, rejected = await deliver_publication(gateway, state, publication)
+
+    assert delivered == 1
+    assert rejected == 2
+    assert calls[0][0] == "post_review"
+    assert [comment["file_path"] for comment in calls[0][1]["comments"]] == ["app.py"]
+    assert calls[0][1]["comments"][0]["line"] == 2
+
+
+@pytest.mark.asyncio
+async def test_deliver_publication_passes_review_body() -> None:
+    state = StateStore(repo="o/r", pr_number=1, head_sha="abc", file_diffs={})
+    publication = Publication(comments=[], summary_items=[], merged=[])
+    calls: list = []
+
+    async def invoke(name, params, state_, agent_name=""):
+        calls.append((name, params))
+        return {"ok": True}
+
+    gateway = SimpleNamespace(invoke=invoke)
+
+    delivered, rejected = await deliver_publication(
+        gateway, state, publication, review_body="<details>summary</details>"
+    )
+
+    assert (delivered, rejected) == (0, 0)
+    assert calls[0][0] == "post_review"
+    assert calls[0][1]["comments"] == []
+    assert calls[0][1]["body"] == "<details>summary</details>"

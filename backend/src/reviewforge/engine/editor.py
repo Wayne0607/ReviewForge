@@ -322,6 +322,28 @@ def _merged_from(parsed: dict[str, Any]) -> list[list[str]]:
     return merged
 
 
+def render_review_body(publication: Publication, ledger: HypothesisLedger, *, output_language: str = "auto") -> str:
+    """Render the PR review body ``<details>`` from summary items + UNKNOWN claims."""
+
+    english = output_language != "zh-CN"
+    claims_by_id = {item.id: item.claim for item in ledger.items.values()}
+    lines: list[str] = ["<details>\n<summary>Review summary</summary>\n"]
+
+    if publication.summary_items:
+        lines.append(f"\n**{'Summary' if english else '摘要'}**\n")
+        for _identity, one_line in publication.summary_items:
+            lines.append(f"- {one_line}\n")
+
+    if publication.unknown_ids:
+        wording = "could not be confirmed within budget" if english else "未能在预算内确认"
+        lines.append(f"\n**{'Unconfirmed' if english else '未能确认'}**（{wording}）\n")
+        for identity in publication.unknown_ids:
+            lines.append(f"- {claims_by_id.get(identity, identity)}\n")
+
+    lines.append("\n</details>\n")
+    return "".join(lines)
+
+
 __all__ = [
     "ConfirmedCluster",
     "Editor",
@@ -330,6 +352,7 @@ __all__ = [
     "cluster_confirmed",
     "fallback_comment",
     "order_clusters",
+    "render_review_body",
     "split_for_publication",
     "validate_comments",
 ]

@@ -91,10 +91,11 @@ async def test_skeleton_emits_complete_workspace_and_context_events(tmp_path) ->
     )
     state = StateStore(repo="owner/repo", pr_number=1, head_sha="abc")
     await run_hypothesis_pipeline(fake, state)
-    workspace_event, context_event = seen
+    workspace_event, context_event = seen[:2]
     assert workspace_event.event_type == "workspace.built"
     assert set(workspace_event.data) == {"source", "file_count", "byte_size", "truncated", "digest", "ms"}
     assert context_event.event_type == "context_pack.built"
     assert set(context_event.data) == {"units", "slices", "truncated_units", "chars"}
+    assert seen[2].event_type == "pipeline_v4.completed"
     assert state.ledger is not None
     assert state.ledger.run_id == "run"

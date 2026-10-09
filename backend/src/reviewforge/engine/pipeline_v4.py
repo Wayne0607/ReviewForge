@@ -125,8 +125,8 @@ async def _run_llm_stages(
     workspace: Any,
     config: Any,
     language: str,
-) -> None:
-    """Generator → lenses → investigator for one run."""
+) -> dict[str, Any]:
+    """Generator → lenses → investigator → editor for one run."""
 
     router = orchestrator._model_router
     events = orchestrator._events
@@ -190,15 +190,13 @@ async def _run_llm_stages(
         max_inline_overflow=config.publish_max_inline_overflow,
     )
     publication = await editor.run(ledger, pack)
-    events.emit(
-        "publication.prepared",
-        {
-            "comments": len(publication.comments),
-            "summary_items": len(publication.summary_items),
-            "unknown_ids": len(publication.unknown_ids),
-            "fallback": publication.fallback,
-        },
-    )
+    editor_stats = {
+        "inline": len(publication.comments),
+        "summary": len(publication.summary_items),
+        "merged": len(publication.merged),
+        "fallback": publication.fallback,
+    }
+    events.emit("editor.completed", editor_stats)
 
     for item in ledger.items.values():
         if item.source.startswith("detector"):
@@ -217,6 +215,7 @@ async def _run_llm_stages(
                     "strength": item.evidence_strength,
                 },
             )
+    return editor_stats
 
 
 async def _persist_ledger(orchestrator: Any, ledger: HypothesisLedger) -> None:
@@ -291,9 +290,34 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         except Exception as exc:
             logger.warning("detector seeding skipped: %s", exc)
 
+    editor_stats: dict[str, Any] = {"inline": 0, "summary": 0, "merged": 0, "fallback": False}
     if getattr(orchestrator, "_model_router", None) is not None and changeset.units:
         language = resolve_output_language(state, config)
-        await _run_llm_stages(orchestrator, state, changeset, pack, ledger, workspace, config, language)
+        editor_stats = await _run_llm_stages(orchestrator, state, changeset, pack, ledger, workspace, config, language)
 
     await _persist_ledger(orchestrator, ledger)
-    return RunHealth.build()
+
+    hypotheses = list(ledger.items.values())
+    unknown_error = sum(
+        1
+        for hypothesis in hypotheses
+        if hypothesis.status == HypothesisStatus.UNKNOWN and hypothesis.severity == "error"
+    )
+    generated = [hypothesis for hypothesis in hypotheses if not hypothesis.source.startswith("detector")]
+    orchestrator._events.emit(
+        "pipeline_v4.completed",
+        {
+            "mode": config.mode,
+            "hypotheses_total": len(hypotheses),
+            "confirmed": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.CONFIRMED),
+            "refuted": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.REFUTED),
+            "unknown": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.UNKNOWN),
+            "generated": len(generated),
+            "published": editor_stats["inline"] if config.mode == "hypothesis" else 0,
+            "tokens_by_agent": {},
+        },
+    )
+    return RunHealth.build(
+        hypothesis_failures=len(ledger.unresolved_units),
+        investigation_unknown_errors=unknown_error,
+    )

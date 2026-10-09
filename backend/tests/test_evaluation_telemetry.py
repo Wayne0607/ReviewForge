@@ -200,3 +200,45 @@ def test_resume_mode_is_a_closed_v1_enum():
 
     with pytest.raises(EvaluationTelemetryError, match="normal or publication-only"):
         parse_evaluation_telemetry(payload)
+
+
+def _pipeline_v4_block(**overrides) -> dict:
+    block = {
+        "mode": "shadow",
+        "hypotheses_total": 3,
+        "confirmed": 1,
+        "refuted": 1,
+        "unknown": 1,
+        "published": 0,
+        "tokens_by_agent": {"generator": 1000},
+    }
+    block.update(overrides)
+    return block
+
+
+def test_pipeline_v4_block_round_trips_when_present():
+    payload = _payload()
+    payload["pipeline_v4"] = _pipeline_v4_block()
+
+    parsed = parse_evaluation_telemetry(payload)
+
+    assert parsed.pipeline_v4["mode"] == "shadow"
+    assert parsed.pipeline_v4["published"] == 0
+    assert parsed.to_dict()["pipeline_v4"]["tokens_by_agent"] == {"generator": 1000}
+
+
+def test_pipeline_v4_is_optional_for_legacy():
+    parsed = parse_evaluation_telemetry(_payload())
+    assert parsed.pipeline_v4 is None
+    assert "pipeline_v4" not in parsed.to_dict()
+
+
+def test_pipeline_v4_block_rejects_legacy_mode_and_bad_counts():
+    payload = _payload()
+    payload["pipeline_v4"] = _pipeline_v4_block(mode="legacy")
+    with pytest.raises(EvaluationTelemetryError, match="shadow or hypothesis"):
+        parse_evaluation_telemetry(payload)
+
+    payload["pipeline_v4"] = _pipeline_v4_block(confirmed=4)
+    with pytest.raises(EvaluationTelemetryError, match="cannot exceed hypotheses_total"):
+        parse_evaluation_telemetry(payload)

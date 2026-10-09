@@ -14,6 +14,7 @@ whether a cheap second pass is worth an extra call.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,7 +138,12 @@ def lens_skill_body(name: str) -> str:
 
 
 def build_lens_generator(
-    llm: BaseChatModel, name: str, *, max_hypotheses: int = 12, output_language: str = "en"
+    llm: BaseChatModel,
+    name: str,
+    *,
+    max_hypotheses: int = 12,
+    output_language: str = "en",
+    on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
 ) -> HypothesisGenerator:
     return HypothesisGenerator(
         llm,
@@ -146,6 +152,7 @@ def build_lens_generator(
         source=f"lens:{name}",
         prompt_template="lens",
         skill_body=lens_skill_body(name),
+        on_update=on_update,
     )
 
 
@@ -160,6 +167,7 @@ async def run_lens(
     *,
     output_language: str = "en",
     max_hypotheses: int = 12,
+    on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
 ) -> HypothesisGenerationResult:
     """Execute one lens over the units that triggered it and upsert into the ledger."""
 
@@ -170,7 +178,9 @@ async def run_lens(
         head_sha=changeset.head_sha,
         units=[unit for unit in changeset.units if unit.id in triggered_ids],
     )
-    generator = build_lens_generator(llm, name, max_hypotheses=max_hypotheses, output_language=output_language)
+    generator = build_lens_generator(
+        llm, name, max_hypotheses=max_hypotheses, output_language=output_language, on_update=on_update
+    )
     return await generator.run(state, pack, filtered, ledger)
 
 

@@ -79,6 +79,9 @@ class Hypothesis:
     observations: list[Observation] = field(default_factory=list)
     verdict_reason: str = ""
     attempts: int = 0
+    investigation_steps: int = 0
+    investigation_tokens: int = 0
+    retryable: bool = False
 
     def __post_init__(self) -> None:
         if self.severity not in _SEVERITY_RANK:
@@ -120,6 +123,9 @@ class Hypothesis:
             observations=observations,
             verdict_reason=str(data.get("verdict_reason", "")),
             attempts=int(data.get("attempts", 0)),
+            investigation_steps=int(data.get("investigation_steps", 0)),
+            investigation_tokens=int(data.get("investigation_tokens", 0)),
+            retryable=bool(data.get("retryable", False)),
         )
 
 
@@ -172,6 +178,9 @@ class HypothesisLedger:
         observations: list[Observation] | None = None,
         severity: str | None = None,
         additional_sites: list[Site] | None = None,
+        investigation_steps: int = 0,
+        investigation_tokens: int = 0,
+        retryable: bool = False,
     ) -> Hypothesis:
         """Apply an investigation verdict to one hypothesis.
 
@@ -192,6 +201,9 @@ class HypothesisLedger:
             if severity in _SEVERITY_RANK:
                 current.severity = severity
             current.attempts += 1
+            current.investigation_steps = investigation_steps
+            current.investigation_tokens = investigation_tokens
+            current.retryable = retryable
             if observations:
                 known = {observation.id for observation in current.observations}
                 for observation in observations:

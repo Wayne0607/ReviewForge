@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import asdict
 from typing import Any
 
 from reviewforge.core.state import StateStore
@@ -23,18 +23,13 @@ from reviewforge.engine.investigator import Investigator, build_workspace_execut
 from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.lenses import run_lens, select_lenses
 from reviewforge.engine.phase0 import scan_changed_files
+from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
 from reviewforge.engine.run_health import RunHealth
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, compile_semantic_changeset
-from reviewforge.tools.workspace import WorkspaceUnavailable
+from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _UnavailableWorkspace:
-    digest: str
-    source: str = "api-fallback"
 
 
 _SEVERITY_ALIASES = {
@@ -125,18 +120,31 @@ async def _run_llm_stages(
     workspace: Any,
     config: Any,
     language: str,
+    usage_by_agent: dict[str, int],
 ) -> Publication:
     """Generator → lenses → investigator → editor for one run."""
 
     router = orchestrator._model_router
     events = orchestrator._events
+    ctx = RunContext()
+    ctx.set(ledger.run_id, getattr(orchestrator, "_db", None))
+
+    def routed(name: str):
+        async def record(usage: dict[str, Any]) -> None:
+            usage_by_agent[name] = usage_by_agent.get(name, 0) + int(usage["total_tokens"])
+
+        return TrackedChatLLM(router.get_llm(name), ctx, name, usage_sink=record)
+
+    async def checkpoint(current: HypothesisLedger) -> None:
+        await _persist_ledger(orchestrator, current)
 
     generator = HypothesisGenerator(
-        router.get_llm("hypothesis_generator"),
+        routed("hypothesis_generator"),
         max_input_chars=config.generator_max_input_chars,
         max_hypotheses=config.generator_max_hypotheses,
         context_max_chars=config.context_pack_max_chars,
         output_language=language,
+        on_update=checkpoint,
     )
     gen_result = await generator.run(state, pack, changeset, ledger)
     events.emit(
@@ -147,7 +155,7 @@ async def _run_llm_stages(
             "accepted": gen_result.accepted,
             "dropped_unanchored": gen_result.dropped_unanchored,
             "dropped_overflow": gen_result.dropped_overflow,
-            "tokens": 0,
+            "tokens": usage_by_agent.get("hypothesis_generator", 0),
         },
     )
 
@@ -160,7 +168,7 @@ async def _run_llm_stages(
         },
     )
     for selection in selections:
-        llm = router.get_llm(f"lens_{selection.name}")
+        llm = routed(f"lens_{selection.name}")
         await run_lens(
             llm,
             selection.name,
@@ -171,20 +179,25 @@ async def _run_llm_stages(
             ledger,
             output_language=language,
             max_hypotheses=config.generator_max_hypotheses,
+            on_update=checkpoint,
         )
 
     executor = build_workspace_executor(workspace, state)
-    investigator = Investigator(router.get_llm("investigator"), executor, output_language=language)
+    for item in ledger.items.values():
+        if item.status == HypothesisStatus.UNKNOWN and item.retryable:
+            item.status = HypothesisStatus.OPEN
+    investigator = Investigator(routed("investigator"), executor, output_language=language)
     await investigator.run(
         ledger,
         state,
         pack,
         max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
         concurrency=config.investigator_concurrency,
+        on_update=checkpoint,
     )
 
     editor = Editor(
-        router.get_llm("editor"),
+        routed("editor"),
         output_language=language,
         max_inline=config.publish_max_inline,
         max_inline_overflow=config.publish_max_inline_overflow,
@@ -209,8 +222,8 @@ async def _run_llm_stages(
                 {
                     "hypothesis_id": item.id,
                     "verdict": item.status.value,
-                    "steps": item.attempts,
-                    "tokens": 0,
+                    "steps": item.investigation_steps,
+                    "tokens": item.investigation_tokens,
                     "observations": len(item.observations),
                     "strength": item.evidence_strength,
                 },
@@ -220,11 +233,18 @@ async def _run_llm_stages(
 
 async def _persist_ledger(orchestrator: Any, ledger: HypothesisLedger) -> None:
     database = getattr(orchestrator, "_db", None)
-    if database is None or not callable(getattr(database, "append_hypothesis", None)):
+    if database is None:
+        return
+    if callable(getattr(database, "checkpoint_hypothesis_ledger", None)):
+        await database.checkpoint_hypothesis_ledger(ledger)
+        return
+    if not callable(getattr(database, "append_hypothesis", None)):
         return
     run_id = ledger.run_id
     for hypothesis in ledger.items.values():
-        await database.append_hypothesis(run_id, hypothesis)
+        await database.append_hypothesis(
+            run_id, hypothesis, head_sha=ledger.head_sha, workspace_digest=ledger.workspace_digest
+        )
 
 
 async def deliver_publication(
@@ -242,6 +262,16 @@ async def deliver_publication(
     ``(delivered, rejected)``.
     """
 
+    params, rejected = publication_payload(state, publication, review_body=review_body)
+    if not params["comments"] and not review_body:
+        return (0, rejected)
+    await gateway.invoke("post_review", params, state, agent_name="orchestrator")
+    return (len(params["comments"]), rejected)
+
+
+def publication_payload(
+    state: StateStore, publication: Publication, *, review_body: str = ""
+) -> tuple[dict[str, Any], int]:
     right_lines: dict[str, set[int]] = {}
     for comment in publication.comments:
         if comment.path in right_lines:
@@ -257,38 +287,22 @@ async def deliver_publication(
             continue
         payload_comments.append({"file_path": comment.path, "line": comment.line, "body": comment.body})
 
-    if not payload_comments and not review_body:
-        return (0, rejected)
-    params: dict[str, Any] = {"comments": payload_comments}
-    if review_body:
-        params["body"] = review_body
-    await gateway.invoke("post_review", params, state, agent_name="orchestrator")
-    return (len(payload_comments), rejected)
+    return ({"comments": payload_comments, "body": review_body}, rejected)
 
 
 async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     """Build the immutable workspace, semantic units and deterministic pack."""
 
     started = time.perf_counter()
-    try:
-        workspace = await orchestrator._gateway.workspace_for(state)
-        info = workspace.info
-        workspace_payload = {
-            "source": info.source,
-            "file_count": info.file_count,
-            "byte_size": info.byte_size,
-            "truncated": info.truncated,
-            "digest": info.digest,
-        }
-    except WorkspaceUnavailable:
-        workspace = _UnavailableWorkspace(digest=str(state.head_sha or ""))
-        workspace_payload = {
-            "source": "unavailable",
-            "file_count": 0,
-            "byte_size": 0,
-            "truncated": True,
-            "digest": str(state.head_sha or ""),
-        }
+    workspace = await orchestrator._gateway.workspace_for(state)
+    info = workspace.info
+    workspace_payload = {
+        "source": info.source,
+        "file_count": info.file_count,
+        "byte_size": info.byte_size,
+        "truncated": info.truncated,
+        "digest": info.digest,
+    }
     workspace_payload["ms"] = int((time.perf_counter() - started) * 1000)
     workspace_event = orchestrator._events.emit("workspace.built", workspace_payload)
 
@@ -326,8 +340,11 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     elif state.ledger.head_sha != str(state.head_sha or ""):
         raise ValueError("restored hypothesis ledger does not match PR head")
     ledger = state.ledger
+    await _persist_ledger(orchestrator, ledger)
+    database = getattr(orchestrator, "_db", None)
+    saved = await database.get_v4_publication(ledger.run_id) if database and config.mode == "hypothesis" else None
 
-    if state.files_changed:
+    if not saved and state.files_changed:
         try:
             scan = await scan_changed_files(orchestrator._gateway, state)
             _seed_detector_hypotheses(state, changeset, ledger, scan.findings)
@@ -336,17 +353,35 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
 
     publication = Publication(comments=[], summary_items=[], merged=[], unknown_ids=[], fallback=False)
     language = resolve_output_language(state, config)
-    if getattr(orchestrator, "_model_router", None) is not None and changeset.units:
-        publication = await _run_llm_stages(orchestrator, state, changeset, pack, ledger, workspace, config, language)
+    usage_by_agent: dict[str, int] = {}
+    if not saved and getattr(orchestrator, "_model_router", None) is not None and changeset.units:
+        publication = await _run_llm_stages(
+            orchestrator, state, changeset, pack, ledger, workspace, config, language, usage_by_agent
+        )
 
     await _persist_ledger(orchestrator, ledger)
 
     delivered = 0
-    if config.mode == "hypothesis":
-        review_body = render_review_body(publication, ledger, output_language=language)
-        delivered, _rejected = await deliver_publication(
-            orchestrator._gateway, state, publication, review_body=review_body
+    rejected = 0
+    outcome = DeliveryOutcome()
+    review_body = render_review_body(publication, ledger, output_language=language)
+    payload, rejected = publication_payload(state, publication, review_body=review_body)
+    if config.mode == "shadow" and database:
+        await database.save_shadow_publication(
+            ledger.run_id, {"publication": asdict(publication), "payload": payload, "rejected": rejected}
         )
+    if config.mode == "hypothesis":
+        if database and (saved or payload["comments"] or payload["body"]):
+            if not saved:
+                await database.prepare_v4_publication(ledger.run_id, ledger.head_sha, {**payload, "rejected": rejected})
+            else:
+                rejected = saved["payload"].get("rejected", 0)
+            outcome = await deliver_saved_publication(database, orchestrator._gateway, state, ledger.run_id)
+            delivered = outcome.delivered
+        elif payload["comments"] or payload["body"]:
+            delivered, rejected = await deliver_publication(
+                orchestrator._gateway, state, publication, review_body=review_body
+            )
 
     hypotheses = list(ledger.items.values())
     unknown_error = sum(
@@ -365,10 +400,14 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             "unknown": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.UNKNOWN),
             "generated": len(generated),
             "published": delivered,
-            "tokens_by_agent": {},
+            "tokens_by_agent": usage_by_agent,
         },
     )
     return RunHealth.build(
         hypothesis_failures=len(ledger.unresolved_units),
         investigation_unknown_errors=unknown_error,
+        investigation_retryable=any(item.retryable for item in hypotheses),
+        delivery_failures=rejected,
+        delivery_errors=(outcome.error,) if outcome.error else (),
+        delivery_retryable=outcome.retryable,
     )

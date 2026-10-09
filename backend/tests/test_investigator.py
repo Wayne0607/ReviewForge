@@ -12,7 +12,7 @@ from pydantic import ConfigDict, Field
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
-from reviewforge.engine.investigator import Investigator, budget_steps
+from reviewforge.engine.investigator import Investigator, budget_steps, build_workspace_executor
 
 
 def _hypothesis(*, severity: str = "warning", refutation: str = "", open_question: str = "") -> Hypothesis:
@@ -366,7 +366,7 @@ async def test_resume_does_not_reuse_observation_ids() -> None:
     )
 
     assert result.verdict == "confirmed"
-    assert result.observations[0].id == "obs_1"
+    assert result.observations[-1].id == "obs_1"
 
 
 @pytest.mark.asyncio
@@ -396,3 +396,37 @@ async def test_search_quote_from_outside_diff_is_strong() -> None:
 
     assert result.verdict == "confirmed"
     assert result.strength == "strong"
+
+
+@pytest.mark.asyncio
+async def test_api_fallback_executor_uses_async_pinned_reader() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    workspace = SimpleNamespace(
+        source="api-fallback",
+        read=Mock(side_effect=AssertionError("sync API read")),
+        read_async=AsyncMock(return_value="pinned content"),
+    )
+    result = await build_workspace_executor(workspace, _state())("read_file", {"path": "a.py", "start": 3, "end": 5})
+    assert result == "pinned content"
+    workspace.read_async.assert_awaited_once_with("a.py", start=3, end=5)
+
+
+@pytest.mark.asyncio
+async def test_investigator_stops_when_token_budget_is_exhausted() -> None:
+    class ExpensiveLLM(_ScriptedToolLLM):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            result = super()._generate(messages, stop, run_manager, **kwargs)
+            result.generations[0].message.usage_metadata = {
+                "input_tokens": 7900,
+                "output_tokens": 100,
+                "total_tokens": 8000,
+            }
+            return result
+
+    llm = ExpensiveLLM(turns=[_read_file_call(), _verdict(quote="return user_input")])
+    result = await Investigator(llm, _executor({}), max_steps=2).investigate(_hypothesis(), _state(), ContextPack())
+    assert result.verdict == "unknown" and result.reason == "token-exhausted"
+    assert result.tokens == 8000
+    assert len(llm.turns) == 1

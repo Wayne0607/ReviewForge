@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import reviewforge.tools.workspace as workspace_module
 from reviewforge.core.specs import build_registry
 from reviewforge.core.state import StateStore
 from reviewforge.tools.gateway import ToolGateway
@@ -114,6 +115,39 @@ async def test_workspace_reads_pinned_tarball_and_manifest_identity() -> None:
         root = workspace.root
         workspace.cleanup()
         assert not root.exists()
+
+
+@pytest.mark.asyncio
+async def test_repeated_searches_reuse_snapshot_listing_and_glob_selection(monkeypatch) -> None:
+    workspace = await PRHeadWorkspace.build(_state(), _TarballGitHub())
+    try:
+        calls = []
+        original = workspace_module._glob_matches
+
+        def count_glob(path, pattern):
+            calls.append((path, pattern))
+            return original(path, pattern)
+
+        monkeypatch.setattr(workspace_module, "_glob_matches", count_glob)
+        first = workspace.grep("normalize", globs=["**/*.py"], max_hits=10, context=1)
+        initial_calls = len(calls)
+        assert first and initial_calls > 0
+        original_rglob = type(workspace.root).rglob
+
+        def no_second_walk(path, pattern, *args, **kwargs):
+            if path == workspace.root:
+                pytest.fail("immutable workspace directory was scanned again")
+            return original_rglob(path, pattern, *args, **kwargs)
+
+        monkeypatch.setattr(type(workspace.root), "rglob", no_second_walk)
+        assert workspace.grep("normalize", globs=["**/*.py"], max_hits=10, context=1) == first
+        other = workspace.grep("return", globs=["**/*.py"], max_hits=10)
+        assert other
+        assert len(calls) == initial_calls
+        first.clear()
+        assert workspace.grep("normalize", globs=["**/*.py"], max_hits=10, context=1)
+    finally:
+        workspace.cleanup()
 
 
 @pytest.mark.asyncio

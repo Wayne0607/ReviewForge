@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -220,6 +221,7 @@ class HypothesisGenerator:
         source: str = "generator",
         prompt_template: str = "generator",
         skill_body: str = "",
+        on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
@@ -229,6 +231,7 @@ class HypothesisGenerator:
         self._source = source
         self._prompt_template = prompt_template
         self._skill_body = skill_body
+        self._on_update = on_update
 
     def _system_prompt(self) -> str:
         lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
@@ -263,16 +266,30 @@ class HypothesisGenerator:
 
         for block in blocks:
             user = self._render_user_message(pack, block, changes_by_unit, context_by_unit, ledger)
-            parsed = await self._invoke_once(user)
-            if parsed is None:
-                parsed = await self._invoke_repair(user)
+            failure = f"{self._source} parse failure"
+            try:
+                parsed = await self._invoke_once(user)
+                if parsed is None:
+                    parsed = await self._invoke_repair(user)
+            except Exception:
+                parsed = None
+                failure = f"{self._source} provider error"
             if parsed is None:
                 result.failed_blocks += 1
                 for unit in block:
-                    ledger.unresolved_units[unit.id] = "generator parse failure"
+                    ledger.unresolved_units[unit.id] = failure
                     result.unresolved_units.append(unit.id)
+                if self._on_update is not None:
+                    await self._on_update(ledger)
                 continue
-            result.dropped_overflow += self._consume(parsed, ledger, result, right_lines, {unit.id for unit in block})
+            for unit in block:
+                if ledger.unresolved_units.get(unit.id, "").startswith(f"{self._source} "):
+                    ledger.unresolved_units.pop(unit.id)
+            result.dropped_overflow += await self._consume(
+                parsed, ledger, result, right_lines, {unit.id for unit in block}
+            )
+            if self._on_update is not None:
+                await self._on_update(ledger)
         return result
 
     def _chunk_units(
@@ -346,7 +363,7 @@ class HypothesisGenerator:
             return None
         return parsed
 
-    def _consume(
+    async def _consume(
         self,
         parsed: dict[str, Any],
         ledger: HypothesisLedger,
@@ -389,7 +406,10 @@ class HypothesisGenerator:
                 source=self._source,
             )
             ledger.upsert(hypothesis)
+            ledger.no_issue_units.pop(hypothesis.unit_id, None)
             result.accepted += 1
+            if self._on_update is not None:
+                await self._on_update(ledger)
 
         raw_no_issue = parsed.get("no_issue_units")
         if isinstance(raw_no_issue, list):

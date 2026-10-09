@@ -60,6 +60,7 @@ class RunHealth:
         delivery_retryable: bool = False,
         hypothesis_failures: int = 0,
         investigation_unknown_errors: int = 0,
+        investigation_retryable: bool = False,
     ) -> RunHealth:
         return cls(
             tasks=StageResult(
@@ -97,6 +98,7 @@ class RunHealth:
             investigation=StageResult(
                 name="investigation",
                 failures=max(0, investigation_unknown_errors),
+                retryable=investigation_retryable,
             ),
         )
 

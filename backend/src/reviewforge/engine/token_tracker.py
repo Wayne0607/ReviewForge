@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -29,7 +30,7 @@ _db_var: contextvars.ContextVar[Database | None] = contextvars.ContextVar("token
 class RunContext:
     """Per-run token-tracking context backed by contextvars (concurrency-safe)."""
 
-    def set(self, run_id: str, db: Database) -> None:
+    def set(self, run_id: str, db: Database | None) -> None:
         _run_id_var.set(run_id)
         _db_var.set(db)
 
@@ -52,6 +53,7 @@ class TrackedChatLLM(BaseChatModel):
     _inner: BaseChatModel
     _ctx: RunContext
     _agent_name: str
+    _usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None
 
     class Config:
         arbitrary_types_allowed = True
@@ -61,11 +63,13 @@ class TrackedChatLLM(BaseChatModel):
         inner: BaseChatModel,
         ctx: RunContext,
         agent_name: str,
+        usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__()
         self._inner = inner
         self._ctx = ctx
         self._agent_name = agent_name
+        self._usage_sink = usage_sink
 
     async def _agenerate(
         self,
@@ -114,6 +118,15 @@ class TrackedChatLLM(BaseChatModel):
             except Exception as e:
                 logger.warning(f"Failed to record token usage: {e}")
 
+        if self._usage_sink is not None:
+            await self._usage_sink(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "model": model,
+                }
+            )
         return result
 
     def _generate(

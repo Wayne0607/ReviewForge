@@ -850,6 +850,11 @@ class Orchestrator:
 
         try:
             health = await run_hypothesis_pipeline(self, state)
+        except (Exception, asyncio.CancelledError) as exc:
+            if self._db:
+                await self._db.fail_run(run_id, f"hypothesis pipeline interrupted: {type(exc).__name__}")
+            self._events.emit("pipeline_v4.failed", {"mode": "hypothesis", "error_type": type(exc).__name__})
+            raise
         finally:
             await self._gateway.cleanup_workspace(state)
 
@@ -869,8 +874,10 @@ class Orchestrator:
                     await self._db.fail_run(run_id, "; ".join(health.errors), summary=summary)
                 else:
                     await self._db.complete_run(run_id, summary)
-            except Exception as exc:
-                logger.warning("hypothesis run finalization failed for %s: %s", run_id, exc)
+            except Exception:
+                # A successful result must not mask an uncommitted DB state.
+                logger.exception("hypothesis run finalization failed for %s", run_id)
+                raise
         return summary
 
     async def _run_legacy(self, state: StateStore) -> dict[str, Any]:

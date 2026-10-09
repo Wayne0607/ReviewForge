@@ -47,12 +47,27 @@
 
 本轮尚未跑真实 LLM dev10/holdout40，因此没有 v4 的 P/R/F1，也不能宣称已超过 v3 或 Qodo。当前默认仍为 `pipeline_v4.mode: legacy`。
 
-先处理接线审计发现的剩余问题：
+2026-10-09 第二轮已完成的可靠性修正：
 
-1. 各 v4 角色接入 token tracking，替换 pipeline 中的占位 token telemetry，并落实调查 token 预算。
-2. 生成/调查逐阶段持久化；恢复及投递接入现有 outbox，验证中断重跑不会重复评论。现有恢复测试主要覆盖账本状态跳过，不足以证明投递幂等。
-3. workspace 全部不可用时应失败；核查新路径异常与数据库 run 状态的一致性。
-4. 调查工具的 API-fallback 异步读取与符号语言处理；大型 PR 分块和截断覆盖的真实边界。
-5. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
+- 全部 v4 角色接入真实 token 用量与数据库记录；调查同时约束步数与累计 token，预算耗尽保留 unknown。
+- 每次生成 upsert、调查完成即保存完整账本快照，包含 head SHA、digest、no_issue/unresolved；一个调查尚未完成时，另一个已完成调查仍可恢复。
+- workspace 不可用与主路径异常写入 failed，清理快照；数据库最终状态写入失败会向上传播。
+- API fallback 采用异步读取；provider 错误保留可重试标记。
+- 旧代码并不存在任务卡提到的 outbox。新增 v4 专用 `v4_review_outbox`，先冻结完整发布负载再投递；远端接受但本地回执丢失时，恢复通过隐藏标记核对同一 head 的已提交 review。网络/5xx 或无有效回执时不会盲目重复 POST。
+- 投递状态不明且远端暂未找到标记时保持 partial，继续只读核对。这种保守策略防重复，但若进程在落库 sending 后、发出请求前崩溃，不能自动证明“尚未发送”；不宣称跨 GitHub/SQLite 的事务性 exactly-once。
+- shadow 的编辑结果存入 `shadow_publications`；空评论、空摘要、无 unknown 时不创建空 review。坐标拒绝与回执错误进入 RunHealth。
+- 真实 keycloak 大仓库的采样栈发现 RESOURCE 上下文反复遍历目录和匹配 glob。只读 PR 快照新增文件列表、glob 选择、grep 结果缓存；不改变搜索范围、顺序、命中上限与内容。
+
+新增 `scripts/benchmarks` 中可追踪的只读 runner 与严格裁判，修复旧脚本的过期配置接口、fork head/tarball 接线和 v4 评论导出；在 HTTP 层拦截全部 GitHub 写操作。每轮保留模型、模式、代码/脚本/工作集标识、LLM 输入/响应、账本、评论、事件与 token。裁判的匹配提示、0.7 门槛及一对一去重算法延用现有严格裁判，并保留回归测试。
+
+用户批准首轮开发集统一使用服务器现有 `deepseek-v4-flash`，英文输出；这不是原 MiniMax-M3 最终验收。初次诊断试跑发现预算上限输出不能解析，正在采集原始 finish_reason 和 reasoning 用量；诊断尝试不计作质量结果。正式配对必须使用相同模型参数与同一 PR head，生产服务、配置、数据库和 main 不参与改动。
+
+尚未完成的关键项：
+
+第二轮 Windows/Python 3.12 全量测试：`1432 passed, 1 skipped, 6 warnings`；新增 Linux benchmark bootstrap 测试在 Windows 因 `fcntl` 跳过，由 dev CI 验证。两项严格裁判回归通过。ruff / format / spec-check 通过，未变更 main 部署。
+
+1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
+2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
+3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。
 
 然后按 SPEC 运行：相同模型、英文输出，dev10 上 legacy 对照与 shadow 调查漏斗；抽查 keycloak#36880、grafana#97529、sentry#80168 的实际 ContextPack。达标后才进行 holdout40 两轮配对验收；holdout 不用于调参。记录账本召回、调查误杀、发布遗漏、重复误报与 token 消耗。通过质量与运行可靠性门槛后，才把 v4 推入 `main` 并切换生产默认。

@@ -85,7 +85,7 @@ class _ScriptedLLM(BaseChatModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def bind_tools(self, tools, **kwargs):
-        return self
+        return self.bind()
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         content = self.responses.pop(0) if self.responses else "{}"

@@ -356,6 +356,14 @@ class ToolGateway:
                 raise ValueError(f"post_review comment {index} has invalid body")
 
         batch_method = getattr(self._github, "post_review_comments", None)
+        delivery_options: dict[str, Any] = {}
+        if params.get("delivery_key"):
+            if not callable(batch_method):
+                raise ValueError("v4 durable delivery requires the batch review API")
+            delivery_options = {
+                "delivery_key": params["delivery_key"],
+                "reconcile_only": bool(params.get("reconcile_only")),
+            }
         if callable(batch_method):
             review = await batch_method(
                 repo=state.repo,
@@ -363,6 +371,7 @@ class ToolGateway:
                 commit_sha=state.head_sha,
                 comments=comments,
                 body=body,
+                **delivery_options,
             )
             return {"delivered_indexes": list(range(len(comments))), "review": review, "compatibility": False}
 

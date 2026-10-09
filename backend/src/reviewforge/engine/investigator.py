@@ -53,6 +53,7 @@ class InvestigationResult:
     additional_sites: list[Site] = field(default_factory=list)
     strength: str = "none"
     steps: int = 0
+    tokens: int = 0
     observations: list[Observation] = field(default_factory=list)
     retryable: bool = False
 
@@ -128,7 +129,10 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
 
     async def _execute(name: str, args: dict[str, Any]) -> str:
         if name == "read_file":
-            content = workspace.read(args["path"], start=args.get("start"), end=args.get("end"))
+            if getattr(workspace, "source", "") == "api-fallback":
+                content = await workspace.read_async(args["path"], start=args.get("start"), end=args.get("end"))
+            else:
+                content = workspace.read(args["path"], start=args.get("start"), end=args.get("end"))
             return content or ""
         if name == "grep":
             globs = [args["glob"]] if args.get("glob") else None
@@ -169,6 +173,7 @@ class Investigator:
         self._obs_counter = 0
         self._tool_counts: dict[str, int] = {}
         self._state: StateStore | None = None
+        self._tokens = 0
 
     def _build_tools(self) -> list[StructuredTool]:
         async def read_file(path: str, start: int | None = None, end: int | None = None) -> str:
@@ -272,7 +277,8 @@ class Investigator:
         """Answer one hypothesis's open_question within its budget_steps."""
 
         self._state = state
-        self._observations = []
+        self._observations = list(hypothesis.observations)
+        self._tokens = 0
         self._tool_counts = {}
         self._obs_counter = max(
             (
@@ -284,6 +290,7 @@ class Investigator:
         )
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
         steps = self._max_steps if self._max_steps is not None else budget_steps(hypothesis)
+        token_limit = steps * 4_000
 
         chat = [
             SystemMessage(content=self._system_prompt()),
@@ -294,8 +301,14 @@ class Investigator:
         bound = self._llm.bind_tools(tools)
 
         for step in range(steps):
+            if self._tokens + self._estimate_input_tokens(chat) >= token_limit:
+                return self._result(
+                    verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step
+                )
             try:
-                response = await bound.ainvoke(chat)
+                response = await bound.ainvoke(
+                    chat, max_tokens=min(4_000, token_limit - self._tokens - self._estimate_input_tokens(chat))
+                )
             except Exception as exc:
                 logger.warning("investigator provider error for %s: %s", hypothesis.identity, exc)
                 return self._result(
@@ -305,6 +318,7 @@ class Investigator:
                     steps=step,
                     retryable=True,
                 )
+            self._record_tokens(response, chat)
             chat.append(response)
             tool_calls = getattr(response, "tool_calls", None) or []
             if not tool_calls:
@@ -313,6 +327,10 @@ class Investigator:
                     return self._finalize(parsed, hypothesis, changed, steps=step + 1)
                 chat.append(HumanMessage(content="请基于已收集的证据，现在只输出调查结论 JSON（不再调用工具）。"))
                 continue
+            if self._tokens >= token_limit:
+                return self._result(
+                    verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step + 1
+                )
             for tool_call in tool_calls:
                 name = str(tool_call.get("name", ""))
                 args = tool_call.get("args", {}) or {}
@@ -323,15 +341,35 @@ class Investigator:
                 chat.append(ToolMessage(content=result, tool_call_id=tool_call.get("id", "")))
 
         chat.append(HumanMessage(content="已达到步数上限。请只输出调查结论 JSON（不再调用工具）。"))
+        if self._tokens + self._estimate_input_tokens(chat) >= token_limit:
+            return self._result(verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=steps)
         try:
-            final = await self._llm.ainvoke(chat)
+            final = await self._llm.ainvoke(
+                chat, max_tokens=min(4_000, token_limit - self._tokens - self._estimate_input_tokens(chat))
+            )
+            self._record_tokens(final, chat)
             parsed = self._parse_verdict(getattr(final, "content", "") or "")
         except Exception as exc:
             logger.warning("investigator final call failed for %s: %s", hypothesis.identity, exc)
-            parsed = None
+            return self._result(
+                verdict="unknown", reason="provider error", severity=hypothesis.severity, steps=steps, retryable=True
+            )
         if parsed is None:
             return self._result(verdict="unknown", reason="step-exhausted", severity=hypothesis.severity, steps=steps)
         return self._finalize(parsed, hypothesis, changed, steps=steps)
+
+    @staticmethod
+    def _estimate_input_tokens(chat: list[Any]) -> int:
+        return sum(len(str(message.content)) for message in chat) // 4
+
+    def _record_tokens(self, response: Any, chat: list[Any]) -> None:
+        usage = getattr(response, "usage_metadata", None) or {}
+        usage = usage or (getattr(response, "response_metadata", {}) or {}).get("token_usage", {})
+        total = usage.get("total_tokens")
+        if total is not None:
+            self._tokens += max(0, int(total))
+        else:
+            self._tokens += self._estimate_input_tokens(chat) + len(str(response.content)) // 4
 
     @staticmethod
     def _parse_verdict(content: str) -> dict[str, Any] | None:
@@ -429,6 +467,7 @@ class Investigator:
             additional_sites=list(additional_sites or []),
             strength=strength,
             steps=steps,
+            tokens=self._tokens,
             observations=list(self._observations),
             retryable=retryable,
         )
@@ -442,6 +481,7 @@ class Investigator:
         changed_paths: set[str] | None = None,
         max_hypotheses_per_pr: int = 12,
         concurrency: int = 1,
+        on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
     ) -> list[InvestigationResult]:
         """Investigate every OPEN hypothesis concurrently, then apply verdicts.
 
@@ -482,20 +522,8 @@ class Investigator:
                         retryable=True,
                     )
 
-        gathered = await asyncio.gather(*(_investigate(index, hypothesis) for index, hypothesis in enumerate(targets)))
-
-        results: list[InvestigationResult] = []
-        for hypothesis, raw in zip(targets, gathered):
-            result = (
-                raw
-                if isinstance(raw, InvestigationResult)
-                else self._result(
-                    verdict="unknown",
-                    reason="investigation error",
-                    severity=hypothesis.severity,
-                    retryable=True,
-                )
-            )
+        async def complete(index: int, hypothesis: Hypothesis) -> InvestigationResult:
+            result = await _investigate(index, hypothesis)
             ledger.apply_verdict(
                 hypothesis.identity,
                 status=result.verdict,
@@ -504,9 +532,22 @@ class Investigator:
                 observations=result.observations,
                 severity=result.severity,
                 additional_sites=result.additional_sites,
+                investigation_steps=result.steps,
+                investigation_tokens=result.tokens,
+                retryable=result.retryable,
             )
-            results.append(result)
-        return results
+            if on_update is not None:
+                await on_update(ledger)
+            return result
+
+        jobs = [asyncio.create_task(complete(index, hypothesis)) for index, hypothesis in enumerate(targets)]
+        try:
+            return list(await asyncio.gather(*jobs))
+        finally:
+            for job in jobs:
+                if not job.done():
+                    job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
 
 
 __all__ = ["InvestigationResult", "Investigator", "build_workspace_executor", "budget_steps"]

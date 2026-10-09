@@ -326,6 +326,9 @@ class PRHeadWorkspace:
         self._fallback_error = fallback_error
         self._content_cache: dict[str, str] = {}
         self._definition_cache: dict[tuple[str, str], tuple[symbol_extractor.SymbolInfo, ...]] = {}
+        self._file_entries: tuple[tuple[str, Path], ...] | None = None
+        self._glob_cache: dict[tuple[str, ...], tuple[tuple[str, Path], ...]] = {}
+        self._grep_cache: dict[tuple[str, tuple[str, ...], int, int], tuple[GrepHit, ...]] = {}
         self._closed = False
 
     @classmethod
@@ -506,10 +509,19 @@ class PRHeadWorkspace:
 
         patterns = tuple(str(item).replace("\\", "/") for item in (globs or []) if str(item))
         margin = max(0, int(context))
+        key = (str(pattern), patterns, max_hits, margin)
+        if key in self._grep_cache:
+            return list(self._grep_cache[key])
+        candidates = self._glob_cache.get(patterns)
+        if candidates is None:
+            candidates = tuple(
+                (relative, candidate)
+                for relative, candidate in self._iter_files()
+                if not patterns or any(_glob_matches(relative, item) for item in patterns)
+            )
+            self._glob_cache[patterns] = candidates
         hits: list[GrepHit] = []
-        for relative, candidate in self._iter_files():
-            if patterns and not any(_glob_matches(relative, item) for item in patterns):
-                continue
+        for relative, candidate in candidates:
             lines = self._read_local(relative, candidate).splitlines()
             if any("\x00" in line for line in lines):
                 continue
@@ -529,7 +541,9 @@ class PRHeadWorkspace:
                     )
                 )
                 if len(hits) >= max_hits:
+                    self._grep_cache[key] = tuple(hits)
                     return hits
+        self._grep_cache[key] = tuple(hits)
         return hits
 
     def find_symbol_definitions(self, symbol: str, *, language: str) -> list[SymbolHit]:
@@ -612,6 +626,11 @@ class PRHeadWorkspace:
             return
         self._closed = True
         shutil.rmtree(self._temp_dir, ignore_errors=True)
+        self._content_cache.clear()
+        self._definition_cache.clear()
+        self._file_entries = None
+        self._glob_cache.clear()
+        self._grep_cache.clear()
 
     def _local_path(self, relative: str | None) -> Path | None:
         if not relative or self._closed:
@@ -678,6 +697,8 @@ class PRHeadWorkspace:
     def _iter_files(self) -> list[tuple[str, Path]]:
         if self._closed or not self.info.root.exists():
             return []
+        if self._file_entries is not None:
+            return list(self._file_entries)
         files: list[tuple[str, Path]] = []
         for candidate in self.info.root.rglob("*"):
             if not candidate.is_file() or candidate.is_symlink():
@@ -685,6 +706,7 @@ class PRHeadWorkspace:
             relative = candidate.relative_to(self.info.root).as_posix()
             files.append((relative, candidate))
         files.sort(key=lambda item: item[0])
+        self._file_entries = tuple(files)
         return files
 
     def _definitions_for(

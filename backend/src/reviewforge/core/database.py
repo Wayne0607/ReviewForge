@@ -7,6 +7,7 @@ so the dashboard can query historical data.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -117,6 +118,31 @@ CREATE TABLE IF NOT EXISTS observations (
     observation_id  TEXT NOT NULL,
     observation_json TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+-- Full ledger metadata is needed even when generation produced no hypotheses.
+CREATE TABLE IF NOT EXISTS hypothesis_ledger_checkpoints (
+    run_id TEXT PRIMARY KEY,
+    ledger_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS v4_review_outbox (
+    run_id TEXT PRIMARY KEY,
+    head_sha TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    receipt_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_publications (
+    run_id TEXT PRIMARY KEY,
+    publication_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
 );
 
@@ -1114,6 +1140,12 @@ class Database:
         """Append one immutable hypothesis revision and its observations."""
 
         payload = hypothesis.to_dict() if hasattr(hypothesis, "to_dict") else dict(hypothesis)
+        await self._append_hypothesis_payload(run_id, payload, head_sha=head_sha, workspace_digest=workspace_digest)
+        await self._db.commit()
+
+    async def _append_hypothesis_payload(
+        self, run_id: str, payload: dict[str, Any], *, head_sha: str, workspace_digest: str
+    ) -> None:
         now = datetime.now(UTC).isoformat()
         await self._db.execute(
             "INSERT INTO hypotheses "
@@ -1141,13 +1173,36 @@ class Database:
                     now,
                 ),
             )
-        await self._db.commit()
+
+    async def checkpoint_hypothesis_ledger(self, ledger: Any) -> None:
+        """Persist a complete recoverable ledger plus append-only audit rows."""
+
+        if not hasattr(self, "_hypothesis_checkpoint_lock"):
+            self._hypothesis_checkpoint_lock = asyncio.Lock()
+        async with self._hypothesis_checkpoint_lock:
+            payload = ledger.to_dict()
+            await self._db.execute(
+                "INSERT INTO hypothesis_ledger_checkpoints (run_id, ledger_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET ledger_json=excluded.ledger_json, updated_at=excluded.updated_at",
+                (ledger.run_id, json.dumps(payload, ensure_ascii=False, sort_keys=True), datetime.now(UTC).isoformat()),
+            )
+            for hypothesis in payload["items"].values():
+                await self._append_hypothesis_payload(
+                    ledger.run_id, hypothesis, head_sha=ledger.head_sha, workspace_digest=ledger.workspace_digest
+                )
+            await self._db.commit()
 
     async def load_hypothesis_ledger(self, run_id: str):
         """Rebuild a ledger from the latest append-only revision per identity."""
 
         from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger
 
+        checkpoint = await self._db.execute(
+            "SELECT ledger_json FROM hypothesis_ledger_checkpoints WHERE run_id=?", (run_id,)
+        )
+        row = await checkpoint.fetchone()
+        if row is not None:
+            return HypothesisLedger.from_dict(json.loads(row["ledger_json"]))
         cursor = await self._db.execute(
             "SELECT h.hypothesis_json, h.head_sha, h.workspace_digest "
             "FROM hypotheses h JOIN ("
@@ -1169,6 +1224,53 @@ class Database:
         return ledger
 
     # ── Token Usage ──────────────────────────────────────────────
+
+    async def save_shadow_publication(self, run_id: str, payload: dict[str, Any]) -> None:
+        await self._db.execute(
+            "INSERT INTO shadow_publications VALUES (?, ?, ?) "
+            "ON CONFLICT(run_id) DO UPDATE SET publication_json=excluded.publication_json, "
+            "updated_at=excluded.updated_at",
+            (run_id, json.dumps(payload, ensure_ascii=False), datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+
+    async def prepare_v4_publication(self, run_id: str, head_sha: str, payload: dict[str, Any]) -> None:
+        """Freeze the publication before the first external write."""
+        await self._db.execute(
+            "INSERT OR IGNORE INTO v4_review_outbox (run_id, head_sha, payload_json, updated_at) VALUES (?, ?, ?, ?)",
+            (run_id, head_sha, json.dumps(payload, ensure_ascii=False), datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+
+    async def get_v4_publication(self, run_id: str) -> dict[str, Any] | None:
+        cursor = await self._db.execute("SELECT * FROM v4_review_outbox WHERE run_id=?", (run_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result.pop("payload_json"))
+        result["receipt"] = json.loads(result.pop("receipt_json"))
+        return result
+
+    async def claim_v4_publication(self, run_id: str) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE v4_review_outbox SET status='sending', updated_at=? WHERE run_id=? AND status='pending'",
+            (datetime.now(UTC).isoformat(), run_id),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def finish_v4_publication(self, run_id: str, receipt: dict[str, Any]) -> None:
+        await self._db.execute(
+            "UPDATE v4_review_outbox SET status='delivered', receipt_json=?, updated_at=? WHERE run_id=?",
+            (json.dumps(receipt, ensure_ascii=False), datetime.now(UTC).isoformat(), run_id),
+        )
+        await self._db.commit()
+
+    async def reset_v4_publication(self, run_id: str) -> None:
+        """Only use after a definite HTTP rejection, never an ambiguous timeout."""
+        await self._db.execute("UPDATE v4_review_outbox SET status='pending' WHERE run_id=?", (run_id,))
+        await self._db.commit()
 
     async def record_token_usage(
         self,

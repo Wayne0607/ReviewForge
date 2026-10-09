@@ -23,7 +23,7 @@ jobs:
       - name: Sync test environment
         run: cd backend && uv sync --frozen --python 3.12
       - name: Lint and format
-        run: cd backend && uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+        run: cd backend && uv run --no-sync ruff check . ../scripts/benchmarks && uv run --no-sync ruff format --check . ../scripts/benchmarks
       - name: Validate local spec
         # spec-check checks presence only; these are not provider credentials.
         env:
@@ -32,3 +32,5 @@ jobs:
         run: cd backend && uv run --no-sync reviewforge spec-check
       - name: Test
         run: cd backend && uv run --no-sync pytest -q
+      - name: Verify strict benchmark scoring
+        run: cd backend && uv run --no-sync python -m unittest discover -s ../scripts/benchmarks -p test_martian_judge_strict.py

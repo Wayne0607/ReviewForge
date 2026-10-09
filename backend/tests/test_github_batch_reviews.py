@@ -13,6 +13,65 @@ import pytest
 from reviewforge.tools.github_api import GitHubAPIError, GitHubClient
 
 
+@pytest.mark.asyncio
+async def test_v4_lost_response_is_reconciled_without_repeating_post():
+    posts = 0
+    accepted = False
+    marker = "<!-- reviewforge:v4:stable -->"
+
+    def handler(request):
+        nonlocal posts, accepted
+        if request.method == "GET":
+            reviews = [{"id": 42, "commit_id": "abc", "state": "COMMENTED", "submitted_at": "now", "body": marker}]
+            return httpx.Response(200, json=reviews if accepted else [])
+        posts += 1
+        accepted = True
+        assert marker in json.loads(request.content)["body"]
+        raise httpx.ReadTimeout("response lost", request=request)
+
+    client = await _client_with_transport(handler)
+    try:
+        with pytest.raises(GitHubAPIError):
+            await client.post_review_comments("o/r", 1, "abc", [], body="summary", delivery_key="stable")
+        receipt = await client.post_review_comments(
+            "o/r", 1, "abc", [], body="summary", delivery_key="stable", reconcile_only=True
+        )
+        assert receipt["id"] == 42
+        assert posts == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_v4_unresolved_or_wrong_head_receipt_cannot_trigger_a_second_post():
+    methods = []
+
+    def handler(request):
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 42,
+                    "commit_id": "other",
+                    "state": "COMMENTED",
+                    "submitted_at": "now",
+                    "body": "<!-- reviewforge:v4:stable -->",
+                }
+            ],
+        )
+
+    client = await _client_with_transport(handler)
+    try:
+        with pytest.raises(GitHubAPIError, match="not yet found"):
+            await client.post_review_comments(
+                "o/r", 1, "abc", [], body="summary", delivery_key="stable", reconcile_only=True
+            )
+        assert methods == ["GET"]
+    finally:
+        await client.close()
+
+
 async def test_github_client_follows_repository_rename_redirects():
     client = GitHubClient("test-token")
     try:

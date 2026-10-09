@@ -407,6 +407,8 @@ def render_review_body(publication: Publication, ledger: HypothesisLedger, *, ou
     """Render the PR review body ``<details>`` from summary items + UNKNOWN claims."""
 
     english = output_language != "zh-CN"
+    if not publication.summary_items and not publication.unknown_ids:
+        return ""
     claims_by_id = {item.id: item.claim for item in ledger.items.values()}
     lines: list[str] = ["<details>\n<summary>Review summary</summary>\n"]
 

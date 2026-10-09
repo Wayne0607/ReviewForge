@@ -142,6 +142,8 @@ class GitHubClient:
         commit_sha: str,
         comments: list[dict[str, Any]],
         body: str = "",
+        delivery_key: str = "",
+        reconcile_only: bool = False,
     ) -> dict[str, Any]:
         """Create one COMMENT review carrying a bounded set of inline comments.
 
@@ -172,12 +174,63 @@ class GitHubClient:
             payload["body"] = body
         if review_comments:
             payload["comments"] = review_comments
+        if delivery_key:
+            marker = f"<!-- reviewforge:v4:{delivery_key} -->"
+            payload["body"] = f"{body}\n\n{marker}"
+            async with _REVIEW_WRITE_LOCK:
+                existing = await self.find_submitted_review(repo, pr_number, commit_sha, marker)
+                if existing is not None:
+                    return existing
+                if reconcile_only:
+                    raise GitHubAPIError("Review receipt not yet found", kind="delivery_uncertain", retryable=True)
+                try:
+                    response = await self._client.post(f"/repos/{repo}/pulls/{int(pr_number)}/reviews", json=payload)
+                except httpx.TransportError as exc:
+                    # Never repeat an ambiguous POST. Recovery performs GETs
+                    # using the durable marker; absence is not proof of failure.
+                    raise GitHubAPIError("Review response lost", kind="network", retryable=True) from exc
+                if not response.is_success:
+                    raise _classify_write_error("create pull request review", response)
+                try:
+                    receipt = response.json()
+                except ValueError as exc:
+                    raise GitHubAPIError("Invalid review receipt", kind="delivery_uncertain", retryable=True) from exc
+                if not isinstance(receipt, dict) or type(receipt.get("id")) is not int or receipt["id"] <= 0:
+                    raise GitHubAPIError("Missing review receipt", kind="delivery_uncertain", retryable=True)
+                return receipt
         async with _REVIEW_WRITE_LOCK:
             return await self._post_json_with_retry(
                 f"/repos/{repo}/pulls/{int(pr_number)}/reviews",
                 payload,
                 operation="create pull request review",
             )
+
+    async def find_submitted_review(
+        self, repo: str, pr_number: int, commit_sha: str, marker: str
+    ) -> dict[str, Any] | None:
+        page = 1
+        while True:
+            response = await self._client.get(
+                f"/repos/{repo}/pulls/{int(pr_number)}/reviews", params={"per_page": 100, "page": page}
+            )
+            response.raise_for_status()
+            batch = response.json()
+            if not isinstance(batch, list):
+                raise GitHubAPIError("Invalid review listing", kind="delivery_uncertain", retryable=True)
+            for review in batch:
+                if (
+                    isinstance(review, dict)
+                    and review.get("commit_id") == commit_sha
+                    and review.get("state") == "COMMENTED"
+                    and review.get("submitted_at")
+                    and marker in str(review.get("body") or "")
+                    and type(review.get("id")) is int
+                    and review["id"] > 0
+                ):
+                    return review
+            if len(batch) < 100:
+                return None
+            page += 1
 
     async def _post_json_with_retry(
         self,

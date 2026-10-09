@@ -9,6 +9,7 @@ confirmed hypotheses are still published through a deterministic template.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -122,17 +123,34 @@ def split_for_publication(
     return inline, summary
 
 
-def fallback_comment(cluster: ConfirmedCluster) -> PublicationComment:
+def _evidence_text(hypothesis: Hypothesis) -> str:
+    lines = []
+    for observation in hypothesis.observations:
+        if observation.status != "success":
+            continue
+        location = observation.path or observation.tool
+        if observation.line_range and observation.line_range[0]:
+            location += f":{observation.line_range[0]}"
+        lines.append(f"{observation.id} {location} (sha={observation.sha}):\n{observation.excerpt}")
+    return "\n".join(lines)
+
+
+def fallback_comment(cluster: ConfirmedCluster, *, output_language: str = "en") -> PublicationComment:
     """Deterministic template used when the editor LLM fails (§4.7 failure)."""
 
     site = cluster.sites[0]
     where = "\n".join(f"- {site.path}:{site.line}" for site in cluster.sites)
+    hypothesis = cluster.hypotheses[0]
+    labels = ("问题", "依据", "位置", "修复") if output_language == "zh-CN" else ("Issue", "Why", "Where", "Fix")
+    why = "\n".join(
+        filter(None, [hypothesis.trigger, hypothesis.impact, *[_evidence_text(h) for h in cluster.hypotheses]])
+    )
     body = "\n\n".join(
         [
-            f"Issue: {cluster.hypotheses[0].claim}",
-            f"Why: {cluster.hypotheses[0].impact}",
-            f"Where:\n{where}",
-            f"Fix: {_fix_suggestion(cluster)}",
+            f"{labels[0]}: {hypothesis.claim}",
+            f"{labels[1]}: {why}",
+            f"{labels[2]}:\n{where}",
+            f"{labels[3]}: {_fix_suggestion(cluster, output_language)}",
         ]
     )
     return PublicationComment(
@@ -144,27 +162,34 @@ def fallback_comment(cluster: ConfirmedCluster) -> PublicationComment:
     )
 
 
-def _fix_suggestion(cluster: ConfirmedCluster) -> str:
+def _fix_suggestion(cluster: ConfirmedCluster, language: str) -> str:
     trigger = cluster.hypotheses[0].trigger
+    if language == "zh-CN":
+        return f"处理触发条件：{trigger}" if trigger else "修复上述问题的根因。"
     return f"Address: {trigger}" if trigger else "Address the underlying mechanism above."
 
 
 def _parse_publication(content: str) -> dict[str, Any] | None:
     parsed = extract_json_value(content or "", required_key="comments", allow_list=False)
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("comments"), list):
+        return None
+    if not isinstance(parsed.get("summary_items", []), list):
+        return None
+    return parsed
 
 
 def _site_index(ledger: HypothesisLedger) -> dict[str, set[tuple[str, int]]]:
     index: dict[str, set[tuple[str, int]]] = {}
     for item in ledger.items.values():
-        index[item.id] = {(site.path, site.line) for site in item.sites}
+        if item.status == HypothesisStatus.CONFIRMED:
+            index[item.id] = {(site.path, site.line) for site in item.sites}
     return index
 
 
 def validate_comments(
     publication: Publication, ledger: HypothesisLedger, *, max_comments: int
 ) -> tuple[list[PublicationComment], list[str]]:
-    """Drop comments whose path:line is not a site of a referenced hypothesis."""
+    """Require confirmed references, a valid anchor and every affected site."""
 
     sites = _site_index(ledger)
     valid: list[PublicationComment] = []
@@ -172,8 +197,14 @@ def validate_comments(
     for comment in publication.comments:
         if len(valid) >= max_comments:
             break
-        if comment.hypothesis_ids and all(
-            (comment.path, comment.line) in sites.get(identity, set()) for identity in comment.hypothesis_ids
+        referenced = set().union(*(sites.get(identity, set()) for identity in comment.hypothesis_ids))
+        if (
+            comment.hypothesis_ids
+            and all(identity in sites for identity in comment.hypothesis_ids)
+            and (comment.path, comment.line) in referenced
+            and all(
+                re.search(rf"(?<![\w/.-]){re.escape(path)}:{line}(?!\d)", comment.body) for path, line in referenced
+            )
         ):
             valid.append(comment)
         else:
@@ -208,13 +239,27 @@ class Editor:
         ledger: HypothesisLedger,
     ) -> str:
         confirmed_lines = []
+        inline_keys = {cluster.key for cluster in inline}
         for cluster in ordered:
+            placement = "inline" if cluster.key in inline_keys else "summary"
             header = (
                 f"- {cluster.hypothesis_ids} | {cluster.key} | "
-                f"severity={cluster.severity} | strength={cluster.strength}"
+                f"severity={cluster.severity} | strength={cluster.strength} | publication={placement}"
             )
             sites = ", ".join(f"{site.path}:{site.line}" for site in cluster.sites)
-            confirmed_lines.append(f"{header}\n  claim: {cluster.hypotheses[0].claim}\n  sites: {sites}")
+            details = [header, f"  sites: {sites}"]
+            for hypothesis in cluster.hypotheses:
+                details.extend(
+                    [
+                        f"  hypothesis_id: {hypothesis.id}",
+                        f"  claim: {hypothesis.claim}",
+                        f"  trigger: {hypothesis.trigger}",
+                        f"  impact: {hypothesis.impact}",
+                        f"  investigation: {hypothesis.verdict_reason}",
+                        f"  observations:\n{_evidence_text(hypothesis)}",
+                    ]
+                )
+            confirmed_lines.append("\n".join(details))
         unknown_ids = [
             item.id
             for item in sorted(ledger.items.values(), key=lambda item: item.identity)
@@ -224,6 +269,8 @@ class Editor:
         return "\n\n".join(
             [
                 "## PR intent\n" + (getattr(pack, "pr_intent", "") or "（无）/(none)"),
+                f"## Publication selection\nWrite comments only for publication=inline (at most {len(inline)}). "
+                "Write summary_items only for publication=summary. Include all sites for merged comments.",
                 "## Confirmed\n" + ("\n".join(confirmed_lines) or "（无）/(none)"),
                 "## Unknown claims\n" + ("\n".join(unknown_lines) or "（无）/(none)"),
             ]
@@ -245,7 +292,9 @@ class Editor:
         ]
 
         if not inline:
-            return Publication(comments=[], summary_items=[], merged=[], unknown_ids=unknown_ids)
+            return Publication(
+                comments=[], summary_items=self._summary_from({}, summary), merged=[], unknown_ids=unknown_ids
+            )
 
         messages = [
             SystemMessage(content=self._system_prompt()),
@@ -259,40 +308,75 @@ class Editor:
             logger.warning("editor LLM failed, using deterministic fallback: %s", exc)
 
         if parsed is None:
-            comments = [fallback_comment(cluster) for cluster in inline]
-            return Publication(comments=comments, summary_items=[], merged=[], unknown_ids=unknown_ids, fallback=True)
+            parsed = {}
 
-        comments = self._comments_from(parsed, ledger)
+        inline_ids = {identity for cluster in inline for identity in cluster.hypothesis_ids}
+        comments = self._comments_from(parsed, inline_ids)
         valid, _rejected = validate_comments(
             Publication(comments=comments, summary_items=[], merged=[], unknown_ids=unknown_ids),
             ledger,
-            max_comments=self._max_inline_overflow,
+            max_comments=len(comments),
         )
-        if not valid and inline:
-            valid = [fallback_comment(cluster) for cluster in inline]
-            return Publication(comments=valid, summary_items=[], merged=[], unknown_ids=unknown_ids, fallback=True)
+        # Treat the deterministic cluster as the unit of coverage. A partial
+        # model response cannot erase a cluster or split it into duplicate
+        # comments, and a merge must cover each participating cluster in full.
+        valid = [
+            comment
+            for comment in valid
+            if all(
+                not set(cluster.hypothesis_ids).intersection(comment.hypothesis_ids)
+                or set(cluster.hypothesis_ids).issubset(comment.hypothesis_ids)
+                for cluster in inline
+            )
+        ]
+        selected: list[PublicationComment] = []
+        covered: set[str] = set()
+        fallback = False
+        for cluster in inline:
+            ids = set(cluster.hypothesis_ids)
+            if ids <= covered:
+                continue
+            comment = next(
+                (
+                    item
+                    for item in valid
+                    if ids <= set(item.hypothesis_ids) and not covered.intersection(item.hypothesis_ids)
+                ),
+                None,
+            )
+            if comment is None:
+                comment = fallback_comment(cluster, output_language=self._output_language)
+                fallback = True
+            selected.append(comment)
+            covered.update(comment.hypothesis_ids)
 
-        summary_items = self._summary_from(parsed, ledger)
+        summary_items = self._summary_from(parsed, summary)
         return Publication(
-            comments=valid, summary_items=summary_items, merged=_merged_from(parsed), unknown_ids=unknown_ids
+            comments=selected,
+            summary_items=summary_items,
+            merged=[comment.hypothesis_ids for comment in selected if len(comment.hypothesis_ids) > 1],
+            unknown_ids=unknown_ids,
+            fallback=fallback,
         )
 
-    def _comments_from(self, parsed: dict[str, Any], ledger: HypothesisLedger) -> list[PublicationComment]:
+    def _comments_from(self, parsed: dict[str, Any], allowed_ids: set[str]) -> list[PublicationComment]:
         comments: list[PublicationComment] = []
-        known_ids = {item.id for item in ledger.items.values()}
         for raw in parsed.get("comments", []) or []:
             if not isinstance(raw, dict):
                 continue
-            ids = [str(i) for i in raw.get("hypothesis_ids", []) or [] if i and str(i) in known_ids]
+            ids = raw.get("hypothesis_ids")
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i in allowed_ids for i in ids):
+                continue
+            ids = list(dict.fromkeys(ids))
             path = str(raw.get("path", "")).strip()
             line = raw.get("line")
-            if not ids or not path or not isinstance(line, int):
+            if not path or type(line) is not int or line <= 0:
                 continue
             comments.append(
                 PublicationComment(
                     hypothesis_ids=ids,
                     path=path,
-                    line=max(1, int(line)),
+                    line=line,
                     title=str(raw.get("title", ""))[:60],
                     body=str(raw.get("body", "")).strip(),
                     suggestion_patch=str(raw.get("suggestion_patch", "")).strip(),
@@ -300,26 +384,23 @@ class Editor:
             )
         return comments
 
-    def _summary_from(self, parsed: dict[str, Any], ledger: HypothesisLedger) -> list[tuple[str, str]]:
-        known_ids = {item.id for item in ledger.items.values()}
-        summary: list[tuple[str, str]] = []
+    def _summary_from(self, parsed: dict[str, Any], clusters: list[ConfirmedCluster]) -> list[tuple[str, str]]:
+        allowed_ids = {identity for cluster in clusters for identity in cluster.hypothesis_ids}
+        model_summary: dict[str, str] = {}
         for raw in parsed.get("summary_items", []) or []:
             if not isinstance(raw, dict):
                 continue
             identity = str(raw.get("hypothesis_id", ""))
-            if identity in known_ids:
-                summary.append((identity, str(raw.get("one_line", ""))))
+            one_line = str(raw.get("one_line") or "").strip()
+            if identity in allowed_ids and one_line:
+                model_summary.setdefault(identity, one_line)
+        summary: list[tuple[str, str]] = []
+        for cluster in clusters:
+            identity = cluster.hypothesis_ids[0]
+            where = ", ".join(f"{site.path}:{site.line}" for site in cluster.sites)
+            text = next((model_summary[i] for i in cluster.hypothesis_ids if i in model_summary), None)
+            summary.append((identity, text or f"{cluster.hypotheses[0].claim} ({where})"))
         return summary
-
-
-def _merged_from(parsed: dict[str, Any]) -> list[list[str]]:
-    merged: list[list[str]] = []
-    for raw in parsed.get("merged", []) or []:
-        if isinstance(raw, list):
-            pair = [str(item) for item in raw if item]
-            if len(pair) > 1:
-                merged.append(pair)
-    return merged
 
 
 def render_review_body(publication: Publication, ledger: HypothesisLedger, *, output_language: str = "auto") -> str:

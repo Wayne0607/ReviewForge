@@ -1,5 +1,12 @@
 # ReviewForge Agent 开发指南
 
+## 当前开发状态
+
+- v4 在 `dev` 开发；`main` 保留现有生产版本与自动部署。未经验收不向 `main` 推送 v4。
+- 用户已授权统一使用 `dev`，替代旧任务卡的 `hp/<卡号>` 分支约定。
+- 新流水线事实源：[hypothesis-pipeline-spec.md](docs/hypothesis-pipeline-spec.md)。进度与待验收项：[v4-development.md](docs/v4-development.md)。
+- 默认仍是 `legacy`；`shadow` 与 `hypothesis` 是尚待真实基准验收的 v4 路径。下述 Planner/Reviewer/Verifier/Commenter 描述适用于 legacy。
+
 ## Agent 架构
 
 ### Planner (Conductor)

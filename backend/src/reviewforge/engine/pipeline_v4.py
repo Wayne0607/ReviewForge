@@ -1,8 +1,7 @@
 """Hypothesis-pipeline orchestration entrypoint.
 
-Shadow mode runs the deterministic stages plus the LLM stages (generator → lens
-→ investigator) and persists the ledger, but never publishes.  ``hypothesis``
-mode is rejected until T9 wires editor + publication.
+Shadow mode runs the same deterministic and LLM stages as hypothesis mode,
+persists the ledger, and leaves publication to the legacy pipeline.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reviewforge.core.state import StateStore
+from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.editor import Editor, Publication, render_review_body
@@ -292,6 +292,11 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     workspace_payload["ms"] = int((time.perf_counter() - started) * 1000)
     workspace_event = orchestrator._events.emit("workspace.built", workspace_payload)
 
+    # The compiler consumes ContextEngine's manifest; it does not extract
+    # symbols itself. Shadow can inherit one from legacy, but a fresh primary
+    # run must build it through the gateway pinned to this PR head first.
+    if state.files_changed and not state.impact_manifest:
+        await ContextEngine(orchestrator._gateway, getattr(orchestrator, "_db", None)).build(state)
     changeset = compile_semantic_changeset(state)
     config = orchestrator._pipeline_v4_config
     pack = ContextPack.build(

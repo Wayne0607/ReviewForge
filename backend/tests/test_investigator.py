@@ -280,3 +280,119 @@ def test_concurrent_upsert_never_loses_sites() -> None:
         thread.join()
 
     assert len(ledger.items["a.py:f::null-path::f"].sites) == 20
+
+
+def _verdict(*, quote: str, ids: list[str] | None = None, sites: list[dict] | None = None) -> str:
+    return json.dumps(
+        {
+            "verdict": "confirmed",
+            "evidence_ids": ids or ["obs_0"],
+            "evidence_quote": quote,
+            "additional_sites": sites or [],
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_not_found_inside_source_is_successful_evidence() -> None:
+    content = 'def f():\n    raise ValueError("not found")'
+    llm = _ScriptedToolLLM(turns=[_read_file_call(), _verdict(quote='raise ValueError("not found")')])
+    result = await Investigator(llm, _executor({("read_file", (("path", "a.py"),)): content})).investigate(
+        _hypothesis(), _state(), ContextPack()
+    )
+
+    assert result.verdict == "confirmed"
+    assert result.observations[0].status == "success"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("glob", ["", "*.py"])
+async def test_search_scope_is_not_an_outside_diff_file(glob: str) -> None:
+    call = {"name": "grep", "args": {"pattern": "return user_input", "glob": glob}, "id": "search"}
+    executor = _executor({("grep", tuple(sorted(call["args"].items()))): "- a.py:2: return user_input"})
+    llm = _ScriptedToolLLM(turns=[call, _verdict(quote="return user_input")])
+    result = await Investigator(llm, executor).investigate(_hypothesis(), _state(), ContextPack())
+
+    assert result.verdict == "confirmed"
+    assert result.strength == "weak"
+
+
+@pytest.mark.asyncio
+async def test_unquoted_external_observation_does_not_promote_strength() -> None:
+    llm = _ScriptedToolLLM(
+        turns=[
+            _read_file_call(),
+            _read_file_call("lib/unrelated.py"),
+            _verdict(quote="return user_input", ids=["obs_0", "obs_1"]),
+        ]
+    )
+    executor = _executor(
+        {
+            ("read_file", (("path", "a.py"),)): "return user_input",
+            ("read_file", (("path", "lib/unrelated.py"),)): "unrelated_constant = 42",
+        }
+    )
+    result = await Investigator(llm, executor).investigate(_hypothesis(), _state(), ContextPack())
+
+    assert result.verdict == "confirmed"
+    assert result.strength == "weak"
+
+
+@pytest.mark.asyncio
+async def test_additional_sites_require_verbatim_right_side_evidence() -> None:
+    sites = [
+        {"path": "a.py", "line": 2, "excerpt": "return user_input"},
+        {"path": "a.py", "line": 2, "excerpt": "invented code"},
+        {"path": "a.py", "line": 999, "excerpt": "return user_input"},
+        {"path": "lib/other.py", "line": 2, "excerpt": "return user_input"},
+    ]
+    llm = _ScriptedToolLLM(turns=[_read_file_call(), _verdict(quote="return user_input", sites=sites)])
+    result = await Investigator(llm, _executor({("read_file", (("path", "a.py"),)): "return user_input"})).investigate(
+        _hypothesis(), _state(diffs={"a.py": "@@ -0,0 +1,2 @@\n+def f():\n+    return user_input\n"}), ContextPack()
+    )
+
+    assert result.additional_sites == [Site(path="a.py", line=2, excerpt="return user_input")]
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_reuse_observation_ids() -> None:
+    from reviewforge.engine.hypothesis import Observation
+
+    hypothesis = _hypothesis()
+    hypothesis.observations = [Observation("obs_0", "grep", "q", "", None, "abc123", "d", "No results", "not_found")]
+    llm = _ScriptedToolLLM(turns=[_read_file_call(), _verdict(quote="return user_input", ids=["obs_1"])])
+    result = await Investigator(llm, _executor({("read_file", (("path", "a.py"),)): "return user_input"})).investigate(
+        hypothesis, _state(), ContextPack()
+    )
+
+    assert result.verdict == "confirmed"
+    assert result.observations[0].id == "obs_1"
+
+
+@pytest.mark.asyncio
+async def test_repeated_tool_call_executes_at_most_twice() -> None:
+    calls = []
+
+    async def execute(name, args):
+        calls.append((name, args))
+        return "return user_input"
+
+    llm = _ScriptedToolLLM(
+        turns=[_read_file_call(), _read_file_call(), _read_file_call(), _verdict(quote="return user_input")]
+    )
+    result = await Investigator(llm, execute).investigate(_hypothesis(), _state(), ContextPack())
+
+    assert len(calls) == 2
+    assert len(result.observations) == 2
+    assert result.verdict == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_search_quote_from_outside_diff_is_strong() -> None:
+    call = {"name": "grep", "args": {"pattern": "return user_input"}, "id": "search"}
+    executor = _executor({("grep", (("pattern", "return user_input"),)): "- lib/caller.py:2: return user_input"})
+    llm = _ScriptedToolLLM(turns=[call, _verdict(quote="return user_input")])
+    result = await Investigator(llm, executor).investigate(_hypothesis(), _state(), ContextPack())
+
+    assert result.verdict == "confirmed"
+    assert result.strength == "strong"

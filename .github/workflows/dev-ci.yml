@@ -1,0 +1,34 @@
+name: V4 Dev CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reviewforge-dev-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Sync test environment
+        run: cd backend && uv sync --frozen --python 3.12
+      - name: Lint and format
+        run: cd backend && uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+      - name: Validate local spec
+        # spec-check checks presence only; these are not provider credentials.
+        env:
+          GITHUB_TOKEN: spec-check-placeholder
+          LLM_API_KEY: spec-check-placeholder
+        run: cd backend && uv run --no-sync reviewforge spec-check
+      - name: Test
+        run: cd backend && uv run --no-sync pytest -q

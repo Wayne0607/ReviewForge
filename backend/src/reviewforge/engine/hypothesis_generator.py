@@ -1,7 +1,7 @@
 """Hypothesis generator for the hypothesis pipeline.
 
 One bounded pass over the whole PR: the deterministic context pack plus the
-right-side diff are rendered per semantic unit (risk-ordered, chunked when the
+before/after diff and RIGHT-side anchors are rendered per semantic unit (risk-ordered, chunked when the
 input exceeds the configured budget) and the model proposes testable
 hypotheses.  The generator only *proposes*; it never investigates and never
 retries with a "look harder" signal — a block with no hypotheses is a valid
@@ -15,6 +15,7 @@ only consumer allowed to move it away from ``OPEN``.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +33,7 @@ from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 _EXCERPT_MIN_CHARS = 12
 _SEVERITIES = frozenset({"error", "warning", "info"})
 _SEVERITY_PRIORITY = {"info": 0, "warning": 1, "error": 2}
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 # The lead-in text shared by every block (PR intent plus the unchecked-summary).
 # It is measured separately so block budgeting never starves the diff itself.
@@ -77,18 +79,48 @@ def _unit_right_lines(
     return sorted(by_line.items())[:max_lines]
 
 
-def _render_changes(units: list[SemanticUnit], right_lines: dict[str, dict[int, str]], max_lines: int) -> str:
-    """Render the RIGHT-side diff for a set of units with line numbers."""
+def _unit_patch(unit: SemanticUnit, diff: str, max_lines: int) -> str:
+    """Keep both sides of intersecting hunks, including deletion-only changes.
+
+    This is source material, not an anchor map: only ``iter_right_lines`` may
+    supply coordinates for generated sites. A removed guard or lock must still
+    be visible when reasoning about the behavior introduced by the PR.
+    """
+
+    hunks: list[tuple[int, int, list[str]]] = []
+    for raw in diff.splitlines():
+        header = _HUNK_HEADER.match(raw)
+        if header:
+            start = int(header[1])
+            count = int(header[2] or 1)
+            hunks.append((start, start + max(1, count) - 1, [raw]))
+        elif hunks and (raw.startswith((" ", "+", "-", "\\ No newline"))):
+            hunks[-1][2].append(raw)
+    start = max(1, unit.start_line - 3)
+    end = max(start, unit.end_line + 3)
+    selected = [lines for first, last, lines in hunks if first <= end and last >= start]
+    # Resource/file units may not have symbol coordinates.
+    if not selected and not unit.start_line:
+        selected = [lines for _, _, lines in hunks]
+    lines = [raw for hunk in selected for raw in hunk]
+    rendered = "\n".join(lines[:max_lines])
+    if len(lines) > max_lines:
+        rendered += "\n(diff truncated; remaining changes unchecked)"
+    return rendered
+
+
+def _render_changes(
+    units: list[SemanticUnit], right_lines: dict[str, dict[int, str]], max_lines: int, diffs: dict[str, str]
+) -> str:
+    """Render before/after hunks separately from commentable RIGHT-side lines."""
 
     sections: list[str] = []
     for unit in units:
         lines = _unit_right_lines(unit, right_lines, max_lines)
         header = f"### {unit.path} — symbol={unit.symbol or '-'} unit_id={unit.id}"
-        if not lines:
-            sections.append(f"{header}\n(no RIGHT-side lines)")
-            continue
-        body = "\n".join(f"{line:>5} | {content}" for line, content in lines)
-        sections.append(f"{header}\n{body}")
+        patch = _unit_patch(unit, diffs.get(unit.path, "") or "", max_lines)
+        body = "\n".join(f"{line:>5} | {content}" for line, content in lines) or "(no RIGHT-side lines)"
+        sections.append(f"{header}\nBefore/after diff:\n{patch}\nRIGHT-side anchors:\n{body}")
     return "\n\n".join(sections)
 
 
@@ -223,7 +255,7 @@ class HypothesisGenerator:
 
         right_lines = _right_lines_by_path(state)
         per_unit_context = max(1_000, self._context_max_chars // max(1, len(units)))
-        changes_by_unit = {unit.id: _render_changes([unit], right_lines, 400) for unit in units}
+        changes_by_unit = {unit.id: _render_changes([unit], right_lines, 400, state.file_diffs or {}) for unit in units}
         context_by_unit = {unit.id: pack.render_for_unit(unit.id, max_chars=per_unit_context) for unit in units}
 
         blocks = self._chunk_units(units, changes_by_unit, context_by_unit)
@@ -240,7 +272,7 @@ class HypothesisGenerator:
                     ledger.unresolved_units[unit.id] = "generator parse failure"
                     result.unresolved_units.append(unit.id)
                 continue
-            result.dropped_overflow += self._consume(parsed, ledger, result, right_lines)
+            result.dropped_overflow += self._consume(parsed, ledger, result, right_lines, {unit.id for unit in block})
         return result
 
     def _chunk_units(
@@ -288,7 +320,7 @@ class HypothesisGenerator:
             HumanMessage(content=user),
         ]
         response = await self._llm.ainvoke(messages)
-        return extract_json_value(getattr(response, "content", "") or "", required_key="hypotheses", allow_list=False)
+        return self._parse_response(getattr(response, "content", "") or "")
 
     async def _invoke_repair(self, user: str) -> dict[str, Any] | None:
         messages = [
@@ -303,7 +335,16 @@ class HypothesisGenerator:
             ),
         ]
         response = await self._llm.ainvoke(messages)
-        return extract_json_value(getattr(response, "content", "") or "", required_key="hypotheses", allow_list=False)
+        return self._parse_response(getattr(response, "content", "") or "")
+
+    @staticmethod
+    def _parse_response(content: str) -> dict[str, Any] | None:
+        parsed = extract_json_value(content, required_key="hypotheses", allow_list=False)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("hypotheses"), list):
+            return None
+        if not isinstance(parsed.get("no_issue_units", []), list):
+            return None
+        return parsed
 
     def _consume(
         self,
@@ -311,6 +352,7 @@ class HypothesisGenerator:
         ledger: HypothesisLedger,
         result: HypothesisGenerationResult,
         right_lines: dict[str, dict[int, str]],
+        unit_ids: set[str],
     ) -> int:
         valid: list[tuple[dict[str, Any], list[tuple[str, int, str]]]] = []
 
@@ -318,7 +360,7 @@ class HypothesisGenerator:
         if isinstance(raw_hypotheses, list):
             for item in raw_hypotheses:
                 payload, sites = self._validate_hypothesis(item, right_lines)
-                if payload is None:
+                if payload is None or payload["unit_id"] not in unit_ids:
                     result.dropped_invalid += 1
                     continue
                 if not sites:
@@ -355,8 +397,10 @@ class HypothesisGenerator:
                 if not isinstance(item, dict):
                     continue
                 unit_id = str(item.get("unit_id") or "").strip()
-                if unit_id:
-                    ledger.no_issue_units[unit_id] = str(item.get("checked") or "").strip()
+                checked = str(item.get("checked") or "").strip()
+                has_hypothesis = any(hypothesis.unit_id == unit_id for hypothesis in ledger.items.values())
+                if unit_id in unit_ids and checked and not has_hypothesis:
+                    ledger.no_issue_units[unit_id] = checked
 
         return overflow
 

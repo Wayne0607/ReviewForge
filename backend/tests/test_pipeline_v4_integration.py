@@ -12,13 +12,16 @@ from pydantic import ConfigDict, Field
 
 from reviewforge.core.config import PipelineV4Config
 from reviewforge.core.events import EventBus
+from reviewforge.core.specs import build_registry
 from reviewforge.core.state import StateStore
+from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.base import DetectorFinding
 from reviewforge.engine.editor import Publication, PublicationComment
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus
 from reviewforge.engine.pipeline_v4 import _seed_detector_hypotheses, deliver_publication, run_hypothesis_pipeline
-from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
-from reviewforge.tools.workspace import WorkspaceInfo
+from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind, compile_semantic_changeset
+from reviewforge.tools.gateway import ToolGateway
+from reviewforge.tools.workspace import PRHeadWorkspace, WorkspaceInfo
 
 
 def _diff(*lines: str) -> str:
@@ -144,7 +147,7 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
                 {
                     "hypotheses": [
                         {
-                            "unit_id": "su_test_f",
+                            "unit_id": compile_semantic_changeset(state).units[0].id,
                             "mechanism": "null-path",
                             "anchor_symbol": "f",
                             "claim": "f dereferences x without a null check",
@@ -203,9 +206,58 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
     assert generated.data["accepted"] == 1
     assert generated.data["source"] == "generator"
 
-    hypothesis = state.ledger.items["su_test_f::null-path::f"]
+    hypothesis = state.ledger.items[f"{compile_semantic_changeset(state).units[0].id}::null-path::f"]
     assert hypothesis.status == HypothesisStatus.UNKNOWN
     assert hypothesis.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_pipeline_populates_symbol_inputs_before_context_pack(tmp_path, monkeypatch) -> None:
+    source = (
+        "class BaseService:\n"
+        "    def get_user(self, key):\n"
+        "        return None\n"
+        "\n"
+        "class Service(BaseService):\n"
+        "    def get_user(self, key):\n"
+        "        self.mu.lock()\n"
+        "        return normalize(key)\n"
+        "\n"
+        "    def set_user(self, key, value):\n"
+        "        return value\n"
+        "\n"
+        "def normalize(key):\n"
+        "    return key.strip()\n"
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    state = StateStore(
+        repo="owner/repo",
+        pr_number=1,
+        head_sha="abc",
+        files_changed=["app.py"],
+        file_diffs={"app.py": _diff(*source.splitlines())},
+    )
+    info = WorkspaceInfo("owner/repo", "owner/repo", "abc", tmp_path, 1, len(source), "d", False, "tarball")
+    workspace = PRHeadWorkspace(info, None, fallback_repo="owner/repo", temp_dir=tmp_path)
+    gateway = ToolGateway(build_registry(), None, pipeline_mode="hypothesis")
+    gateway._workspaces[id(state)] = workspace
+    events = EventBus()
+    captured: dict = {}
+    original = ContextPack.build
+
+    def capture(changeset, *args, **kwargs):
+        captured["changeset"] = changeset
+        captured["pack"] = original(changeset, *args, **kwargs)
+        return captured["pack"]
+
+    monkeypatch.setattr(ContextPack, "build", capture)
+    fake = SimpleNamespace(_gateway=gateway, _events=events, _pipeline_v4_config=PipelineV4Config(mode="shadow"))
+    await run_hypothesis_pipeline(fake, state)
+
+    units = captured["changeset"].units
+    assert any(unit.symbol == "get_user" and unit.calls for unit in units)
+    kinds = {slice_.kind for context in captured["pack"].units.values() for slice_ in context.slices}
+    assert {"callee", "base_class", "sibling", "lock_usage"} <= kinds
 
 
 @pytest.mark.asyncio

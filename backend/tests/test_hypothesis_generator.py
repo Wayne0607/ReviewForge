@@ -250,3 +250,60 @@ async def test_chunking_shares_the_ledger_across_blocks() -> None:
     second_block_text = "\n".join(getattr(message, "content", "") for message in llm.calls[1])
     assert "wrong-argument" in second_block_text
     assert "## Existing hypotheses" in second_block_text
+
+
+@pytest.mark.asyncio
+async def test_generator_sees_removed_guard_and_patch_markers() -> None:
+    patch = (
+        "@@ -1,4 +1,2 @@\n"
+        " def get_or_create_resource(owner_id):\n"
+        "-    if owner_id is None:\n"
+        "-        raise ValueError('owner required')\n"
+        "     return create_resource(owner_id)\n"
+    )
+    llm = _ScriptedLLM(responses=['{"hypotheses": [], "no_issue_units": []}'])
+    await HypothesisGenerator(llm).run(
+        StateStore(file_diffs={"service.py": patch}),
+        ContextPack(),
+        _changeset(_unit("service.py", "get_or_create_resource")),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+
+    prompt = str(llm.calls[0][1].content)
+    assert "-    if owner_id is None:" in prompt
+    assert "@@ -1,4 +1,2 @@" in prompt
+    assert "2 |     return create_resource(owner_id)" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [{"hypotheses": "invalid"}, {"hypotheses": [], "no_issue_units": 7}])
+async def test_malformed_arrays_are_repaired_then_marked_unresolved(bad: dict) -> None:
+    llm = _ScriptedLLM(responses=[json.dumps(bad), json.dumps(bad)])
+    unit = _unit("service.py", "get_or_create_resource")
+    ledger = HypothesisLedger("run", "abc", "digest")
+    result = await HypothesisGenerator(llm).run(
+        StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(unit), ledger
+    )
+
+    assert len(llm.calls) == 2
+    assert result.failed_blocks == 1
+    assert unit.id in ledger.unresolved_units
+    assert not ledger.no_issue_units
+
+
+@pytest.mark.asyncio
+async def test_generator_rejects_unknown_unit_even_with_real_site() -> None:
+    hypothesis = _hypothesis("wrong-argument")
+    hypothesis["unit_id"] = "invented.py:missing"
+    llm = _ScriptedLLM(responses=[json.dumps({"hypotheses": [hypothesis], "no_issue_units": []})])
+    ledger = HypothesisLedger("run", "abc", "digest")
+    result = await HypothesisGenerator(llm).run(
+        StateStore(file_diffs=_server_diff()),
+        ContextPack(),
+        _changeset(_unit("service.py", "get_or_create_resource")),
+        ledger,
+    )
+
+    assert result.accepted == 0
+    assert result.dropped_invalid == 1
+    assert not ledger.items

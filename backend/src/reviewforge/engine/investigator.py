@@ -23,6 +23,7 @@ from langchain_core.tools import StructuredTool
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.detectors.unified_diff import iter_right_lines
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Observation, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 
@@ -35,7 +36,7 @@ _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
 _MAX_STEPS = 8
 _TOOL_RESULT_CHARS = 6_000
 _OBS_EXCERPT_CHARS = 1_200
-_NOT_FOUND_MARKERS = ("no results", "not found", "no matches", "no definition", "no callers")
+_NOT_FOUND_MARKERS = frozenset({"no results", "not found", "no matches", "no definition found", "no callers found"})
 
 _OUT_OF_DIFF_TOKENS = ("caller", "callee", "parent", "base class", "interface", "schema")
 _REQUIRES_CONTEXT_TOKENS = ("caller", "parent", "schema", "base class")
@@ -77,7 +78,9 @@ def _query_string(name: str, args: dict[str, Any]) -> str:
 
 
 def _observation_path(args: dict[str, Any]) -> str:
-    return str(args.get("path") or args.get("glob") or "")
+    # A search scope is not a source file. Search hit locations are resolved
+    # from the actual result when checking the quoted evidence below.
+    return str(args.get("path") or "")
 
 
 def _line_range(args: dict[str, Any]) -> tuple[int, int] | None:
@@ -91,20 +94,24 @@ def _is_not_found(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return True
-    return any(marker in stripped.lower() for marker in _NOT_FOUND_MARKERS)
+    return stripped.lower() in _NOT_FOUND_MARKERS
 
 
-def _parse_additional_sites(raw: Any) -> list[Site]:
+def _parse_additional_sites(raw: Any, state: StateStore | None) -> list[Site]:
     sites: list[Site] = []
     if not isinstance(raw, list):
         return sites
+    right_lines = {
+        path: dict(iter_right_lines(diff or "")) for path, diff in ((state.file_diffs or {}) if state else {}).items()
+    }
     for item in raw:
         if not isinstance(item, dict):
             continue
         path = str(item.get("path", "")).strip()
         excerpt = str(item.get("excerpt", "")).strip()
         line = item.get("line")
-        if path and isinstance(line, int) and line > 0:
+        content = right_lines.get(path, {}).get(line) if type(line) is int else None
+        if content is not None and len(excerpt) >= 12 and excerpt in content:
             sites.append(Site(path=path, line=line, excerpt=excerpt))
     return sites
 
@@ -160,6 +167,7 @@ class Investigator:
         self._max_steps = None if max_steps is None else max(1, int(max_steps))
         self._observations: list[Observation] = []
         self._obs_counter = 0
+        self._tool_counts: dict[str, int] = {}
         self._state: StateStore | None = None
 
     def _build_tools(self) -> list[StructuredTool]:
@@ -202,14 +210,18 @@ class Investigator:
         ]
 
     async def _run_tool(self, name: str, args: dict[str, Any]) -> str:
-        error_text = ""
+        query = _query_string(name, args)
+        if self._tool_counts.get(query, 0) >= 2:
+            return "Repeated tool call limit reached; use existing observations or investigate a different fact."
+        self._tool_counts[query] = self._tool_counts.get(query, 0) + 1
+        failed = False
         try:
             text = str(await self._executor(name, args) or "")
-        except Exception as exc:
+        except Exception:
             text = ""
-            error_text = str(exc)
+            failed = True
         text = text[:_TOOL_RESULT_CHARS]
-        if error_text:
+        if failed:
             status = "error"
         elif _is_not_found(text):
             status = "not_found"
@@ -218,7 +230,7 @@ class Investigator:
         observation = Observation(
             id=f"obs_{self._obs_counter}",
             tool=name,
-            query=_query_string(name, args),
+            query=query,
             path=_observation_path(args),
             line_range=_line_range(args),
             sha=self._state.head_sha if self._state else "",
@@ -261,7 +273,15 @@ class Investigator:
 
         self._state = state
         self._observations = []
-        self._obs_counter = 0
+        self._tool_counts = {}
+        self._obs_counter = max(
+            (
+                int(obs.id[4:]) + 1
+                for obs in hypothesis.observations
+                if obs.id.startswith("obs_") and obs.id[4:].isdigit()
+            ),
+            default=0,
+        )
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
         steps = self._max_steps if self._max_steps is not None else budget_steps(hypothesis)
 
@@ -329,22 +349,27 @@ class Investigator:
         severity = str(parsed.get("severity", "")).strip().lower()
         if severity not in {"error", "warning", "info"}:
             severity = hypothesis.severity
-        evidence_ids = [str(item) for item in (parsed.get("evidence_ids") or []) if item]
+        raw_ids = parsed.get("evidence_ids")
+        evidence_ids = [item for item in raw_ids if isinstance(item, str) and item] if isinstance(raw_ids, list) else []
         evidence_quote = str(parsed.get("evidence_quote", "")).strip()
-        additional_sites = _parse_additional_sites(parsed.get("additional_sites"))
+        additional_sites = _parse_additional_sites(parsed.get("additional_sites"), self._state)
 
         strength = "none"
         if verdict in {"confirmed", "refuted"}:
             by_id = {observation.id: observation for observation in self._observations}
             cited = [by_id[identity] for identity in evidence_ids if identity in by_id]
             success_cited = [observation for observation in cited if observation.status == "success"]
-            grounded = any(evidence_quote and evidence_quote in observation.excerpt for observation in success_cited)
-            if not success_cited or not grounded:
+            grounded = [
+                observation for observation in success_cited if evidence_quote and evidence_quote in observation.excerpt
+            ]
+            if not grounded:
                 verdict = "unknown"
                 reason = "ungrounded"
                 evidence_ids, evidence_quote = [], ""
             else:
-                outside_diff = any(observation.path not in changed for observation in success_cited)
+                outside_diff = any(
+                    self._quote_outside_diff(observation, evidence_quote, changed) for observation in grounded
+                )
                 strength = "strong" if (outside_diff or hypothesis.source.startswith("detector")) else "weak"
 
         return self._result(
@@ -358,6 +383,27 @@ class Investigator:
             strength=strength,
             steps=steps,
         )
+
+    @staticmethod
+    def _quote_outside_diff(observation: Observation, quote: str, changed: set[str]) -> bool:
+        if observation.path:
+            return observation.path not in changed
+        if observation.tool in {"grep", "find_callers"}:
+            # Executor search results have one concrete path:line per hit. An
+            # unrelated hit must not promote evidence quoted from the diff.
+            for line in observation.excerpt.splitlines():
+                path, separator, rest = line.removeprefix("- ").partition(":")
+                number, separator2, text = rest.partition(":")
+                if separator and separator2 and number.isdigit() and quote in text and path not in changed:
+                    return True
+        if observation.tool == "find_definition":
+            for section in observation.excerpt.split("\n- "):
+                header, _, text = section.partition("\n")
+                _, separator, location = header.partition("] ")
+                path, colon, number = location.rpartition(":")
+                if separator and colon and number.isdigit() and quote in text and path not in changed:
+                    return True
+        return False
 
     def _result(
         self,

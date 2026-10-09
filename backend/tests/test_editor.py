@@ -13,12 +13,13 @@ from reviewforge.engine.editor import (
     Publication,
     PublicationComment,
     cluster_confirmed,
+    fallback_comment,
     order_clusters,
     render_review_body,
     split_for_publication,
     validate_comments,
 )
-from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
+from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Observation, Site
 
 
 def _hyp(
@@ -90,7 +91,7 @@ def test_validate_comments_requires_site_path() -> None:
         1, Mechanism.NULL_PATH, "f", "error", "strong", sites=[Site(path="a.py", line=10, excerpt="excerpt")]
     )
     ledger = _ledger(hypothesis)
-    ok = PublicationComment(hypothesis_ids=["h_1"], path="a.py", line=10, title="t", body="b")
+    ok = PublicationComment(hypothesis_ids=["h_1"], path="a.py", line=10, title="t", body="Where: a.py:10")
     bad = PublicationComment(hypothesis_ids=["h_1"], path="a.py", line=999, title="t", body="b")
 
     valid, rejected = validate_comments(
@@ -185,3 +186,106 @@ def test_render_review_body_uses_fixed_zh_wording() -> None:
     body = render_review_body(publication, ledger, output_language="zh-CN")
 
     assert "未能在预算内确认" in body
+
+
+def _raw_comment(*ids: str, line: int = 1, body: str = "Where: a.py:1") -> dict:
+    return {"hypothesis_ids": list(ids), "path": "a.py", "line": line, "title": "issue", "body": body}
+
+
+@pytest.mark.asyncio
+async def test_partial_editor_output_preserves_every_selected_cluster_and_summary() -> None:
+    ledger = _ledger(*[_hyp(i, Mechanism.NULL_PATH, f"f{i}", "warning", "weak") for i in range(1, 5)])
+    response = json.dumps({"comments": [_raw_comment("h_4", line=4, body="Where: a.py:4")]})
+    publication = await Editor(_ScriptedLLM(responses=[response]), max_inline=2, max_inline_overflow=2).run(
+        ledger, None
+    )
+
+    assert {identity for comment in publication.comments for identity in comment.hypothesis_ids} == {"h_4", "h_3"}
+    assert {identity for identity, _ in publication.summary_items} == {"h_2", "h_1"}
+    assert publication.fallback is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", ["invalid JSON", '{"comments": 5}'])
+async def test_editor_failure_keeps_overflow_summary(response: str) -> None:
+    ledger = _ledger(*[_hyp(i, Mechanism.NULL_PATH, f"f{i}", "warning", "weak") for i in range(1, 4)])
+    publication = await Editor(_ScriptedLLM(responses=[response]), max_inline=1, max_inline_overflow=1).run(
+        ledger, None
+    )
+
+    assert len(publication.comments) == 1
+    assert {identity for identity, _ in publication.summary_items} == {"h_2", "h_1"}
+    assert publication.fallback is True
+
+
+@pytest.mark.asyncio
+async def test_summary_only_configuration_retains_confirmed_findings() -> None:
+    ledger = _ledger(_hyp(1, Mechanism.NULL_PATH, "f", "warning", "weak"))
+    publication = await Editor(_ScriptedLLM(), max_inline=0, max_inline_overflow=0).run(ledger, None)
+
+    assert publication.comments == []
+    assert publication.summary_items == [("h_1", "claim 1 (a.py:1)")]
+
+
+@pytest.mark.asyncio
+async def test_editor_cannot_publish_unknown_refuted_or_summary_candidates_inline() -> None:
+    unknown = _hyp(10, Mechanism.NULL_PATH, "unknown", "error", "strong")
+    unknown.status = HypothesisStatus.UNKNOWN
+    refuted = _hyp(11, Mechanism.NULL_PATH, "refuted", "error", "strong")
+    refuted.status = HypothesisStatus.REFUTED
+    ledger = _ledger(
+        _hyp(1, Mechanism.NULL_PATH, "f1", "warning", "weak"),
+        _hyp(2, Mechanism.NULL_PATH, "f2", "warning", "weak"),
+        unknown,
+        refuted,
+    )
+    response = json.dumps(
+        {
+            "comments": [_raw_comment(f"h_{i}", line=i, body=f"Where: a.py:{i}") for i in [10, 11, 1]],
+            "summary_items": [{"hypothesis_id": "h_10", "one_line": "fake confirmed"}],
+        }
+    )
+    publication = await Editor(_ScriptedLLM(responses=[response]), max_inline=1, max_inline_overflow=1).run(
+        ledger, None
+    )
+
+    assert [comment.hypothesis_ids for comment in publication.comments] == [["h_2"]]
+    assert [identity for identity, _ in publication.summary_items] == ["h_1"]
+    assert publication.unknown_ids == ["h_10"]
+
+
+def test_merged_comment_anchors_any_site_and_lists_all_sites() -> None:
+    ledger = _ledger(
+        _hyp(1, Mechanism.NULL_PATH, "f1", "error", "strong"),
+        _hyp(2, Mechanism.NULL_PATH, "f2", "error", "strong"),
+    )
+    good = PublicationComment(["h_1", "h_2"], "a.py", 1, "merged", "Where: a.py:1, a.py:2")
+    incomplete = PublicationComment(["h_1", "h_2"], "a.py", 1, "merged", "Where: a.py:1")
+    valid, _ = validate_comments(Publication([good, incomplete], [], []), ledger, max_comments=5)
+
+    assert valid == [good]
+
+
+def test_site_line_prefix_does_not_satisfy_where_list() -> None:
+    ledger = _ledger(_hyp(1, Mechanism.NULL_PATH, "f", "error", "strong"))
+    bad = PublicationComment(["h_1"], "a.py", 1, "issue", "Where: a.py:10")
+    valid, _ = validate_comments(Publication([bad], [], []), ledger, max_comments=5)
+    assert valid == []
+
+
+def test_editor_receives_and_fallback_quotes_investigation_evidence() -> None:
+    hypothesis = _hyp(1, Mechanism.NULL_PATH, "f", "error", "strong")
+    hypothesis.trigger = "caller passes None"
+    hypothesis.impact = "request crashes"
+    hypothesis.observations = [
+        Observation("obs_0", "read_file", "q", "lib/caller.py", (7, 9), "abc", "d", "call_f(None)", "success")
+    ]
+    ledger = _ledger(hypothesis)
+    clusters = cluster_confirmed(ledger)
+    prompt = Editor(_ScriptedLLM())._render(clusters, clusters, [], None, ledger)
+
+    assert "caller passes None" in prompt and "request crashes" in prompt
+    assert "call_f(None)" in prompt and "lib/caller.py:7" in prompt
+    assert "publication=inline" in prompt
+    comment = fallback_comment(clusters[0])
+    assert "call_f(None)" in comment.body and "lib/caller.py:7" in comment.body

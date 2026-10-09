@@ -19,6 +19,13 @@ overrides and aligns every profile with the global provider. Record the optional
 `--reasoning-effort` identically for both sides. Never compare runs with different
 PR head SHAs or change parameters between paired runs.
 
+`--llm-min-interval` defaults to 30 seconds between request starts across all
+benchmark processes on the host. The benchmark disables SDK automatic retries;
+rate failures remain visible instead of consuming an unrecorded retry burst.
+Tracing wraps the provider below the token wrapper so private `_agenerate`
+delegation cannot bypass it. Judge requests must also respect the provider's
+quota; do not run the judge while review workers are using the same quota.
+
 `llm-traces/` contains public benchmark source and model responses. Keep credential
 files outside the output directory. Each process uses its own SQLite DB; completed
 results are skipped on restart. Diagnose partial execution before treating a

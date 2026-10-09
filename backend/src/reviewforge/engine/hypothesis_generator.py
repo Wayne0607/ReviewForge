@@ -15,6 +15,7 @@ only consumer allowed to move it away from ``OPEN``.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ _EXCERPT_MIN_CHARS = 12
 _SEVERITIES = frozenset({"error", "warning", "info"})
 _SEVERITY_PRIORITY = {"info": 0, "warning": 1, "error": 2}
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+logger = logging.getLogger(__name__)
 
 # The lead-in text shared by every block (PR intent plus the unchecked-summary).
 # It is measured separately so block budgeting never starves the diff itself.
@@ -271,9 +273,10 @@ class HypothesisGenerator:
                 parsed = await self._invoke_once(user)
                 if parsed is None:
                     parsed = await self._invoke_repair(user)
-            except Exception:
+            except Exception as exc:
                 parsed = None
-                failure = f"{self._source} provider error"
+                failure = f"{self._source} provider error: {type(exc).__name__}"
+                logger.warning("%s generation failed: %s", self._source, type(exc).__name__)
             if parsed is None:
                 result.failed_blocks += 1
                 for unit in block:
@@ -336,7 +339,7 @@ class HypothesisGenerator:
             SystemMessage(content=self._system_prompt()),
             HumanMessage(content=user),
         ]
-        response = await self._llm.ainvoke(messages)
+        response = await self._llm.ainvoke(messages, max_tokens=8192)
         return self._parse_response(getattr(response, "content", "") or "")
 
     async def _invoke_repair(self, user: str) -> dict[str, Any] | None:
@@ -351,7 +354,7 @@ class HypothesisGenerator:
                 )
             ),
         ]
-        response = await self._llm.ainvoke(messages)
+        response = await self._llm.ainvoke(messages, max_tokens=8192)
         return self._parse_response(getattr(response, "content", "") or "")
 
     @staticmethod

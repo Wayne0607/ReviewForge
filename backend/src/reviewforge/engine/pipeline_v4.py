@@ -154,7 +154,10 @@ async def _run_llm_stages(
             "source": "generator",
             "accepted": gen_result.accepted,
             "dropped_unanchored": gen_result.dropped_unanchored,
+            "dropped_invalid": gen_result.dropped_invalid,
             "dropped_overflow": gen_result.dropped_overflow,
+            "blocks": gen_result.blocks,
+            "failed_blocks": gen_result.failed_blocks,
             "tokens": usage_by_agent.get("hypothesis_generator", 0),
         },
     )

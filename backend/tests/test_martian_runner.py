@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import httpx
@@ -64,3 +65,19 @@ async def test_read_only_wrapper_preserves_head_tarball_transport(runner):
         assert await runner.ReadOnlyGitHub(raw).get_repo_tarball("fork/repo", "head-sha") == b"archive"
     finally:
         await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_trace_survives_token_wrapper_private_call(runner, tmp_path):
+    from langchain_core.messages import HumanMessage
+
+    from reviewforge.engine.mock_llm import MockChatLLM
+    from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
+
+    traced = runner.BenchmarkLLM(MockChatLLM(), tmp_path, "test", interval=0)
+    llm = TrackedChatLLM(traced, RunContext(), "test")
+    await llm.ainvoke([HumanMessage(content="review this code")])
+    inputs = list(tmp_path.glob("*-input.json"))
+    outputs = list(tmp_path.glob("*-output.json"))
+    assert len(inputs) == len(outputs) == 1
+    assert json.loads(outputs[0].read_text())["responses"][0]["content"]

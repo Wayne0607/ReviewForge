@@ -13,12 +13,14 @@ import logging
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models import BaseChatModel
+from pydantic import PrivateAttr
 
 REPO_ROOT = Path(os.environ.get("REVIEWFORGE_REPO_ROOT", "/opt/reviewforge"))
 BACKEND_ROOT = REPO_ROOT / "backend"
@@ -54,36 +56,89 @@ _SEARCH_INTERVAL_SECONDS = 7.0
 _SEARCH_RATE_FILE = Path("/tmp/reviewforge-martian-search-rate")
 
 
-class TraceCallback(BaseCallbackHandler):
-    def __init__(self, root: Path, agent: str) -> None:
-        self.root, self.agent = root, agent
+class BenchmarkLLM(BaseChatModel):
+    """Trace below token wrappers and pace every actual provider request."""
+
+    _inner: BaseChatModel = PrivateAttr()
+    _root: Path = PrivateAttr()
+    _agent: str = PrivateAttr()
+    _interval: float = PrivateAttr()
+
+    def __init__(self, inner, root, agent, interval):
+        super().__init__()
+        self._inner, self._root, self._agent, self._interval = inner, root, agent, interval
         root.mkdir(parents=True, exist_ok=True)
 
-    def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        await asyncio.to_thread(_wait_for_llm_slot, self._interval)
+        request_id = uuid.uuid4().hex
         _atomic_json(
-            self.root / f"{run_id}-input.json",
+            self._root / f"{request_id}-input.json",
             {
-                "agent": self.agent,
-                "messages": [[{"role": m.type, "content": m.content} for m in chat] for chat in messages],
+                "agent": self._agent,
+                "messages": [{"role": m.type, "content": m.content} for m in messages],
+                "max_tokens": kwargs.get("max_tokens", getattr(self._inner, "max_tokens", None)),
             },
         )
-
-    def on_llm_end(self, response, *, run_id, **kwargs):
+        try:
+            result = await self._inner._agenerate(messages, stop, run_manager, **kwargs)
+        except Exception as exc:
+            _atomic_json(
+                self._root / f"{request_id}-error.json",
+                {
+                    "agent": self._agent,
+                    "error_type": type(exc).__name__,
+                    "status_code": getattr(exc, "status_code", None),
+                },
+            )
+            raise
         records = []
-        for batch in response.generations:
-            for generation in batch:
-                message = getattr(generation, "message", None)
-                if message is not None:
-                    records.append(
-                        {
-                            "content": message.content,
-                            "usage": message.usage_metadata,
-                            "reasoning": message.additional_kwargs.get("reasoning_content", ""),
-                            "finish_reason": message.response_metadata.get("finish_reason", ""),
-                            "tool_calls": message.tool_calls,
-                        }
-                    )
-        _atomic_json(self.root / f"{run_id}-output.json", {"agent": self.agent, "responses": records})
+        for generation in result.generations:
+            message = generation.message
+            records.append(
+                {
+                    "content": message.content,
+                    "usage": message.usage_metadata,
+                    "reasoning": message.additional_kwargs.get("reasoning_content", ""),
+                    "finish_reason": generation.generation_info.get("finish_reason")
+                    if generation.generation_info
+                    else "",
+                    "tool_calls": message.tool_calls,
+                }
+            )
+        _atomic_json(self._root / f"{request_id}-output.json", {"agent": self._agent, "responses": records})
+        return result
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._inner._generate(messages, stop, run_manager, **kwargs)
+
+    def bind_tools(self, tools, **kwargs):
+        bound = self._inner.bind_tools(tools, **kwargs)
+        return self.bind(**bound.kwargs)
+
+    @property
+    def _llm_type(self):
+        return "benchmark"
+
+    @property
+    def _identifying_params(self):
+        return {"agent": self._agent}
+
+
+def _wait_for_llm_slot(interval: float) -> None:
+    if interval <= 0:
+        return
+    with Path("/tmp/reviewforge-martian-llm-rate").open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        previous = float(handle.read().strip() or 0)
+        delay = interval - (time.monotonic() - previous)
+        if delay > 0:
+            time.sleep(delay)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(time.monotonic()))
+        handle.flush()
 
 
 class BenchmarkScheduler(Scheduler):
@@ -212,6 +267,7 @@ async def _build_runtime(
     output_language: str = "",
     pipeline: str = "legacy",
     reasoning_effort: str = "",
+    llm_min_interval: float = 30.0,
 ) -> tuple[Orchestrator, Database, GitHubClient]:
     os.environ["REVIEWFORGE_PIPELINE"] = pipeline
     if output_language:
@@ -245,13 +301,17 @@ async def _build_runtime(
     github = ReadOnlyGitHub(raw_github)
     router = ModelRouter(cfg.llm)
     original_get_llm = router.get_llm
+    traced = {}
 
     def traced_llm(name, *args, **kwargs):
+        if name in traced:
+            return traced[name]
         llm = original_get_llm(name, *args, **kwargs)
-        llm.callbacks = [TraceCallback(root / "llm-traces", name)]
         if reasoning_effort:
             llm.reasoning_effort = reasoning_effort
-        return llm
+        llm.max_retries = 0
+        traced[name] = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
+        return traced[name]
 
     router.get_llm = traced_llm
     policy_cfg = PublicationPolicyConfig(
@@ -386,7 +446,7 @@ async def main_async(args: argparse.Namespace) -> None:
     results = {str(item["golden_url"]): item for item in existing if item.get("status") == "completed"}
 
     orchestrator, db, raw_github = await _build_runtime(
-        root, args.model_override, args.output_language, args.pipeline, args.reasoning_effort
+        root, args.model_override, args.output_language, args.pipeline, args.reasoning_effort, args.llm_min_interval
     )
     metadata = {
         "pipeline": args.pipeline,
@@ -397,6 +457,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "github_writes": "blocked",
         "source_revision": os.environ.get("REVIEWFORGE_SOURCE_REVISION", ""),
         "reasoning_effort": args.reasoning_effort or "provider-default",
+        "llm_min_interval": args.llm_min_interval,
     }
     _atomic_json(root / "metadata.json", metadata)
     try:
@@ -447,6 +508,7 @@ def main() -> None:
     parser.add_argument("--model-override", default="")
     parser.add_argument("--pipeline", choices=("legacy", "shadow", "hypothesis"), default="legacy")
     parser.add_argument("--reasoning-effort", choices=("", "low", "high", "max"), default="")
+    parser.add_argument("--llm-min-interval", type=float, default=30.0)
     parser.add_argument(
         "--output-language",
         choices=("auto", "en", "zh-CN"),

@@ -61,11 +61,13 @@ class _ScriptedLLM(BaseChatModel):
 
     responses: list[str] = Field(default_factory=list)
     calls: list[list[BaseMessage]] = Field(default_factory=list)
+    output_limits: list[int | None] = Field(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.calls.append(list(messages))
+        self.output_limits.append(kwargs.get("max_tokens"))
         content = self.responses.pop(0) if self.responses else "{}"
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
@@ -206,6 +208,7 @@ async def test_parse_failure_marks_the_units_unresolved() -> None:
     assert result.failed_blocks == 1
     assert result.unresolved_units == [unit.id]
     assert ledger.unresolved_units[unit.id] == "generator parse failure"
+    assert llm.output_limits == [8192, 8192]
 
 
 @pytest.mark.asyncio

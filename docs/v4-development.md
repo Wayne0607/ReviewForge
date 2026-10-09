@@ -66,6 +66,8 @@
 
 第二轮 Windows/Python 3.12 全量测试：`1432 passed, 1 skipped, 6 warnings`；新增 Linux benchmark bootstrap 测试在 Windows 因 `fcntl` 跳过，由 dev CI 验证。两项严格裁判回归通过。ruff / format / spec-check 通过，未变更 main 部署。
 
+Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复；修正测试隔离后，`169c795` 的 dev CI 成功（Linux 1434 项测试通过）。首个固定提交试跑：上下文包含 58 units / 168 slices；生成/专项阶段 partial，未形成有效配对。并发尝试遇到 provider `429 rpm exhausted`，结果不用于 F1 宣称。诊断还发现新生成器没有显式传 SPEC 的 8192 输出上限，以及 token wrapper 的私有调用绕过了外层回调；补齐预算参数和 provider 层 trace，并采用跨进程限速后再跑。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

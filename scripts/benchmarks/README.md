@@ -31,6 +31,13 @@ files outside the output directory. Each process uses its own SQLite DB; complet
 results are skipped on restart. Diagnose partial execution before treating a
 zero-comment result as successful review coverage.
 
+For an OpenAI-compatible provider supporting DeepSeek's thinking parameter,
+`--thinking disabled` requests the non-thinking model. Apply it identically to
+both review sides and the judge, and label this experiment separately from the
+provider-default runs. `--profile` enables periodic Python stack dumps; ordinary
+runs keep them disabled. SIGTERM cancels the benchmark task and cleans its known
+workspaces and connections.
+
 The strict judge preserves the existing matching prompts, threshold, one-to-one
 matching and duplicate penalties. Its settings-path adapter permits use of the
 same existing provider from an isolated checkout. Record its SHA256 with each

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,7 +74,7 @@ def _strip_fence(content: str) -> str:
 
 
 class Judge:
-    def __init__(self, concurrency: int) -> None:
+    def __init__(self, concurrency: int, *, thinking: str = "default", min_interval: float = 30.0) -> None:
         repo_root = Path(os.environ.get("REVIEWFORGE_REPO_ROOT", "/opt/reviewforge"))
         load_dotenv(os.environ.get("REVIEWFORGE_ENV_FILE", repo_root / ".env"))
         config = ReviewForgeConfig.load(repo_root / "reviewforge.yaml")
@@ -85,6 +86,8 @@ class Judge:
         api_key = llm.api_key
         base_url = llm.base_url
         self.model = llm.model
+        self.thinking = thinking
+        self.min_interval = min_interval
         self.is_minimax = bool(base_url and "minimax" in base_url.lower() and self.model.lower().startswith("minimax-"))
         if self.is_minimax:
             anthropic_url = base_url.split("/v1", 1)[0].rstrip("/") + "/anthropic"
@@ -95,7 +98,7 @@ class Judge:
                 temperature=0.0,
             )
         else:
-            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         self.semaphore = asyncio.Semaphore(concurrency)
         self.input_tokens = 0
         self.output_tokens = 0
@@ -108,6 +111,10 @@ class Judge:
                 await result
 
     async def _complete(self, prompt: str, timeout: int) -> object:
+        if self.min_interval > 0:
+            from martian_runner import _wait_for_llm_slot
+
+            await asyncio.to_thread(_wait_for_llm_slot, self.min_interval)
         system = "You are a precise code review evaluator. Always respond with valid JSON."
         if self.is_minimax:
             response = await asyncio.wait_for(
@@ -126,6 +133,7 @@ class Judge:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
+                **({"extra_body": {"thinking": {"type": self.thinking}}} if self.thinking != "default" else {}),
             ),
             timeout=timeout,
         )
@@ -335,7 +343,13 @@ async def main_async(args: argparse.Namespace) -> None:
     output = Path(args.output)
     state = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {"completed": {}}
     completed = state.setdefault("completed", {})
-    judge = Judge(args.concurrency)
+    judge = Judge(args.concurrency, thinking=args.thinking, min_interval=args.llm_min_interval)
+    state["judge_parameters"] = {
+        "model": judge.model,
+        "thinking": args.thinking,
+        "llm_min_interval": args.llm_min_interval,
+        "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
     try:
         selected = workload[: args.limit or None]
         batch_size = max(1, min(args.concurrency // 2, 8))
@@ -389,6 +403,8 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument("--thinking", choices=("default", "enabled", "disabled"), default="default")
+    parser.add_argument("--llm-min-interval", type=float, default=30.0)
     args = parser.parse_args()
     asyncio.run(main_async(args))
 

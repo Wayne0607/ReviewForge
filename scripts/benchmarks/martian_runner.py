@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import uuid
@@ -98,12 +99,12 @@ class BenchmarkLLM(BaseChatModel):
             records.append(
                 {
                     "content": message.content,
-                    "usage": message.usage_metadata,
+                    "usage": getattr(message, "usage_metadata", None),
                     "reasoning": message.additional_kwargs.get("reasoning_content", ""),
                     "finish_reason": generation.generation_info.get("finish_reason")
                     if generation.generation_info
                     else "",
-                    "tool_calls": message.tool_calls,
+                    "tool_calls": getattr(message, "tool_calls", []),
                 }
             )
         _atomic_json(self._root / f"{request_id}-output.json", {"agent": self._agent, "responses": records})
@@ -268,6 +269,7 @@ async def _build_runtime(
     pipeline: str = "legacy",
     reasoning_effort: str = "",
     llm_min_interval: float = 30.0,
+    thinking: str = "default",
 ) -> tuple[Orchestrator, Database, GitHubClient]:
     os.environ["REVIEWFORGE_PIPELINE"] = pipeline
     if output_language:
@@ -307,7 +309,11 @@ async def _build_runtime(
         if name in traced:
             return traced[name]
         llm = original_get_llm(name, *args, **kwargs)
-        if reasoning_effort:
+        if thinking != "default":
+            llm.extra_body = {"thinking": {"type": thinking}}
+        if thinking == "disabled":
+            llm.reasoning_effort = None
+        elif reasoning_effort:
             llm.reasoning_effort = reasoning_effort
         llm.max_retries = 0
         traced[name] = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
@@ -428,6 +434,9 @@ async def _run_one(
 
 
 async def main_async(args: argparse.Namespace) -> None:
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
     global _PUBLICATION_GATE_CONCURRENCY, _SCHEDULER_CONCURRENCY
     _SCHEDULER_CONCURRENCY = args.reviewer_concurrency
     _PUBLICATION_GATE_CONCURRENCY = args.publication_gate_concurrency
@@ -446,7 +455,13 @@ async def main_async(args: argparse.Namespace) -> None:
     results = {str(item["golden_url"]): item for item in existing if item.get("status") == "completed"}
 
     orchestrator, db, raw_github = await _build_runtime(
-        root, args.model_override, args.output_language, args.pipeline, args.reasoning_effort, args.llm_min_interval
+        root,
+        args.model_override,
+        args.output_language,
+        args.pipeline,
+        args.reasoning_effort,
+        args.llm_min_interval,
+        args.thinking,
     )
     metadata = {
         "pipeline": args.pipeline,
@@ -458,6 +473,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "source_revision": os.environ.get("REVIEWFORGE_SOURCE_REVISION", ""),
         "reasoning_effort": args.reasoning_effort or "provider-default",
         "llm_min_interval": args.llm_min_interval,
+        "thinking": args.thinking,
     }
     _atomic_json(root / "metadata.json", metadata)
     try:
@@ -491,13 +507,13 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
             _atomic_json(output_path, list(results.values()))
     finally:
+        orchestrator._gateway.cleanup_workspaces()
         await db.close()
         await raw_github.close()
 
 
 def main() -> None:
     faulthandler.enable()
-    faulthandler.dump_traceback_later(60, repeat=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--workload", required=True)
     parser.add_argument("--output", required=True)
@@ -509,6 +525,7 @@ def main() -> None:
     parser.add_argument("--pipeline", choices=("legacy", "shadow", "hypothesis"), default="legacy")
     parser.add_argument("--reasoning-effort", choices=("", "low", "high", "max"), default="")
     parser.add_argument("--llm-min-interval", type=float, default=30.0)
+    parser.add_argument("--thinking", choices=("default", "enabled", "disabled"), default="default")
     parser.add_argument(
         "--output-language",
         choices=("auto", "en", "zh-CN"),
@@ -518,7 +535,10 @@ def main() -> None:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    if args.profile:
+        faulthandler.dump_traceback_later(60, repeat=True)
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

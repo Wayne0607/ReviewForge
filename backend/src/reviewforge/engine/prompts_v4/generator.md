@@ -41,7 +41,7 @@
 {
   "hypotheses": [
     {
-      "unit_id": "file.py:functionName",
+      "unit_id": "su_0123456789abcdef",
       "mechanism": "wrong-argument",
       "anchor_symbol": "updateDevice",
       "claim": "传入的 client id 与资源 owner 约定不一致",
@@ -56,12 +56,14 @@
     }
   ],
   "no_issue_units": [
-    {"unit_id": "file.py:functionName", "checked": "没有可验证的缺陷；仅改写了数值字面量"}
+    {"unit_id": "su_0123456789abcdef", "checked": "没有可验证的缺陷；仅改写了数值字面量"}
   ]
 }
 ```
 
 约束：
+
+- `unit_id` 是不透明标识，必须逐字复制 `## Changes` 中 Allowed unit_id 列表的值；不得用文件名、函数名、资源 key 拼造 ID。以上 `su_0123456789abcdef` 只是格式示例，不是本次可用 ID。
 
 - `mechanism` 只能是以下之一：`wrong-argument` / `wrong-operator` / `null-path` / `contract-mismatch` / `missing-await` / `lock-scope` / `state-leak` / `error-path` / `regression-removed` / `security-sink` / `i18n` / `a11y` / `perf` / `test-gap` / `doc`。
 - `severity` 只能是 `error` / `warning` / `info`。

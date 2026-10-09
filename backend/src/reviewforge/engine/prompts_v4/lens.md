@@ -40,7 +40,7 @@
 {
   "hypotheses": [
     {
-      "unit_id": "file.py:functionName",
+      "unit_id": "su_0123456789abcdef",
       "mechanism": "security-sink",
       "anchor_symbol": "updateDevice",
       "claim": "用户可控输入进入命令执行",
@@ -52,11 +52,13 @@
       "sites": [{"path": "app/main.go", "line": 42, "excerpt": "exec.Command(\"sh\", \"-c\", userInput)"}]
     }
   ],
-  "no_issue_units": [{"unit_id": "file.py:functionName", "checked": "本维度无可验证缺陷"}]
+  "no_issue_units": [{"unit_id": "su_0123456789abcdef", "checked": "本维度无可验证缺陷"}]
 }
 ```
 
 约束：
+
+- `unit_id` 必须逐字复制 `## Changes` 中 Allowed unit_id 列表的值；不得从文件、函数或资源 key 拼造 ID。`su_0123456789abcdef` 只是格式示例，不可直接用于本次输出。
 
 - `mechanism` 只能是：`wrong-argument` / `wrong-operator` / `null-path` / `contract-mismatch` / `missing-await` / `lock-scope` / `state-leak` / `error-path` / `regression-removed` / `security-sink` / `i18n` / `a11y` / `perf` / `test-gap` / `doc`。
 - `severity` 只能是 `error` / `warning` / `info`。

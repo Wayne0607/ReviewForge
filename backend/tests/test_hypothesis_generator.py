@@ -80,6 +80,20 @@ class _ScriptedLLM(BaseChatModel):
         return {}
 
 
+@pytest.mark.asyncio
+async def test_oversized_unit_is_unresolved_instead_of_exceeding_input_cap():
+    llm = _ScriptedLLM(responses=['{"hypotheses": [], "no_issue_units": []}'])
+    unit = _unit("service.py", "get_or_create_resource")
+    ledger = HypothesisLedger("run", "abc", "digest")
+    result = await HypothesisGenerator(llm, max_input_chars=200).run(
+        StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(unit), ledger
+    )
+    assert not llm.calls
+    assert result.failed_blocks == 1
+    assert ledger.unresolved_units[unit.id] == "generator input-too-large"
+    assert not ledger.no_issue_units
+
+
 def _hypothesis(
     mechanism: str, severity: str = "error", excerpt: str = "return create_resource(owner_id)", line: int = 2
 ) -> dict[str, Any]:
@@ -243,13 +257,14 @@ async def test_chunking_shares_the_ledger_across_blocks() -> None:
     ]
     llm = _ScriptedLLM(responses=responses)
     # A tiny budget forces each unit into its own block.
-    generator = HypothesisGenerator(llm, max_input_chars=200)
+    generator = HypothesisGenerator(llm, max_input_chars=1000)
     ledger = HypothesisLedger("run", "abc", "digest")
 
     result = await generator.run(StateStore(file_diffs=diffs), ContextPack(), _changeset(first, second), ledger)
 
     assert result.blocks == 2
     assert len(ledger.items) == 1
+    assert all(len(call[1].content) <= 1000 for call in llm.calls)
     second_block_text = "\n".join(getattr(message, "content", "") for message in llm.calls[1])
     assert "wrong-argument" in second_block_text
     assert "## Existing hypotheses" in second_block_text
@@ -310,3 +325,36 @@ async def test_generator_rejects_unknown_unit_even_with_real_site() -> None:
     assert result.accepted == 0
     assert result.dropped_invalid == 1
     assert not ledger.items
+
+
+@pytest.mark.asyncio
+async def test_generator_shows_opaque_ids_and_full_tail_of_changed_unit():
+    unit = _unit("service.py", "get_or_create_resource", end_line=601)
+    unit.id = "su_0123456789abcdef"
+    llm = _ScriptedLLM(responses=['{"hypotheses": [], "no_issue_units": []}'])
+    source = ["def get_or_create_resource(owner_id):", *["    # unchanged padding" for _ in range(599)], _EXCERPT_LINE]
+    await HypothesisGenerator(llm).run(
+        StateStore(file_diffs={"service.py": _diff("service.py", *source)}),
+        ContextPack(),
+        _changeset(unit),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+    assert "Allowed unit_id values" in llm.calls[0][1].content
+    assert "su_0123456789abcdef" in llm.calls[0][1].content
+    assert "601 |" in llm.calls[0][1].content
+    assert _EXCERPT_LINE in llm.calls[0][1].content
+
+
+@pytest.mark.asyncio
+async def test_lens_no_issue_does_not_erase_unresolved_generator_boundary():
+    unit = _unit("service.py", "get_or_create_resource")
+    ledger = HypothesisLedger("run", "abc", "digest")
+    ledger.unresolved_units[unit.id] = "generator parse failure"
+    llm = _ScriptedLLM(
+        responses=[json.dumps({"hypotheses": [], "no_issue_units": [{"unit_id": unit.id, "checked": "lens clean"}]})]
+    )
+    await HypothesisGenerator(llm, source="lens:security").run(
+        StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(unit), ledger
+    )
+    assert unit.id in ledger.unresolved_units
+    assert unit.id not in ledger.no_issue_units

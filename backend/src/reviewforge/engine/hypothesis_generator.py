@@ -259,24 +259,43 @@ class HypothesisGenerator:
             return result
 
         right_lines = _right_lines_by_path(state)
-        per_unit_context = max(1_000, self._context_max_chars // max(1, len(units)))
-        changes_by_unit = {unit.id: _render_changes([unit], right_lines, 400, state.file_diffs or {}) for unit in units}
-        context_by_unit = {unit.id: pack.render_for_unit(unit.id, max_chars=per_unit_context) for unit in units}
+        diffs = state.file_diffs or {}
+        changes_by_unit = {
+            unit.id: _render_changes([unit], right_lines, max(1, len(diffs.get(unit.path, "").splitlines())), diffs)
+            for unit in units
+        }
+        # Match the pack's global, risk-ordered water filling. A per-unit floor
+        # multiplied by many units must not exceed the advertised pack budget.
+        pack.render_all(max_chars=self._context_max_chars)
+        remaining = self._context_max_chars
+        context_by_unit = {}
+        for unit in units:
+            context = pack.render_for_unit(unit.id, max_chars=max(0, remaining))
+            context_by_unit[unit.id] = context
+            remaining -= len(context) + (2 if context else 0)
 
         blocks = self._chunk_units(units, changes_by_unit, context_by_unit)
-        result.blocks = len(blocks)
-
-        for block in blocks:
+        while blocks:
+            block = blocks.pop(0)
             user = self._render_user_message(pack, block, changes_by_unit, context_by_unit, ledger)
+            if len(user) > self._max_input_chars and len(block) > 1:
+                split = len(block) // 2
+                blocks[0:0] = [block[:split], block[split:]]
+                continue
+            result.blocks += 1
             failure = f"{self._source} parse failure"
-            try:
-                parsed = await self._invoke_once(user)
-                if parsed is None:
-                    parsed = await self._invoke_repair(user)
-            except Exception as exc:
+            if len(user) > self._max_input_chars:
                 parsed = None
-                failure = f"{self._source} provider error: {type(exc).__name__}"
-                logger.warning("%s generation failed: %s", self._source, type(exc).__name__)
+                failure = f"{self._source} input-too-large"
+            else:
+                try:
+                    parsed = await self._invoke_once(user)
+                    if parsed is None:
+                        parsed = await self._invoke_repair(user)
+                except Exception as exc:
+                    parsed = None
+                    failure = f"{self._source} provider error: {type(exc).__name__}"
+                    logger.warning("%s generation failed: %s", self._source, type(exc).__name__)
             if parsed is None:
                 result.failed_blocks += 1
                 for unit in block:
@@ -327,7 +346,13 @@ class HypothesisGenerator:
         sections: list[str] = []
         sections.append("## PR intent\n" + (pack.pr_intent or "（无）/(none)"))
         changes = "\n\n".join(changes_by_unit[unit.id] for unit in block)
-        sections.append("## Changes\n" + changes)
+        allowed = ", ".join(unit.id for unit in block)
+        sections.append(
+            "## Changes\nAllowed unit_id values (copy exactly; do not construct a file:symbol ID):\n"
+            + allowed
+            + "\n\n"
+            + changes
+        )
         context = "\n\n".join(context_by_unit[unit.id] for unit in block if context_by_unit.get(unit.id))
         sections.append("## Context\n" + (context or "（无）/(none)"))
         sections.append("## Unchecked\n" + _render_unchecked(pack))
@@ -422,7 +447,7 @@ class HypothesisGenerator:
                 unit_id = str(item.get("unit_id") or "").strip()
                 checked = str(item.get("checked") or "").strip()
                 has_hypothesis = any(hypothesis.unit_id == unit_id for hypothesis in ledger.items.values())
-                if unit_id in unit_ids and checked and not has_hypothesis:
+                if unit_id in unit_ids and checked and not has_hypothesis and unit_id not in ledger.unresolved_units:
                     ledger.no_issue_units[unit_id] = checked
 
         return overflow

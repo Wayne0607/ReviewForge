@@ -68,6 +68,10 @@
 
 Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复；修正测试隔离后，`169c795` 的 dev CI 成功（Linux 1434 项测试通过）。首个固定提交试跑：上下文包含 58 units / 168 slices；生成/专项阶段 partial，未形成有效配对。并发尝试遇到 provider `429 rpm exhausted`，结果不用于 F1 宣称。诊断还发现新生成器没有显式传 SPEC 的 8192 输出上限，以及 token wrapper 的私有调用绕过了外层回调；补齐预算参数和 provider 层 trace，并采用跨进程限速后再跑。
 
+随后原始回执确认两个可复现问题：生成器/lens 示例使用 `file.py:functionName`，与真实 `su_…` ID 不一致，模型产生的候选因未知 ID 被丢弃；两次调用 `finish_reason=length`，8192 个 completion tokens 全为 reasoning，正文为空。修正 ID 示例并显式列出每块允许的 ID；生成输入按实际渲染长度复核、过大块继续拆分，单 unit 无法容纳则 unresolved。取消 400 行静默截断，Context 总字符预算采用全包水位分配，专项 no_issue 不覆盖其它阶段的 unresolved。
+
+同一服务商的探测证明 `thinking.type=disabled` 可用（reasoning tokens=0）。后续开发对照统一采用 DeepSeek 非思考模式和跨进程 30 秒限速；与默认思考模式诊断结果分开，不能混算或冒充原 MiniMax-M3 验收。该参数格式参考 [DeepSeek 官方说明](https://api-docs.deepseek.com/guides/thinking_mode/)，实际可用性以此服务器探测回执验证。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

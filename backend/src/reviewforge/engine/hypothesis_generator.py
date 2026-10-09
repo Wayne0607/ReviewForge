@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,7 +26,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.detectors.unified_diff import iter_right_lines
+from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
@@ -35,7 +34,6 @@ from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 _EXCERPT_MIN_CHARS = 12
 _SEVERITIES = frozenset({"error", "warning", "info"})
 _SEVERITY_PRIORITY = {"info": 0, "warning": 1, "error": 2}
-_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 logger = logging.getLogger(__name__)
 
 # The lead-in text shared by every block (PR intent plus the unchecked-summary).
@@ -90,22 +88,13 @@ def _unit_patch(unit: SemanticUnit, diff: str, max_lines: int) -> str:
     be visible when reasoning about the behavior introduced by the PR.
     """
 
-    hunks: list[tuple[int, int, list[str]]] = []
-    for raw in diff.splitlines():
-        header = _HUNK_HEADER.match(raw)
-        if header:
-            start = int(header[1])
-            count = int(header[2] or 1)
-            hunks.append((start, start + max(1, count) - 1, [raw]))
-        elif hunks and (raw.startswith((" ", "+", "-", "\\ No newline"))):
-            hunks[-1][2].append(raw)
     start = max(1, unit.start_line - 3)
     end = max(start, unit.end_line + 3)
-    selected = [lines for first, last, lines in hunks if first <= end and last >= start]
+    selected = select_diff_hunks(diff, [(start, end)])
     # Resource/file units may not have symbol coordinates.
     if not selected and not unit.start_line:
-        selected = [lines for _, _, lines in hunks]
-    lines = [raw for hunk in selected for raw in hunk]
+        selected = select_diff_hunks(diff, [(0, 2**63 - 1)])
+    lines = selected.splitlines()
     rendered = "\n".join(lines[:max_lines])
     if len(lines) > max_lines:
         rendered += "\n(diff truncated; remaining changes unchecked)"

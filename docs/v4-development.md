@@ -76,6 +76,12 @@ Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复�
 
 本轮 Windows 全量测试：`1438 passed, 1 skipped, 6 warnings`，新增 3 项生成契约回归。此前 `96827a3` Linux dev CI 为 1438 项通过。本轮限流回执包含 `inference exceeds tpm/rpm limit`，30 秒间隔不足；下次开发诊断及正式配对均显式用 60 秒请求间隔，与前一轮结果分开保存。
 
+`ac634db` 的 60 秒间隔单 PR 诊断已得到两个正常闭合的生成响应（finish_reason=stop，5706 / 3599 输出 tokens，各 12 条候选），不再因重复输出耗尽预算。专项响应也包含了语言不匹配候选，仍需调查及严格裁判，不能据此宣称召回提高。该提交 Linux dev CI 成功。
+
+调查输入复核发现两项原规格实现偏差：原先交付整个文件 diff 而非该语义单元的 hunks；工具给模型 6000 字符但 observation 只保存 1200，未告知可引用边界。新增共用的 before/after hunk 选择函数，初始调查保留对应 unit 与全部附加 site 的相关 hunks，完整文件变化仍可用 read_diff 获取；较长结果显式分隔可引用 excerpt 和额外上下文，提示窄窗口重新取证。未放宽 grounded 校验或增加调查预算。
+
+新增 hunk/证据边界回归后，Windows 全量测试 `1440 passed, 1 skipped, 6 warnings`；ruff / format 均通过。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

@@ -189,7 +189,7 @@ async def _run_llm_stages(
     for item in ledger.items.values():
         if item.status == HypothesisStatus.UNKNOWN and item.retryable:
             item.status = HypothesisStatus.OPEN
-    investigator = Investigator(routed("investigator"), executor, output_language=language)
+    investigator = Investigator(routed("investigator"), executor, output_language=language, changeset=changeset)
     await investigator.run(
         ledger,
         state,

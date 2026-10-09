@@ -8,11 +8,38 @@ especially when a patch contains context, deletions, or multiple hunks.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 _HUNK_HEADER = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
     r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?:.*)$"
 )
+
+
+def select_diff_hunks(diff: str, ranges: Iterable[tuple[int, int]]) -> str:
+    """Keep verbatim before/after hunks intersecting RIGHT-side ranges.
+
+    This selects source context, including deleted lines. It does not supply
+    comment coordinates; those must still come from ``iter_right_lines``.
+    A deletion-only hunk intersects its post-image boundary.
+    """
+
+    windows = list(ranges)
+    selected: list[str] = []
+    include = False
+    for raw in (diff or "").splitlines():
+        header = _HUNK_HEADER.match(raw)
+        if header:
+            first = int(header.group("new_start"))
+            last = first + max(1, int(header.group("new_count") or 1)) - 1
+            include = any(first <= end and last >= start for start, end in windows)
+            if include:
+                selected.append(raw)
+        elif raw.startswith(("@@", "diff --git ")):
+            include = False
+        elif include and raw.startswith((" ", "+", "-", "\\ No newline")):
+            selected.append(raw)
+    return "\n".join(selected)
 
 
 def _iter_right_lines(diff: str) -> list[tuple[int, str, bool]]:

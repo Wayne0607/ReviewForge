@@ -21,6 +21,7 @@
 - `evidence_quote` 必须逐字引自你读到的工具结果原文（是一个子串）。
 - `evidence_ids` 引用你**实际调用过**的那些 observation id（工具结果开头标注的 `obs_N`）。
 - `confirmed` / `refuted` 至少要引用一条 `success` 的 observation，且 `evidence_quote` 必须出现在它的结果里。
+- 较长的工具结果会标出 `Saved evidence excerpt` 和 `Additional context`：只有前一段保存为 observation，可在结论中引用。若必要证据在后段，用更窄的 read_file 行窗口或更精确的搜索重新取证；不要把后段当成该 observation 的可引用原文。
 
 ## 输出
 

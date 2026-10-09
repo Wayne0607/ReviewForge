@@ -23,9 +23,10 @@ from langchain_core.tools import StructuredTool
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.detectors.unified_diff import iter_right_lines
+from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Observation, Site
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.semantic_diff import SemanticChangeSet
 
 logger = logging.getLogger(__name__)
 
@@ -164,11 +165,13 @@ class Investigator:
         *,
         output_language: str = "en",
         max_steps: int | None = None,
+        changeset: SemanticChangeSet | None = None,
     ) -> None:
         self._llm = llm
         self._executor = executor
         self._output_language = output_language
         self._max_steps = None if max_steps is None else max(1, int(max_steps))
+        self._changeset = changeset
         self._observations: list[Observation] = []
         self._obs_counter = 0
         self._tool_counts: dict[str, int] = {}
@@ -245,6 +248,14 @@ class Investigator:
         )
         self._obs_counter += 1
         self._observations.append(observation)
+        if len(text) > _OBS_EXCERPT_CHARS:
+            return (
+                f"[{observation.id}] Saved evidence excerpt (cite only this section):\n"
+                f"{observation.excerpt}\n[End saved evidence excerpt]\n"
+                "Additional context (not citable under this observation; use read_file with a narrower "
+                "line range or a more specific search to record it as evidence):\n"
+                f"{text[_OBS_EXCERPT_CHARS:]}"
+            )[:_TOOL_RESULT_CHARS]
         return f"[{observation.id}] {text}" if text else f"[{observation.id}] (no content)"
 
     def _system_prompt(self) -> str:
@@ -252,10 +263,19 @@ class Investigator:
 
     def _render_user(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> str:
         diffs = state.file_diffs or {}
-        diff_section = (
-            "\n\n".join(diffs.get(path, "") for path in sorted({site.path for site in hypothesis.sites}))
-            or "（无）/(none)"
-        )
+        ranges: dict[str, list[tuple[int, int]]] = {}
+        for site in hypothesis.sites:
+            ranges.setdefault(site.path, []).append((site.line, site.line))
+        if self._changeset is not None:
+            for unit in self._changeset.units:
+                if unit.id == hypothesis.unit_id:
+                    ranges.setdefault(unit.path, []).append((max(1, unit.start_line - 3), unit.end_line + 3))
+        sections = []
+        for path, windows in sorted(ranges.items()):
+            patch = select_diff_hunks(diffs.get(path, ""), windows)
+            if patch:
+                sections.append(f"### {path}\n{patch}")
+        diff_section = "\n\n".join(sections) or "(no matching hunk; use read_diff to inspect the file's changes)"
         context = pack.render_for_unit(hypothesis.unit_id, max_chars=12_000)
         hypothesis_body = json.dumps(hypothesis.to_dict(), ensure_ascii=False, indent=2)
         return "\n\n".join(
@@ -510,6 +530,7 @@ class Investigator:
                     self._executor,
                     output_language=self._output_language,
                     max_steps=self._max_steps,
+                    changeset=self._changeset,
                 )
                 try:
                     return await worker.investigate(hypothesis, state, pack, changed_paths=changed)

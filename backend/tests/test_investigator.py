@@ -13,6 +13,7 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.investigator import Investigator, budget_steps, build_workspace_executor
+from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 
 
 def _hypothesis(*, severity: str = "warning", refutation: str = "", open_question: str = "") -> Hypothesis:
@@ -90,6 +91,63 @@ def test_budget_by_severity() -> None:
         severity="error", refutation="caller already validates", open_question="does the schema allow null?"
     )
     assert budget_steps(boosted) == 8
+
+
+def test_investigation_input_selects_unit_hunks_and_all_additional_sites():
+    hypothesis = _hypothesis()
+    hypothesis.sites.append(Site(path="b.py", line=20, excerpt="another affected call"))
+    unit = SemanticUnit(
+        id=hypothesis.unit_id,
+        path="a.py",
+        language="python",
+        kind=UnitKind.SYMBOL,
+        symbol="f",
+        start_line=1,
+        end_line=12,
+    )
+    changeset = SemanticChangeSet(repo="owner/repo", pr_number=1, head_sha="abc123", units=[unit])
+    state = _state(
+        diffs={
+            "a.py": "@@ -1,2 +1,2 @@\n def f():\n+return user_input\n"
+            "@@ -10 +10 @@\n-validate(user_input)\n+skip_validation()\n"
+            "@@ -200 +200 @@\n+UNRELATED_CHANGE\n",
+            "b.py": "@@ -20 +20 @@\n+another affected call\n@@ -900 +900 @@\n+OTHER_UNRELATED\n",
+        }
+    )
+    user = Investigator(_ScriptedToolLLM(), _executor({}), changeset=changeset)._render_user(
+        hypothesis, state, ContextPack()
+    )
+    assert "-validate(user_input)" in user and "+skip_validation()" in user
+    assert "### b.py\n@@ -20 +20 @@" in user
+    assert "UNRELATED" not in user
+
+
+@pytest.mark.asyncio
+async def test_long_tool_output_identifies_saved_citation_boundary_and_narrow_read():
+    content = "x" * 1200 + "\n50: important_fact()\n" + "y" * 5500
+    investigator = Investigator(_ScriptedToolLLM(), _executor({("read_file", (("path", "a.py"),)): content}))
+    result = await investigator._run_tool("read_file", {"path": "a.py"})
+    observation = investigator._observations[0]
+    assert len(result) <= 6000
+    assert "important_fact()" not in observation.excerpt
+    assert result.index("End saved evidence excerpt") < result.index("important_fact()")
+    assert "narrower line range" in result
+
+    investigator._executor = _executor(
+        {("read_file", (("end", 50), ("path", "a.py"), ("start", 50))): "50: important_fact()"}
+    )
+    await investigator._run_tool("read_file", {"path": "a.py", "start": 50, "end": 50})
+    verdict = investigator._finalize(
+        {
+            "verdict": "confirmed",
+            "evidence_ids": ["obs_1"],
+            "evidence_quote": "important_fact()",
+        },
+        _hypothesis(),
+        {"a.py"},
+        steps=2,
+    )
+    assert verdict.verdict == "confirmed"
 
 
 @pytest.mark.asyncio

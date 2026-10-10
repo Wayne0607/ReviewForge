@@ -148,6 +148,10 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 据此增加显式开发消融参数 `--generator-max-input-chars`（0 保持现有配置），接入既有语义单元分块；metadata 固定原始 override 和 effective budget。同时修正专项 lens 未继承 generator 输入与 ContextPack 字符预算的接线缺口，默认值均不变。新增小预算下所有单元、完整变更与 no_issue 覆盖仍保留的回归，增强 bootstrap 验证实际配置；完整测试为 `1499 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。接下来用 50000 字符输入块、65 秒请求间隔进行新的单 PR 开发诊断；不复用旧目录或旧成绩。
 
+`3170802` dev CI 成功。50000/65 秒开发消融仍不稳定：6 次生成请求，3 次成功、3 次 429，记录 52437 tokens；停止时最新账本为 22 个唯一 OPEN 假设、18 个 no_issue units、25 个 unresolved units。已停止验证过的本机工作进程，启动器关闭资源组并写失败记录，峰值约 333 MiB。`.reviewforge/benchmarks/deepseek-dev-pair-3170802-50k-65s-20261010/outcome.json` 明确标记非质量结果，全部原始回执/账本保留。尚未形成有效完整配对，未跑 holdout、未切默认、未发布 v4 到 main。
+
+已询问用户 SenseNova 控制台的实际 TPM/RPM 上限及是否共享 key；不能把通用 `tpm/rpm limit` 文本当成某个已知上限，也不继续盲调输入大小/重试次数。最近生产复核仍 active、HTTP 200、main SHA 不变，生产数据库近一小时没有 token usage 记录；这不能排除该 key 在其它应用的用量或模型服务整体限流。待核实限额后继续真实对照。另有诊断待分析：此前一个语法正确的生成回执覆盖 38 个输入单元中的 34 个，需核对省略的 4 个是否属于明确排除项；不能仅凭返回 JSON 合法就宣称全部单元已审查。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

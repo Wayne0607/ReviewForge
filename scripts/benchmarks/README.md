@@ -14,6 +14,42 @@ alone does not isolate CPU or memory; do not launch multiple bare Python context
 jobs on the production host. Resource-limit failures must remain failed/partial,
 never a zero-finding success.
 
+`launch_isolated.py` is the shared-host entry point for `runner`, `context`, and
+`judge`. It requires Linux root, systemd, and cgroup v2; it refuses an unbounded
+fallback or the production checkout. Choose the limits from actual host capacity
+and production load. Both the memory reserve and disk reserve are required.
+
+```bash
+python scripts/benchmarks/launch_isolated.py \
+  --repo-root "$EVAL_SNAPSHOT" \
+  --python /opt/reviewforge/backend/.venv/bin/python \
+  --env-file /opt/reviewforge/.env \
+  --settings-dir /opt/reviewforge/.reviewforge \
+  --revision "$EVAL_SOURCE_REVISION" \
+  --record "$EVAL_SNAPSHOT/results/context/execution.json" \
+  --memory-mb "$EVAL_MEMORY_MB" --reserve-mb "$PRODUCTION_RESERVE_MB" \
+  --disk-reserve-mb "$PRODUCTION_DISK_RESERVE_MB" \
+  --cpu-percent "$EVAL_CPU_PERCENT" --runtime-seconds "$EVAL_RUNTIME_SECONDS" \
+  --task context -- --repo keycloak/keycloak --pr 36880 \
+  --output "$EVAL_SNAPSHOT/results/context/context.json"
+```
+
+The launcher holds a host-wide process lock until the task exits, rejects an
+existing evaluation service or known unmanaged evaluation process, and checks
+that the production service is active. A transient service sets MemoryHigh,
+MemoryMax, zero swap, CPUQuota, TasksMax and RuntimeMaxSec for the entire process
+tree. The child verifies the actual kernel memory/swap/CPU limits before importing
+the workload. CPUQuota is a percentage of one CPU, as described in the
+[systemd resource-control manual](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml).
+An execution record and log retain failures; an interrupted launcher stops its
+own service. RuntimeMaxSec also bounds an orphaned service. Records are new for
+each attempt; an old result file is not proof that a new attempt succeeded.
+
+These checks require a bounded smoke test on the actual host before evaluation.
+The disk reserve is a preflight free-space check, not a filesystem quota; monitor
+artifact growth and clean only known evaluation workspaces. Unit completion
+indicates process exit, not that an inner partial review passed quality gates.
+
 Environment variables:
 
 - `REVIEWFORGE_REPO_ROOT`: isolated source checkout.

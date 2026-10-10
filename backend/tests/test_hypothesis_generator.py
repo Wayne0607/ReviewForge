@@ -367,6 +367,11 @@ async def test_chunking_shares_the_ledger_across_blocks() -> None:
     second_block_text = "\n".join(getattr(message, "content", "") for message in llm.calls[1])
     assert "wrong-argument" in second_block_text
     assert "## Existing hypotheses" in second_block_text
+    for call, unit in zip(llm.calls, (first, second), strict=True):
+        checklist = call[1].content.split("## Required assessments (1)\n")[1]
+        assert unit.id in checklist
+        other = second if unit is first else first
+        assert other.id not in checklist
 
 
 @pytest.mark.asyncio

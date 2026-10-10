@@ -177,6 +177,7 @@ class Investigator:
         self._tool_counts: dict[str, int] = {}
         self._state: StateStore | None = None
         self._tokens = 0
+        self._input_overhead = 0
 
     def _build_tools(self) -> list[StructuredTool]:
         async def read_file(path: str, start: int | None = None, end: int | None = None) -> str:
@@ -299,6 +300,7 @@ class Investigator:
         self._state = state
         self._observations = list(hypothesis.observations)
         self._tokens = 0
+        self._input_overhead = 0
         self._tool_counts = {}
         self._obs_counter = max(
             (
@@ -316,19 +318,32 @@ class Investigator:
             SystemMessage(content=self._system_prompt()),
             HumanMessage(content=self._render_user(hypothesis, state, pack)),
         ]
+        initial = list(chat)
         tools = self._build_tools()
         known_names = {tool.name for tool in tools}
         bound = self._llm.bind_tools(tools)
+        schema_tokens = self._estimate_text_tokens(
+            json.dumps(
+                [{"name": tool.name, "description": tool.description, "parameters": tool.args} for tool in tools],
+                ensure_ascii=False,
+            )
+        )
 
         for step in range(steps):
-            if self._tokens + self._estimate_input_tokens(chat) >= token_limit:
-                return self._result(
-                    verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step
-                )
+            closing = self._closing_chat(initial, token_limit)
+            # A tool round is useful only if we can still ask for a verdict.
+            # Reserve the closing input and output within the SAME budget,
+            # before spending on more tools. The output reserve is capped at
+            # a quarter of the total budget so small budgets can collect facts.
+            input_tokens = self._estimate_input_tokens(chat) + schema_tokens + self._input_overhead
+            closing_tokens = self._estimate_input_tokens(closing) + self._input_overhead
+            remaining = token_limit - self._tokens
+            closing_output = min(4_000, token_limit // 4)
+            output_tokens = min(4_000, remaining - input_tokens - closing_tokens - closing_output)
+            if output_tokens <= 0:
+                return await self._close(closing, hypothesis, changed, token_limit=token_limit, steps=step)
             try:
-                response = await bound.ainvoke(
-                    chat, max_tokens=min(4_000, token_limit - self._tokens - self._estimate_input_tokens(chat))
-                )
+                response = await bound.ainvoke(chat, max_tokens=output_tokens)
             except Exception as exc:
                 logger.warning("investigator provider error for %s: %s", hypothesis.identity, exc)
                 return self._result(
@@ -338,15 +353,24 @@ class Investigator:
                     steps=step,
                     retryable=True,
                 )
-            self._record_tokens(response, chat)
+            self._record_tokens(response, chat, schema_tokens=schema_tokens)
             chat.append(response)
+            if self._tokens > token_limit:
+                return self._result(
+                    verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step + 1
+                )
             tool_calls = getattr(response, "tool_calls", None) or []
             if not tool_calls:
                 parsed = self._parse_verdict(getattr(response, "content", "") or "")
                 if parsed is not None:
                     return self._finalize(parsed, hypothesis, changed, steps=step + 1)
-                chat.append(HumanMessage(content="请基于已收集的证据，现在只输出调查结论 JSON（不再调用工具）。"))
-                continue
+                return await self._close(
+                    self._closing_chat(initial, token_limit),
+                    hypothesis,
+                    changed,
+                    token_limit=token_limit,
+                    steps=step + 1,
+                )
             if self._tokens >= token_limit:
                 return self._result(
                     verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step + 1
@@ -360,13 +384,50 @@ class Investigator:
                     result = await self._run_tool(name, args)
                 chat.append(ToolMessage(content=result, tool_call_id=tool_call.get("id", "")))
 
-        chat.append(HumanMessage(content="已达到步数上限。请只输出调查结论 JSON（不再调用工具）。"))
-        if self._tokens + self._estimate_input_tokens(chat) >= token_limit:
+        return await self._close(
+            self._closing_chat(initial, token_limit), hypothesis, changed, token_limit=token_limit, steps=steps
+        )
+
+    def _closing_chat(self, initial: list[Any], token_limit: int) -> list[Any]:
+        # Replay the hypothesis/context and code-written excerpts, rather than
+        # every 6000-character tool result and the model's speculative history.
+        # Nothing outside a saved Observation becomes citable during closure.
+        observations = [
+            {
+                "id": obs.id,
+                "tool": obs.tool,
+                "query": obs.query,
+                "path": obs.path,
+                "status": obs.status,
+                "excerpt": obs.excerpt,
+            }
+            for obs in self._observations
+        ]
+        return [
+            *initial,
+            HumanMessage(
+                content="## Recorded observations\n"
+                + json.dumps(observations, ensure_ascii=False)
+                + f"\nRemaining investigation budget: {max(0, token_limit - self._tokens)} tokens. "
+                "Finish now. Answer the one open_question using these saved observations. "
+                "Return only the verdict JSON; no more tools. If evidence is insufficient, return unknown."
+            ),
+        ]
+
+    async def _close(
+        self,
+        chat: list[Any],
+        hypothesis: Hypothesis,
+        changed: set[str],
+        *,
+        token_limit: int,
+        steps: int,
+    ) -> InvestigationResult:
+        input_tokens = self._estimate_input_tokens(chat) + self._input_overhead
+        if self._tokens + input_tokens >= token_limit:
             return self._result(verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=steps)
         try:
-            final = await self._llm.ainvoke(
-                chat, max_tokens=min(4_000, token_limit - self._tokens - self._estimate_input_tokens(chat))
-            )
+            final = await self._llm.ainvoke(chat, max_tokens=min(4_000, token_limit - self._tokens - input_tokens))
             self._record_tokens(final, chat)
             parsed = self._parse_verdict(getattr(final, "content", "") or "")
         except Exception as exc:
@@ -374,22 +435,49 @@ class Investigator:
             return self._result(
                 verdict="unknown", reason="provider error", severity=hypothesis.severity, steps=steps, retryable=True
             )
+        if self._tokens > token_limit:
+            return self._result(verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=steps)
         if parsed is None:
             return self._result(verdict="unknown", reason="step-exhausted", severity=hypothesis.severity, steps=steps)
         return self._finalize(parsed, hypothesis, changed, steps=steps)
 
     @staticmethod
-    def _estimate_input_tokens(chat: list[Any]) -> int:
-        return sum(len(str(message.content)) for message in chat) // 4
+    def _estimate_text_tokens(text: str) -> int:
+        # A forecast, not a provider tokenizer. The old len/4 estimate missed
+        # tool arguments/schema and badly underestimated Chinese instructions.
+        non_ascii = sum(ord(char) > 127 for char in text)
+        return (len(text) - non_ascii + 3) // 4 + non_ascii
 
-    def _record_tokens(self, response: Any, chat: list[Any]) -> None:
+    @classmethod
+    def _estimate_input_tokens(cls, chat: list[Any]) -> int:
+        payload = [
+            {
+                "role": message.type,
+                "content": message.content,
+                "tool_calls": getattr(message, "tool_calls", []),
+                "tool_call_id": getattr(message, "tool_call_id", ""),
+            }
+            for message in chat
+        ]
+        return cls._estimate_text_tokens(json.dumps(payload, ensure_ascii=False, default=str)) + 12 * len(chat)
+
+    def _record_tokens(self, response: Any, chat: list[Any], *, schema_tokens: int = 0) -> None:
         usage = getattr(response, "usage_metadata", None) or {}
         usage = usage or (getattr(response, "response_metadata", {}) or {}).get("token_usage", {})
         total = usage.get("total_tokens")
+        measured_input = usage.get("input_tokens", usage.get("prompt_tokens"))
+        if measured_input is not None:
+            self._input_overhead = max(
+                self._input_overhead, int(measured_input) - self._estimate_input_tokens(chat) - schema_tokens
+            )
+        if total is None and measured_input is not None:
+            output = usage.get("output_tokens", usage.get("completion_tokens"))
+            if output is not None:
+                total = int(measured_input) + int(output)
         if total is not None:
             self._tokens += max(0, int(total))
         else:
-            self._tokens += self._estimate_input_tokens(chat) + len(str(response.content)) // 4
+            self._tokens += self._estimate_input_tokens(chat) + schema_tokens + self._estimate_input_tokens([response])
 
     @staticmethod
     def _parse_verdict(content: str) -> dict[str, Any] | None:

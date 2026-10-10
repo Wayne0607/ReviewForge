@@ -392,6 +392,11 @@ class HypothesisGenerator:
         sections.append("## Context\n" + (context or "（无）/(none)"))
         sections.append("## Unchecked\n" + _render_unchecked(pack))
         sections.append("## Existing hypotheses\n" + _render_existing(ledger))
+        sections.append(
+            f"## Required assessments ({len(block)})\n"
+            "Return each ID in hypotheses or no_issue_units.checked, including tests/fixtures. "
+            "Existing hypotheses/context do not count as this response's assessment.\n" + allowed
+        )
         return "\n\n".join(sections)
 
     async def _invoke_once(self, user: str) -> tuple[dict[str, Any] | None, str]:

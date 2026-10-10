@@ -488,3 +488,112 @@ async def test_investigator_stops_when_token_budget_is_exhausted() -> None:
     assert result.verdict == "unknown" and result.reason == "token-exhausted"
     assert result.tokens == 8000
     assert len(llm.turns) == 1
+
+
+class _BudgetAwareLLM(_ScriptedToolLLM):
+    calls: list[dict] = Field(default_factory=list)
+    quote: str = "return user_input"
+    fail_final: bool = False
+
+    def bind_tools(self, tools, **kwargs):
+        return self.bind(investigation_tools=True)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        tools_enabled = kwargs.get("investigation_tools", False)
+        self.calls.append({"tools": tools_enabled, "messages": list(messages), "limit": kwargs.get("max_tokens")})
+        if tools_enabled:
+            message = AIMessage(content="", tool_calls=[_read_file_call()])
+            input_tokens, output_tokens = 2500, 100
+        else:
+            if self.fail_final:
+                raise RuntimeError("closing provider failure")
+            message = AIMessage(content=_verdict(quote=self.quote))
+            input_tokens, output_tokens = 2000, 200
+        message.usage_metadata = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+@pytest.mark.asyncio
+async def test_investigator_reserves_a_grounded_verdict_before_replaying_long_tools():
+    llm = _BudgetAwareLLM()
+    content = "return user_input\n" + "x" * 5980
+    result = await Investigator(llm, _executor({("read_file", (("path", "a.py"),)): content}), max_steps=2).investigate(
+        _hypothesis(), _state(), ContextPack()
+    )
+
+    assert result.verdict == "confirmed"
+    assert result.tokens <= 8000
+    assert [call["tools"] for call in llm.calls] == [True, False]
+    closing = llm.calls[-1]["messages"]
+    assert "return user_input" in str(closing)
+    assert "obs_0" in str(closing)
+    assert "x" * 1200 not in str(closing)  # Only code-written, saved excerpts are needed to decide.
+    assert not any(message.type == "tool" for message in closing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "quote"),
+    [("x" * 1200 + "not saved fact" + "x" * 4780, "not saved fact"), ("No results", "No results")],
+)
+async def test_budget_closure_cannot_promote_unsaved_or_not_found_evidence(content, quote):
+    llm = _BudgetAwareLLM(quote=quote)
+    result = await Investigator(llm, _executor({("read_file", (("path", "a.py"),)): content}), max_steps=2).investigate(
+        _hypothesis(), _state(), ContextPack()
+    )
+    assert result.verdict == "unknown" and result.reason == "ungrounded"
+    if quote == "not saved fact":
+        assert quote not in str(llm.calls[-1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_budget_closure_provider_failure_is_retryable():
+    llm = _BudgetAwareLLM(fail_final=True)
+    result = await Investigator(
+        llm, _executor({("read_file", (("path", "a.py"),)): "return user_input\n" + "x" * 5980}), max_steps=2
+    ).investigate(_hypothesis(), _state(), ContextPack())
+    assert result.verdict == "unknown" and result.retryable
+    assert "provider error" in result.reason
+    assert [call["tools"] for call in llm.calls] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_single_step_budget_can_read_evidence_and_close():
+    class CheapLLM(_BudgetAwareLLM):
+        def _generate(self, *args, **kwargs):
+            result = super()._generate(*args, **kwargs)
+            result.generations[0].message.usage_metadata = {
+                "input_tokens": 500,
+                "output_tokens": 100,
+                "total_tokens": 600,
+            }
+            return result
+
+    llm = CheapLLM()
+    result = await Investigator(
+        llm, _executor({("read_file", (("path", "a.py"),)): "return user_input"}), max_steps=1
+    ).investigate(_hypothesis(), _state(), ContextPack())
+    assert result.verdict == "confirmed" and result.tokens == 1200
+    assert [call["tools"] for call in llm.calls] == [True, False]
+
+
+def test_input_forecast_includes_tool_arguments_and_measured_provider_overhead():
+    from types import SimpleNamespace
+
+    small = [AIMessage(content="", tool_calls=[_read_file_call()])]
+    large = [AIMessage(content="", tool_calls=[_read_file_call("x" * 8000)])]
+    assert Investigator._estimate_input_tokens(large) > Investigator._estimate_input_tokens(small) + 1900
+
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}))
+    response = SimpleNamespace(
+        content="ok",
+        usage_metadata={},
+        response_metadata={"token_usage": {"prompt_tokens": 3500, "completion_tokens": 50}},
+    )
+    investigator._record_tokens(response, small, schema_tokens=500)
+    assert investigator._tokens == 3550
+    assert investigator._estimate_input_tokens(small) + 500 + investigator._input_overhead == 3500

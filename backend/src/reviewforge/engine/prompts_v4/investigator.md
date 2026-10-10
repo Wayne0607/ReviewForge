@@ -7,6 +7,9 @@
 1. 先读 `## Context` 里已经给到的片段；不够再用工具。
 2. 优先用 `find_definition` / `find_callers` / `grep` 定位事实，再用 `read_file` 取证。
 3. **每次调用工具之前，先写一句你要证明或推翻的具体事实**，再调用工具。
+4. 一旦读到能回答 `open_question` 并验证 trigger/impact 或 refutation 的证据，立即输出结论，不要继续探索其它潜在问题。预算包含最后一次结论调用；收到结束指令时，证据不足必须返回 `unknown`。
+
+已知文件路径和行号时，直接用 `read_file` 读取相关行前后约 12 行，避免整文件读取后再重复取证。`grep.pattern` 匹配文件内容，`glob` 限定路径；不要用文件名当内容搜索来判断文件是否存在。Context 已给出的事实若需要引用为结论证据，用一次窄窗口读取记录 observation。
 
 ## 判定
 

@@ -232,6 +232,7 @@ class HypothesisLedger:
 4. `## Context`：`pack.render_all()`；每个 slice 以 `### {kind} {path}:{start}-{end} — {reason}` 开头。
 5. `## Unchecked`：`truncated_kinds` 汇总——告诉模型哪些上下文没给到，这些方向只能提 `open_question` 不能下结论。
 6. `## Existing hypotheses`（分块或 lens 时）：identity / claim 列表。
+7. `## Required assessments`：本块 unit ID 清单与数量，要求每个 ID 返回 hypothesis 或带 checked 边界的 no_issue（包括测试与 fixture）；不得由上下文或旧账本代替本轮返回。清单计入既有输入字符上限，省略仍进入 unresolved，不做补找重试。
 
 **输出 schema（严格）。**
 ```json
@@ -276,6 +277,8 @@ budget_steps = base(severity) + bonus
   上限 8；token 上限 = steps × 4000
 ```
 每 PR 调查总预算 `investigator.max_hypotheses_per_pr`（默认 12），超出的按 severity → sites 数量排序，余下标 `unknown`，reason `budget-exhausted`。
+
+预算包含结论调用，不能把全部额度用于工具循环。每轮先预留结论输入及输出（输出预留为总预算的四分之一，最多 4000 tokens），不足以继续工具调用时提前结束调查。结论输入重用原始假设/上下文及代码保存的 Observation excerpts，不重放完整工具结果或模型探索文字。估算计入工具参数、schema 与非 ASCII 文本，并用已测 provider input usage 校正遗漏的开销；实际 usage 仍如实记账，超支不可写已确认结论。
 
 **工具（通过 gateway，绑定 workspace）。** `read_file(path, start, end)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path)`。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
 

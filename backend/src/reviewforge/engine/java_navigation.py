@@ -9,6 +9,7 @@ locate alternative configuration paths without deciding initialization order.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from functools import cached_property
 
 from reviewforge.engine import symbol_extractor
@@ -28,6 +29,14 @@ def matches_qualified(actual: str, query: str, *, package: str) -> bool:
     # Package omission is permitted only at the package/class boundary.
     # Dropping arbitrary prefixes would make Gate.method match Nested.Gate.method.
     return bool(package) and actual.removeprefix(package + ".") == query
+
+
+@dataclass(frozen=True)
+class JavaField:
+    name: str
+    line: int
+    owner: symbol_extractor.SymbolInfo
+    mutable_static: bool
 
 
 class JavaSource:
@@ -73,10 +82,46 @@ class JavaSource:
 
     def _function(self, line: int):
         return min(
-            (d for d in self.functions if d.line <= line <= d.end_line),
+            (d for d in self.functions if (d.start_line or d.line) <= line <= d.end_line),
             key=lambda d: d.end_line - d.line,
             default=None,
         )
+
+    @cached_property
+    def field_declarations(self) -> tuple[JavaField, ...]:
+        """Declared members in a recognized class body, never local statements.
+
+        The lexical brace depth excludes initializer blocks and anonymous
+        bodies too. Unsupported/inherited declarations remain unresolved.
+        """
+        fields = []
+        for match in _BINDING.finditer(self.mask):
+            if match.group(1) in _NOT_TYPES:
+                continue
+            offset = match.start()
+            line = self.mask.count("\n", 0, offset) + 1
+            owner = self.owner(line)
+            if owner is None or self._function(line) is not None:
+                continue
+            class_start = sum(len(row) for row in self.mask.splitlines(keepends=True)[: owner.line - 1])
+            body = self.mask.find("{", class_start)
+            if body < 0 or body >= offset:
+                continue
+            depth = self.mask.count("{", 0, offset) - self.mask.count("}", 0, offset)
+            class_depth = self.mask.count("{", 0, body + 1) - self.mask.count("}", 0, body + 1)
+            if depth != class_depth:
+                continue
+            start = max(self.mask.rfind(token, 0, offset) for token in (";", "{", "}")) + 1
+            modifiers = self.mask[start:offset]
+            fields.append(
+                JavaField(
+                    match.group(2),
+                    line,
+                    owner,
+                    bool(re.search(r"\bstatic\b", modifiers) and not re.search(r"\bfinal\b", modifiers)),
+                )
+            )
+        return tuple(fields)
 
     @cached_property
     def bindings(self):
@@ -153,28 +198,19 @@ class JavaSource:
             return next(iter(imported))
         return self._type_name(callee) if callee[:1].isupper() else None
 
-    def state_navigation(self, definition, *, max_chars: int = 600) -> str:
-        """Point to mutable static fields and same-class reference locations.
+    def state_references(self, definition):
+        """Index mutable static fields and same-class reference locations.
 
         Inspect the callee and one layer of local helpers. Do not infer writers,
         execution order, or completeness from this lexical index.
         """
         owner = self.owner(definition.line)
         if owner is None or definition.symbol_type != "function":
-            return ""
+            return []
         lines = self.mask.splitlines()
-        fields = {}
-        for number in range(owner.line, owner.end_line + 1):
-            if self.owner(number) != owner or any(d.line <= number <= d.end_line for d in self.functions):
-                continue
-            line = lines[number - 1]
-            if not re.search(r"\bstatic\b", line) or re.search(r"\bfinal\b", line):
-                continue
-            match = re.search(rf"\b({_NAME})\s*(?:=|;)\s*", line)
-            if match:
-                fields[match.group(1)] = number
+        fields = [field for field in self.field_declarations if field.owner == owner and field.mutable_static]
         if not fields:
-            return ""
+            return []
         methods = [d for d in self.functions if self.owner(d.line) == owner]
         related = [definition]
         for call in self.calls:
@@ -184,19 +220,29 @@ class JavaSource:
             related.extend(d for d in methods if self.qualified_definition(d) == target)
         used = set(re.findall(_NAME, "\n".join("\n".join(lines[d.line - 1 : d.end_line]) for d in related)))
         entries = []
-        for name, declaration_line in fields.items():
-            if name not in used:
+        for field in fields:
+            if field.name not in used:
                 continue
-            matcher = re.compile(rf"\b{re.escape(name)}\b")
+            matcher = re.compile(rf"\b{re.escape(field.name)}\b")
             references = []
             for method in methods:
                 for number in range(method.line, method.end_line + 1):
                     if self.owner(number) == owner and matcher.search(lines[number - 1]):
-                        references.append(f"{method.name}@{method.line} (reference {number})")
+                        references.append((method, number))
                         break
+            entries.append((field, references))
+        return entries
+
+    def state_navigation(self, definition, *, max_chars: int = 600) -> str:
+        indexed = self.state_references(definition)
+        entries = []
+        for field, references in indexed[:4]:
             entries.append(
-                f"{name}@{declaration_line}: "
-                + ", ".join(references[:6])
+                f"{field.name}@{field.line}: "
+                + ", ".join(
+                    f"{self.qualified_definition(method)}@{method.line} (reference {number})"
+                    for method, number in references[:6]
+                )
                 + ("; more omitted" if len(references) > 6 else "")
             )
         if not entries:
@@ -204,7 +250,7 @@ class JavaSource:
         text = "State navigation (not evidence; inspect config/reset callers; order unproved): " + "; ".join(
             entries[:4]
         )
-        if len(entries) > 4:
+        if len(indexed) > 4:
             text += "; more fields omitted"
         marker = " ... omitted"
         return text if len(text) <= max_chars else (text[: max(0, max_chars - len(marker))] + marker)[:max_chars]

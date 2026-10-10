@@ -373,4 +373,14 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 
 新增 7 项回归先在旧代码上失败，覆盖同文件密集命中、限定/短名 Java caller、缓存隔离、显式 glob、相同条数、1200 字符保存/后续窄读与扫描提前停止；相关 114 项通过。零模型调用的真实源码子集复现另保存在本轮 `probe/search-retrieval-audit/`，声明仅三份固定 head 文件，核对 ProfileTest 的 Git blob 摘要；相同 grep / caller 查询现在将 `Environment.java:243` 保存在实际 Observation，未伪称完整 workspace 或质量测评。完整 `1678 passed, 1 skipped, 6 warnings`，ruff / 200 文件 format / spec-check / 严格裁判回归通过；真实判断效果待新冻结复测。
 
+冻结 `0d49892` 的同输入复测位于 `.reviewforge/benchmarks/v4-java-navigation-20261011-070957/`。完整源码预检/20 units/40000 字符与前轮一致；9 次成功请求 / 33899 tokens（15363 / 18536），正常退出、峰值 395444224 bytes、锁释放。两条仍为 UNKNOWN，本次没有查询替代 configure caller；第二条还错误读取不存在的 Profile 路径，随后宽读未保存需要的赋值位置。semantic-audit 保留原结果 SHA256 `576e6a0d...`，不将检索修复等同于真实多跳判断已修好，无本轮 pipeline 分数、legacy 配对或 holdout。
+
+### Java 状态上下文的声明与相关性（2026-10-11）
+
+追查实录发现 Metadata unit 的多条 field_usage 实际为 `uses return`。两问回查 `dc0d43c2`：原跨语言字段正则允许省略类型，并把函数中的普通赋值视为成员，导致 return/throw、局部变量、注释、大小写相似和嵌套类命中占用有界上下文。Java 现在使用所属类、声明、方法与词法括号深度选择实际成员，排除初始化块和方法参数，按大小写及 owner 匹配引用；其它语言原行为不改。
+
+同一声明索引也服务可变 static 导航。为已定位 callee 的相关状态引用附窄源码片段，让生成和调查能够看到配置/init/reset 的真实位置；方法名带 owner，字段类别的收集顺序、4 字段/6 方法限制、原 slice/行/字符预算和未检查标记保留。Context 不变成证据，调查仍须成功 Observation，实际入口顺序和输入绑定仍需单独证明。
+
+新增 6 项回归，其中 5 项先在旧实现失败；验证实际字段、局部/参数/初始化块隔离、同一行修饰符不串扰、精确大小写/owner、字面量不能触发，以及跨 unit 的 callee 状态隔离和禁止凭 Context 构造引用。既有源码导航与片段预算测试扩充真实 configure/init/reset 片段及截断标记。相关 156 项通过，完整 `1684 passed, 1 skipped, 6 warnings`，ruff / 200 文件 format / spec-check / 严格裁判回归通过。新源码的真实生成与判断效果尚待冻结检查；生产 main 未更新，服务 active / HTTP 200，服务器仍为 `00c667556c88241d72d96f24430c7c16b4add24e`。
+
 新增 20 项单一关系协议回归，先复现旧实现 9 项失败，再验证三值映射、空/畸形关系、两前提、负向/未知引用、无效旧引用与旧矛盾 verdict，以及原 4000 token 单步取证→收尾。相关共 170 项通过；完整 `1643 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。共享审查范围与本协议变更只用于下一份独立源码快照。`decision-duplication-audit.json` 记录两条真实矛盾响应及账本 hash，两前提引用均已精确保存；历史 verdict 保持原值。

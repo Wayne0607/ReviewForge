@@ -157,6 +157,12 @@ async def test_context_retains_receiver_identity_and_state_producer_navigation(j
     assert "CURRENT" in callees[0].reason
     assert "configure" in callees[0].reason and "init" in callees[0].reason and "reset" in callees[0].reason
     assert "not evidence" in callees[0].reason
+    states = [s for s in slices if s.kind == "field_usage"]
+    assert states and all(s.symbol == "core.Gate.CURRENT" and s.path == "core/Gate.java" for s in states)
+    assert any("core.Gate.configure" in s.reason and "CURRENT = new Gate(enabled);" in s.text for s in states)
+    assert any("core.Gate.init" in s.reason for s in states)
+    assert any("core.Gate.reset" in s.reason and "CURRENT = null" in s.text for s in states)
+    assert all("order unproved" in s.reason and s.end_line - s.start_line < 7 for s in states)
     assert len(slices) <= 12
     assert len(pack.render_all(max_chars=40_000)) <= 40_000
     assert pack.render_all(max_chars=40_000) == ContextPack.build(_changeset(call), java_workspace).render_all(
@@ -261,7 +267,54 @@ async def test_navigation_obeys_the_existing_slice_budget(java_workspace, limit)
         _changeset({"callee": "isEnabled", "receiver": "Gate", "line": 5}), java_workspace, max_slices=limit
     )
     assert len(pack.units["cmd"].slices) <= limit
+    assert "field_usage" in pack.units["cmd"].truncated_kinds
     assert len(pack.render_all(max_chars=500)) <= 500
+
+
+@pytest.mark.asyncio
+async def test_callee_state_source_is_isolated_by_unit_and_never_an_observation(java_workspace):
+    from reviewforge.engine.hypothesis import Hypothesis, Mechanism, Site
+    from reviewforge.engine.investigator import Investigator, build_workspace_executor
+
+    changeset = _changeset({"callee": "isEnabled", "receiver": "Gate", "line": 5})
+    changeset.units.append(
+        SemanticUnit("other", "other/Calls.java", "java", UnitKind.SYMBOL, "execute", 3, 3, [3], calls=[])
+    )
+    pack = ContextPack.build(changeset, java_workspace)
+    assert any(s.kind == "field_usage" for s in pack.units["cmd"].slices)
+    assert not [s for s in pack.units["other"].slices if s.kind == "field_usage" and s.path == "core/Gate.java"]
+    worker = Investigator(None, build_workspace_executor(java_workspace, _state()), changeset=changeset)
+    hypothesis = Hypothesis(
+        "h",
+        "cmd::contract-mismatch::run",
+        "cmd",
+        Mechanism.CONTRACT_MISMATCH,
+        "State is not initialized",
+        "The command runs",
+        "Incorrect feature flag",
+        "Is it initialized?",
+        "A caller configures it",
+        [Site("cli/Command.java", 5, "Gate.isEnabled()")],
+        "error",
+        "generator",
+    )
+    assert "CURRENT = new Gate(enabled)" in worker._render_user(hypothesis, _state(), pack)
+    result = worker._finalize(
+        {
+            "answer": "A configuration path exists",
+            "assessment": {
+                "expected": "Configured flag",
+                "actual": "Configured flag",
+                "expected_evidence": ["obs_0:e1"],
+                "actual_evidence": ["obs_0:e1"],
+                "comparison": "compatible",
+            },
+        },
+        hypothesis,
+        {"cli/Command.java"},
+        steps=1,
+    )
+    assert result.verdict == "unknown" and result.reason == "ungrounded-assessment"
 
 
 def test_state_navigation_masks_literals_and_excludes_nested_class_state():
@@ -284,6 +337,127 @@ def test_state_navigation_masks_literals_and_excludes_nested_class_state():
     assert "configure" in result and "init" in result and "reset" in result
     assert "UNRELATED" not in result and "example" not in result and "nestedConfigure" not in result
     assert len(navigation.state_navigation(definition, max_chars=110)) <= 110
+
+
+def test_java_fields_require_a_declaration_at_class_scope():
+    source = """package core;
+class Fields {
+    private static volatile Fields CURRENT;
+    private boolean ready;
+    // private int COMMENT;
+    private String example = "private int LITERAL;";
+    static { int temporary = 1; }
+    void run(boolean argument) {
+        int local = 1;
+        ready = true;
+        if (ready) { return; }
+        throw new IllegalStateException();
+    }
+    class Nested {
+        private int nested;
+    }
+}
+"""
+    navigation = JavaSource(source, "Fields.java")
+    fields = navigation.field_declarations
+    assert {field.name for field in fields} == {"CURRENT", "ready", "example", "nested"}
+    assert {field.name for field in fields if field.mutable_static} == {"CURRENT"}
+    assert (
+        navigation.class_name(next(field.owner for field in fields if field.name == "nested")) == "core.Fields.Nested"
+    )
+
+
+def test_inline_field_modifiers_do_not_leak_from_a_sibling_declaration():
+    navigation = JavaSource(
+        "class Fields { static int first; int second; static final int CONSTANT = 1; }", "Fields.java"
+    )
+    assert {field.name for field in navigation.field_declarations} == {"first", "second", "CONSTANT"}
+    assert {field.name for field in navigation.field_declarations if field.mutable_static} == {"first"}
+
+
+@pytest.mark.asyncio
+async def test_java_context_does_not_treat_return_throw_or_local_assignments_as_fields(tmp_path):
+    from reviewforge.core.state import StateStore
+    from reviewforge.tools.workspace import WorkspaceInfo
+
+    source = """class Command {
+    void run() {
+        int local = 1;
+        local = 2;
+        if (local == 2) { return; }
+        throw failure;
+    }
+}
+"""
+    (tmp_path / "Command.java").write_text(source, encoding="utf-8")
+    workspace = PRHeadWorkspace(
+        WorkspaceInfo("o/r", "o/r", "head", tmp_path, 1, len(source), "d", False, "tarball"),
+        None,
+        fallback_repo="o/r",
+        temp_dir=tmp_path,
+    )
+    state = StateStore(repo="o/r", pr_number=1, head_sha="head")
+    changeset = SemanticChangeSet(
+        repo=state.repo,
+        head_sha=state.head_sha,
+        units=[SemanticUnit("run", "Command.java", "java", UnitKind.SYMBOL, "run", 2, 7, [3, 4, 5, 6])],
+    )
+    pack = ContextPack.build(changeset, workspace)
+    assert not [s for s in pack.units["run"].slices if s.kind == "field_usage"]
+
+
+@pytest.mark.asyncio
+async def test_java_context_keeps_real_field_uses_with_exact_case_and_owner(tmp_path):
+    from reviewforge.tools.workspace import WorkspaceInfo
+
+    source = """class Command {
+    private boolean ready;
+    void unrelated() {
+        String example = "ready";
+        // ready
+        int Ready = 1;
+    }
+    void run() {
+        if (ready) { return; }
+    }
+    class Nested {
+        private boolean ready;
+        void run() { if (ready) { return; } }
+    }
+}
+"""
+    (tmp_path / "Command.java").write_text(source, encoding="utf-8")
+    workspace = PRHeadWorkspace(
+        WorkspaceInfo("o/r", "o/r", "head", tmp_path, 1, len(source), "d", False, "tarball"),
+        None,
+        fallback_repo="o/r",
+        temp_dir=tmp_path,
+    )
+    changeset = SemanticChangeSet(
+        units=[SemanticUnit("run", "Command.java", "java", UnitKind.SYMBOL, "run", 8, 10, [9])]
+    )
+    pack = ContextPack.build(changeset, workspace)
+    fields = [s for s in pack.units["run"].slices if s.kind == "field_usage"]
+    assert [s.reason for s in fields] == ["uses ready at line 2", "uses ready at line 9"]
+    assert all(s.symbol == "ready" for s in fields)
+
+
+@pytest.mark.asyncio
+async def test_java_context_literals_cannot_select_a_field(tmp_path):
+    from reviewforge.tools.workspace import WorkspaceInfo
+
+    source = 'class Command {\n    private int ready;\n    void run() { String text = "ready"; }\n}\n'
+    (tmp_path / "Command.java").write_text(source, encoding="utf-8")
+    workspace = PRHeadWorkspace(
+        WorkspaceInfo("o/r", "o/r", "head", tmp_path, 1, len(source), "d", False, "tarball"),
+        None,
+        fallback_repo="o/r",
+        temp_dir=tmp_path,
+    )
+    changeset = SemanticChangeSet(
+        units=[SemanticUnit("run", "Command.java", "java", UnitKind.SYMBOL, "run", 3, 3, [3])]
+    )
+    assert not [s for s in ContextPack.build(changeset, workspace).units["run"].slices if s.kind == "field_usage"]
 
 
 @pytest.mark.asyncio

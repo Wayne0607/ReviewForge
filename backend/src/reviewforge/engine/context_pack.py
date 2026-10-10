@@ -298,6 +298,7 @@ class _PackBuilder:
         self.degraded = _workspace_degraded(workspace)
         self._unchecked: list[str] = []
         self._java_sources: dict[str, JavaSource] = {}
+        self._callee_state: list[ContextSlice] = []
 
     def build_unit(self, unit: SemanticUnit, unit_id: str) -> UnitContext:
         context = UnitContext(unit_id=unit_id, pr_intent=self.pr_intent)
@@ -307,6 +308,7 @@ class _PackBuilder:
 
         candidates: list[ContextSlice] = []
         self._unchecked = []
+        self._callee_state = []
         candidates.extend(self._collect_callers(unit))
         candidates.extend(self._collect_callees(unit))
         base, interfaces = self._collect_inheritance(unit)
@@ -316,6 +318,7 @@ class _PackBuilder:
         lock_usage, field_usage = self._collect_state_usage(unit)
         candidates.extend(lock_usage)
         candidates.extend(field_usage)
+        candidates.extend(self._callee_state)
         candidates.extend(self._collect_tests(unit))
         schema, config = self._collect_resources(unit)
         candidates.extend(schema)
@@ -527,6 +530,25 @@ class _PackBuilder:
                 )
                 if result_slice is not None:
                     result.append(result_slice)
+                    if language.lower() == "java" and definition:
+                        indexed = navigation.state_references(definition)
+                        if len(indexed) > 4 or any(len(references) > 6 for _, references in indexed):
+                            self._unchecked.append("field_usage")
+                        for field, references in indexed[:4]:
+                            field_name = f"{navigation.class_name(field.owner)}.{field.name}"
+                            for method, number in references[:6]:
+                                state_slice = self._slice_from_source(
+                                    kind="field_usage",
+                                    path=path,
+                                    start_line=max(1, number - 3),
+                                    end_line=number + 3,
+                                    symbol=field_name,
+                                    reason=f"shared state reference {field_name} in "
+                                    f"{navigation.qualified_definition(method)} at line {number}; order unproved",
+                                    source=source,
+                                )
+                                if state_slice:
+                                    self._callee_state.append(state_slice)
         return result
 
     def _collect_inheritance(self, unit: SemanticUnit) -> tuple[list[ContextSlice], list[ContextSlice]]:
@@ -643,7 +665,13 @@ class _PackBuilder:
         source = self._read(path)
         if not path or source is None:
             return [], []
-        lines = source.splitlines()
+        language = str(_value(unit, "language", "") or "").lower()
+        navigation = self._java_source(path) if language == "java" else None
+        owner = None
+        if navigation:
+            declaration = navigation.definition_at(str(_value(unit, "symbol", "") or ""), _unit_anchor_line(unit))
+            owner = navigation.owner(declaration.line if declaration else _unit_anchor_line(unit))
+        lines = (navigation.mask if navigation else source).splitlines()
         added_lines = sorted({int(line) for line in (_value(unit, "added_lines", []) or []) if _is_int_like(line)})
         added_text = "\n".join(lines[line - 1] for line in added_lines if 0 < line <= len(lines))
         if not added_text:
@@ -651,7 +679,11 @@ class _PackBuilder:
 
         lock_names = {_normalise_token(match.group(0)) for match in _LOCK_TOKEN.finditer(added_text)}
         lock_names.discard("")
-        fields = _field_names(source, str(_value(unit, "language", "") or ""))
+        fields = (
+            {field.name for field in navigation.field_declarations if field.owner == owner}
+            if navigation
+            else _field_names(source, language)
+        )
         added_identifiers = set(_IDENTIFIER.findall(added_text))
         field_names = sorted(fields.intersection(added_identifiers))
         lock_result = self._usage_slices(
@@ -660,6 +692,8 @@ class _PackBuilder:
             source=source,
             names=sorted(lock_names),
             reason_prefix="uses",
+            navigation=navigation,
+            owner=owner,
         )
         field_result = self._usage_slices(
             kind="field_usage",
@@ -667,6 +701,8 @@ class _PackBuilder:
             source=source,
             names=field_names,
             reason_prefix="uses",
+            navigation=navigation,
+            owner=owner,
         )
         return lock_result, field_result
 
@@ -678,12 +714,16 @@ class _PackBuilder:
         source: str,
         names: list[str],
         reason_prefix: str,
+        navigation: JavaSource | None = None,
+        owner: Any = None,
     ) -> list[ContextSlice]:
         if not names:
             return []
-        patterns = {name: re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE) for name in names}
+        patterns = {name: re.compile(rf"\b{re.escape(name)}\b", 0 if navigation else re.IGNORECASE) for name in names}
         usage_lines: dict[int, str] = {}
-        for line_number, line in enumerate(source.splitlines(), start=1):
+        for line_number, line in enumerate((navigation.mask if navigation else source).splitlines(), start=1):
+            if navigation and navigation.owner(line_number) != owner:
+                continue
             if any(pattern.search(line) for pattern in patterns.values()):
                 usage_lines[line_number] = next(name for name, pattern in patterns.items() if pattern.search(line))
         result: list[ContextSlice] = []

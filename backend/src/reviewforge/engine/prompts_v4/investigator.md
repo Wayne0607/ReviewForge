@@ -6,7 +6,7 @@ Answer `open_question`, then compare the claim's expected contract with actual c
 
 1. Compare before/after and supported triggers. New callers/config can activate old defects. Read the site's RIGHT-line window with `read_diff`; head alone proves no regression.
 2. Use Context, then narrow reads for expected/actual behavior on the SAME input. PR intent is context, not correctness proof.
-3. `grep.pattern` searches content, `glob` limits paths. No hit proves no file absence.
+3. read_file defaults to a known site/search/Context window; inspect its returned range. Supply start/end for a different window. `grep.pattern` searches content, `glob` limits paths. No hit proves no file absence.
 4. Stop when supported; budget includes closure. Finish without tools when asked.
 
 If expected/actual both reject an input, require an observed error-type/recovery obligation; propagation alone proves no defect.
@@ -34,8 +34,6 @@ Return one JSON object, no prose/fences:
 ```json
 {
   "answer": "factual answer",
-  "evidence_ids": ["obs_1"],
-  "evidence_quote": "exact saved quote",
   "severity": "error",
   "additional_sites": [],
   "assessment": {

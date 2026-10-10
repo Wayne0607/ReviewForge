@@ -196,3 +196,23 @@ def test_author_intent_is_bounded_context_and_retained_for_closure():
     assert intent[:2_000] in user and intent not in user
     assert intent[:2_000] in str(worker._closing_chat([HumanMessage(content=user)], 24_000))
     assert "## PR intent" not in worker._render_user(_hypothesis(), state, ContextPack())
+
+
+def test_two_premise_protocol_derives_the_common_citation_without_a_third_quote():
+    raw = _verdict()
+    raw.pop("evidence_ids")
+    raw.pop("evidence_quote")
+    result = _worker()._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert result.verdict == "confirmed"
+    assert result.evidence_ids == ["obs_0", "obs_1"]
+    assert result.evidence_quote == "return None"
+    raw["assessment"]["actual_evidence"][0]["quote"] = "a value outside the saved excerpt"
+    rejected = _worker()._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert rejected.verdict == "unknown" and rejected.reason == "ungrounded-assessment"
+
+
+def test_explicit_legacy_quote_is_still_checked_even_with_valid_assessment():
+    raw = _verdict()
+    raw["evidence_quote"] = "return a_fabricated_value"
+    result = _worker()._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert result.verdict == "unknown" and result.reason == "ungrounded"

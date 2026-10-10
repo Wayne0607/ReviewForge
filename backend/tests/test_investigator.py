@@ -82,7 +82,12 @@ class _ScriptedToolLLM(BaseChatModel):
 def _executor(results: dict[tuple[str, tuple], str]):
     async def _exec(name: str, args: dict) -> str:
         key = (name, tuple(sorted(args.items())))
-        return results.get(key, "No results")
+        if key in results:
+            return results[key]
+        # Path-only fixtures represent a source excerpt, not a full file.
+        if name == "read_file":
+            return results.get((name, (("path", args.get("path")),)), "No results")
+        return "No results"
 
     return _exec
 

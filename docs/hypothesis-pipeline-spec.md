@@ -280,7 +280,9 @@ budget_steps = base(severity) + bonus
 
 预算包含结论调用，不能把全部额度用于工具循环。每轮先预留结论输入及输出（输出预留为总预算的四分之一，最多 4000 tokens），不足以继续工具调用时提前结束调查。结论输入重用原始假设/上下文及代码保存的 Observation excerpts，不重放完整工具结果或模型探索文字。估算计入工具参数、schema 与非 ASCII 文本，并用已测 provider input usage 校正遗漏的开销；实际 usage 仍如实记账，超支不可写已确认结论。
 
-**工具（通过 gateway，绑定 workspace）。** `read_file(path, start, end)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path, start?, end?)`。diff 行窗口选择与指定 RIGHT 行相交的完整 before/after hunk，保留删除行与上下文；省略窗口保留原完整 diff 行为，未命中为空/`not_found`，不得用作反证。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
+**工具（通过 gateway，绑定 workspace）。** `read_file(path, start?, end?)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path, start?, end?)`。diff 行窗口选择与指定 RIGHT 行相交的完整 before/after hunk，保留删除行与上下文；省略窗口保留原完整 diff 行为，未命中为空/`not_found`，不得用作反证。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
+
+v4 的 `read_file` 两个边界都省略时，优先使用该文件最近一个已保存的成功 grep/caller/definition 命中行；其次用 compiler 关联假设的 site，或该 unit 自己的 Context slice 起始行。默认请求该行前 3 / 后 8 行，把相关正文交付到现有 1200 字符保存区，避免整份文件的版权头占满证据。显式任一边界仍按原请求读取，无已知位置仍读原文件；工具描述和返回标签明确窗口，query/line_range 记录实际请求参数。只用已保存的正向命中，不从 not_found/error 或不可引用的 Additional context 猜位置。每个调查员独立计算窗口，不增加工具调用、预算或证据保存长度；workspace/legacy 的读取 API 不变。
 
 **输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。额外交付 `pack.pr_intent` 的前 2000 字符；作者意图是理解行为变化的背景，不能作为正确性证据或豁免契约。收尾保留这份背景。
 
@@ -292,8 +294,6 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
 ```json
 {"verdict":"confirmed|refuted|unknown",
  "answer":"对 open_question 的直接回答",
- "evidence_ids":["obs_..."],           // 支撑 verdict 的 observation id，confirmed/refuted 时 ≥1
- "evidence_quote":"...",               // 必须是某 observation.excerpt 的子串
  "severity":"error|warning|info",      // 可修正
  "additional_sites":[{"path":"...","line":1,"excerpt":"..."}],
  "assessment": {
@@ -305,7 +305,7 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
  },
  "reason":"..."}
 ```
-校验：`confirmed`/`refuted` 必须引用 ≥1 个 `status=success` 的 observation 且 `evidence_quote` 在其 excerpt 内，否则降级为 `unknown`，reason `ungrounded`。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，保留空白和真正的数字前缀，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）——若 evidence 全是 not_found 则降为 `unknown`。
+校验：`confirmed`/`refuted` 的 assessment 两组引用均需指定 `status=success` 的 observation，quote 精确命中各自的保存正文；从通过校验的引用派生内部 `evidence_ids/evidence_quote`，模型无需再抄第三份引用。若响应仍显式提供旧的顶层 `evidence_ids/evidence_quote`，继续精确校验，失败为 UNKNOWN/ungrounded；不忽略无效旧引用。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，保留空白和真正的数字前缀，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）。
 
 事实回答不等于缺陷成立。新调查的 `confirmed/refuted` 还必须分别交付 expected 与 actual 的非空陈述和引用；每条引用必须精确命中其指定的成功 Observation，而不能用一个无关成功读取掩盖另一前提的缺失。同一 Observation 能证明两者时可复用，但不能把实际 throw 当成“必须收集消息”的契约。标准库的预期行为可来自已文档化契约，引用需绑定实际类型/配置/数据流，无需本地包含库源码。`confirmed` 仅接受 `conflict`，`refuted` 仅接受 `compatible`；结构缺失、引用无效、关系与 verdict 矛盾分别降为 UNKNOWN（`incomplete-assessment` / `ungrounded-assessment` / `inconsistent-assessment`）。UNKNOWN 不要求完整 assessment，也不会因附带证明被自动提升。代码核实引用和关系一致性，语义判断仍由调查员承担。
 

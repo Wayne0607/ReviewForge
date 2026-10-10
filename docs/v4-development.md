@@ -288,3 +288,13 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 在既有调查阶段增加结构化 `ContractAssessment`：先分别写 expected/actual 的事实和各自 Observation 引用，再写二者关系，最后选择 verdict。代码逐条核实指定 Observation 成功、quote 精确保存、关系与 verdict 一致；缺项或无效仍是 UNKNOWN，不转成 no_issue、不补重试。标准契约允许引用实际类型/配置的绑定，同一 Observation 能证明两前提时可复用；语义是否真的支持义务仍需调查员判断，不能宣称代码已证明语义。assessment 经现有 JSON 账本进入 editor/失败模板与续跑事实摘要；旧闭合 checkpoint 保持兼容，不重新调查。
 
 另补交调查员遗漏的 PR intent（最多 2000 字符），明确仅作作者背景，不能免责；编辑修复须保留有效新行为，避免正确的 locale 评论建议恢复旧 HTML。调查和发布预算、主模型、goldens/裁判阈值、legacy 与 main 均不变。先新增回归复现 9 项旧行为失败，再实现；新增 13 项独立/参数化回归覆盖两前提引用、关系矛盾、UNKNOWN 不提升、真实 DB/ledger/editor/失败模板/续跑交付与旧 checkpoint 兼容。缩短提示正文而非扩大预算，单步读取后收尾回归继续通过。完整检查为 `1572 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过；新冻结实测仍待完成。
+
+冻结 `0c59514` 的第七轮位于 `.reviewforge/benchmarks/v4-contract-assessment-20261011-034038/`。GEN 13 + lens 9 = 22 条候选，58 units 无漏答；立陶宛 account 的两前提分别引用相邻立陶宛原文与新增意大利语，已 CONFIRMED 并落库，契约交付有效。但 English 路径候选再次成为 error UNKNOWN/ungrounded，停止剩余请求：14 个成功请求记录 142901 tokens，账本为 1 CONFIRMED / 1 REFUTED / 11 UNKNOWN / 9 OPEN。Job Object 返回 125、峰值约 358 MiB，锁已释放；无完整评论、质量分或配对，可能有进行中请求的未记录用量。
+
+## 2026-10-11 默认读取的证据窗口
+
+`evidence-input-audit.json` 保存原回执 hash 和诊断，原 verdict 不改。English 路径调查三次读取整份 Java 文件，obs_0/2/3 的 1200 字符保存区主要是版权头/import；实际方法位于展示用 Additional context。顶层搜索引用还压缩了真实缩进，expected/actual 引用了未保存的方法正文。响应的 compatible 与 confirmed 也不一致，但先被旧引用门槛拦住。这证明新契约协议仍需相关原始证据输入，不能通过扩大保存长度或放松匹配解决。
+
+两问回查工具描述“完整内容或窗口”与 `_run_tool` 的头部保存：原接口假设模型会自行改为窄读，真实回执反复违背该假设。现在省略窗口时确定性定位最近保存的正向搜索位置、compiler 关联 site 或本 unit 的 Context slice；显式范围和无位置文件保留原行为。记录实际请求的行窗口，源码仍由固定 head 读取、精确引用仍验证保存的原文，not_found/error/未保存命中不提供定位依据。另从已校验的两组 assessment 引用生成公共引用，移除新模型输出里重复的第三份字段；显式旧引用仍严格检查。
+
+新增 13 项回归覆盖真实长版权头文件、三种正向搜索、相关/无关 Context、负向与未保存结果、显式/未知路径、最新命中切换，以及派生引用和无效旧引用拒收。相关 73 项通过，完整检查为 `1585 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。新的独立冻结预检待完成，未运行 holdout。

@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from itertools import groupby, zip_longest
@@ -197,6 +198,7 @@ class Investigator:
         self._state: StateStore | None = None
         self._tokens = 0
         self._input_overhead = 0
+        self._read_focus: dict[str, int] = {}
 
     def _build_tools(self) -> list[StructuredTool]:
         async def read_file(path: str, start: int | None = None, end: int | None = None) -> str:
@@ -226,7 +228,11 @@ class Investigator:
 
         return [
             StructuredTool.from_function(
-                coroutine=read_file, name="read_file", description="读取仓库 head 版本文件的完整内容或 1-based 行窗口"
+                coroutine=read_file,
+                name="read_file",
+                description="Read pinned head source. Supply 1-based start/end for an explicit window; otherwise "
+                "focus on the latest saved search hit, hypothesis site or related Context location when known. "
+                "Returned path/range identify the requested window; only its saved excerpt is citable.",
             ),
             StructuredTool.from_function(
                 coroutine=grep, name="grep", description="按正则或字面串在仓库中搜索匹配行（可用 glob 限定文件）"
@@ -245,6 +251,8 @@ class Investigator:
         ]
 
     async def _run_tool(self, name: str, args: dict[str, Any]) -> str:
+        if name == "read_file":
+            args = self._focus_read_args(args)
         query = _query_string(name, args)
         if self._tool_counts.get(query, 0) >= 2:
             return "Repeated tool call limit reached; use existing observations or investigate a different fact."
@@ -287,6 +295,41 @@ class Investigator:
                 f"{text[_OBS_EXCERPT_CHARS:]}"
             )[:_TOOL_RESULT_CHARS]
         return f"{label}\n{text}" if text else f"{label} (no content)"
+
+    def _prepare_read_focus(self, hypothesis: Hypothesis, pack: ContextPack) -> None:
+        self._read_focus = {}
+        context = pack.units.get(hypothesis.unit_id)
+        if context is not None:
+            for item in context.slices:
+                if item.start_line > 0:
+                    self._read_focus.setdefault(item.path, item.start_line)
+        # Compiler-associated sites take priority over the related slices.
+        if self._changeset and any(unit.id == hypothesis.unit_id for unit in self._changeset.units):
+            for site in reversed(hypothesis.sites):
+                if site.line > 0:
+                    self._read_focus[site.path] = site.line
+
+    def _focus_read_args(self, args: dict[str, Any]) -> dict[str, Any]:
+        if args.get("start") is not None or args.get("end") is not None:
+            return args
+        path = args.get("path")
+        focus = self._read_focus.get(path)
+        # Search scopes are not files. Use concrete locations in saved positive
+        # hits, never an absent result or model-authored filename/line guess.
+        for observation in reversed(self._observations):
+            if observation.status != "success" or observation.tool not in {"grep", "find_callers", "find_definition"}:
+                continue
+            for line in observation.excerpt.splitlines():
+                if observation.tool == "find_definition":
+                    match = re.match(r"^- .* \[[^]]+\] (.+):(\d+)$", line)
+                else:
+                    match = re.match(r"^- (.+?):(\d+):", line)
+                if match and match[1] == path and int(match[2]) > 0:
+                    focus = int(match[2])
+                    return {**args, "start": max(1, focus - 3), "end": focus + 8}
+        if focus is None:
+            return args
+        return {**args, "start": max(1, focus - 3), "end": focus + 8}
 
     def _system_prompt(self) -> str:
         return load_prompt("investigator", output_language=_language_directive(self._output_language))
@@ -366,6 +409,7 @@ class Investigator:
         """Answer one hypothesis's open_question within its budget_steps."""
 
         self._state = state
+        self._prepare_read_focus(hypothesis, pack)
         self._observations = list(hypothesis.observations)
         self._tokens = 0
         self._input_overhead = 0
@@ -578,7 +622,11 @@ class Investigator:
             grounded = [
                 observation for observation in success_cited if evidence_quote and evidence_quote in observation.excerpt
             ]
-            if not grounded:
+            # The two-premise protocol carries its own exact citations. Retain
+            # strict validation of legacy quote fields when explicitly sent,
+            # but do not require a third duplicate model-authored citation.
+            legacy_citation = "evidence_ids" in parsed or "evidence_quote" in parsed
+            if legacy_citation and not grounded:
                 verdict = "unknown"
                 reason = "ungrounded"
                 evidence_ids, evidence_quote = [], ""
@@ -600,6 +648,8 @@ class Investigator:
                     elif assessment.comparison != required:
                         verdict, reason = "unknown", "inconsistent-assessment"
                     else:
+                        evidence_ids = list(dict.fromkeys(citation.observation_id for citation in proof))
+                        evidence_quote = assessment.actual_evidence[0].quote
                         outside_diff = any(
                             self._quote_outside_diff(by_id[citation.observation_id], citation.quote, changed)
                             for citation in proof

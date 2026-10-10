@@ -285,6 +285,43 @@ def test_investigation_receives_relevant_contract_knowledge_through_closure(mech
         assert str(closing).count("## Verification guidance") == 1
 
 
+@pytest.mark.parametrize(
+    ("path", "source", "expected"),
+    [
+        ("a.py", "process = ctx.Process(target=work)", True),
+        ("a.py", "return user_input", False),
+        ("Worker.java", "process = ctx.Process(target=work)", False),
+    ],
+)
+def test_python_contract_knowledge_survives_investigation_closure_without_becoming_evidence(path, source, expected):
+    hypothesis = _hypothesis()
+    hypothesis.sites = [Site(path=path, line=1, excerpt=source)]
+    unit = SemanticUnit(id=hypothesis.unit_id, path=path, kind=UnitKind.SYMBOL, start_line=1, end_line=1)
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}), changeset=SemanticChangeSet(units=[unit]))
+    user = investigator._render_user(hypothesis, _state(diffs={path: f"@@ -1 +1 @@\n+{source}\n"}), ContextPack())
+    assert ("### Python concurrency contracts" in user) is expected
+    if expected:
+        closing = investigator._closing_chat([AIMessage(content=user)], 24000)
+        assert str(closing).count("### Python concurrency contracts") == 1
+        assert not investigator._observations
+        result = investigator._finalize(
+            {
+                "verdict": "confirmed",
+                "assessment": {
+                    "expected": "All processes must be joined explicitly",
+                    "actual": "The process is not joined explicitly",
+                    "expected_evidence": ["obs_0:e1"],
+                    "actual_evidence": ["obs_0:e1"],
+                    "comparison": "conflict",
+                },
+            },
+            hypothesis,
+            {path},
+            steps=0,
+        )
+        assert result.verdict == "unknown" and result.strength == "none"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", ["step=安裝手機應用程式", "No results"])
 async def test_locale_boundary_still_requires_recorded_source_evidence(content):

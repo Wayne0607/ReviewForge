@@ -111,7 +111,9 @@ class ContractAssessment:
                     or not quote.strip()
                 ):
                     raise ValueError("assessment citation requires an observation and quote")
-                citations.append(EvidenceCitation(identity.strip(), quote.strip()))
+                # Quotes are source, including its whitespace. Keep them stable
+                # across persistence; normalization can change a fact digest.
+                citations.append(EvidenceCitation(identity.strip(), quote))
             fields[key] = citations
         return cls(**fields)
 

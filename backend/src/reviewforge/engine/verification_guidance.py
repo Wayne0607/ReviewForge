@@ -1,7 +1,7 @@
 """Shared v4 contract knowledge; selection never decides a verdict.
 
-Keep localization's existing path trigger identical across generation, lenses
-and investigation so a specialist's contract facts survive the stage boundary.
+Keep contract facts available across generation, lenses and investigation;
+guidance selects relevant knowledge, never marks a defect as proved.
 The legacy skill is intentionally independent of this v4 overlay.
 """
 
@@ -12,6 +12,10 @@ import re
 from reviewforge.engine.prompts_v4 import load_prompt
 
 _LOCALIZATION_PATH = re.compile(r"\.(properties|po)$|messages_[^/]+\.json$|/locale/", re.IGNORECASE)
+_PYTHON_CONCURRENCY = re.compile(
+    r"\b(?:multiprocessing|threading|concurrent\.futures|get_context)\b|"
+    r"\b(?:Process|Thread|ProcessPoolExecutor|ThreadPoolExecutor)\s*\("
+)
 
 
 def is_localization_path(path: str) -> bool:
@@ -20,6 +24,14 @@ def is_localization_path(path: str) -> bool:
 
 def localization_guidance() -> str:
     return load_prompt("localization_contracts")
+
+
+def has_python_concurrency(path: str, source: str) -> bool:
+    return path.lower().endswith(".py") and bool(_PYTHON_CONCURRENCY.search(source))
+
+
+def python_concurrency_guidance() -> str:
+    return load_prompt("python_concurrency_contracts")
 
 
 def investigation_capabilities() -> str:

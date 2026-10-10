@@ -68,6 +68,16 @@ def test_no_lens_for_plain_unit() -> None:
     assert _names(state, _changeset(unit)) == []
 
 
+def test_python_concurrency_contracts_are_shared_with_the_specialist_only():
+    from reviewforge.engine.verification_guidance import python_concurrency_guidance
+
+    guide = python_concurrency_guidance()
+    concurrency = build_lens_generator(_ScriptedLLM(), "concurrency")._system_prompt()
+    assert concurrency.count(guide) == 1
+    for name in ("security", "localization", "accessibility", "dependency"):
+        assert guide not in build_lens_generator(_ScriptedLLM(), name)._system_prompt()
+
+
 def test_localization_triggered_by_path() -> None:
     assert "localization" in _names(StateStore(file_diffs={}), _changeset(_unit("src/locale/messages_en.properties")))
     assert "localization" not in _names(StateStore(file_diffs={}), _changeset(_unit("src/service.py")))

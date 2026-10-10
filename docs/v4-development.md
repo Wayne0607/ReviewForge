@@ -318,3 +318,17 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 另一次 CONFIRMED 声称 choice 正则替换会留下 `<`，引用真实但推理错误。独立 Java String.replaceAll 小型复现对引用的英文输入得到 `...`，证实该误报；`regex-semantics-audit.json` 保留诊断，原 verdict 不改、未执行完整 theme verifier、不生成质量分。提示补充具体输入→运算→结果及“缺少证明仍为 UNKNOWN”，代码只能核实结构/引用，不能宣称已解决全部语义误判。
 
 先以新约束复现 9 处旧实现外露正文；新增 6 项独立/参数化回归覆盖五种工具和真实 workspace 的宽读→窄读→有效 assessment，全套相关 79 项通过。完整本地 `1595 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。下一轮优先使用预先选定的另外两个 dev PR 检查通用性，未使用 holdout，main 仍保持原生产版本。
+
+## 2026-10-11 源码引用协议与并发契约
+
+冻结 `02e9072` 的两个预先选定开发样本位于 `.reviewforge/benchmarks/v4-dev-breadth-02e9072-20261011-044255/`。keycloak#36882 的固定 head 为 `62bf98939eda58f0d0a1a41a58aa6d4ecdc24dba`，源码预检为 10212 文件 / 88550621 bytes；20 units 均返回判断，接受 9 条候选，结果为 0 CONFIRMED / 3 REFUTED / 6 UNKNOWN、0 条发布评论，25 次成功调用 / 104480 tokens / 913.687 秒。error 级 CLI feature 候选的源码在保存区内，但模型将方法压成单行、压缩搜索命中的缩进，原文校验拒收为 ungrounded-assessment，内层 partial。另一个原始 doc site 仅 3 字符，被既有 ≥12 字符门槛拒收；不更改门槛或分母。
+
+sentry#93824 的固定 head 为 `3162ad68a5c87666788b27a44eb31235025091a9`，源码预检为 17150 文件 / 170102538 bytes。接受 13 条候选，调查上限仍 12；出现不可重试的 error UNKNOWN，整个两 PR 集合已不能严格评分，遂停止余下付费调用。两 PR 合计记录 52 次成功请求 / 274923 tokens（GEN 43761 / concurrency lens 20324 / INV 210838）；取消时 Sentry 为 2 CONFIRMED / 1 REFUTED / 9 UNKNOWN / 1 OPEN。Job Object 返回 125，峰值 494084096 bytes，评测锁已释放，进行中的请求可能有未记录用量。没有本轮质量分、legacy 配对或 holdout，也不将候选确认数量作为进步。
+
+两问回查 `_run_tool` 与 assessment 解析：精确原文校验用于防止伪造证据，这一约束成立；但要求模型转抄原文空白的接口假设再次失败。现在工具仅从已保存的成功 Observation 原文生成短引用 ID（例如 `obs_0:e1`），模型复制 ID，代码还原精确源码后进入原校验；收尾同样交付这些 ID。旧 quote 对象仍精确校验，未知 ID/负向结果/未保存正文不能通过，无效旧引用不能被新 ID 掩盖。解析、落库和续跑保留原文缩进、Unicode、CRLF 与摘要稳定；未增加证据保存长度、工具、模型阶段、调查预算或放松 UNKNOWN。
+
+新增 16 项引用回归，覆盖已保存范围、未知/拼造 ID、负向结果、旧引用拒收、关系矛盾、源码位置与事实摘要；相关 95 项及完整 `1611 passed, 1 skipped, 6 warnings` 通过。该结果验证接口保真，不能宣称已改善真实质量，后续需新冻结源码实跑。
+
+Sentry 的两条确认理由另暴露语义问题：缺显式 join 不足以证明持续僵尸进程；计数从 0 初始化不证明成功重启后必须清零。依据 [Python 进程生命周期指南](https://docs.python.org/3.13/library/multiprocessing.html#programming-guidelines) 与 [CPython context 类型实现](https://github.com/python/cpython/blob/3.13/Lib/multiprocessing/context.py)，新增共享 Python 并发指南，贯通相关生成块、concurrency lens、调查和收尾；要求追踪具体类型/清理顺序及实际限额策略。标准知识不是目标仓库 Observation，自动回收也不能当作停止挂起子进程的证明。未改原 verdict；本机仅创建未启动的 spawn Process 对象核对类型关系，不声称执行了 Sentry/Linux 生命周期测试。
+
+原源码的 spawn context 工厂与全局 Process 类型检查还值得验证，不能把它自动替换成已确认候选或强行对齐 golden。生成/lens 提示补充真实边界调用/配置/支持契约，不凭“可传入空值”猜业务缺陷。新增 10 项指南交付、非 Python/无关块隔离、预算计量和收尾仍需 Observation 的回归；相关共 148 项通过。完整检查为 `1621 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。Issue/开放 PR 列表仍为空，main 和 legacy 继续保持既有发布边界。

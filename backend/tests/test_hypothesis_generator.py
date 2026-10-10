@@ -64,12 +64,20 @@ def test_general_generation_contract_guidance_is_scoped_to_each_block():
 
 
 @pytest.mark.asyncio
-async def test_generation_contract_guidance_counts_toward_each_block_budget():
-    units = [_unit(path, "", end_line=32) for path in ("messages_en.properties", "messages_fr.properties")]
-    lines = [
-        f"key_{index}=A long translated message with enough source text to exercise the input budget."
-        for index in range(32)
-    ]
+@pytest.mark.parametrize("contract", ["localization", "python-concurrency"])
+async def test_generation_contract_guidance_counts_toward_each_block_budget(contract):
+    if contract == "localization":
+        paths = ("messages_en.properties", "messages_fr.properties")
+        lines = [
+            f"key_{index}=A long translated message with enough source text to exercise the input budget."
+            for index in range(32)
+        ]
+    else:
+        paths = ("first.py", "second.py")
+        lines = ["import multiprocessing"] + [
+            f"process_{index} = multiprocessing.get_context('spawn').Process(target=run_worker)" for index in range(31)
+        ]
+    units = [_unit(path, "", end_line=32) for path in paths]
     diffs = {unit.path: _diff(unit.path, *lines) for unit in units}
     right = {unit.path: dict(enumerate(lines, start=1)) for unit in units}
     ledger = HypothesisLedger("run", "abc", "digest")
@@ -94,6 +102,28 @@ async def test_generation_contract_guidance_counts_toward_each_block_budget():
     for messages in llm.calls:
         assert len(messages[-1].content) <= limit
         assert messages[-1].content.count("## Verification guidance") == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "expected"),
+    [
+        ("workers.py", "process = ctx.Process(target=work)", True),
+        ("workers.py", "import multiprocessing", True),
+        ("workers.py", "return ProcessPoolExecutor()", True),
+        ("plain.py", "return input_value + 1", False),
+        ("workers.java", "process = ctx.Process(target=work)", False),
+    ],
+)
+def test_generation_supplies_python_contracts_only_to_relevant_blocks(path, source, expected):
+    unit = _unit(path, "f", end_line=1)
+    generator = HypothesisGenerator(_ScriptedLLM())
+    user = generator._render_user_message(
+        ContextPack(), [unit], {path: {1: source}}, {path: _diff(path, source)}, {}, HypothesisLedger("r", "s", "d")
+    )
+    assert ("### Python concurrency contracts" in user) is expected
+    if expected:
+        assert "BaseProcess" in user and "total attempts" in user
+    assert source in user and user.endswith(unit.id)
 
 
 def _server_diff() -> dict[str, str]:

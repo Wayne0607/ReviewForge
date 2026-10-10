@@ -26,10 +26,23 @@ from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
-from reviewforge.engine.hypothesis import ContractAssessment, Hypothesis, HypothesisLedger, Mechanism, Observation, Site
+from reviewforge.engine.hypothesis import (
+    ContractAssessment,
+    EvidenceCitation,
+    Hypothesis,
+    HypothesisLedger,
+    Mechanism,
+    Observation,
+    Site,
+)
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
-from reviewforge.engine.verification_guidance import is_localization_path, localization_guidance
+from reviewforge.engine.verification_guidance import (
+    has_python_concurrency,
+    is_localization_path,
+    localization_guidance,
+    python_concurrency_guidance,
+)
 from reviewforge.tools.workspace import _bounded_range
 
 logger = logging.getLogger(__name__)
@@ -41,10 +54,42 @@ _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
 _MAX_STEPS = 8
 _TOOL_RESULT_CHARS = 6_000
 _OBS_EXCERPT_CHARS = 1_200
+_EVIDENCE_SEGMENT_CHARS = 400
 _NOT_FOUND_MARKERS = frozenset({"no results", "not found", "no matches", "no definition found", "no callers found"})
 
 _OUT_OF_DIFF_TOKENS = ("caller", "callee", "parent", "base class", "interface", "schema")
 _REQUIRES_CONTEXT_TOKENS = ("caller", "parent", "schema", "base class")
+
+
+class _UnknownEvidenceReferenceError(ValueError):
+    pass
+
+
+def _evidence_segments(observation: Observation) -> dict[str, EvidenceCitation]:
+    """Name saved source spans; never synthesize quotes or include unsaved text."""
+    if observation.status != "success":
+        return {}
+    if observation.tool in {"grep", "find_callers"}:
+        blocks = observation.excerpt.splitlines(keepends=True)
+    elif observation.tool == "find_definition":
+        blocks = re.split(r"(?m)(?=^- )", observation.excerpt)
+    else:
+        blocks = [observation.excerpt]
+    chunks = []
+    for block in blocks:
+        pending = ""
+        for line in block.splitlines(keepends=True):
+            if pending and len(pending) + len(line) > _EVIDENCE_SEGMENT_CHARS:
+                chunks.append(pending)
+                pending = ""
+            pending += line
+        if pending:
+            chunks.append(pending)
+    return {
+        f"{observation.id}:e{index}": EvidenceCitation(observation.id, quote)
+        for index, quote in enumerate(chunks, 1)
+        if quote.strip()
+    }
 
 
 @dataclass
@@ -286,15 +331,18 @@ class Investigator:
         label = f"[{observation.id}]"
         if name == "read_file" and observation.line_range:
             label += f" {observation.path} (requested lines {observation.line_range[0]}-{observation.line_range[1]})"
+        segments = _evidence_segments(observation)
+        if not segments:
+            return f"{label} status={status}\n{text}" if text else f"{label} status={status} (no content)"
+        view = "\n\n".join(f"[{reference}]\n{citation.quote}" for reference, citation in segments.items())
+        reply = f"{label} Saved evidence (copy the exact reference IDs into assessment):\n{view}"
         if len(text) > _OBS_EXCERPT_CHARS:
-            return (
-                f"{label} Saved evidence excerpt (cite only this section):\n"
-                f"{observation.excerpt}\n[End saved evidence excerpt]\n"
-                "Result exceeds the saved excerpt; omitted source is not shown. "
+            reply += (
+                "\n[End saved evidence excerpt]\nResult exceeds the saved excerpt; omitted source is not shown. "
                 "Use read_file/read_diff with a narrower line range or a more specific search "
                 "to record the required evidence."
-            )[:_TOOL_RESULT_CHARS]
-        return f"{label}\n{text}" if text else f"{label} (no content)"
+            )
+        return reply[:_TOOL_RESULT_CHARS]
 
     def _prepare_read_focus(self, hypothesis: Hypothesis, pack: ContextPack) -> None:
         self._read_focus = {}
@@ -370,6 +418,8 @@ class Investigator:
             unit is not None and unit.kind is UnitKind.RESOURCE and is_localization_path(unit.path)
         ):
             sections.append("## Verification guidance\n" + localization_guidance())
+        if any(has_python_concurrency(path, diffs.get(path, "")) for path in ranges):
+            sections.append("## Verification guidance\n" + python_concurrency_guidance())
         return "\n\n".join(sections)
 
     def _resource_boundary(self, hypothesis: Hypothesis) -> str:
@@ -512,7 +562,11 @@ class Investigator:
                 "path": obs.path,
                 "line_range": obs.line_range,
                 "status": obs.status,
-                "excerpt": obs.excerpt,
+                **(
+                    {"evidence": {reference: citation.quote for reference, citation in _evidence_segments(obs).items()}}
+                    if obs.status == "success"
+                    else {"excerpt": obs.excerpt}
+                ),
             }
             for obs in self._observations
         ]
@@ -632,7 +686,9 @@ class Investigator:
                 evidence_ids, evidence_quote = [], ""
             else:
                 try:
-                    assessment = ContractAssessment.from_dict(parsed.get("assessment"))
+                    assessment = self._assessment_from_output(parsed.get("assessment"))
+                except _UnknownEvidenceReferenceError:
+                    verdict, reason = "unknown", "ungrounded-assessment"
                 except ValueError:
                     verdict, reason = "unknown", "incomplete-assessment"
                 if assessment is not None:
@@ -669,6 +725,32 @@ class Investigator:
             assessment=assessment,
         )
 
+    def _assessment_from_output(self, raw: Any) -> ContractAssessment:
+        if not isinstance(raw, dict):
+            return ContractAssessment.from_dict(raw)
+        references = {
+            reference: citation
+            for observation in self._observations
+            for reference, citation in _evidence_segments(observation).items()
+        }
+        converted = dict(raw)
+        for key in ("expected_evidence", "actual_evidence"):
+            values = raw.get(key)
+            if not isinstance(values, list):
+                continue
+            citations = []
+            for value in values:
+                if isinstance(value, str):
+                    citation = references.get(value)
+                    if citation is None:
+                        raise _UnknownEvidenceReferenceError(value)
+                    citations.append({"observation_id": citation.observation_id, "quote": citation.quote})
+                else:
+                    # Explicit legacy quotes still go through exact validation.
+                    citations.append(value)
+            converted[key] = citations
+        return ContractAssessment.from_dict(converted)
+
     @staticmethod
     def _quote_outside_diff(observation: Observation, quote: str, changed: set[str]) -> bool:
         if observation.path:
@@ -679,14 +761,20 @@ class Investigator:
             for line in observation.excerpt.splitlines():
                 path, separator, rest = line.removeprefix("- ").partition(":")
                 number, separator2, text = rest.partition(":")
-                if separator and separator2 and number.isdigit() and quote in text and path not in changed:
+                if (
+                    separator
+                    and separator2
+                    and number.isdigit()
+                    and (quote in text or quote.rstrip("\r\n") == line)
+                    and path not in changed
+                ):
                     return True
         if observation.tool == "find_definition":
-            for section in observation.excerpt.split("\n- "):
+            for section in re.split(r"(?m)(?=^- )", observation.excerpt):
                 header, _, text = section.partition("\n")
                 _, separator, location = header.partition("] ")
                 path, colon, number = location.rpartition(":")
-                if separator and colon and number.isdigit() and quote in text and path not in changed:
+                if separator and colon and number.isdigit() and quote in section and path not in changed:
                     return True
         return False
 

@@ -290,6 +290,8 @@ v4 的 `read_file` 两个边界都省略时，优先使用该文件最近一个�
 
 v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路径判定保持既有 lens 规则。生成器仅在包含相关资源的块中交付指南并计入块预算；localization lens 仍在系统规则中交付一次；调查员对 i18n 或对应 localization resource 的候选交付同一指南，收尾保留。指南解释标准默认值与配置边界，不证明目标资源实际使用了该标准；引用必须证明具体消费调用/初始化，import、邻近文本或未搜索到其它库不足以推翻格式缺陷。共享 legacy SKILL.md 不变，未新增独立模型阶段或发现重试；增加的指南仍受原块预算约束，可能影响分块。
 
+Python 并发契约也由同一模块交付：生成器只对 `.py` 且 diff 含进程/线程库或构造器的块交付并计入预算，concurrency lens 在系统规则中交付一次，调查员对关联 `.py` diff 使用同一选择规则并保留到收尾。规则覆盖 CPython context 工厂的具体类型、已完成子进程的自动回收、仍存活的挂起进程、共享 IPC 与限额生命周期；需绑定实际对象、平台及契约，不能因缺少显式 join/reset 就断言缺陷。原 lens 触发、legacy skill 与调用次数不变，指南不能作为 Observation 或自动 verdict。边界输入假设需有真实调用、配置或支持契约，方法允许传入 0/None/空集合本身不证明业务支持。
+
 **输出 schema。**
 ```json
 {"verdict":"confirmed|refuted|unknown",
@@ -299,13 +301,15 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
  "assessment": {
    "expected":"同一受支持输入的预期行为或契约",
    "actual":"本次变更的实际行为或反证",
-   "expected_evidence":[{"observation_id":"obs_0","quote":"契约或实际标准绑定的精确引用"}],
-   "actual_evidence":[{"observation_id":"obs_1","quote":"实际行为或反证的精确引用"}],
+   "expected_evidence":["obs_0:e1"],
+   "actual_evidence":["obs_1:e1"],
    "comparison":"conflict|compatible|unresolved"
  },
  "reason":"..."}
 ```
-校验：`confirmed`/`refuted` 的 assessment 两组引用均需指定 `status=success` 的 observation，quote 精确命中各自的保存正文；从通过校验的引用派生内部 `evidence_ids/evidence_quote`，模型无需再抄第三份引用。若响应仍显式提供旧的顶层 `evidence_ids/evidence_quote`，继续精确校验，失败为 UNKNOWN/ungrounded；不忽略无效旧引用。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，保留空白和真正的数字前缀，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）。
+校验：`confirmed`/`refuted` 的 assessment 两组引用均需来自 `status=success` 的 observation。工具回复与收尾输入提供代码从已保存源码生成的 `obs_N:eM` ID，模型复制 ID；代码将其解析为内部 `{observation_id, quote}`，再用原精确匹配校验。源码按完整行分段（目标 400 字符，单行可更长），搜索命中/定义分段不跨结果边界；不增加现有 1200 字符保存区，负向结果不生成 ID。未知、拼造或带多余字符的 ID 为 UNKNOWN/ungrounded-assessment。旧 assessment 原文引用仍兼容并逐条精确校验，不能用有效 ID 掩盖无效旧引用。
+
+从通过校验的引用派生内部 `evidence_ids/evidence_quote`，模型无需再抄第三份引用。若响应仍显式提供旧的顶层 `evidence_ids/evidence_quote`，继续精确校验，失败为 UNKNOWN/ungrounded；不忽略无效旧引用。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，解析后的原文保留缩进、换行、Unicode 和真正的数字前缀，落库/续跑也不 trim quote，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）。
 
 工具回复只交付实际保存的 excerpt 与位置元数据；超过 1200 字符的正文不再以 Additional context 展示，保留缩小 read/search 范围的提示。结果摘要 digest 与既有最大工具读取水位不变，原始 Context 仍作导航而非 Observation 证据；需更深正文时通过既有工具窄读，不增加新工具或调查预算。缺少证明为 UNKNOWN，不能凭“未看到触发路径”推翻；声称值转换失败时需追踪引用的具体输入、运算及结果，不能只看语法推断失败。
 

@@ -30,7 +30,7 @@ _STRENGTH_RANK = {"none": 0, "weak": 1, "strong": 2}
 
 @dataclass
 class ConfirmedCluster:
-    """One (mechanism, anchor_symbol) group of confirmed hypotheses."""
+    """One (mechanism, scoped_anchor) group of confirmed hypotheses."""
 
     key: tuple[str, str]
     hypothesis_ids: list[str]
@@ -60,7 +60,17 @@ class Publication:
 
 
 def _anchor(hypothesis: Hypothesis) -> str:
-    return hypothesis.identity.rsplit("::", 1)[-1]
+    symbol = hypothesis.identity.rsplit("::", 1)[-1]
+    # A missing symbol describes no shared cause. Resource/file units with an
+    # empty or module anchor must remain independent; a bare function name is
+    # meaningful only within its primary source file. Explicit multi-site
+    # hypotheses keep their sites, and the editor can still merge proven causes.
+    scope = (
+        ["symbol", hypothesis.sites[0].path, symbol]
+        if symbol and symbol != "<module>"
+        else ["unit", hypothesis.unit_id]
+    )
+    return json.dumps(scope, ensure_ascii=False, separators=(",", ":"))
 
 
 def _max_severity(a: str, b: str) -> str:
@@ -72,7 +82,7 @@ def _max_strength(a: str, b: str) -> str:
 
 
 def cluster_confirmed(ledger: HypothesisLedger) -> list[ConfirmedCluster]:
-    """Group CONFIRMED hypotheses by (mechanism, anchor_symbol) and merge sites."""
+    """Group CONFIRMED hypotheses by mechanism and source-scoped anchor."""
 
     groups: dict[tuple[str, str], ConfirmedCluster] = {}
     for hypothesis in sorted(ledger.items.values(), key=lambda item: item.identity):

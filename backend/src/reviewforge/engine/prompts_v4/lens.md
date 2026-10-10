@@ -4,7 +4,7 @@
 
 ## 输入说明
 
-- `## Changes`：共享 before/after diff 中代码只呈现一次，`+` 新增、`-` 删除，可评论 RIGHT 行标为 `行号 | 代码`。各 unit 列出可用行号并分别需要返回判断；共享 hunk 不是多条独立缺陷。`excerpt` 逐字取自 `|` 后的代码，不包含 diff 标记、行号或 `|`。
+- `## Changes`：共享 before/after diff 中代码只呈现一次，`+` 新增、`-` 删除，可评论 RIGHT 行标为 `行号 | 代码`。各 unit 列出可用行号并分别需要返回判断；共享 hunk 不是多条独立缺陷。`excerpt` 逐字取自 `|` 后的代码，不复制前置的 diff 标记、行号及分隔符；代码本身的 `|` 保持原样。
 - `## Context`：我们替你收集的相关代码。**优先基于 Context 判断跨文件一致性**：调用方约定、父类要求、兄弟方法既有模式、锁/字段使用点。
   `Same source as Unit ..., slice ...` 指向本块前面已交付的相同源码，当前 unit 的关系与 reason 仍保留。
 - `## Unchecked`：没有给到你的上下文方向。对这些方向只能提 `open_question`，不能下结论。

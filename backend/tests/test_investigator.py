@@ -472,6 +472,47 @@ async def test_api_fallback_executor_uses_async_pinned_reader() -> None:
 
 
 @pytest.mark.asyncio
+async def test_diff_window_records_before_after_evidence_past_the_full_diff_limit():
+    from types import SimpleNamespace
+
+    old = "message=existing language defect with <a href='old'>link</a>"
+    new = "message=existing language defect with link"
+    patch = "@@ -1 +1 @@\n-" + "x" * 7000 + "\n+" + "y" * 7000 + f"\n@@ -101 +101 @@\n-{old}\n+{new}\n"
+    state = _state(diffs={"a.py": patch})
+    executor = build_workspace_executor(SimpleNamespace(), state)
+    assert await executor("read_diff", {"path": "a.py"}) == patch  # Old callers keep the full view.
+    investigator = Investigator(_ScriptedToolLLM(), executor)
+    await investigator._run_tool("read_diff", {"path": "a.py"})
+    assert old not in investigator._observations[0].excerpt
+    result = await investigator._run_tool("read_diff", {"path": "a.py", "start": 101, "end": 101})
+    assert "@@ -1 +1 @@" not in result
+    assert old in investigator._observations[1].excerpt and new in investigator._observations[1].excerpt
+    verdict = investigator._finalize(
+        {"verdict": "refuted", "evidence_ids": ["obs_1"], "evidence_quote": old},
+        _hypothesis(),
+        {"a.py"},
+        steps=2,
+    )
+    assert verdict.verdict == "refuted"
+
+
+@pytest.mark.asyncio
+async def test_missing_diff_window_cannot_be_evidence_of_refutation():
+    from types import SimpleNamespace
+
+    investigator = Investigator(_ScriptedToolLLM(), build_workspace_executor(SimpleNamespace(), _state()))
+    await investigator._run_tool("read_diff", {"path": "a.py", "start": 900, "end": 900})
+    assert investigator._observations[0].status == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_diff_window_tool_schema_accepts_line_coordinates():
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}))
+    schema = next(tool for tool in investigator._build_tools() if tool.name == "read_diff").args
+    assert "start" in schema and "end" in schema
+
+
+@pytest.mark.asyncio
 async def test_investigator_stops_when_token_budget_is_exhausted() -> None:
     class ExpensiveLLM(_ScriptedToolLLM):
         def _generate(self, messages, stop=None, run_manager=None, **kwargs):

@@ -217,3 +217,18 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 离线按捕获输入压缩（不调用模型、不打质量分）保留全部 units / hunks 与相同 RIGHT 坐标正文，五个输入合计节省 80016 字符，记录 `shared-input-audit.json`。这不是实际 token 消耗或质量成绩；下一轮需冻结新提交重新实测。新增测试覆盖共享 hunk/预算、跨块源码、删除 guard、元数据/畸形重复行、空行/尾空格、共享上下文边界、来源差异与截断不复原。
 
 本轮新增 14 个参数化/独立回归；完整本地 `1526 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。检查结束后再建立新的源码快照和输出目录，模型、数据集、预算与资源限制保持一致。
+
+冻结 `78aee14` 的第二轮结果位于 `.reviewforge/benchmarks/v4-shared-inputs-20261011-002149/`。同一 PR head、模型和预算下，38 次请求全部成功；GEN 2 / lens 1 / INV 34 / editor 1 次。58 units 均返回判断，unresolved、token-exhausted、ungrounded 和 error-severity UNKNOWN 均为 0，内层首次 completed，严格裁判准入通过。账本为 5 CONFIRMED / 2 REFUTED / 21 UNKNOWN（16 条预算未调查、5 条证据不足）。用量 230363 tokens（GEN 50453 / lens 44677 / INV 127718 / editor 7515），较上一轮减少约 28%，低于单 PR 250000 目标；耗时 1503.625 秒，较上一轮减少约 20%。候选仍为 28 条，噪音问题未解决。
+
+冻结相同 `78aee14` 裁判严格评分，全部请求完成，裁判额外记录 9097 tokens。一个 PR 的实际发布成绩：ReviewForge 0 TP / 1 FP / 4 FN，P/R/F1 均为 0；历史 Qodo-v2 为 1 TP / 1 FP / 3 FN，P=0.5、R=0.25、F1=0.3333。未把调查候选当作实际发布成绩。confirmed 池中两条真实匹配（立陶宛 loginTotpStep1 与中文 account totpStep1）在发布时丢失。裁判输出的 ledger 辅助召回 3/4、refuted_goldens=1，抽查发现方法名拼写与 matcher 状态错误、templateHelp 与 totpStep1 被跨原因/键配对；保留原始输出及阈值，不以这些辅助匹配宣称漏杀或进步。未运行 legacy 配对、完整 dev10 或 holdout；该单 PR 结果不构成整体验收。
+
+## 2026-10-11 变更归因与发布聚类修正
+
+回查 SPEC §4.6/§4.7、模块注释与 `8466d395`：原编辑器假设 `(mechanism, anchor_symbol)` 足以跨 unit 表示同根因。真实账本五条不同资源问题均为 `(i18n, "")`，被代码强制合成一簇；模型只返回其中一条评论，簇完整性保护正确拒收部分结果，却随后以错误的首条 claim 为模板混合全部 sites。保留簇完整性保护与发布上限，修正“空符号代表同因”的假设；Issue 库仍为空。
+
+- 已命名 anchor 加上主 site 文件 scope，避免不同文件同名函数自动合并；空符号和 `<module>` 使用独立 unit scope。显式多 site 假设保持原位置；模型仍可在证据支持同一处修复时合并跨簇候选。
+- 调查工具 `read_diff` 支持 RIGHT 行窗口，保留相交完整 before/after hunk；默认全 diff 兼容。窄读避免目标反证位于长结果的未保存部分。不存在/未命中保留 not_found，不成为反证。
+- 调查提示先核对新触发条件/后果，再比较 before/after；旧代码可被新调用或配置触发，不能仅凭代码曾存在就推翻。原始 diff 复核：中文 account 的简体变繁体确实由本 PR 引入，admin templateHelp 则仍为简体且已正确推翻。
+- 一条 formatter 候选真实响应的 reason 明确推翻，但 verdict 填 confirmed；改为先写事实与理由、最后选一致的三值结论。仅引用 import/构造/方法名不足以证明 API 能力。这是提示词改进，不能声称已在代码层解决语义矛盾，需新冻结轮次实测。
+
+新增 3 项窄 diff 回归及 7 项编辑聚类/降级回归；六项旧实现的错误合并已先复现，再修正，原同文件命名符号合并和全部 sites 校验继续通过。完整本地 `1536 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。尚待新的冻结提交真实预检，不提高预算、不改数据集/goldens/裁判阈值，main 仍保留 legacy 生产版本。

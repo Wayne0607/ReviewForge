@@ -64,6 +64,44 @@ def test_cluster_merges_sites_and_takes_max_severity_strength() -> None:
     assert {(site.path, site.line) for site in cluster.sites} == {("a.py", 1), ("a.py", 99)}
 
 
+@pytest.mark.parametrize("anchor", ["", "<module>"])
+@pytest.mark.parametrize("second_path", ["a.properties", "b.properties"])
+def test_symbol_less_units_are_independent_publication_clusters(anchor: str, second_path: str) -> None:
+    ledger = _ledger(
+        _hyp(1, Mechanism.I18N, anchor, "error", "weak", sites=[Site("a.properties", 1, "first=value")]),
+        _hyp(2, Mechanism.I18N, anchor, "error", "weak", sites=[Site(second_path, 2, "second=value")]),
+    )
+
+    clusters = cluster_confirmed(ledger)
+
+    assert len(clusters) == 2
+    assert {tuple(cluster.hypothesis_ids) for cluster in clusters} == {("h_1",), ("h_2",)}
+    assert len({cluster.key for cluster in clusters}) == 2
+
+
+def test_same_function_name_in_different_files_does_not_merge() -> None:
+    ledger = _ledger(
+        _hyp(1, Mechanism.NULL_PATH, "validate", "error", "strong", sites=[Site("auth.py", 1, "token.name")]),
+        _hyp(2, Mechanism.NULL_PATH, "validate", "error", "strong", sites=[Site("order.py", 2, "item.price")]),
+    )
+
+    assert len(cluster_confirmed(ledger)) == 2
+
+
+def test_explicit_multi_file_hypothesis_keeps_all_sites_without_empty_anchor_merges() -> None:
+    sites = [Site("login.properties", 1, "first=value"), Site("account.properties", 2, "first=value")]
+    ledger = _ledger(
+        _hyp(1, Mechanism.I18N, "", "error", "weak", sites=sites),
+        _hyp(2, Mechanism.I18N, "", "error", "weak", sites=[Site("email.properties", 3, "second=value")]),
+    )
+
+    clusters = cluster_confirmed(ledger)
+
+    assert len(clusters) == 2
+    grouped = {tuple(cluster.hypothesis_ids): cluster for cluster in clusters}
+    assert grouped[("h_1",)].sites == sites
+
+
 def test_order_clusters_by_severity_strength_sites() -> None:
     weak = _hyp(1, Mechanism.NULL_PATH, "a", "error", "weak")
     strong = _hyp(2, Mechanism.LOCK_SCOPE, "b", "error", "strong")
@@ -72,7 +110,7 @@ def test_order_clusters_by_severity_strength_sites() -> None:
     )
     ledger = _ledger(weak, strong, many)
     ordered = order_clusters(cluster_confirmed(ledger))
-    assert [cluster.key[1] for cluster in ordered] == ["b", "a", "c"]
+    assert [cluster.hypothesis_ids for cluster in ordered] == [["h_2"], ["h_1"], ["h_3"]]
 
 
 def test_split_inline_cap_and_error_strong_overflow() -> None:
@@ -113,6 +151,22 @@ class _ScriptedLLM(BaseChatModel):
     @property
     def _llm_type(self):
         return "scripted"
+
+
+@pytest.mark.asyncio
+async def test_editor_fallback_does_not_hide_independent_resource_issues() -> None:
+    ledger = _ledger(
+        _hyp(1, Mechanism.I18N, "", "error", "weak", sites=[Site("login.properties", 1, "first=value")]),
+        _hyp(2, Mechanism.I18N, "", "error", "weak", sites=[Site("account.properties", 2, "second=value")]),
+    )
+
+    publication = await Editor(_ScriptedLLM(responses=["not json"])).run(ledger, None)
+
+    assert publication.fallback
+    assert len(publication.comments) == 2
+    assert {tuple(comment.hypothesis_ids) for comment in publication.comments} == {("h_1",), ("h_2",)}
+    assert publication.merged == []
+    assert all(not ("claim 1" in comment.body and "claim 2" in comment.body) for comment in publication.comments)
 
     @property
     def _identifying_params(self):

@@ -265,7 +265,7 @@ class HypothesisLedger:
 
 ### 4.6 `engine/investigator.py` — 调查
 
-**职责。** 对每个 `OPEN` 假设回答它的 `open_question`，产出三值结论与 observations。这是唯一有工具的 LLM 阶段，也是唯一的过滤阶段。
+**职责。** 对每个 `OPEN` 假设回答它的 `open_question`，核实本次改动如何使 trigger 可达或产生新的后果，产出三值结论与 observations。head 中已有某个现象不代表本 PR 引入；旧代码也可能因新调用/数据流成为回归，不能只按旧侧是否存在某段表达式判定。这是唯一有工具的 LLM 阶段，也是唯一的过滤阶段。
 
 **调用。** agent 名 `investigator`，角色 `verifier`，temperature 0。并发 `investigator.concurrency`（默认 4）。
 
@@ -280,7 +280,7 @@ budget_steps = base(severity) + bonus
 
 预算包含结论调用，不能把全部额度用于工具循环。每轮先预留结论输入及输出（输出预留为总预算的四分之一，最多 4000 tokens），不足以继续工具调用时提前结束调查。结论输入重用原始假设/上下文及代码保存的 Observation excerpts，不重放完整工具结果或模型探索文字。估算计入工具参数、schema 与非 ASCII 文本，并用已测 provider input usage 校正遗漏的开销；实际 usage 仍如实记账，超支不可写已确认结论。
 
-**工具（通过 gateway，绑定 workspace）。** `read_file(path, start, end)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path)`。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
+**工具（通过 gateway，绑定 workspace）。** `read_file(path, start, end)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path, start?, end?)`。diff 行窗口选择与指定 RIGHT 行相交的完整 before/after hunk，保留删除行与上下文；省略窗口保留原完整 diff 行为，未命中为空/`not_found`，不得用作反证。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
 
 **输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。
 
@@ -307,7 +307,7 @@ budget_steps = base(severity) + bonus
 **调用。** agent 名 `editor`，角色 `publication_gate`，temperature 0，每 PR 1 次。输入 = 所有 `CONFIRMED` 假设（含 sites、observations excerpt、evidence_strength）+ `UNKNOWN` 假设的 claim 列表（仅用于摘要，不可发布）+ `pr_intent` + 输出语言。
 
 **确定性预处理（先于 LLM）。**
-1. 同 identity 已合并；再按 `(mechanism, anchor_symbol)` 跨 unit 聚类，同簇合并 sites。
+1. 同 identity 已合并；再按 `(mechanism, scoped_anchor)` 跨 unit 聚类，同簇合并 sites。已命名符号的 scope 包含主 site 文件路径与 anchor；无符号或 `<module>` 的 scope 使用 unit_id，不把不同文件/资源单元的空 anchor 当作同根因。显式多 site 假设保留全部位置；跨簇仅在证据支持同一处修复时由编辑合并。
 2. 排序键：`severity_rank × strength_rank × min(len(sites),3)`，severity error=3/warning=2/info=1，strength strong=3/weak=1。
 3. 取前 `publish.max_inline`（默认 5）为 inline 候选；`error` + `strong` 溢出到 `publish.max_inline_overflow`（默认 8）。
 

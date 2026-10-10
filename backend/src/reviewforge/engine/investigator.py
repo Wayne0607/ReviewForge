@@ -149,7 +149,14 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
             hits = workspace.find_callers(args["symbol"], language=language, max_hits=int(args.get("max_hits", 10)))
             return "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in hits) or "No callers found"
         if name == "read_diff":
-            return (state.file_diffs or {}).get(args["path"], "") or ""
+            patch = (state.file_diffs or {}).get(args["path"], "") or ""
+            if args.get("start") is None and args.get("end") is None:
+                return patch
+            start = int(args["start"]) if args.get("start") is not None else 0
+            end = int(args["end"]) if args.get("end") is not None else 2**63 - 1
+            if start < 0 or end < start:
+                raise ValueError("read_diff requires an ordered RIGHT-line window")
+            return select_diff_hunks(patch, [(start, end)])
         raise KeyError(f"unknown investigator tool: {name}")
 
     return _execute
@@ -197,8 +204,13 @@ class Investigator:
         async def find_callers(symbol: str, max_hits: int = 10) -> str:
             return await self._run_tool("find_callers", {"symbol": symbol, "max_hits": max_hits})
 
-        async def read_diff(path: str) -> str:
-            return await self._run_tool("read_diff", {"path": path})
+        async def read_diff(path: str, start: int | None = None, end: int | None = None) -> str:
+            payload: dict[str, Any] = {"path": path}
+            if start is not None:
+                payload["start"] = start
+            if end is not None:
+                payload["end"] = end
+            return await self._run_tool("read_diff", payload)
 
         return [
             StructuredTool.from_function(
@@ -214,7 +226,9 @@ class Investigator:
                 coroutine=find_callers, name="find_callers", description="查找某符号的调用位置"
             ),
             StructuredTool.from_function(
-                coroutine=read_diff, name="read_diff", description="读取某文件在本 PR 的 diff"
+                coroutine=read_diff,
+                name="read_diff",
+                description="读取 PR before/after diff；可用 start/end RIGHT 行窗口定位 hunk，保留删除行与上下文",
             ),
         ]
 

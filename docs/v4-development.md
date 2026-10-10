@@ -134,6 +134,10 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 另按 SPEC §4.3 修正假设身份：旧实现直接采用模型填的 `anchor_symbol`，同一 unit/机制可因任意命名产生重复假设。现在从固定 head 的真实源码用 `_find_enclosing_function` 定位 site 所在的最内层函数；没有函数或源码不可用时回退 `unit.symbol`，不发明资源文件的身份规则。生成器与专项 lens 共用按文件缓存的解析器。新增重复命名、嵌套函数、不可用源码/资源文件回归；完整检查为 `1492 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。生产服务与 main 未改，尚无有效完整配对质量成绩。
 
+`04af96b` dev CI 成功。Sentry 同 `e92e136` 提交的串行重试成功：23 个语义/上下文单元全部保留、260 段源码、40000 字符、进程组峰值约 414 MiB。三仓库审计均来自完整 tarball，所有 slice 的 SHA 与固定 head 相同；失败尝试仍留存，本机审计汇总为 `.reviewforge/benchmarks/local-contexts-e92e136-20261010/audit-summary.json`。这验证上下文交付，尚不等于质量提升。
+
+补齐可执行的 Phase 2 测量入口：严格裁判新增显式 `--ledger-recall`，重用原 claim 池选择，并用相同裁判和一对一匹配分别测 CONFIRMED+OPEN+UNKNOWN、CONFIRMED、REFUTED；生成/确认召回与误杀数单独写入 `ledger_metrics`，不混入发布评论 F1。拒绝 head 不一致或畸形账本；参数与 helper hash 固定续跑身份。同时修正裁判请求失败后静默排除样本的缺口：所有请求成功前只保存 partial 诊断、不输出完整集合质量分，失败请求可在同输入下重试。新增 5 项回归（含失败后恢复），完整检查为 `1497 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。恢复期间核对生产仍 active、HTTP 200、main SHA 未变。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

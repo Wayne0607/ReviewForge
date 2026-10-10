@@ -94,7 +94,18 @@ calls the model or produces scores. It refuses to quietly exclude missing or
 partial reviews. Judge resume is tied to exact input hashes and parameters.
 Diagnose partial execution before treating a zero-comment result as successful
 review coverage. The matching prompts, confidence threshold and one-to-one
-matching remain unchanged.
+matching remain unchanged. All requested judge decisions must also succeed before
+aggregate scores are emitted; failed requests stay in `completed` for a same-input
+retry, the artifact is `partial`, and no subset metrics are presented as final.
+
+Use `martian_judge.py --ledger-recall` for SPEC Phase 2 diagnostics on complete v4
+results. It validates that the ledger is pinned to the result head, reuses
+`eval.ledger_recall.candidate_claims`, and applies the same judge/matching algorithm
+to three separate pools: CONFIRMED + OPEN + UNKNOWN, CONFIRMED, and REFUTED.
+`ledger_metrics` reports generation recall, confirmed recall, and the number of
+goldens wrongly refuted. Primary `metrics` still score only published inline
+comments and historical Qodo v2 candidates. The flag and helper hash are recorded
+in judge provenance; optional diagnostics cannot replace primary publication F1.
 
 For an OpenAI-compatible provider supporting DeepSeek's thinking parameter,
 `--thinking disabled` requests the non-thinking model. Apply it identically to

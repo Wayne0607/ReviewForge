@@ -19,8 +19,11 @@ from openai import AsyncOpenAI
 from reviewforge.core.config import ReviewForgeConfig
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.llm_settings import EncryptedLLMSettingsStore, apply_override
+from reviewforge.eval import ledger_recall
 
 _MIN_MATCH_CONFIDENCE = 0.7
+_PRIMARY_SOURCES = ("reviewforge", "qodo-v2")
+_LEDGER_SOURCES = ("ledger", "confirmed", "refuted")
 
 
 JUDGE_PROMPT = """You are evaluating AI code review tools.
@@ -333,6 +336,53 @@ def _metrics(completed: dict[str, Any], tool: str) -> dict[str, Any]:
     }
 
 
+def _ledger_sources(row: dict[str, Any]) -> dict[str, list[str]]:
+    """Use SPEC §6 claim pools without adding unpublished claims to primary F1."""
+    ledger = row.get("ledger")
+    if not isinstance(ledger, dict) or not row.get("head_sha") or ledger.get("head_sha") != row["head_sha"]:
+        raise RuntimeError("ledger diagnostic requires a ledger pinned to the result head")
+    items = ledger.get("items")
+    if not isinstance(items, dict):
+        raise RuntimeError("ledger items must be a dictionary")
+    for item in items.values():
+        if not isinstance(item, dict) or item.get("status") not in {"confirmed", "open", "unknown", "refuted"}:
+            raise RuntimeError("ledger item has an invalid status")
+        if not isinstance(item.get("claim"), str) or not item["claim"].strip():
+            raise RuntimeError("ledger item has an invalid claim")
+    values = list(items.values())
+    return {
+        "ledger": ledger_recall.candidate_claims(values, ("confirmed", "open", "unknown")),
+        "confirmed": ledger_recall.candidate_claims(values, ("confirmed",)),
+        "refuted": ledger_recall.candidate_claims(values, ("refuted",)),
+    }
+
+
+def _update_metrics(state: dict[str, Any], urls: list[str], source_names: tuple[str, ...]) -> None:
+    completed = state["completed"]
+    ready = all(
+        name in completed.get(url, {}) and not completed[url][name].get("errors")
+        for url in urls
+        for name in source_names
+    )
+    state["status"] = "completed" if ready else "partial"
+    state.pop("metrics", None)
+    state.pop("ledger_metrics", None)
+    if not ready:
+        return
+    state["metrics"] = {name: _metrics(completed, name) for name in _PRIMARY_SOURCES}
+    if "ledger" in source_names:
+        pools = {name: _metrics(completed, name) for name in _LEDGER_SOURCES}
+        state["ledger_metrics"] = {
+            "reviews": pools["ledger"]["reviews"],
+            "total_golden": pools["ledger"]["tp"] + pools["ledger"]["fn"],
+            "ledger_tp": pools["ledger"]["tp"],
+            "ledger_recall": pools["ledger"]["recall"],
+            "confirmed_tp": pools["confirmed"]["tp"],
+            "confirmed_recall": pools["confirmed"]["recall"],
+            "refuted_goldens": pools["refuted"]["tp"],
+        }
+
+
 async def main_async(args: argparse.Namespace) -> None:
     workload = json.loads(Path(args.workload).read_text(encoding="utf-8"))
     selected = workload[: args.limit or None]
@@ -340,6 +390,16 @@ async def main_async(args: argparse.Namespace) -> None:
         json.loads(Path(args.reviewforge_results).read_text(encoding="utf-8")), selected
     )
     qodo = json.loads(Path(args.qodo_candidates).read_text(encoding="utf-8"))
+    with_ledger = bool(getattr(args, "ledger_recall", False))
+    source_names = _PRIMARY_SOURCES + (_LEDGER_SOURCES if with_ledger else ())
+    sources_by_url = {}
+    for item in selected:
+        url = item["golden_url"]
+        sources_by_url[url] = {
+            "reviewforge": [comment["body"] for comment in reviewforge[url]["review_comments"]],
+            "qodo-v2": [candidate["text"] for candidate in qodo.get(url, {}).get("qodo-v2", [])],
+            **(_ledger_sources(reviewforge[url]) if with_ledger else {}),
+        }
     output = Path(args.output)
     state = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {"completed": {}}
     completed = state.setdefault("completed", {})
@@ -354,6 +414,8 @@ async def main_async(args: argparse.Namespace) -> None:
         "results_sha256": hashlib.sha256(Path(args.reviewforge_results).read_bytes()).hexdigest(),
         "qodo_sha256": hashlib.sha256(Path(args.qodo_candidates).read_bytes()).hexdigest(),
         "limit": args.limit,
+        "ledger_recall": with_ledger,
+        "ledger_helper_sha256": hashlib.sha256(Path(ledger_recall.__file__).read_bytes()).hexdigest(),
     }
     try:
         validate_resume_metadata(state.get("judge_parameters"), parameters, has_results=bool(completed))
@@ -368,10 +430,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 if url not in reviewforge:
                     continue
                 tools = completed.setdefault(url, {})
-                sources = {
-                    "reviewforge": [comment["body"] for comment in reviewforge[url]["review_comments"]],
-                    "qodo-v2": [candidate["text"] for candidate in qodo.get(url, {}).get("qodo-v2", [])],
-                }
+                sources = sources_by_url[url]
                 pending = [
                     (tool, candidates)
                     for tool, candidates in sources.items()
@@ -389,14 +448,18 @@ async def main_async(args: argparse.Namespace) -> None:
             evaluated = await asyncio.gather(*jobs)
             for (url, tool), result in zip(metadata, evaluated, strict=True):
                 completed[url][tool] = result
-            state["metrics"] = {name: _metrics(completed, name) for name in ("reviewforge", "qodo-v2")}
+            _update_metrics(state, list(sources_by_url), source_names)
             state["judge_tokens"] = {
                 "input": judge.input_tokens,
                 "output": judge.output_tokens,
                 "total": judge.input_tokens + judge.output_tokens,
             }
             _atomic_json(output, state)
-            print(json.dumps(state["metrics"], ensure_ascii=False), flush=True)
+            print(
+                json.dumps({"status": state["status"], "metrics": state.get("metrics")}, ensure_ascii=False), flush=True
+            )
+        if state.get("status") != "completed":
+            raise RuntimeError("judge requests are incomplete; no quality score produced")
     finally:
         await judge.close()
 
@@ -411,6 +474,9 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--thinking", choices=("default", "enabled", "disabled"), default="default")
     parser.add_argument("--llm-min-interval", type=float, default=30.0)
+    parser.add_argument(
+        "--ledger-recall", action="store_true", help="Separately measure ledger/confirmed/refuted claims"
+    )
     args = parser.parse_args()
     asyncio.run(main_async(args))
 

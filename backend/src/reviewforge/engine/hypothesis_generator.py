@@ -26,15 +26,44 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
+from reviewforge.engine.symbol_extractor import _find_enclosing_function
+from reviewforge.tools.workspace import WorkspaceUnavailable
 
 _EXCERPT_MIN_CHARS = 12
 _SEVERITIES = frozenset({"error", "warning", "info"})
 _SEVERITY_PRIORITY = {"info": 0, "warning": 1, "error": 2}
 logger = logging.getLogger(__name__)
+
+AnchorResolver = Callable[[str, str, int], Awaitable[str]]
+
+
+def build_anchor_resolver(workspace: Any, changeset: SemanticChangeSet) -> AnchorResolver:
+    """Resolve identity anchors from immutable source, as required by SPEC §4.3."""
+    unit_symbols = {unit.id: unit.symbol for unit in changeset.units}
+    owners: dict[str, dict[int, str]] = {}
+
+    async def resolve(unit_id: str, path: str, line: int) -> str:
+        if path not in owners:
+            reader = getattr(workspace, "read_async", None)
+            try:
+                source = await reader(path) if callable(reader) else None
+            except (WorkspaceUnavailable, OSError):
+                source = None
+            owners[path] = (
+                _find_enclosing_function(source.splitlines(), extract_code_definitions(source, path))
+                if isinstance(source, str)
+                else {}
+            )
+        function = owners[path].get(line - 1, "<module>")
+        return function if function != "<module>" else unit_symbols.get(unit_id, "")
+
+    return resolve
+
 
 # The lead-in text shared by every block (PR intent plus the unchecked-summary).
 # It is measured separately so block budgeting never starves the diff itself.
@@ -213,6 +242,7 @@ class HypothesisGenerator:
         prompt_template: str = "generator",
         skill_body: str = "",
         on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
+        anchor_resolver: AnchorResolver | None = None,
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
@@ -223,6 +253,7 @@ class HypothesisGenerator:
         self._prompt_template = prompt_template
         self._skill_body = skill_body
         self._on_update = on_update
+        self._anchor_resolver = anchor_resolver
 
     def _system_prompt(self) -> str:
         lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
@@ -298,7 +329,7 @@ class HypothesisGenerator:
                 if ledger.unresolved_units.get(unit.id, "").startswith(f"{self._source} "):
                     ledger.unresolved_units.pop(unit.id)
             result.dropped_overflow += await self._consume(
-                parsed, ledger, result, right_lines, {unit.id for unit in block}
+                parsed, ledger, result, right_lines, {unit.id: unit for unit in block}
             )
             if self._on_update is not None:
                 await self._on_update(ledger)
@@ -391,7 +422,7 @@ class HypothesisGenerator:
         ledger: HypothesisLedger,
         result: HypothesisGenerationResult,
         right_lines: dict[str, dict[int, str]],
-        unit_ids: set[str],
+        units: dict[str, SemanticUnit],
     ) -> int:
         valid: list[tuple[dict[str, Any], list[tuple[str, int, str]]]] = []
 
@@ -399,7 +430,7 @@ class HypothesisGenerator:
         if isinstance(raw_hypotheses, list):
             for item in raw_hypotheses:
                 payload, sites = self._validate_hypothesis(item, right_lines)
-                if payload is None or payload["unit_id"] not in unit_ids:
+                if payload is None or payload["unit_id"] not in units:
                     result.dropped_invalid += 1
                     continue
                 if not sites:
@@ -412,7 +443,16 @@ class HypothesisGenerator:
         overflow = len(valid) - len(kept)
 
         for payload, sites in kept:
-            identity = _identity(payload["unit_id"], payload["mechanism"], payload["anchor_symbol"])
+            unit = units[payload["unit_id"]]
+            # The model can describe an anchor, but cannot define its identity.
+            # Prefer a primary site in the declared unit, then use stable order.
+            primary = min(sites, key=lambda site: (site[0] != unit.path, site[0], site[1]))
+            anchor = (
+                await self._anchor_resolver(unit.id, primary[0], primary[1])
+                if self._anchor_resolver is not None
+                else unit.symbol
+            )
+            identity = _identity(payload["unit_id"], payload["mechanism"], anchor)
             hypothesis = Hypothesis(
                 id=_new_hypothesis_id(identity),
                 identity=identity,
@@ -441,7 +481,7 @@ class HypothesisGenerator:
                 unit_id = str(item.get("unit_id") or "").strip()
                 checked = str(item.get("checked") or "").strip()
                 has_hypothesis = any(hypothesis.unit_id == unit_id for hypothesis in ledger.items.values())
-                if unit_id in unit_ids and checked and not has_hypothesis and unit_id not in ledger.unresolved_units:
+                if unit_id in units and checked and not has_hypothesis and unit_id not in ledger.unresolved_units:
                     ledger.no_issue_units[unit_id] = checked
 
         return overflow

@@ -138,6 +138,72 @@ async def test_generator_accepts_valid_output_and_upserts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_anchor_variants_cannot_split_the_same_code_hypothesis() -> None:
+    first = _hypothesis("wrong-argument")
+    second = {**first, "anchor_symbol": "invented_other_function"}
+    llm = _ScriptedLLM(responses=[json.dumps({"hypotheses": [first, second], "no_issue_units": []})])
+    ledger = HypothesisLedger("run", "abc", "digest")
+    await HypothesisGenerator(llm).run(
+        StateStore(file_diffs=_server_diff()),
+        ContextPack(),
+        _changeset(_unit("service.py", "get_or_create_resource")),
+        ledger,
+    )
+    assert list(ledger.items) == ["service.py:get_or_create_resource::wrong-argument::get_or_create_resource"]
+
+
+@pytest.mark.asyncio
+async def test_anchor_uses_innermost_head_function_and_caches_source() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from reviewforge.engine.hypothesis_generator import build_anchor_resolver
+
+    source = (
+        "class Outer:\n"
+        "    def method(self):\n"
+        "        def nested(owner_id):\n"
+        "            return create_resource(owner_id)\n"
+        "        return nested(self.owner_id)\n"
+    )
+    unit = _unit("service.py", "Outer")
+    changeset = _changeset(unit)
+    workspace = SimpleNamespace(read_async=AsyncMock(return_value=source))
+    resolver = build_anchor_resolver(workspace, changeset)
+    assert await resolver(unit.id, unit.path, 4) == "nested"
+    assert await resolver(unit.id, unit.path, 5) == "method"
+    hypothesis = {**_hypothesis("wrong-argument", line=4), "unit_id": unit.id, "anchor_symbol": "invented"}
+    llm = _ScriptedLLM(responses=[json.dumps({"hypotheses": [hypothesis], "no_issue_units": []})])
+    ledger = HypothesisLedger("run", "abc", "digest")
+    await HypothesisGenerator(llm, anchor_resolver=resolver).run(
+        StateStore(file_diffs={unit.path: "@@ -0,0 +1,5 @@\n" + "\n".join("+" + line for line in source.splitlines())}),
+        ContextPack(),
+        changeset,
+        ledger,
+    )
+    assert list(ledger.items) == [f"{unit.id}::wrong-argument::nested"]
+    workspace.read_async.assert_awaited_once_with(unit.path)
+
+
+@pytest.mark.asyncio
+async def test_anchor_falls_back_to_unit_symbol_for_unavailable_or_resource_source() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from reviewforge.engine.hypothesis_generator import build_anchor_resolver
+    from reviewforge.tools.workspace import WorkspaceUnavailable
+
+    unit = _unit("service.py", "get_or_create_resource")
+    workspace = SimpleNamespace(read_async=AsyncMock(side_effect=WorkspaceUnavailable()))
+    resolver = build_anchor_resolver(workspace, _changeset(unit))
+    assert await resolver(unit.id, unit.path, 2) == unit.symbol
+    resource = _unit("messages.properties", "")
+    workspace = SimpleNamespace(read_async=AsyncMock(return_value="translation = Hello\n"))
+    resolver = build_anchor_resolver(workspace, _changeset(resource))
+    assert await resolver(resource.id, resource.path, 1) == ""
+
+
+@pytest.mark.asyncio
 async def test_unanchored_excerpt_drops_hypothesis() -> None:
     llm = _ScriptedLLM(
         responses=[

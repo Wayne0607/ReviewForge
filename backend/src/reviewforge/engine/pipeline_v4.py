@@ -27,7 +27,7 @@ from reviewforge.engine.editor import (
     resumed_publication,
 )
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
-from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+from reviewforge.engine.hypothesis_generator import HypothesisGenerator, build_anchor_resolver
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
 from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.lenses import run_lens, select_lenses
@@ -155,6 +155,7 @@ async def _run_llm_stages(
     # A frozen first review proves discovery was attempted. Retry only if
     # generation/lens failures remain; finished verdicts stay in the ledger.
     if not resume or ledger.unresolved_units:
+        anchor_resolver = build_anchor_resolver(workspace, changeset)
         generator = HypothesisGenerator(
             routed("hypothesis_generator"),
             max_input_chars=config.generator_max_input_chars,
@@ -162,6 +163,7 @@ async def _run_llm_stages(
             context_max_chars=config.context_pack_max_chars,
             output_language=language,
             on_update=checkpoint,
+            anchor_resolver=anchor_resolver,
         )
         gen_result = await generator.run(state, pack, changeset, ledger)
         events.emit(
@@ -200,6 +202,7 @@ async def _run_llm_stages(
                 output_language=language,
                 max_hypotheses=config.generator_max_hypotheses,
                 on_update=checkpoint,
+                anchor_resolver=anchor_resolver,
             )
 
     executor = build_workspace_executor(workspace, state)

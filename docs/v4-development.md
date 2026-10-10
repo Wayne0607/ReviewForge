@@ -130,6 +130,10 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 新增 4 项源码/重载/重复行/manifest 回归，验证真实注释误识别、所有行保留、同 head 重编译稳定，以及 legacy 行为不变。串行采集结束后 7 项 Windows 限额探针通过；本轮完整检查为 `1489 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。`8bc641d` Linux CI 为 `1483 passed, 3 skipped, 6 warnings`。下一步固定声明修正的提交，复查实际上下文与开发集对照，质量结论仍待完整评测。
 
+`e92e136` 的 Linux CI 为 `1487 passed, 3 skipped, 6 warnings`。固定该提交复查：keycloak#36880 的 77 个语义单元全部保留，732 段源码上下文；grafana#97529 的 8 个单元全部保留，94 段上下文。两者 head 与 slices 的 SHA 一致，分别渲染 40000 / 37651 字符，进程组峰值约 319 / 361 MiB。Sentry#80168 本次 tarball 下载发生 `ConnectError`，严格抽查记为失败，保留退化诊断；不把零 slices 算作通过，待同提交串行重试。
+
+另按 SPEC §4.3 修正假设身份：旧实现直接采用模型填的 `anchor_symbol`，同一 unit/机制可因任意命名产生重复假设。现在从固定 head 的真实源码用 `_find_enclosing_function` 定位 site 所在的最内层函数；没有函数或源码不可用时回退 `unit.symbol`，不发明资源文件的身份规则。生成器与专项 lens 共用按文件缓存的解析器。新增重复命名、嵌套函数、不可用源码/资源文件回归；完整检查为 `1492 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。生产服务与 main 未改，尚无有效完整配对质量成绩。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

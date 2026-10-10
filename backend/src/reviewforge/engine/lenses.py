@@ -24,7 +24,7 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines
 from reviewforge.engine.hypothesis import HypothesisLedger
-from reviewforge.engine.hypothesis_generator import HypothesisGenerationResult, HypothesisGenerator
+from reviewforge.engine.hypothesis_generator import AnchorResolver, HypothesisGenerationResult, HypothesisGenerator
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 
 _LOCALIZATION_PATH = re.compile(r"\.(properties|po)$|messages_[^/]+\.json$|/locale/", re.IGNORECASE)
@@ -144,6 +144,7 @@ def build_lens_generator(
     max_hypotheses: int = 12,
     output_language: str = "en",
     on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
+    anchor_resolver: AnchorResolver | None = None,
 ) -> HypothesisGenerator:
     return HypothesisGenerator(
         llm,
@@ -153,6 +154,7 @@ def build_lens_generator(
         prompt_template="lens",
         skill_body=lens_skill_body(name),
         on_update=on_update,
+        anchor_resolver=anchor_resolver,
     )
 
 
@@ -168,6 +170,7 @@ async def run_lens(
     output_language: str = "en",
     max_hypotheses: int = 12,
     on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
+    anchor_resolver: AnchorResolver | None = None,
 ) -> HypothesisGenerationResult:
     """Execute one lens over the units that triggered it and upsert into the ledger."""
 
@@ -179,7 +182,12 @@ async def run_lens(
         units=[unit for unit in changeset.units if unit.id in triggered_ids],
     )
     generator = build_lens_generator(
-        llm, name, max_hypotheses=max_hypotheses, output_language=output_language, on_update=on_update
+        llm,
+        name,
+        max_hypotheses=max_hypotheses,
+        output_language=output_language,
+        on_update=on_update,
+        anchor_resolver=anchor_resolver,
     )
     return await generator.run(state, pack, filtered, ledger)
 

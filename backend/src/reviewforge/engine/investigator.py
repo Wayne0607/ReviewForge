@@ -198,7 +198,7 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
             return "".join(lines[first - 1 : last])
         if name == "grep":
             globs = [args["glob"]] if args.get("glob") else None
-            hits = workspace.grep(args["pattern"], globs=globs, max_hits=int(args.get("max_hits", 10)))
+            hits = workspace.grep(args["pattern"], globs=globs, max_hits=int(args.get("max_hits", 10)), diverse=True)
             return "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in hits) or "No results"
         if name == "find_definition":
             hits = workspace.find_symbol_definitions(args["symbol"], language=language)
@@ -207,7 +207,9 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
                 or "No definition found"
             )
         if name == "find_callers":
-            hits = workspace.find_callers(args["symbol"], language=language, max_hits=int(args.get("max_hits", 10)))
+            hits = workspace.find_callers(
+                args["symbol"], language=language, max_hits=int(args.get("max_hits", 10)), diverse=True
+            )
             return "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in hits) or "No callers found"
         if name == "read_diff":
             patch = (state.file_diffs or {}).get(args["path"], "") or ""

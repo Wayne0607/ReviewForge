@@ -96,9 +96,9 @@ class PRHeadWorkspace:
     async def build(cls, state: StateStore, github: GitHubClient, *, max_bytes: int) -> PRHeadWorkspace
     def read(self, path: str, start: int | None = None, end: int | None = None) -> str | None
     def exists(self, path: str) -> bool
-    def grep(self, pattern: str, *, globs: list[str] | None, max_hits: int, context: int = 0) -> list[GrepHit]
+    def grep(self, pattern: str, *, globs: list[str] | None, max_hits: int, context: int = 0, diverse: bool = False) -> list[GrepHit]
     def find_symbol_definitions(self, symbol: str, *, language: str) -> list[SymbolHit]   # 用 symbol_extractor.extract_definitions 逐文件扫（带缓存）
-    def find_callers(self, symbol: str, *, language: str, max_hits: int) -> list[GrepHit]  # 正则 \bsymbol\s*\( 排除定义行
+    def find_callers(self, symbol: str, *, language: str, max_hits: int, diverse: bool = False) -> list[GrepHit]  # 排除定义行；可按文件轮转
     def cleanup(self) -> None
 ```
 
@@ -321,6 +321,8 @@ Python 并发契约也由同一模块交付：生成器只对 `.py` 且 diff 含
 从通过校验的引用派生内部 `evidence_ids/evidence_quote`，模型无需再抄第三份引用。若响应仍显式提供旧的顶层 `evidence_ids/evidence_quote`，继续精确校验，失败为 UNKNOWN/ungrounded；不忽略无效旧引用。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，解析后的原文保留缩进、换行、Unicode 和真正的数字前缀，落库/续跑也不 trim quote，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）。
 
 工具回复只交付实际保存的 excerpt 与位置元数据；超过 1200 字符的正文不再以 Additional context 展示，保留缩小 read/search 范围的提示。结果摘要 digest 与既有最大工具读取水位不变，原始 Context 仍作导航而非 Observation 证据；需更深正文时通过既有工具窄读，不增加新工具或调查预算。缺少证明为 UNKNOWN，不能凭“未看到触发路径”推翻；声称值转换失败时需追踪引用的具体输入、运算及结果，不能只看语法推断失败。
+
+v4 Investigator 的 `grep` / `find_callers` 使用 workspace 的 `diverse=True`：先选不同文件各自的首条命中，再按文件中的命中序号轮转，序号相同时按 path/line 排序。结果仍不超过请求的 max_hits，选择器最多保存这么多行，找到足够的不同文件后停止；避免一个早排序文件的重复调用占满结果和 1200 字符证据区。原 workspace 默认 path/line 顺序、显式 glob、源码行、位置与引用校验保留；不按“生产/测试”猜测过滤。这仍是有界抽样，长行或超过文件名额的路径可能遗漏，不能把未返回的调用当成不存在。更广的扫描可能增加检索耗时，评测的 CPU/内存/总时限约束继续生效。
 
 事实回答不等于缺陷成立。新调查的 `confirmed/refuted` 还必须分别交付 expected 与 actual 的非空陈述和引用；每条引用必须精确命中其指定的成功 Observation，而不能用一个无关成功读取掩盖另一前提的缺失。同一 Observation 能证明两者时可复用，但不能把实际 throw 当成“必须收集消息”的契约。标准库的预期行为可来自已文档化契约，引用需绑定实际类型/配置/数据流，无需本地包含库源码。`confirmed` 仅接受 `conflict`，`refuted` 仅接受 `compatible`；结构缺失、引用无效、关系与 verdict 矛盾分别降为 UNKNOWN（`incomplete-assessment` / `ungrounded-assessment` / `inconsistent-assessment`）。UNKNOWN 不要求完整 assessment，也不会因附带证明被自动提升。代码核实引用和关系一致性，语义判断仍由调查员承担。
 

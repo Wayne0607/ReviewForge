@@ -19,7 +19,9 @@ import re
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -86,6 +88,30 @@ class GrepHit:
             "start_line": self.start_line,
             "end_line": self.end_line,
         }
+
+
+def _select_search_hits(hits: Iterable[GrepHit], limit: int, *, diverse: bool) -> list[GrepHit]:
+    """Keep the same limit while giving distinct files their first turn.
+
+    Input is ordered by path/line. In diverse mode, select by the match's
+    ordinal within its file, then path/line. Retain at most ``limit`` source
+    rows and stop once that many distinct files provide a first match. This
+    is a bounded sample, not an exhaustive list or a production/test ranking.
+    """
+    if not diverse:
+        return list(islice(hits, limit))
+    counts: dict[str, int] = {}
+    selected: list[tuple[int, str, int, GrepHit]] = []
+    for hit in hits:
+        ordinal = counts.get(hit.path, 0)
+        counts[hit.path] = ordinal + 1
+        if ordinal < limit:
+            selected.append((ordinal, hit.path, hit.line, hit))
+            selected.sort(key=lambda row: row[:3])
+            del selected[limit:]
+        if len(counts) >= limit:
+            break
+    return [row[3] for row in selected]
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,7 +374,7 @@ class PRHeadWorkspace:
         self._definition_cache: dict[tuple[str, str], tuple[symbol_extractor.SymbolInfo, ...]] = {}
         self._file_entries: tuple[tuple[str, Path], ...] | None = None
         self._glob_cache: dict[tuple[str, ...], tuple[tuple[str, Path], ...]] = {}
-        self._grep_cache: dict[tuple[str, tuple[str, ...], int, int], tuple[GrepHit, ...]] = {}
+        self._grep_cache: dict[tuple[str, tuple[str, ...], int, int, bool], tuple[GrepHit, ...]] = {}
         self._closed = False
 
     @classmethod
@@ -519,8 +545,9 @@ class PRHeadWorkspace:
         globs: list[str] | None,
         max_hits: int,
         context: int = 0,
+        diverse: bool = False,
     ) -> list[GrepHit]:
-        """Search the local snapshot in stable path/line order."""
+        """Search in stable order; optionally round-robin matching files."""
 
         if self._closed or self.info.source == "api-fallback" or max_hits <= 0:
             return []
@@ -531,7 +558,7 @@ class PRHeadWorkspace:
 
         patterns = tuple(str(item).replace("\\", "/") for item in (globs or []) if str(item))
         margin = max(0, int(context))
-        key = (str(pattern), patterns, max_hits, margin)
+        key = (str(pattern), patterns, max_hits, margin, diverse)
         if key in self._grep_cache:
             return list(self._grep_cache[key])
         candidates = self._glob_cache.get(patterns)
@@ -542,18 +569,18 @@ class PRHeadWorkspace:
                 if not patterns or any(_glob_matches(relative, item) for item in patterns)
             )
             self._glob_cache[patterns] = candidates
-        hits: list[GrepHit] = []
-        for relative, candidate in candidates:
-            lines = self._read_local(relative, candidate).splitlines()
-            if any("\x00" in line for line in lines):
-                continue
-            for index, line in enumerate(lines):
-                if not matcher.search(line):
+
+        def scan() -> Iterable[GrepHit]:
+            for relative, candidate in candidates:
+                lines = self._read_local(relative, candidate).splitlines()
+                if any("\x00" in line for line in lines):
                     continue
-                first = max(0, index - margin)
-                last = min(len(lines), index + margin + 1)
-                hits.append(
-                    GrepHit(
+                for index, line in enumerate(lines):
+                    if not matcher.search(line):
+                        continue
+                    first = max(0, index - margin)
+                    last = min(len(lines), index + margin + 1)
+                    yield GrepHit(
                         path=relative,
                         line=index + 1,
                         text=line,
@@ -561,10 +588,8 @@ class PRHeadWorkspace:
                         start_line=first + 1,
                         end_line=last,
                     )
-                )
-                if len(hits) >= max_hits:
-                    self._grep_cache[key] = tuple(hits)
-                    return hits
+
+        hits = _select_search_hits(scan(), max_hits, diverse=diverse)
         self._grep_cache[key] = tuple(hits)
         return hits
 
@@ -615,8 +640,8 @@ class PRHeadWorkspace:
                 )
         return hits
 
-    def find_callers(self, symbol: str, *, language: str, max_hits: int) -> list[GrepHit]:
-        """Find call expressions while excluding definition lines."""
+    def find_callers(self, symbol: str, *, language: str, max_hits: int, diverse: bool = False) -> list[GrepHit]:
+        """Find call expressions; optionally round-robin matching files."""
 
         if self._closed or self.info.source == "api-fallback" or max_hits <= 0:
             return []
@@ -628,7 +653,6 @@ class PRHeadWorkspace:
         except re.error:
             return []
         wanted_language = _language_name(language)
-        hits: list[GrepHit] = []
         java_targets: set[str] = set()
         if "." in target and wanted_language in {"", "java"}:
             for definition in self.find_symbol_definitions(target, language="java"):
@@ -638,39 +662,37 @@ class PRHeadWorkspace:
                     java_targets.add(navigation.qualified_definition(declaration))
             if wanted_language == "java" and not java_targets:
                 return []
-        for relative, candidate in self._iter_files():
-            detected = _language_name(symbol_extractor.detect_language(relative))
-            if wanted_language and detected != wanted_language:
-                continue
-            content = self._read_local(relative, candidate)
-            lines = content.splitlines()
-            if detected == "java" and "." in target:
-                method = target.rsplit(".", 1)[-1]
-                if not re.search(rf"\b{re.escape(method)}\s*\(", content):
+
+        def scan() -> Iterable[GrepHit]:
+            for relative, candidate in self._iter_files():
+                detected = _language_name(symbol_extractor.detect_language(relative))
+                if wanted_language and detected != wanted_language:
                     continue
-                navigation = self._java_source(relative, candidate)
-                for call in navigation.calls:
-                    actual = navigation.call_target(call)
-                    if call.callee == method and actual in java_targets:
-                        hit = GrepHit(path=relative, line=call.line, text=lines[call.line - 1])
-                        if hit not in hits:
-                            hits.append(hit)
-                        if len(hits) >= max_hits:
-                            return hits
-                continue
-            definition_lines = {
-                definition.line
-                for definition in self._definitions_for(relative, detected, content)
-                if definition.name == target
-            }
-            for index, line in enumerate(lines):
-                line_number = index + 1
-                if line_number in definition_lines or not matcher.search(line):
+                content = self._read_local(relative, candidate)
+                lines = content.splitlines()
+                if detected == "java" and "." in target:
+                    method = target.rsplit(".", 1)[-1]
+                    if not re.search(rf"\b{re.escape(method)}\s*\(", content):
+                        continue
+                    navigation = self._java_source(relative, candidate)
+                    seen_lines = set()
+                    for call in navigation.calls:
+                        actual = navigation.call_target(call)
+                        if call.callee == method and actual in java_targets and call.line not in seen_lines:
+                            seen_lines.add(call.line)
+                            yield GrepHit(path=relative, line=call.line, text=lines[call.line - 1])
                     continue
-                hits.append(GrepHit(path=relative, line=line_number, text=line))
-                if len(hits) >= max_hits:
-                    return hits
-        return hits
+                definition_lines = {
+                    definition.line
+                    for definition in self._definitions_for(relative, detected, content)
+                    if definition.name == target
+                }
+                for index, line in enumerate(lines):
+                    line_number = index + 1
+                    if line_number not in definition_lines and matcher.search(line):
+                        yield GrepHit(path=relative, line=line_number, text=line)
+
+        return _select_search_hits(scan(), max_hits, diverse=diverse)
 
     def cleanup(self) -> None:
         """Remove the temporary snapshot; safe to call more than once."""

@@ -363,4 +363,14 @@ Sentry 的 error 重启计数候选出现 `comparison=compatible` / `verdict=con
 
 再回查规则交付：已有初始索引说明仍未使调查员完成实际路径取证。现把共享状态的证明要求贯通相关生成块、lens、调查与收尾；要求证明输入绑定、producer 与入口顺序，初始化名称/注册标签/配置调用本身不足以闭合。索引是导航，规则不是证据；按编译 reason 选择，源码中的同名字符串不能触发，字符计入分块且不加模型阶段或预算。新增 5 项跨阶段隔离、收尾保留、不得凭指南构造引用及分块预算回归；相关 164 项通过，完整 `1671 passed, 1 skipped, 6 warnings`，ruff / format 通过，同预算独立复测待完成。
 
+冻结 `428d039` 的复测位于 `.reviewforge/benchmarks/v4-java-navigation-20261011-065313/`，保持相同候选输入、固定 head / 完整源码摘要、24 个源码/配置摘要、模型/thinking/语言/retries 与每候选原预算。8 次成功请求 / 35157 tokens（17405 / 17752），Job 正常退出、峰值 395132928 bytes，锁释放；两条原始结果均为 UNKNOWN，缺少配置值绑定和命令入口顺序的证明。第二条回答仍错误声称 init 是唯一 writer，但 unresolved 未升级成已确认/推翻。原结果 SHA256 `0c476326...` 与 semantic-audit 保留，不能把 UNKNOWN 或正确拒绝猜测等同于完成审查；无本轮质量分、legacy 配对或 holdout。
+
+### 搜索命中的文件覆盖（2026-10-11）
+
+复测记录显示 `find_callers(Profile.configure)` 的前十条几乎全部来自同一个 ProfileTest，1200 字符保存区只留下测试前几行；`grep` 同样截掉实际 Environment.configure 路径。两问回查 `acd1339b` / `7db82230`：按 path/line 截取前 N 条适合早期小仓库，却假定这些行能覆盖不同调用路径，大仓库中的重复设置不满足该假设。修复搜索的选择方式，继续保留原证据水位和严格判断。
+
+workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator 的 grep / find_callers 启用。每个文件先占一条，然后才补第二、第三条，结果总数仍为原 max_hits，候选保存最多 N 行、不排除测试、不改变源码内容，也不增加模型阶段。更广扫描存在耗时成本，有界结果仍不代表调用全集。
+
+新增 7 项回归先在旧代码上失败，覆盖同文件密集命中、限定/短名 Java caller、缓存隔离、显式 glob、相同条数、1200 字符保存/后续窄读与扫描提前停止；相关 114 项通过。零模型调用的真实源码子集复现另保存在本轮 `probe/search-retrieval-audit/`，声明仅三份固定 head 文件，核对 ProfileTest 的 Git blob 摘要；相同 grep / caller 查询现在将 `Environment.java:243` 保存在实际 Observation，未伪称完整 workspace 或质量测评。完整 `1678 passed, 1 skipped, 6 warnings`，ruff / 200 文件 format / spec-check / 严格裁判回归通过；真实判断效果待新冻结复测。
+
 新增 20 项单一关系协议回归，先复现旧实现 9 项失败，再验证三值映射、空/畸形关系、两前提、负向/未知引用、无效旧引用与旧矛盾 verdict，以及原 4000 token 单步取证→收尾。相关共 170 项通过；完整 `1643 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。共享审查范围与本协议变更只用于下一份独立源码快照。`decision-duplication-audit.json` 记录两条真实矛盾响应及账本 hash，两前提引用均已精确保存；历史 verdict 保持原值。

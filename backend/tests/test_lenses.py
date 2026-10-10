@@ -78,6 +78,19 @@ def test_python_concurrency_contracts_are_shared_with_the_specialist_only():
         assert guide not in build_lens_generator(_ScriptedLLM(), name)._system_prompt()
 
 
+def test_defect_scope_is_consistent_across_general_and_specialist_discovery():
+    from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+    from reviewforge.engine.verification_guidance import defect_scope_guidance
+
+    guide = defect_scope_guidance()
+    generators = [HypothesisGenerator(_ScriptedLLM())] + [
+        build_lens_generator(_ScriptedLLM(), name)
+        for name in ("security", "localization", "accessibility", "concurrency", "dependency")
+    ]
+    for generator in generators:
+        assert generator._system_prompt().count(guide) == 1
+
+
 def test_localization_triggered_by_path() -> None:
     assert "localization" in _names(StateStore(file_diffs={}), _changeset(_unit("src/locale/messages_en.properties")))
     assert "localization" not in _names(StateStore(file_diffs={}), _changeset(_unit("src/service.py")))

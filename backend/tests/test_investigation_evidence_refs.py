@@ -154,3 +154,74 @@ def test_compiled_quotes_and_fact_digest_survive_checkpoint_round_trip():
     restored = Hypothesis.from_dict(encoded)
     assert restored.assessment == result.assessment
     assert confirmed_fact_digest(restored) == confirmed_fact_digest(hypothesis)
+
+
+@pytest.mark.parametrize(
+    ("comparison", "verdict"), [("conflict", "confirmed"), ("compatible", "refuted"), ("unresolved", "unknown")]
+)
+def test_new_assessment_output_has_one_decision(comparison, verdict):
+    raw = _verdict()
+    raw.pop("verdict")
+    raw["assessment"]["comparison"] = comparison
+    assert Investigator._parse_verdict(json.dumps(raw)) == raw
+    result = _worker()._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert result.verdict == verdict
+    if verdict != "unknown":
+        assert result.assessment and result.strength == "strong"
+        assert result.evidence_ids == ["obs_0", "obs_1"]
+    else:
+        assert result.strength == "none"
+
+
+@pytest.mark.parametrize("failure", ["unknown-ref", "negative-result", "missing-premise", "invalid-legacy"])
+def test_derived_decision_still_requires_both_grounded_premises(failure):
+    raw = _verdict()
+    raw.pop("verdict")
+    worker = _worker()
+    if failure == "unknown-ref":
+        raw["assessment"]["actual_evidence"] = ["obs_99:e1"]
+    elif failure == "negative-result":
+        worker._observations[1] = _observation("obs_1", "a.py", "No results", status="not_found")
+    elif failure == "missing-premise":
+        raw["assessment"].pop("expected")
+    else:
+        raw.update(evidence_ids=["obs_1"], evidence_quote="invented quote")
+    result = worker._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert result.verdict == "unknown" and result.strength == "none"
+    assert result.reason == (
+        "incomplete-assessment"
+        if failure == "missing-premise"
+        else "ungrounded"
+        if failure == "invalid-legacy"
+        else "ungrounded-assessment"
+    )
+
+
+@pytest.mark.parametrize("comparison", ["conflict|compatible", "Compatible", True, [], {}, None])
+def test_invalid_or_ambiguous_relation_cannot_create_a_verdict(comparison):
+    raw = _verdict()
+    raw.pop("verdict")
+    raw["assessment"]["comparison"] = comparison
+    result = _worker()._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert result.verdict == "unknown" and result.strength == "none"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "comparison"), [("confirmed", "compatible"), ("refuted", "conflict"), ("unknown", "conflict")]
+)
+def test_explicit_legacy_verdict_is_never_rewritten(verdict, comparison):
+    raw = _verdict()
+    raw["verdict"] = verdict
+    raw["assessment"]["comparison"] = comparison
+    result = _worker()._finalize(raw, _hypothesis(), {"a.py"}, steps=2)
+    assert result.verdict == "unknown" and result.strength == "none"
+    if verdict != "unknown":
+        assert result.reason == "inconsistent-assessment"
+
+
+@pytest.mark.parametrize(
+    "raw", [{"assessment": None, "answer": "No proof"}, {"verdict": "unknown"}, {"answer": "No proof"}]
+)
+def test_decision_parser_preserves_unknown_and_legacy_shapes(raw):
+    parsed = Investigator._parse_verdict(json.dumps(raw))
+    assert parsed == (raw if "assessment" in raw or "verdict" in raw else None)

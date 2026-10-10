@@ -38,6 +38,7 @@ from reviewforge.engine.hypothesis import (
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
 from reviewforge.engine.verification_guidance import (
+    defect_scope_guidance,
     has_python_concurrency,
     is_localization_path,
     localization_guidance,
@@ -403,6 +404,7 @@ class Investigator:
             "## Hypothesis\n" + hypothesis_body,
             "## Diff hunk(s)\n" + diff_section,
             "## Context\n" + (context or "（无）/(none)"),
+            defect_scope_guidance(),
         ]
         if pack.pr_intent:
             sections.append("## PR intent (author context, not defect evidence)\n" + pack.pr_intent[:2_000])
@@ -577,7 +579,7 @@ class Investigator:
                 + json.dumps(observations, ensure_ascii=False)
                 + f"\nRemaining investigation budget: {max(0, token_limit - self._tokens)} tokens. "
                 "Finish now. Answer the one open_question using these saved observations. "
-                "Return only the verdict JSON; no more tools. If evidence is insufficient, return unknown."
+                "Assessment JSON only; no tools. Missing proof: comparison=unresolved or assessment=null."
             ),
         ]
 
@@ -648,13 +650,28 @@ class Investigator:
 
     @staticmethod
     def _parse_verdict(content: str) -> dict[str, Any] | None:
-        parsed = extract_json_value(content or "", required_key="verdict", allow_list=False)
+        parsed = extract_json_value(content or "", required_key="assessment", allow_list=False)
+        if not isinstance(parsed, dict):
+            parsed = extract_json_value(content or "", required_key="verdict", allow_list=False)
         return parsed if isinstance(parsed, dict) else None
 
     def _finalize(
         self, parsed: dict[str, Any], hypothesis: Hypothesis, changed: set[str], *, steps: int
     ) -> InvestigationResult:
-        verdict = str(parsed.get("verdict", "")).strip().lower()
+        if "verdict" in parsed:
+            # Explicit legacy decisions must still agree with the assessment;
+            # never repair a contradictory or UNKNOWN historical response.
+            verdict = str(parsed["verdict"]).strip().lower()
+        else:
+            raw_assessment = parsed.get("assessment")
+            comparison = raw_assessment.get("comparison") if isinstance(raw_assessment, dict) else None
+            verdict = (
+                {"conflict": "confirmed", "compatible": "refuted", "unresolved": "unknown"}.get(
+                    comparison.strip(), "unknown"
+                )
+                if isinstance(comparison, str)
+                else "unknown"
+            )
         if verdict not in {"confirmed", "refuted", "unknown"}:
             verdict = "unknown"
         answer = str(parsed.get("answer", "")).strip()

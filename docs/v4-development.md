@@ -332,3 +332,19 @@ sentry#93824 的固定 head 为 `3162ad68a5c87666788b27a44eb31235025091a9`，源
 Sentry 的两条确认理由另暴露语义问题：缺显式 join 不足以证明持续僵尸进程；计数从 0 初始化不证明成功重启后必须清零。依据 [Python 进程生命周期指南](https://docs.python.org/3.13/library/multiprocessing.html#programming-guidelines) 与 [CPython context 类型实现](https://github.com/python/cpython/blob/3.13/Lib/multiprocessing/context.py)，新增共享 Python 并发指南，贯通相关生成块、concurrency lens、调查和收尾；要求追踪具体类型/清理顺序及实际限额策略。标准知识不是目标仓库 Observation，自动回收也不能当作停止挂起子进程的证明。未改原 verdict；本机仅创建未启动的 spawn Process 对象核对类型关系，不声称执行了 Sentry/Linux 生命周期测试。
 
 原源码的 spawn context 工厂与全局 Process 类型检查还值得验证，不能把它自动替换成已确认候选或强行对齐 golden。生成/lens 提示补充真实边界调用/配置/支持契约，不凭“可传入空值”猜业务缺陷。新增 10 项指南交付、非 Python/无关块隔离、预算计量和收尾仍需 Observation 的回归；相关共 148 项通过。完整检查为 `1621 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。Issue/开放 PR 列表仍为空，main 和 legacy 继续保持既有发布边界。
+
+## 2026-10-11 审查范围的阶段一致性
+
+`ca81eb8` 在同一两个开发 PR 上独立重跑，目录 `.reviewforge/benchmarks/v4-dev-breadth-ca81eb8-20261011-052220/`。Keycloak 完整源码及 20 units / 152 slices / 40000 字符预算一致；GEN user 输入 55238 字符，SHA256 与上一轮逐字相同。新真实调查已经复制 `obs_N:eM` 并解析、落库为保真的原文引用；不能把引用修正当作语义质量提升。
+
+运行中一条“新测试缺少退出码断言”已 CONFIRMED，原 reason 只证明 `assertError` 检查消息、`exitCode()` 没被调用，并无必须断言退出码的义务或错误行为后果。保留原响应与 verdict，等待固定裁判；不由 Editor 删除已确认项。两问回查 §4.4/5.1 的排除项与调查输入：纯测试覆盖建议早已排除，但生成/lens 的范围没有完整交给唯一过滤阶段。新增共享 `defect_scope.md`，交付通用生成器、全部 lens、调查和收尾；允许真正导致测试执行错误或掩盖已观察到失败的测试缺陷，排除缺一次断言本身，规则不能充当 Observation。
+
+新增 2 项跨阶段一致性及收尾保留回归，相关共 150 项通过。新增规则曾挤占最小单步预算，已缩短调查提示中重复说明；保留精确引用、同输入比较、before/after、标准绑定及三值约束，原单步取证→收尾回归再次通过。未提高预算、增加模型调用或代码侧类别过滤，完整检查与这批改动的独立冻结实跑待完成；当前付费任务仍使用 `ca81eb8` 的不可变快照，不混入工作区改动。
+
+`ca81eb8` 的 Keycloak 已完整结束：1 CONFIRMED / 5 REFUTED / 5 UNKNOWN、1 条实际评论，27 次成功调用 / 111637 tokens（GEN 20468 / INV 88711 / editor 2458），960.718 秒，error UNKNOWN 与 unresolved 均为 0。Sentry 基础 GEN user 输入与前轮逐字相同，只额外交付 1745 字符并发指南；没有自动把库知识当源码证据。模型没有再次提出僵尸积累候选，但仍提出其它待验证重启/计数问题，不能称语义错误已经解决。
+
+Sentry 的 error 重启计数候选出现 `comparison=compatible` / `verdict=confirmed`，原一致性检查降为不可重试 UNKNOWN，整个两 PR 集合不能评分，停止余下请求。合计 47 个成功请求 / 257286 tokens（GEN 45230 / lens 20795 / INV 188803 / editor 2458）；取消时 Sentry 为 4 CONFIRMED / 1 REFUTED / 3 UNKNOWN / 5 OPEN。Job Object 返回 125、峰值 490074112 bytes、评测锁已释放，可能有进行中请求的未记录用量。只有第一 PR 完整，未单独挑出它评分；无本轮整组质量分、legacy 配对或 holdout。
+
+两问回查 `0c59514` 的关系一致性校验：它防止矛盾结论通过，约束继续成立；但新 schema 让模型把同一三值判断写成 comparison/verdict 两份，又产生冗余转抄错误。新响应只写 comparison，由代码在两前提与原引用校验后确定 verdict；旧显式 verdict 矛盾继续拒收，旧 UNKNOWN 不提升，已有闭合账本不重开，不修正这轮历史输出。未放宽 SOURCE/UNKNOWN/严格裁判门槛，也不解决语义推理本身。
+
+新增 20 项单一关系协议回归，先复现旧实现 9 项失败，再验证三值映射、空/畸形关系、两前提、负向/未知引用、无效旧引用与旧矛盾 verdict，以及原 4000 token 单步取证→收尾。相关共 170 项通过；完整 `1643 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。共享审查范围与本协议变更只用于下一份独立源码快照。`decision-duplication-audit.json` 记录两条真实矛盾响应及账本 hash，两前提引用均已精确保存；历史 verdict 保持原值。

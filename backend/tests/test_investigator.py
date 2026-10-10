@@ -322,6 +322,18 @@ def test_python_contract_knowledge_survives_investigation_closure_without_becomi
         assert result.verdict == "unknown" and result.strength == "none"
 
 
+def test_discovery_scope_survives_investigation_closure_and_is_not_source_evidence():
+    from reviewforge.engine.verification_guidance import defect_scope_guidance
+
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}))
+    user = investigator._render_user(_hypothesis(), _state(), ContextPack())
+    guide = defect_scope_guidance()
+    assert user.count(guide) == 1
+    closure = investigator._closing_chat([AIMessage(content=user)], 24000)
+    assert "\n\n".join(message.content for message in closure).count(guide) == 1
+    assert not investigator._observations
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", ["step=安裝手機應用程式", "No results"])
 async def test_locale_boundary_still_requires_recorded_source_evidence(content):
@@ -986,6 +998,28 @@ async def test_single_step_budget_can_read_evidence_and_close():
         llm, _executor({("read_file", (("path", "a.py"),)): "return user_input"}), max_steps=1
     ).investigate(_hypothesis(), _state(), ContextPack())
     assert result.verdict == "confirmed" and result.tokens == 1200
+    assert [call["tools"] for call in llm.calls] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_single_step_closure_accepts_the_assessment_only_protocol():
+    class AssessmentLLM(_BudgetAwareLLM):
+        def _generate(self, *args, **kwargs):
+            result = super()._generate(*args, **kwargs)
+            message = result.generations[0].message
+            message.usage_metadata = {"input_tokens": 500, "output_tokens": 100, "total_tokens": 600}
+            if message.content:
+                raw = json.loads(message.content)
+                raw.pop("verdict")
+                message.content = json.dumps(raw)
+            return result
+
+    llm = AssessmentLLM()
+    result = await Investigator(
+        llm, _executor({("read_file", (("path", "a.py"),)): "return user_input"}), max_steps=1
+    ).investigate(_hypothesis(), _state(), ContextPack())
+    assert result.verdict == "confirmed" and result.tokens == 1200
+    assert result.assessment and result.assessment.comparison == "conflict"
     assert [call["tools"] for call in llm.calls] == [True, False]
 
 

@@ -34,6 +34,10 @@ def python_concurrency_guidance() -> str:
     return load_prompt("python_concurrency_contracts")
 
 
+def defect_scope_guidance() -> str:
+    return load_prompt("defect_scope")
+
+
 def investigation_capabilities() -> str:
     return (
         "## Investigation capabilities\n"

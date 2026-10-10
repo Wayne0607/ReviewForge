@@ -292,10 +292,11 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
 
 Python 并发契约也由同一模块交付：生成器只对 `.py` 且 diff 含进程/线程库或构造器的块交付并计入预算，concurrency lens 在系统规则中交付一次，调查员对关联 `.py` diff 使用同一选择规则并保留到收尾。规则覆盖 CPython context 工厂的具体类型、已完成子进程的自动回收、仍存活的挂起进程、共享 IPC 与限额生命周期；需绑定实际对象、平台及契约，不能因缺少显式 join/reset 就断言缺陷。原 lens 触发、legacy skill 与调用次数不变，指南不能作为 Observation 或自动 verdict。边界输入假设需有真实调用、配置或支持契约，方法允许传入 0/None/空集合本身不证明业务支持。
 
+生成器、全部 lens 与调查员共享 `defect_scope.md`：沿用排除纯测试/文档建议、风格与命名的既有审查范围，事实回答不足以确认缺陷，必须有真实义务与同一输入下的新后果。测试本身执行错误或掩盖已观察到的失败仍可构成缺陷，缺一次断言本身不构成。调查和收尾保留同一范围说明；它是审查规则，不能充当源码 Observation。只改阶段规则交付，不增加代码侧候选类别过滤；Editor 仍不能丢弃已确认项。
+
 **输出 schema。**
 ```json
-{"verdict":"confirmed|refuted|unknown",
- "answer":"对 open_question 的直接回答",
+{"answer":"对 open_question 的直接回答",
  "severity":"error|warning|info",      // 可修正
  "additional_sites":[{"path":"...","line":1,"excerpt":"..."}],
  "assessment": {
@@ -308,6 +309,8 @@ Python 并发契约也由同一模块交付：生成器只对 `.py` 且 diff 含
  "reason":"..."}
 ```
 校验：`confirmed`/`refuted` 的 assessment 两组引用均需来自 `status=success` 的 observation。工具回复与收尾输入提供代码从已保存源码生成的 `obs_N:eM` ID，模型复制 ID；代码将其解析为内部 `{observation_id, quote}`，再用原精确匹配校验。源码按完整行分段（目标 400 字符，单行可更长），搜索命中/定义分段不跨结果边界；不增加现有 1200 字符保存区，负向结果不生成 ID。未知、拼造或带多余字符的 ID 为 UNKNOWN/ungrounded-assessment。旧 assessment 原文引用仍兼容并逐条精确校验，不能用有效 ID 掩盖无效旧引用。
+
+新模型响应只写一份 `assessment.comparison`，不重复输出 verdict。两前提及引用通过原校验后，代码将 conflict/compatible/unresolved 分别映射为 CONFIRMED/REFUTED/UNKNOWN；assessment=null、未知或畸形关系保持 UNKNOWN。若响应仍显式携带旧 verdict，按原一致性检查处理，矛盾仍为 UNKNOWN/inconsistent-assessment；显式 UNKNOWN 不被提升，也不改写已有账本或历史响应。减少同一三值判断的重复转抄，不增加确认/推翻条件。
 
 从通过校验的引用派生内部 `evidence_ids/evidence_quote`，模型无需再抄第三份引用。若响应仍显式提供旧的顶层 `evidence_ids/evidence_quote`，继续精确校验，失败为 UNKNOWN/ungrounded；不忽略无效旧引用。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，解析后的原文保留缩进、换行、Unicode 和真正的数字前缀，落库/续跑也不 trim quote，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）。
 

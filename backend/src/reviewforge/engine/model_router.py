@@ -81,10 +81,12 @@ def _build_llm(
     model: str,
     temperature: float,
     max_tokens: int | None = None,
+    max_retries: int = 2,
 ) -> BaseChatModel:
     common = {
         "model": model,
         "temperature": temperature,
+        "max_retries": max_retries,
     }
     if max_tokens is not None:
         common["max_tokens"] = max_tokens
@@ -102,7 +104,6 @@ def _build_llm(
         api_key=api_key,
         streaming=False,
         timeout=120,
-        max_retries=2,
         **common,
     )
 
@@ -168,8 +169,11 @@ class ModelRouter:
               api_key: "sk-deep"
     """
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(self, config: LLMConfig, *, max_retries: int = 2) -> None:
         self._config = config
+        # Set this before SDK clients are constructed: mutating the LangChain
+        # field later does not update an already-created provider client.
+        self._max_retries = max_retries
         self._cache: dict[str, BaseChatModel] = {}
         # Seed an empty role_overrides dict so legacy configs still index safely.
         if not getattr(config, "role_overrides", None):
@@ -237,6 +241,7 @@ class ModelRouter:
             model=effective["model"],
             temperature=temperature,
             max_tokens=max_tokens,
+            max_retries=self._max_retries,
         )
         self._cache[key] = llm
         if key.startswith("role:"):

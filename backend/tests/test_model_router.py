@@ -84,6 +84,7 @@ def test_minimax_models_use_anthropic_compatibility():
 
     assert DummyLLM.instances[-1].kwargs["base_url"] == "https://api.minimaxi.com/anthropic"
     assert DummyLLM.instances[-1].kwargs["anthropic_api_key"] == "sk-test"
+    assert DummyLLM.instances[-1].kwargs["max_retries"] == 2
 
 
 def test_other_openai_compatible_providers_do_not_receive_minimax_options():
@@ -92,6 +93,7 @@ def test_other_openai_compatible_providers_do_not_receive_minimax_options():
     assert DummyLLM.instances[-1].kwargs["base_url"] == "https://test.example.com/v1"
     assert DummyLLM.instances[-1].kwargs["api_key"] == "sk-test"
     assert "anthropic_api_key" not in DummyLLM.instances[-1].kwargs
+    assert DummyLLM.instances[-1].kwargs["max_retries"] == 2
 
 
 def test_minimax_m27_also_uses_anthropic_compatibility():

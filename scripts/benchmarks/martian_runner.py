@@ -282,7 +282,7 @@ async def _build_runtime(
 
         raw_github._client.event_hooks["request"].append(block_github_writes)
         github = ReadOnlyGitHub(raw_github)
-        router = ModelRouter(cfg.llm)
+        router = ModelRouter(cfg.llm, max_retries=0)
         original_get_llm = router.get_llm
         traced = {}
 
@@ -296,7 +296,6 @@ async def _build_runtime(
                 llm.reasoning_effort = None
             elif reasoning_effort:
                 llm.reasoning_effort = reasoning_effort
-            llm.max_retries = 0
             traced[name] = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
             return traced[name]
 
@@ -461,6 +460,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "source_revision": os.environ.get("REVIEWFORGE_SOURCE_REVISION", ""),
         "reasoning_effort": args.reasoning_effort or "provider-default",
         "llm_min_interval": args.llm_min_interval,
+        "sdk_max_retries": 0,
         "thinking": args.thinking,
         "reviewer_concurrency": args.reviewer_concurrency,
         "publication_gate_concurrency": args.publication_gate_concurrency,

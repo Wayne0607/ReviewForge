@@ -77,6 +77,8 @@ PR head SHAs or change parameters between paired runs.
 
 `--llm-min-interval` defaults to 30 seconds between request starts across all
 benchmark processes on the host. The benchmark disables SDK automatic retries;
+the zero-retry option is supplied before constructing provider clients, and its
+effective HTTP behavior is covered by a real-SDK/mock-transport regression.
 rate failures remain visible instead of consuming an unrecorded retry burst.
 Tracing wraps the provider below the token wrapper so private `_agenerate`
 delegation cannot bypass it. Judge requests must also respect the provider's

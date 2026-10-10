@@ -100,6 +100,7 @@ class Judge:
                 base_url=anthropic_url,
                 model=self.model,
                 temperature=0.0,
+                max_retries=0,
             )
         else:
             self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
@@ -408,6 +409,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "model": judge.model,
         "thinking": args.thinking,
         "llm_min_interval": args.llm_min_interval,
+        "sdk_max_retries": 0,
         "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "support_sha256": hashlib.sha256(Path(__file__).with_name("benchmark_support.py").read_bytes()).hexdigest(),
         "workload_sha256": hashlib.sha256(Path(args.workload).read_bytes()).hexdigest(),

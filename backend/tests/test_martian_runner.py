@@ -37,6 +37,9 @@ async def test_benchmark_runtime_loads_config_and_blocks_all_real_github_writes(
         assert orchestrator._gateway._pipeline_mode == "hypothesis"
         router = orchestrator._model_router
         assert not router._config.profiles
+        llm = router.get_llm("hypothesis_generator")._inner
+        assert llm.root_async_client.max_retries == 0
+        assert llm.root_client.max_retries == 0
         for agent in ("planner", "security_reviewer", "verifier", "hypothesis_generator", "investigator", "editor"):
             _, effective, profile, _, max_tokens = router._resolve(agent)
             assert effective["model"] == "test-model"
@@ -56,6 +59,43 @@ async def test_benchmark_runtime_loads_config_and_blocks_all_real_github_writes(
     finally:
         await db.close()
         await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_benchmark_actual_sdk_sends_one_http_attempt_on_429(runner, monkeypatch, tmp_path):
+    from langchain_core.messages import HumanMessage
+    from openai import RateLimitError
+
+    from reviewforge.engine import model_router
+
+    requests = []
+
+    def reject(request):
+        requests.append(request)
+        return httpx.Response(429, json={"error": {"message": "rpm exhausted", "type": "rate_limit_error"}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(reject))
+    original = model_router.ChatOpenAI
+
+    def with_mock_http(**kwargs):
+        return original(**kwargs, http_async_client=http)
+
+    monkeypatch.setattr(model_router, "ChatOpenAI", with_mock_http)
+    monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "test-placeholder")
+    monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
+    orchestrator, db, raw = await runner._build_runtime(tmp_path, "test-model", llm_min_interval=0)
+    try:
+        with pytest.raises(RateLimitError):
+            await orchestrator._model_router.get_llm("hypothesis_generator").ainvoke([HumanMessage(content="test")])
+        assert len(requests) == 1
+        traces = list((tmp_path / "llm-traces").glob("*-error.json"))
+        assert len(traces) == 1
+        assert json.loads(traces[0].read_text())["status_code"] == 429
+    finally:
+        await db.close()
+        await raw.close()
+        await http.aclose()
 
 
 @pytest.mark.asyncio

@@ -383,6 +383,8 @@ async def _run_one(
     orchestrator: Orchestrator,
     db: Database,
     github: GitHubClient,
+    *,
+    workspace_preflight_dir: Path | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     repo = str(item["repo"])
@@ -405,7 +407,36 @@ async def _run_one(
         ),
         file_diffs={str(file["filename"]): str(file.get("patch") or "") for file in files},
     )
-    summary = await orchestrator.run(state)
+    if workspace_preflight_dir is not None:
+        try:
+            workspace = await orchestrator._gateway.workspace_for(state)
+            info = workspace.info
+            payload = {
+                "repo": repo,
+                "pr_number": pr_number,
+                "head_sha": info.head_sha,
+                "source": info.source,
+                "file_count": info.file_count,
+                "byte_size": info.byte_size,
+                "digest": info.digest,
+                "truncated": info.truncated,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "before_model_requests": True,
+            }
+            key = hashlib.sha256(f"{repo}#{pr_number}".encode()).hexdigest()[:16]
+            _atomic_json(workspace_preflight_dir / f"{key}.json", payload)
+            if info.source != "tarball" or info.truncated or info.head_sha != state.head_sha:
+                raise RuntimeError("Complete pinned workspace required; saved preflight diagnostic before model calls")
+        except BaseException:
+            await orchestrator._gateway.cleanup_workspace(state)
+            raise
+    try:
+        summary = await orchestrator.run(state)
+    finally:
+        if workspace_preflight_dir is not None:
+            # The hypothesis path also cleans up; this API is idempotent. Legacy
+            # does not consume/own this preflight workspace, so release it here.
+            await orchestrator._gateway.cleanup_workspace(state)
     runs = await db.get_runs(repo=repo, limit=5)
     run = next((row for row in runs if row.get("head_sha") == state.head_sha), {})
     token_rows = await db.get_token_usage(run_id=str(run.get("run_id") or "")) if run else []
@@ -473,6 +504,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "shard_index": args.shard_index,
         "limit": args.limit,
         "generator_max_input_chars_override": args.generator_max_input_chars,
+        "require_complete_workspace": args.require_complete_workspace,
     }
 
     orchestrator, db, raw_github = await _build_runtime(
@@ -506,7 +538,13 @@ async def main_async(args: argparse.Namespace) -> None:
                 flush=True,
             )
             try:
-                result = await _run_one(item, orchestrator, db, raw_github)
+                result = await _run_one(
+                    item,
+                    orchestrator,
+                    db,
+                    raw_github,
+                    workspace_preflight_dir=root / "workspace-preflight" if args.require_complete_workspace else None,
+                )
                 results[key] = result
                 print(
                     f"DONE {index}/{len(workload)} comments={len(result['review_comments'])} "
@@ -540,6 +578,11 @@ def main() -> None:
     parser.add_argument("--reviewer-concurrency", type=int, default=4)
     parser.add_argument("--publication-gate-concurrency", type=int, default=1)
     parser.add_argument("--capture-invalid-outputs", action="store_true")
+    parser.add_argument(
+        "--require-complete-workspace",
+        action="store_true",
+        help="Reject degraded/truncated head snapshots before model calls; save preflight diagnostics",
+    )
     parser.add_argument("--model-override", default="")
     parser.add_argument(
         "--generator-max-input-chars", type=int, default=0, help="Dev ablation; 0 keeps the YAML budget"

@@ -231,3 +231,82 @@ async def test_context_audit_saves_degradation_but_does_not_report_success(runne
     assert db._db is None
     assert github.closed
     assert not gateway._workspaces
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["complete", "download-error", "truncated", "run-error"])
+async def test_benchmark_workspace_preflight_precedes_models_and_reuses_one_snapshot(runner, tmp_path, case):
+    import io
+    import tarfile
+
+    from reviewforge.core.specs import build_registry
+    from reviewforge.tools.gateway import ToolGateway
+
+    data = b"enabled = True\n"
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+        directory = tarfile.TarInfo("repo/")
+        directory.type = tarfile.DIRTYPE
+        tar.addfile(directory)
+        member = tarfile.TarInfo("repo/src/f.py")
+        member.size = len(data)
+        tar.addfile(member, io.BytesIO(data))
+
+    class GitHub:
+        downloads = 0
+        comments = {}
+        bodies = {}
+
+        async def get_pr_info(self, *args):
+            return {"head": {"sha": "head", "repo": {"full_name": "fork/repo"}}, "base": {"sha": "base"}}
+
+        async def get_pr_files(self, *args):
+            return [{"filename": "src/f.py", "patch": "@@ -0,0 +1 @@\n+enabled = True", "additions": 1}]
+
+        async def get_repo_tarball(self, *args):
+            self.downloads += 1
+            if case == "download-error":
+                raise OSError("codeload unavailable")
+            return archive.getvalue()
+
+        async def get_file_content(self, *args):
+            return data.decode()
+
+    class DB:
+        async def get_runs(self, **kwargs):
+            return []
+
+    class Orchestrator:
+        model_calls = 0
+
+        def __init__(self, gateway):
+            self._gateway = gateway
+
+        async def run(self, state):
+            self.model_calls += 1
+            # Production v4 calls this same public API with the same StateStore.
+            workspace = await self._gateway.workspace_for(state)
+            assert workspace.read("src/f.py") == data.decode()
+            if case == "run-error":
+                raise RuntimeError("graph interrupted")
+            return {"status": "completed"}
+
+    github = GitHub()
+    gateway = ToolGateway(
+        build_registry(), github, pipeline_mode="hypothesis", workspace_max_bytes=1 if case == "truncated" else 10000
+    )
+    orchestrator = Orchestrator(gateway)
+    item = {"repo": "owner/repo", "pr_number": 1, "golden_url": "https://example.test/pr/1"}
+    if case == "complete":
+        row = await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=tmp_path)
+        assert row["summary"]["status"] == "completed" and row["tokens"] == 0
+    else:
+        with pytest.raises(RuntimeError, match="graph interrupted" if case == "run-error" else "before model calls"):
+            await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=tmp_path)
+    assert github.downloads == 1
+    assert orchestrator.model_calls == (1 if case in {"complete", "run-error"} else 0)
+    assert not gateway._workspaces and not gateway._workspace_states
+    receipt = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert receipt["head_sha"] == "head" and receipt["before_model_requests"]
+    assert receipt["source"] == ("api-fallback" if case == "download-error" else "tarball")
+    assert receipt["truncated"] == (case == "truncated")

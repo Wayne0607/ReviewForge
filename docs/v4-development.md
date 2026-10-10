@@ -298,3 +298,11 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 两问回查工具描述“完整内容或窗口”与 `_run_tool` 的头部保存：原接口假设模型会自行改为窄读，真实回执反复违背该假设。现在省略窗口时确定性定位最近保存的正向搜索位置、compiler 关联 site 或本 unit 的 Context slice；显式范围和无位置文件保留原行为。记录实际请求的行窗口，源码仍由固定 head 读取、精确引用仍验证保存的原文，not_found/error/未保存命中不提供定位依据。另从已校验的两组 assessment 引用生成公共引用，移除新模型输出里重复的第三份字段；显式旧引用仍严格检查。
 
 新增 13 项回归覆盖真实长版权头文件、三种正向搜索、相关/无关 Context、负向与未保存结果、显式/未知路径、最新命中切换，以及派生引用和无效旧引用拒收。相关 73 项通过，完整检查为 `1585 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。新的独立冻结预检待完成，未运行 holdout。
+
+冻结 `a20a113` 的新尝试位于 `.reviewforge/benchmarks/v4-focused-evidence-20261011-040016/`。GitHub codeload 返回 ConnectError，workspace 退化为 api-fallback（0 本地文件），ContextPack 为 0 slices / 58 truncated units；这一输入与先前完整 tarball 不可公平比较。停止该次尝试，保留原始记录，Job Object 返回 125，5 个成功请求记录 83896 tokens，可能有进行中请求未记录用量，无质量分；下载链路独立 HEAD 探针已恢复 200。另预先声明了 keycloak#36882 与 sentry#93824 两个额外 dev 样本，尚未发模型请求，未用 holdout。
+
+## 2026-10-11 付费调用前的源码预检
+
+回查 benchmark `_run_one` 与 `ToolGateway.workspace_for`：原评测沿用产品允许的 API 降级行为，付费调用前不区分完整/退化源码。这适合产品可用性，但不满足当前固定输入的质量对照。新增显式 `--require-complete-workspace`，仅用于评测：在任何 graph/model 调用之前取得固定 head 的 tarball，校验来源、截断标记和 SHA，并保存预检诊断；不满足则失败且没有模型调用。使用现有 run-scoped workspace cache，后续 v4 复用同一对象、不再次下载；拒收和 graph 异常时释放该 state 的 workspace，legacy 预检缓存也显式清理。默认关闭，产品降级路径保持原行为。开关写入续跑 provenance，避免混用输入协议。
+
+新增 4 项真实 tarball/gateway 回归，验证完整源码复用一次下载、网络降级/截断均先于 graph 拒收、graph 失败清理和诊断保留；相关 11 项通过，完整检查为 `1589 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。下一次固定输入预检及后续配对显式开启此开关。

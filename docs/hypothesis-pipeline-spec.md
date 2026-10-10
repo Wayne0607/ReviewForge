@@ -307,6 +307,8 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
 ```
 校验：`confirmed`/`refuted` 的 assessment 两组引用均需指定 `status=success` 的 observation，quote 精确命中各自的保存正文；从通过校验的引用派生内部 `evidence_ids/evidence_quote`，模型无需再抄第三份引用。若响应仍显式提供旧的顶层 `evidence_ids/evidence_quote`，继续精确校验，失败为 UNKNOWN/ungrounded；不忽略无效旧引用。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，保留空白和真正的数字前缀，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）。
 
+工具回复只交付实际保存的 excerpt 与位置元数据；超过 1200 字符的正文不再以 Additional context 展示，保留缩小 read/search 范围的提示。结果摘要 digest 与既有最大工具读取水位不变，原始 Context 仍作导航而非 Observation 证据；需更深正文时通过既有工具窄读，不增加新工具或调查预算。缺少证明为 UNKNOWN，不能凭“未看到触发路径”推翻；声称值转换失败时需追踪引用的具体输入、运算及结果，不能只看语法推断失败。
+
 事实回答不等于缺陷成立。新调查的 `confirmed/refuted` 还必须分别交付 expected 与 actual 的非空陈述和引用；每条引用必须精确命中其指定的成功 Observation，而不能用一个无关成功读取掩盖另一前提的缺失。同一 Observation 能证明两者时可复用，但不能把实际 throw 当成“必须收集消息”的契约。标准库的预期行为可来自已文档化契约，引用需绑定实际类型/配置/数据流，无需本地包含库源码。`confirmed` 仅接受 `conflict`，`refuted` 仅接受 `compatible`；结构缺失、引用无效、关系与 verdict 矛盾分别降为 UNKNOWN（`incomplete-assessment` / `ungrounded-assessment` / `inconsistent-assessment`）。UNKNOWN 不要求完整 assessment，也不会因附带证明被自动提升。代码核实引用和关系一致性，语义判断仍由调查员承担。
 
 `ContractAssessment` 随假设落入现有 JSON 账本/checkpoint，交付 editor 和失败模板；不增加数据库表或 LLM 阶段。旧 checkpoint 缺少该字段仍可加载，不重开已有 CONFIRMED/REFUTED。证据强度按通过校验的两组引用判断 diff 外来源，而非无关 observation。预算、UNKNOWN 准入和严格裁判保持原值。

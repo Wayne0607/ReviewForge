@@ -308,3 +308,13 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 新增 4 项真实 tarball/gateway 回归，验证完整源码复用一次下载、网络降级/截断均先于 graph 拒收、graph 失败清理和诊断保留；相关 11 项通过，完整检查为 `1589 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。下一次固定输入预检及后续配对显式开启此开关。
 
 冻结 `03960a8` 的首次预检位于 `.reviewforge/benchmarks/v4-workspace-preflight-20261011-041438/`。实跑暴露诊断父目录未初始化，写回执时失败；0 次模型请求、0 tokens，严格准入拒收且没有质量分。runner 进程返回 0 只是逐 PR 错误已被记录，不代表 review 完成。补上递归创建诊断目录，将原 4 项回归改为尚不存在的嵌套路径，覆盖真实启动场景；相关 11 项再次通过。保留失败回执，下一次使用新的冻结提交与独立目录，不复用失败结果。
+
+## 2026-10-11 工具展示与可引用证据一致
+
+冻结 `1a80cde` 的实跑位于 `.reviewforge/benchmarks/v4-workspace-preflight-20261011-042353/`。源码预检通过，同一固定 head、10310 文件、89316617 bytes 与既有摘要；58 units / 168 slices 不变。生成 24 条候选，无单元漏答。调查正确推翻了短路条件仍调用 Matcher.group() 的候选，但立陶宛 account 候选产生 error UNKNOWN/ungrounded-assessment，停止剩余付费请求；22 个成功请求记录 190274 tokens（GEN 2 / lens 1 / INV 19），账本为 2 CONFIRMED / 2 REFUTED / 14 UNKNOWN / 6 OPEN，可能有进行中请求未记录用量。Job Object 返回 125、峰值约 358 MiB，锁已释放；没有完整发布、质量分或 legacy 配对。
+
+`evidence-visibility-audit.json` 逐条核实引用：实际 diff 引用有效，失败的是显式读取文件 1–110 行后，对 1200 字符保存区之外的 expected 前提引用。默认窄读不能替代模型主动指定的大范围。两问回查 `bc9bc151`：展示 Additional context 最初是为帮助导航，并假设模型会再次窄读后才引用；连续实跑违背该假设。现在五种工具仅展示实际保存的原文 excerpt、元数据与缩小范围提示，省略正文不再交给模型作潜在证据；原读取上限、digest、保存水位、工具集合与预算不变，精确引用和 UNKNOWN 门槛不放宽。
+
+另一次 CONFIRMED 声称 choice 正则替换会留下 `<`，引用真实但推理错误。独立 Java String.replaceAll 小型复现对引用的英文输入得到 `...`，证实该误报；`regex-semantics-audit.json` 保留诊断，原 verdict 不改、未执行完整 theme verifier、不生成质量分。提示补充具体输入→运算→结果及“缺少证明仍为 UNKNOWN”，代码只能核实结构/引用，不能宣称已解决全部语义误判。
+
+先以新约束复现 9 处旧实现外露正文；新增 6 项独立/参数化回归覆盖五种工具和真实 workspace 的宽读→窄读→有效 assessment，全套相关 79 项通过。完整本地 `1595 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。下一轮优先使用预先选定的另外两个 dev PR 检查通用性，未使用 holdout，main 仍保持原生产版本。

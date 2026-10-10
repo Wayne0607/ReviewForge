@@ -114,7 +114,7 @@ async def test_explicit_window_and_unknown_path_keep_existing_behavior(tmp_path)
 async def test_unfocused_long_read_does_not_silently_grow_saved_evidence(tmp_path):
     worker, _ = _worker(tmp_path, changeset=False)
     output = await worker._run_tool("read_file", {"path": "a.py"})
-    assert "return None" in output
+    assert "return None" not in output
     assert len(worker._observations[-1].excerpt) == 1200
     assert "return None" not in worker._observations[-1].excerpt
 
@@ -157,6 +157,6 @@ async def test_unsaved_search_hit_is_not_used_as_a_default_location(tmp_path):
 
     worker._executor = execute
     output = await worker._run_tool("grep", {"pattern": "transform"})
-    assert "caller.py:80" in output and "caller.py:80" not in worker._observations[0].excerpt
+    assert "caller.py:80" not in output and "caller.py:80" not in worker._observations[0].excerpt
     await worker._run_tool("read_file", {"path": "caller.py"})
     assert worker._observations[-1].line_range is None

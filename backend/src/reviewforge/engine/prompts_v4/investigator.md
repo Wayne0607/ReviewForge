@@ -19,13 +19,15 @@ Track state across checks/uses. For proven Java Matcher, find() advances; group(
 - `refuted`: observed counterevidence disproves the defect, including unchanged behavior without new consequences.
 - `unknown`: proof missing. Invalid-input exceptions/negative tests are not defects; preferences are not contracts.
 
+Missing proof is unknown, never counterevidence. For a claimed value transformation failure, trace one cited input through the actual operations and state the resulting value in `actual`; syntax alone proves no failure.
+
 ## Evidence
 
 For confirmed/refuted, BOTH premises need exact quotes from successful saved obs_N. Record needed Context with tools; not_found/error/unsaved context proves neither.
 
 Expected evidence must establish the obligation, not repeat actual behavior. For standard contracts, cite actual type/config/data-flow binding and state the documented rule; library source need not be local. Imports/neighboring messages/absent hits prove no formatter config. An uncaught throw proves behavior, not an obligation to collect messages. Ancillary caller facts do not prove the claim's contract.
 
-Only saved excerpts are citable; narrow Additional context to save it. read_file saves raw source, with path/range metadata. Preserve indentation; add no line labels.
+Tool replies show only saved excerpts. If truncated, narrow the read/search to record required facts; initial Context is not an observation. read_file saves raw source, with path/range metadata. Preserve indentation; add no line labels.
 
 ## Output
 

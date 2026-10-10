@@ -310,7 +310,8 @@ async def test_long_tool_output_identifies_saved_citation_boundary_and_narrow_re
     observation = investigator._observations[0]
     assert len(result) <= 6000
     assert "important_fact()" not in observation.excerpt
-    assert result.index("End saved evidence excerpt") < result.index("important_fact()")
+    assert "important_fact()" not in result
+    assert observation.excerpt in result
     assert "narrower line range" in result
 
     investigator._executor = _executor(
@@ -329,6 +330,67 @@ async def test_long_tool_output_identifies_saved_citation_boundary_and_narrow_re
         steps=2,
     )
     assert verdict.verdict == "confirmed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["read_file", "read_diff", "grep", "find_definition", "find_callers"])
+async def test_all_tool_views_hide_unsaved_proof_and_still_reject_it(tool):
+    content = "x" * 1200 + "unsaved_proof()"
+
+    async def execute(name, args):
+        return content
+
+    investigator = Investigator(_ScriptedToolLLM(), execute)
+    result = await investigator._run_tool(tool, {"path": "a.py"})
+    observation = investigator._observations[0]
+    assert "unsaved_proof()" not in result
+    assert observation.excerpt == "x" * 1200 and observation.excerpt in result
+    assert observation.status == "success"
+    verdict = investigator._finalize(
+        {"verdict": "confirmed", "assessment": _assessment("unsaved_proof()", "obs_0")},
+        _hypothesis(),
+        {"a.py"},
+        steps=1,
+    )
+    assert verdict.verdict == "unknown" and verdict.reason == "ungrounded-assessment"
+
+
+@pytest.mark.asyncio
+async def test_wide_read_requires_narrow_recording_before_model_receives_the_proof(tmp_path):
+    class RecordingLLM(_ScriptedToolLLM):
+        seen: list = Field(default_factory=list)
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            self.seen.append(list(messages))
+            return super()._generate(messages, stop, run_manager, **kwargs)
+
+    contract = "assert transform('valid') == 'ready'"
+    behavior = "def transform(value):\n    return None"
+    workspace = _source_workspace(
+        tmp_path, "# Copyright header before the relevant source.\n" * 79 + contract + "\n" + behavior
+    )
+    state = _state()
+    assessment = _assessment("return None", "obs_1")
+    assessment["expected"] = "Valid input must produce ready."
+    assessment["expected_evidence"] = [{"observation_id": "obs_1", "quote": contract}]
+    llm = RecordingLLM(
+        turns=[
+            {"name": "read_file", "args": {"path": "a.py", "start": 1, "end": 100}, "id": "wide"},
+            {"name": "read_file", "args": {"path": "a.py", "start": 80, "end": 82}, "id": "narrow"},
+            json.dumps({"verdict": "confirmed", "assessment": assessment}),
+        ]
+    )
+    result = await Investigator(llm, build_workspace_executor(workspace, state)).investigate(
+        _hypothesis(), state, ContextPack()
+    )
+    assert result.verdict == "confirmed" and result.assessment is not None
+    assert len(result.observations) == 2
+    assert contract not in result.observations[0].excerpt
+    assert contract in result.observations[1].excerpt and behavior in result.observations[1].excerpt
+    first_view = [message.content for message in llm.seen[1] if message.type == "tool"]
+    assert first_view and all(contract not in content and "return None" not in content for content in first_view)
+    second_view = [message.content for message in llm.seen[2] if message.type == "tool"]
+    assert any(contract in content and behavior in content for content in second_view)
 
 
 @pytest.mark.asyncio

@@ -290,9 +290,9 @@ class Investigator:
             return (
                 f"{label} Saved evidence excerpt (cite only this section):\n"
                 f"{observation.excerpt}\n[End saved evidence excerpt]\n"
-                "Additional context (not citable under this observation; use read_file with a narrower "
-                "line range or a more specific search to record it as evidence):\n"
-                f"{text[_OBS_EXCERPT_CHARS:]}"
+                "Result exceeds the saved excerpt; omitted source is not shown. "
+                "Use read_file/read_diff with a narrower line range or a more specific search "
+                "to record the required evidence."
             )[:_TOOL_RESULT_CHARS]
         return f"{label}\n{text}" if text else f"{label} (no content)"
 

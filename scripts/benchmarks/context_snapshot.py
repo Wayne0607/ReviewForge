@@ -29,7 +29,12 @@ async def build_context_runtime(root: Path):
     db = Database(root / f"reviewforge-context-{os.getpid()}.db")
     try:
         await db.connect()
-        gateway = ToolGateway(build_registry(), ReadOnlyGitHub(github), pipeline_mode="hypothesis")
+        gateway = ToolGateway(
+            build_registry(),
+            ReadOnlyGitHub(github),
+            pipeline_mode="hypothesis",
+            workspace_max_bytes=config.pipeline_v4.workspace_max_bytes,
+        )
         return gateway, config.pipeline_v4, db, github
     except BaseException:
         try:
@@ -84,7 +89,14 @@ async def capture(args: argparse.Namespace) -> None:
             "llm_calls": 0,
         }
         _atomic_json(output, payload)
-        print(f"Saved {state.repo}#{state.pr_number}@{state.head_sha}: {len(pack.units)} units, {len(rendered)} chars")
+        slice_count = sum(len(context.slices) for context in pack.units.values())
+        print(
+            f"Saved {state.repo}#{state.pr_number}@{state.head_sha}: "
+            f"source={workspace.source}, files={workspace.info.file_count}, "
+            f"units={len(pack.units)}, slices={slice_count}, chars={len(rendered)}"
+        )
+        if args.require_tarball and workspace.source != "tarball":
+            raise RuntimeError("Context audit requires a repository snapshot; saved degraded diagnostic only")
     finally:
         if state is not None:
             await gateway.cleanup_workspace(state)
@@ -97,6 +109,7 @@ def main() -> None:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--pr", required=True, type=int)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--require-tarball", action="store_true", help="Reject degraded context in snapshot audits")
     asyncio.run(capture(parser.parse_args()))
 
 

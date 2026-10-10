@@ -84,7 +84,7 @@ Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复�
 
 新增只读 `context_snapshot.py`，记录固定 PR head 的语义单元、原始 ContextSlice、渲染与截断方向；不调用模型，重复渲染检查一致性。用于 SPEC 指定的三个大仓库实例抽查。
 
-### 19:12 服务器连通性异常（尚待恢复核实）
+### 19:12 服务器连通性异常与次日恢复
 
 在生产同机的隔离源码目录并行启动三个上下文抽查后，SSH 握手及 HTTP 开始超时。TCP 80 连接仍能建立，但 HEAD 请求无响应；SSH 未进入认证阶段。不能据此判定数据库/凭据故障，也不能在没有主机数据时确认 OOM。最近一次生产服务核对为 active、SHA 为上述 main；异常之后尚不能复核其运行状态。
 
@@ -111,6 +111,12 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 本轮 Windows 全量测试 `1478 passed, 1 skipped, 6 warnings`，ruff / format 和严格裁判回归通过。`a5112d5` 的 Linux dev CI 为 `1470 passed, 6 warnings`。恢复后的再次外部检查仍为 HTTP 200。
 
 还需补齐的运行协议缺口：当前 frozen outbox 会在恢复时跳过所有 LLM 阶段；若第一次已发布部分结果，但仍有 OPEN/可重试 UNKNOWN，就无法继续调查并发布新增确认问题。需实现不修改已发送负载、仅补充未发布假设的恢复协议，并验证丢回执与重复恢复。此项未完成，v4 不可进入生产。
+
+`311552c` 的 Linux dev CI 为 `1476 passed, 3 skipped, 6 warnings`（Windows Job Object 内核探针在 Linux 跳过）。本机三个真实上下文采集已串行结束：Sentry 获得 15464 文件、22 units 的 tarball 快照；keycloak 与 grafana 因 Windows MAX_PATH 限制退化为 API fallback，代码 slices 为零，因此不能计为通过抽查。工作进程组峰值分别约 178 / 165 / 413 MiB，均在 2 GiB 内核总内存限制内，未在生产主机启动真实评测。
+
+回溯 workspace 的原实现：正常临时目录路径适用于 Linux，却不能覆盖 Windows 上大仓库的合法长路径。新增微型 tarball 回归，先复现“一个无关长路径文件使整个仓库降级”，再仅对 Windows 物理快照根使用扩展绝对路径；逻辑仓库路径、SHA、归档安全校验与降级契约保持原规格。提取、读取、搜索、manifest 和清理共用同一根路径，不依赖修改操作系统注册表。上下文审计显式记录 snapshot 来源、文件数与 slices，并可用 `--require-tarball` 拒绝把降级诊断算成成功；仍保留原始诊断文件。
+
+本轮 Windows 全量测试 `1480 passed, 1 skipped, 6 warnings`；长路径、安全归档、上下文与 bootstrap 的 29 项回归通过，ruff / format 通过。接下来固定本轮提交，重新进行串行、受限的真实 ContextPack 抽查。尚无有效 v3/v4 配对 F1。
 
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。

@@ -147,6 +147,23 @@ def _normalise_repo_path(path: str) -> str | None:
     return "/".join(parts)
 
 
+def _physical_workspace_path(path: Path) -> Path:
+    """Use Windows extended paths for all I/O, retaining logical repo paths.
+
+    GitHub archives can contain paths beyond MAX_PATH even when their individual
+    components are valid. Prefix the absolute snapshot root once so extraction,
+    local tools, manifest traversal and cleanup share the same filesystem view.
+    """
+    if os.name != "nt":
+        return path
+    absolute = str(path.resolve())
+    if absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def _language_name(language: str) -> str:
     """Normalise the small set of language aliases accepted by the tools."""
 
@@ -350,7 +367,7 @@ class PRHeadWorkspace:
         if max_bytes < 0:
             raise ValueError("workspace max_bytes must be non-negative")
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="reviewforge-workspace-"))
+        temp_dir = _physical_workspace_path(Path(tempfile.mkdtemp(prefix="reviewforge-workspace-")))
         root = temp_dir / "repo"
         root.mkdir(parents=True, exist_ok=True)
         repo = str(state.repo or "")

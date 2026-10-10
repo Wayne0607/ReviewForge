@@ -251,6 +251,34 @@ async def test_workspace_fallback_fails_closed_for_deletion_only_pr() -> None:
 
 
 @pytest.mark.asyncio
+async def test_workspace_retains_long_repository_paths() -> None:
+    # Large repositories contain valid paths longer than Windows MAX_PATH.
+    # An unrelated long member must not turn the entire snapshot into API fallback.
+    long_path = "/".join(["nested_directory_with_long_name_123"] * 8 + ["long.py"])
+    contents = {"src/changed.py": b"changed = True\n", long_path: b"long_path_marker = True\n"}
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for path, content in contents.items():
+            member = tarfile.TarInfo(f"workspace-repo-test/{path}")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    github = _TarballGitHub(payload=output.getvalue())
+    workspace = await PRHeadWorkspace.build(_state(files_changed=["src/changed.py"]), github)
+    root = workspace.root
+    try:
+        assert len(str(root / long_path)) > 260
+        assert workspace.source == "tarball"
+        assert workspace.info.file_count == 2
+        assert workspace.exists(long_path)
+        assert await workspace.read_async(long_path) == contents[long_path].decode()
+        assert [hit.path for hit in workspace.grep("long_path_marker", globs=None, max_hits=10)] == [long_path]
+        assert github.content_calls == []
+    finally:
+        workspace.cleanup()
+    assert not root.exists()
+
+
+@pytest.mark.asyncio
 async def test_workspace_rejects_traversal_and_symlink_members() -> None:
     workspace = await PRHeadWorkspace.build(
         _state(files_changed=["src/safe.py"]),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -124,8 +125,60 @@ async def test_context_runtime_needs_no_model_key_and_blocks_github_writes(runne
     gateway, config, db, github = await module.build_context_runtime(tmp_path)
     try:
         assert gateway._pipeline_mode == "hypothesis"
+        assert gateway._workspace_max_bytes == config.workspace_max_bytes
         with pytest.raises(RuntimeError, match="blocked a GitHub write"):
             await github._client.post("/repos/example/repo/issues", json={"title": "blocked"})
     finally:
         await db.close()
         await github.close()
+
+
+@pytest.mark.asyncio
+async def test_context_audit_saves_degradation_but_does_not_report_success(runner, tmp_path, monkeypatch):
+    import importlib
+
+    from reviewforge.core.config import PipelineV4Config
+    from reviewforge.core.database import Database
+    from reviewforge.core.specs import build_registry
+    from reviewforge.tools.gateway import ToolGateway
+
+    module = importlib.import_module("context_snapshot")
+
+    class GitHub:
+        closed = False
+
+        async def get_pr_info(self, *args):
+            return {"head": {"sha": "head", "repo": {"full_name": "fork/repo"}}, "base": {"sha": "base"}}
+
+        async def get_pr_files(self, *args):
+            return [{"filename": "src/f.py", "patch": "@@ -0,0 +1 @@\n+enabled = True", "additions": 1}]
+
+        async def get_repo_tarball(self, *args):
+            raise OSError("archive unavailable")
+
+        async def get_file_content(self, *args):
+            return "enabled = True\n"
+
+        async def close(self):
+            self.closed = True
+
+    github = GitHub()
+    gateway = ToolGateway(build_registry(), github, pipeline_mode="hypothesis")
+    db = Database(tmp_path / "context.db")
+    await db.connect()
+
+    async def runtime(*args):
+        return gateway, PipelineV4Config(), db, github
+
+    monkeypatch.setattr(module, "build_context_runtime", runtime)
+    output = tmp_path / "context.json"
+    args = SimpleNamespace(repo="owner/repo", pr=1, output=str(output), require_tarball=True)
+    with pytest.raises(RuntimeError, match="saved degraded diagnostic only"):
+        await module.capture(args)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["workspace"]["source"] == "api-fallback"
+    assert payload["llm_calls"] == 0
+    assert all(context["truncated_kinds"] == ["all"] for context in payload["units"].values())
+    assert db._db is None
+    assert github.closed
+    assert not gateway._workspaces

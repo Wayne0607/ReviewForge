@@ -7,6 +7,7 @@ persists the ledger, and leaves publication to the legacy pipeline.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from dataclasses import asdict
@@ -16,7 +17,14 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
-from reviewforge.engine.editor import Editor, Publication, render_review_body
+from reviewforge.engine.editor import (
+    Editor,
+    Publication,
+    cluster_confirmed,
+    confirmed_fact_digest,
+    render_review_body,
+    resumed_publication,
+)
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
@@ -121,6 +129,11 @@ async def _run_llm_stages(
     config: Any,
     language: str,
     usage_by_agent: dict[str, int],
+    *,
+    resume: bool = False,
+    covered_ids: set[str] | None = None,
+    published_clusters: set[tuple[str, str]] | None = None,
+    inline_used: int = 0,
 ) -> Publication:
     """Generator → lenses → investigator → editor for one run."""
 
@@ -138,74 +151,89 @@ async def _run_llm_stages(
     async def checkpoint(current: HypothesisLedger) -> None:
         await _persist_ledger(orchestrator, current)
 
-    generator = HypothesisGenerator(
-        routed("hypothesis_generator"),
-        max_input_chars=config.generator_max_input_chars,
-        max_hypotheses=config.generator_max_hypotheses,
-        context_max_chars=config.context_pack_max_chars,
-        output_language=language,
-        on_update=checkpoint,
-    )
-    gen_result = await generator.run(state, pack, changeset, ledger)
-    events.emit(
-        "hypothesis.generated",
-        {
-            "pass": 1,
-            "source": "generator",
-            "accepted": gen_result.accepted,
-            "dropped_unanchored": gen_result.dropped_unanchored,
-            "dropped_invalid": gen_result.dropped_invalid,
-            "dropped_overflow": gen_result.dropped_overflow,
-            "blocks": gen_result.blocks,
-            "failed_blocks": gen_result.failed_blocks,
-            "tokens": usage_by_agent.get("hypothesis_generator", 0),
-        },
-    )
-
-    selections = select_lenses(state, changeset, max_lenses=config.max_lenses)
-    events.emit(
-        "lens.selected",
-        {
-            "lenses": [selection.name for selection in selections],
-            "reasons": [selection.reason for selection in selections],
-        },
-    )
-    for selection in selections:
-        llm = routed(f"lens_{selection.name}")
-        await run_lens(
-            llm,
-            selection.name,
-            selection,
-            state,
-            pack,
-            changeset,
-            ledger,
-            output_language=language,
+    # A frozen first review proves discovery was attempted. Retry only if
+    # generation/lens failures remain; finished verdicts stay in the ledger.
+    if not resume or ledger.unresolved_units:
+        generator = HypothesisGenerator(
+            routed("hypothesis_generator"),
+            max_input_chars=config.generator_max_input_chars,
             max_hypotheses=config.generator_max_hypotheses,
+            context_max_chars=config.context_pack_max_chars,
+            output_language=language,
             on_update=checkpoint,
         )
+        gen_result = await generator.run(state, pack, changeset, ledger)
+        events.emit(
+            "hypothesis.generated",
+            {
+                "pass": 1,
+                "source": "generator",
+                "accepted": gen_result.accepted,
+                "dropped_unanchored": gen_result.dropped_unanchored,
+                "dropped_invalid": gen_result.dropped_invalid,
+                "dropped_overflow": gen_result.dropped_overflow,
+                "blocks": gen_result.blocks,
+                "failed_blocks": gen_result.failed_blocks,
+                "tokens": usage_by_agent.get("hypothesis_generator", 0),
+            },
+        )
+
+        selections = select_lenses(state, changeset, max_lenses=config.max_lenses)
+        events.emit(
+            "lens.selected",
+            {
+                "lenses": [selection.name for selection in selections],
+                "reasons": [selection.reason for selection in selections],
+            },
+        )
+        for selection in selections:
+            llm = routed(f"lens_{selection.name}")
+            await run_lens(
+                llm,
+                selection.name,
+                selection,
+                state,
+                pack,
+                changeset,
+                ledger,
+                output_language=language,
+                max_hypotheses=config.generator_max_hypotheses,
+                on_update=checkpoint,
+            )
 
     executor = build_workspace_executor(workspace, state)
     for item in ledger.items.values():
         if item.status == HypothesisStatus.UNKNOWN and item.retryable:
             item.status = HypothesisStatus.OPEN
-    investigator = Investigator(routed("investigator"), executor, output_language=language, changeset=changeset)
-    await investigator.run(
-        ledger,
-        state,
-        pack,
-        max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
-        concurrency=config.investigator_concurrency,
-        on_update=checkpoint,
-    )
+    if ledger.open():
+        investigator = Investigator(routed("investigator"), executor, output_language=language, changeset=changeset)
+        await investigator.run(
+            ledger,
+            state,
+            pack,
+            max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
+            concurrency=config.investigator_concurrency,
+            on_update=checkpoint,
+        )
 
-    editor = Editor(
-        routed("editor"),
-        output_language=language,
-        max_inline=config.publish_max_inline,
-        max_inline_overflow=config.publish_max_inline_overflow,
-    )
-    publication = await editor.run(ledger, pack)
+    if resume:
+        publication = resumed_publication(
+            ledger,
+            covered_ids=covered_ids or set(),
+            published_clusters=published_clusters or set(),
+            inline_used=inline_used,
+            max_inline=config.publish_max_inline,
+            max_inline_overflow=config.publish_max_inline_overflow,
+            output_language=language,
+        )
+    else:
+        editor = Editor(
+            routed("editor"),
+            output_language=language,
+            max_inline=config.publish_max_inline,
+            max_inline_overflow=config.publish_max_inline_overflow,
+        )
+        publication = await editor.run(ledger, pack)
     editor_stats = {
         "inline": len(publication.comments),
         "summary": len(publication.summary_items),
@@ -293,6 +321,29 @@ def publication_payload(
     return ({"comments": payload_comments, "body": review_body}, rejected)
 
 
+def _publication_coverage(
+    ledger: HypothesisLedger, publication: Publication, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Freeze only confirmed facts actually retained in inline or summary output."""
+    accepted = {(item["file_path"], item["line"], item["body"]) for item in payload["comments"]}
+    covered = {
+        identity
+        for comment in publication.comments
+        if (comment.path, comment.line, comment.body) in accepted
+        for identity in comment.hypothesis_ids
+    }
+    summary_ids = {identity for identity, _ in publication.summary_items}
+    clusters = cluster_confirmed(ledger)
+    for cluster in clusters:
+        if summary_ids.intersection(cluster.hypothesis_ids):
+            covered.update(cluster.hypothesis_ids)
+    return {
+        "confirmed_ids": sorted(covered),
+        "cluster_keys": [list(cluster.key) for cluster in clusters if covered.intersection(cluster.hypothesis_ids)],
+        "fact_hashes": {item.id: confirmed_fact_digest(item) for item in ledger.items.values() if item.id in covered},
+    }
+
+
 async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     """Build the immutable workspace, semantic units and deterministic pack."""
 
@@ -346,6 +397,38 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     await _persist_ledger(orchestrator, ledger)
     database = getattr(orchestrator, "_db", None)
     saved = await database.get_v4_publication(ledger.run_id) if database and config.mode == "hypothesis" else None
+    delivered, rejected = 0, 0
+    outcome = DeliveryOutcome()
+    records = await database.list_v4_publications(ledger.run_id) if saved else []
+    # Finish/reconcile every frozen batch before spending model tokens or
+    # preparing new writes. Ambiguous acceptance permits reads only.
+    for record in records:
+        rejected += int(record["payload"].get("rejected", 0))
+        outcome = await deliver_saved_publication(
+            database, orchestrator._gateway, state, ledger.run_id, batch_id=record["batch_id"]
+        )
+        delivered += outcome.delivered
+        if outcome.error:
+            break
+    fact_hashes = {
+        identity: digest
+        for record in records
+        for identity, digest in record["payload"].get("coverage", {}).get("fact_hashes", {}).items()
+    }
+    covered_ids = {item.id for item in ledger.items.values() if fact_hashes.get(item.id) == confirmed_fact_digest(item)}
+    published_clusters = {
+        tuple(key) for record in records for key in record["payload"].get("coverage", {}).get("cluster_keys", [])
+    }
+    needs_resume = bool(ledger.unresolved_units) or any(
+        item.status == HypothesisStatus.OPEN
+        or (item.status == HypothesisStatus.UNKNOWN and item.retryable)
+        or (item.status == HypothesisStatus.CONFIRMED and item.id not in covered_ids)
+        for item in ledger.items.values()
+    )
+    if saved and needs_resume and any("coverage" not in record["payload"] for record in records):
+        # Old dev records cannot prove which confirmed facts were published.
+        # Do not guess coverage and risk duplicating or dropping findings.
+        outcome = DeliveryOutcome(error="frozen review lacks coverage metadata; start a new isolated review run")
 
     if not saved and state.files_changed:
         try:
@@ -357,30 +440,55 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     publication = Publication(comments=[], summary_items=[], merged=[], unknown_ids=[], fallback=False)
     language = resolve_output_language(state, config)
     usage_by_agent: dict[str, int] = {}
-    if not saved and getattr(orchestrator, "_model_router", None) is not None and changeset.units:
+    if (
+        not outcome.error
+        and (not saved or needs_resume)
+        and getattr(orchestrator, "_model_router", None) is not None
+        and changeset.units
+    ):
         publication = await _run_llm_stages(
-            orchestrator, state, changeset, pack, ledger, workspace, config, language, usage_by_agent
+            orchestrator,
+            state,
+            changeset,
+            pack,
+            ledger,
+            workspace,
+            config,
+            language,
+            usage_by_agent,
+            resume=bool(saved),
+            covered_ids=covered_ids,
+            published_clusters=published_clusters,
+            inline_used=delivered,
         )
 
     await _persist_ledger(orchestrator, ledger)
 
-    delivered = 0
-    rejected = 0
-    outcome = DeliveryOutcome()
     review_body = render_review_body(publication, ledger, output_language=language)
-    payload, rejected = publication_payload(state, publication, review_body=review_body)
+    payload, new_rejected = publication_payload(state, publication, review_body=review_body)
+    rejected += new_rejected
     if config.mode == "shadow" and database:
         await database.save_shadow_publication(
             ledger.run_id, {"publication": asdict(publication), "payload": payload, "rejected": rejected}
         )
-    if config.mode == "hypothesis":
-        if database and (saved or payload["comments"] or payload["body"]):
-            if not saved:
-                await database.prepare_v4_publication(ledger.run_id, ledger.head_sha, {**payload, "rejected": rejected})
-            else:
-                rejected = saved["payload"].get("rejected", 0)
-            outcome = await deliver_saved_publication(database, orchestrator._gateway, state, ledger.run_id)
-            delivered = outcome.delivered
+    if config.mode == "hypothesis" and not outcome.error:
+        if database and (payload["comments"] or payload["body"]):
+            coverage = _publication_coverage(ledger, publication, payload)
+            batch_id = (
+                hashlib.sha256(json.dumps(coverage["fact_hashes"], sort_keys=True).encode()).hexdigest()[:24]
+                if saved
+                else ""
+            )
+            await database.prepare_v4_publication(
+                ledger.run_id,
+                ledger.head_sha,
+                {**payload, "rejected": new_rejected, "coverage": coverage},
+                batch_id=batch_id,
+            )
+            outcome = await deliver_saved_publication(
+                database, orchestrator._gateway, state, ledger.run_id, batch_id=batch_id
+            )
+            delivered += outcome.delivered
         elif payload["comments"] or payload["body"]:
             delivered, rejected = await deliver_publication(
                 orchestrator._gateway, state, publication, review_body=review_body

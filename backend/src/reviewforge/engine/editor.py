@@ -8,9 +8,11 @@ confirmed hypotheses are still published through a deterministic template.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -159,6 +161,54 @@ def fallback_comment(cluster: ConfirmedCluster, *, output_language: str = "en") 
         line=site.line,
         title=cluster.hypotheses[0].claim[:60],
         body=body,
+    )
+
+
+def fallback_summary(cluster: ConfirmedCluster) -> tuple[str, str]:
+    where = ", ".join(f"{site.path}:{site.line}" for site in cluster.sites)
+    return cluster.hypothesis_ids[0], f"{cluster.hypotheses[0].claim} ({where})"
+
+
+def confirmed_fact_digest(hypothesis: Hypothesis) -> str:
+    """Track changes to published facts, including new sites of the same issue."""
+    facts = {
+        "claim": hypothesis.claim,
+        "trigger": hypothesis.trigger,
+        "impact": hypothesis.impact,
+        "severity": hypothesis.severity,
+        "strength": hypothesis.evidence_strength,
+        "sites": sorted((site.path, site.line, site.excerpt) for site in hypothesis.sites),
+    }
+    return hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def resumed_publication(
+    ledger: HypothesisLedger,
+    *,
+    covered_ids: set[str],
+    published_clusters: set[tuple[str, str]],
+    inline_used: int,
+    max_inline: int,
+    max_inline_overflow: int,
+    output_language: str,
+) -> Publication:
+    """Express only newly confirmed facts without repeating the editor LLM call.
+
+    Already published clusters receive a summary supplement for new sites, not
+    another inline comment. Both inline limits apply across the entire run.
+    """
+    pending = replace(ledger, items={key: item for key, item in ledger.items.items() if item.id not in covered_ids})
+    ordered = order_clusters(cluster_confirmed(pending))
+    fresh = [cluster for cluster in ordered if cluster.key not in published_clusters]
+    inline, _ = split_for_publication(
+        fresh, max(0, max_inline - inline_used), max(0, max_inline_overflow - inline_used)
+    )
+    inline_keys = {cluster.key for cluster in inline}
+    return Publication(
+        comments=[fallback_comment(cluster, output_language=output_language) for cluster in inline],
+        summary_items=[fallback_summary(cluster) for cluster in ordered if cluster.key not in inline_keys],
+        merged=[cluster.hypothesis_ids for cluster in inline if len(cluster.hypothesis_ids) > 1],
+        fallback=bool(ordered),
     )
 
 
@@ -397,9 +447,8 @@ class Editor:
         summary: list[tuple[str, str]] = []
         for cluster in clusters:
             identity = cluster.hypothesis_ids[0]
-            where = ", ".join(f"{site.path}:{site.line}" for site in cluster.sites)
             text = next((model_summary[i] for i in cluster.hypothesis_ids if i in model_summary), None)
-            summary.append((identity, text or f"{cluster.hypotheses[0].claim} ({where})"))
+            summary.append((identity, text or fallback_summary(cluster)[1]))
         return summary
 
 
@@ -433,9 +482,11 @@ __all__ = [
     "Publication",
     "PublicationComment",
     "cluster_confirmed",
+    "confirmed_fact_digest",
     "fallback_comment",
     "order_clusters",
     "render_review_body",
+    "resumed_publication",
     "split_for_publication",
     "validate_comments",
 ]

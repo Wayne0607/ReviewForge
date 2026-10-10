@@ -139,6 +139,20 @@ CREATE TABLE IF NOT EXISTS v4_review_outbox (
     FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
 );
 
+-- Supplements append newly confirmed findings without changing the first review.
+CREATE TABLE IF NOT EXISTS v4_review_supplements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    receipt_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id, batch_id),
+    FOREIGN KEY (run_id) REFERENCES review_runs(run_id)
+);
+
 CREATE TABLE IF NOT EXISTS shadow_publications (
     run_id TEXT PRIMARY KEY,
     publication_json TEXT NOT NULL,
@@ -1234,42 +1248,67 @@ class Database:
         )
         await self._db.commit()
 
-    async def prepare_v4_publication(self, run_id: str, head_sha: str, payload: dict[str, Any]) -> None:
-        """Freeze the publication before the first external write."""
-        await self._db.execute(
-            "INSERT OR IGNORE INTO v4_review_outbox (run_id, head_sha, payload_json, updated_at) VALUES (?, ?, ?, ?)",
-            (run_id, head_sha, json.dumps(payload, ensure_ascii=False), datetime.now(UTC).isoformat()),
-        )
-        await self._db.commit()
+    @staticmethod
+    def _v4_outbox_target(run_id: str, batch_id: str) -> tuple[str, str, tuple[str, ...]]:
+        if batch_id:
+            return "v4_review_supplements", "run_id=? AND batch_id=?", (run_id, batch_id)
+        return "v4_review_outbox", "run_id=?", (run_id,)
 
-    async def get_v4_publication(self, run_id: str) -> dict[str, Any] | None:
-        cursor = await self._db.execute("SELECT * FROM v4_review_outbox WHERE run_id=?", (run_id,))
-        row = await cursor.fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _decode_v4_publication(row: Any) -> dict[str, Any]:
         result = dict(row)
+        result.setdefault("batch_id", "")
         result["payload"] = json.loads(result.pop("payload_json"))
         result["receipt"] = json.loads(result.pop("receipt_json"))
         return result
 
-    async def claim_v4_publication(self, run_id: str) -> bool:
+    async def prepare_v4_publication(
+        self, run_id: str, head_sha: str, payload: dict[str, Any], *, batch_id: str = ""
+    ) -> None:
+        """Freeze the publication before the first external write."""
+        table, _, keys = self._v4_outbox_target(run_id, batch_id)
+        columns = "run_id, batch_id" if batch_id else "run_id"
+        key_slots = "?, ?" if batch_id else "?"
+        await self._db.execute(
+            f"INSERT OR IGNORE INTO {table} ({columns}, head_sha, payload_json, updated_at) "
+            f"VALUES ({key_slots}, ?, ?, ?)",
+            (*keys, head_sha, json.dumps(payload, ensure_ascii=False), datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+
+    async def get_v4_publication(self, run_id: str, *, batch_id: str = "") -> dict[str, Any] | None:
+        table, where, keys = self._v4_outbox_target(run_id, batch_id)
+        cursor = await self._db.execute(f"SELECT * FROM {table} WHERE {where}", keys)
+        row = await cursor.fetchone()
+        return self._decode_v4_publication(row) if row is not None else None
+
+    async def list_v4_publications(self, run_id: str) -> list[dict[str, Any]]:
+        """First review, then immutable supplements in insertion order."""
+        first = await self.get_v4_publication(run_id)
+        cursor = await self._db.execute("SELECT * FROM v4_review_supplements WHERE run_id=? ORDER BY id", (run_id,))
+        return ([first] if first else []) + [self._decode_v4_publication(row) for row in await cursor.fetchall()]
+
+    async def claim_v4_publication(self, run_id: str, *, batch_id: str = "") -> bool:
+        table, where, keys = self._v4_outbox_target(run_id, batch_id)
         cursor = await self._db.execute(
-            "UPDATE v4_review_outbox SET status='sending', updated_at=? WHERE run_id=? AND status='pending'",
-            (datetime.now(UTC).isoformat(), run_id),
+            f"UPDATE {table} SET status='sending', updated_at=? WHERE {where} AND status='pending'",
+            (datetime.now(UTC).isoformat(), *keys),
         )
         await self._db.commit()
         return cursor.rowcount == 1
 
-    async def finish_v4_publication(self, run_id: str, receipt: dict[str, Any]) -> None:
+    async def finish_v4_publication(self, run_id: str, receipt: dict[str, Any], *, batch_id: str = "") -> None:
+        table, where, keys = self._v4_outbox_target(run_id, batch_id)
         await self._db.execute(
-            "UPDATE v4_review_outbox SET status='delivered', receipt_json=?, updated_at=? WHERE run_id=?",
-            (json.dumps(receipt, ensure_ascii=False), datetime.now(UTC).isoformat(), run_id),
+            f"UPDATE {table} SET status='delivered', receipt_json=?, updated_at=? WHERE {where}",
+            (json.dumps(receipt, ensure_ascii=False), datetime.now(UTC).isoformat(), *keys),
         )
         await self._db.commit()
 
-    async def reset_v4_publication(self, run_id: str) -> None:
+    async def reset_v4_publication(self, run_id: str, *, batch_id: str = "") -> None:
         """Only use after a definite HTTP rejection, never an ambiguous timeout."""
-        await self._db.execute("UPDATE v4_review_outbox SET status='pending' WHERE run_id=?", (run_id,))
+        table, where, keys = self._v4_outbox_target(run_id, batch_id)
+        await self._db.execute(f"UPDATE {table} SET status='pending' WHERE {where}", keys)
         await self._db.commit()
 
     async def record_token_usage(

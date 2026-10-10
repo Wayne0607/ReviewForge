@@ -110,13 +110,19 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 本轮 Windows 全量测试 `1478 passed, 1 skipped, 6 warnings`，ruff / format 和严格裁判回归通过。`a5112d5` 的 Linux dev CI 为 `1470 passed, 6 warnings`。恢复后的再次外部检查仍为 HTTP 200。
 
-还需补齐的运行协议缺口：当前 frozen outbox 会在恢复时跳过所有 LLM 阶段；若第一次已发布部分结果，但仍有 OPEN/可重试 UNKNOWN，就无法继续调查并发布新增确认问题。需实现不修改已发送负载、仅补充未发布假设的恢复协议，并验证丢回执与重复恢复。此项未完成，v4 不可进入生产。
+本轮定位的恢复缺口：原 frozen outbox 在恢复时跳过所有 LLM 阶段；若第一次已发布部分结果，但仍有 OPEN/可重试 UNKNOWN，就无法继续调查并发布新增确认问题。原因是把“冻结首次投递”误当成“全部调查已完成”，与 SPEC §4.8 的账本恢复要求不符。
 
 `311552c` 的 Linux dev CI 为 `1476 passed, 3 skipped, 6 warnings`（Windows Job Object 内核探针在 Linux 跳过）。本机三个真实上下文采集已串行结束：Sentry 获得 15464 文件、22 units 的 tarball 快照；keycloak 与 grafana 因 Windows MAX_PATH 限制退化为 API fallback，代码 slices 为零，因此不能计为通过抽查。工作进程组峰值分别约 178 / 165 / 413 MiB，均在 2 GiB 内核总内存限制内，未在生产主机启动真实评测。
 
 回溯 workspace 的原实现：正常临时目录路径适用于 Linux，却不能覆盖 Windows 上大仓库的合法长路径。新增微型 tarball 回归，先复现“一个无关长路径文件使整个仓库降级”，再仅对 Windows 物理快照根使用扩展绝对路径；逻辑仓库路径、SHA、归档安全校验与降级契约保持原规格。提取、读取、搜索、manifest 和清理共用同一根路径，不依赖修改操作系统注册表。上下文审计显式记录 snapshot 来源、文件数与 slices，并可用 `--require-tarball` 拒绝把降级诊断算成成功；仍保留原始诊断文件。
 
 本轮 Windows 全量测试 `1480 passed, 1 skipped, 6 warnings`；长路径、安全归档、上下文与 bootstrap 的 29 项回归通过，ruff / format 通过。接下来固定本轮提交，重新进行串行、受限的真实 ContextPack 抽查。尚无有效 v3/v4 配对 F1。
+
+补齐恢复发布协议：首次 outbox 保持原负载与原 delivery key；新增 `v4_review_supplements` 追加独立冻结批次。每批记录已表达的 confirmed IDs、聚类键与事实摘要（含 sites），恢复时先逐批核对回执，投递不明则仅核对远端，不继续模型和新写入。核对完成后 OPEN / 可重试 UNKNOWN 继续调查，CONFIRMED / REFUTED 跳过；生成/lens 只在 unresolved 时重试。新增确认事实或同一问题的新位置经确定性模板补发，复用既有 editor fallback 规则，不再次调用 Editor LLM；5 / 8 评论上限按整个 run 累计，同簇补充进摘要。首次冻结记录没有覆盖元数据且仍需续跑时，不能猜测已发表问题，要求在隔离环境新建 run。
+
+新增恢复回归覆盖：重开 SQLite 后继续调查；first payload 不变；两档全局 inline 上限；补发回执丢失后只读核对；重复恢复不调用 LLM、不重新 POST；同一确认身份连续新增两个 sites 均追加可见摘要；旧回执未明确时不启动后续模型。37 项相关回归通过，ruff / format 与严格裁判算法回归通过。全量测试中 1482 项通过，3 个 Windows 启动器内核探针被正在采集的独占锁拒绝（预期的互斥保护）；待串行采集结束后再单独验证这 3 项，不能将本次全量命令报告为全部通过。
+
+真实大仓库重新采集：`74058dc` 首次 keycloak 请求发生空消息异常并保存降级诊断，新增异常类型日志后固定 `18bf939` 重试。后者 keycloak 为 10252 文件 / 68 pack units / 624 slices，grafana 为 16203 文件 / 8 units / 94 slices，均为 tarball。内容抽查发现注释被误认作定义，以及同名声明共用 unit ID、后者在 ContextPack 字典覆盖前者；接下来只在 v4 分支校正声明与唯一单元交付，legacy 的符号/manifest 行为保持原样。此轮抽查尚不能判定全部质量门槛通过。
 
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。

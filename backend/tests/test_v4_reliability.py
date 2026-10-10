@@ -215,6 +215,157 @@ async def test_delivered_outbox_resume_skips_all_model_calls(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inline_limit", [1, 5])
+@pytest.mark.parametrize("lose_supplement_receipt", [False, True])
+async def test_partial_publication_resumes_investigation_and_only_sends_new_confirmed(
+    tmp_path, monkeypatch, inline_limit, lose_supplement_receipt
+):
+    from reviewforge.engine.hypothesis import Hypothesis, Mechanism, Site
+    from reviewforge.engine.investigator import InvestigationResult, Investigator
+
+    db = Database(tmp_path / "db.sqlite")
+    await db.connect()
+    try:
+        await db.create_run("run", "owner/repo", 1, "abc")
+        state, fake = state_and_fake(tmp_path, db=db)
+        fake._pipeline_v4_config.mode = "hypothesis"
+        fake._pipeline_v4_config.publish_max_inline = inline_limit
+        fake._pipeline_v4_config.publish_max_inline_overflow = inline_limit
+        state.file_diffs["app.py"] = "@@ -0,0 +1,4 @@\n+def f(x):\n+    return x.name\n+enabled = True\n+other = None\n"
+        unit = compile_semantic_changeset(state).units[0]
+        ledger = state.ledger = HypothesisLedger("run", "abc", "d")
+        for identity, mechanism, status in (
+            ("a", Mechanism.NULL_PATH, HypothesisStatus.CONFIRMED),
+            ("b", Mechanism.ERROR_PATH, HypothesisStatus.OPEN),
+        ):
+            ledger.upsert(
+                Hypothesis(
+                    id=identity,
+                    identity=f"{unit.id}::{mechanism.value}::{identity}",
+                    unit_id=unit.id,
+                    mechanism=mechanism,
+                    claim=f"issue {identity}",
+                    trigger="input is None",
+                    impact="crash",
+                    open_question="is it reachable?",
+                    refutation="caller prevents it",
+                    sites=[Site("app.py", 2, "return x.name")],
+                    severity="error",
+                    source="generator",
+                    status=status,
+                    evidence_strength="strong" if status == HypothesisStatus.CONFIRMED else "none",
+                )
+            )
+        generator = AsyncMock(
+            return_value=SimpleNamespace(
+                accepted=0, dropped_unanchored=0, dropped_invalid=0, dropped_overflow=0, blocks=1, failed_blocks=0
+            )
+        )
+        monkeypatch.setattr("reviewforge.engine.pipeline_v4.HypothesisGenerator.run", generator)
+        investigated = []
+
+        async def investigate(self, hypothesis, *args, **kwargs):
+            investigated.append(hypothesis.id)
+            if len(investigated) == 1:
+                return InvestigationResult(verdict="unknown", reason="provider interrupted", retryable=True)
+            return InvestigationResult(verdict="confirmed", reason="grounded", severity="error", strength="strong")
+
+        monkeypatch.setattr(Investigator, "investigate", investigate)
+        calls, roles = [], []
+
+        async def invoke(name, params, *args, **kwargs):
+            calls.append(params)
+            if len(calls) == 2 and lose_supplement_receipt:
+                from reviewforge.tools.github_api import GitHubAPIError
+
+                raise GitHubAPIError("receipt lost", kind="network", retryable=True)
+            return {
+                "delivered_indexes": list(range(len(params["comments"]))),
+                "review": {"id": len(calls)},
+                "compatibility": False,
+            }
+
+        fake._gateway.invoke = invoke
+
+        def llm(name):
+            roles.append(name)
+            return UsageLLM()
+
+        fake._model_router.get_llm = llm
+        assert not (await run_hypothesis_pipeline(fake, state)).completed
+        frozen = await db.get_v4_publication("run")
+        assert len(calls) == 1 and "issue a" in calls[0]["comments"][0]["body"]
+        # Resume from persisted state and a new SQLite connection.
+        await db.close()
+        await db.connect()
+        state.ledger = await db.load_hypothesis_ledger("run")
+        health = await run_hypothesis_pipeline(fake, state)
+        assert health.completed is (not lose_supplement_receipt)
+        assert investigated == ["b", "b"]
+        assert generator.await_count == 1
+        assert roles.count("editor") == 1
+        assert len(calls) == 2
+        new_text = calls[1]["body"] + "".join(comment["body"] for comment in calls[1]["comments"])
+        assert "issue b" in new_text and "issue a" not in new_text
+        assert sum(len(call["comments"]) for call in calls) <= inline_limit
+        assert calls[0]["delivery_key"] != calls[1]["delivery_key"]
+        assert (await db.get_v4_publication("run"))["payload"] == frozen["payload"]
+        roles_before = list(roles)
+        assert (await run_hypothesis_pipeline(fake, state)).completed
+        if lose_supplement_receipt:
+            assert calls[2]["reconcile_only"] is True
+            assert calls[2]["delivery_key"] == calls[1]["delivery_key"]
+        assert len(calls) == (3 if lose_supplement_receipt else 2) and roles == roles_before
+        calls_before = len(calls)
+        assert (await run_hypothesis_pipeline(fake, state)).completed
+        assert len(calls) == calls_before and roles == roles_before
+        records = await db.list_v4_publications("run")
+        assert len(records) == 2 and all(record["status"] == "delivered" for record in records)
+        assert "coverage" not in calls[0]
+        # Discovery retries can add sites to an already confirmed identity.
+        # Each new fact must survive, without a duplicate inline or another LLM.
+        existing = next(item for item in state.ledger.items.values() if item.id == "a")
+        for line, excerpt in ((3, "enabled = True"), (4, "other = None")):
+            existing.sites.append(Site("app.py", line, excerpt))
+            assert (await run_hypothesis_pipeline(fake, state)).completed
+            assert calls[-1]["comments"] == []
+            assert f"app.py:{line}" in calls[-1]["body"]
+            assert roles == roles_before
+            assert calls[-1]["delivery_key"] != calls[-2]["delivery_key"]
+        assert (await db.get_v4_publication("run"))["payload"] == frozen["payload"]
+        calls_before = len(calls)
+        assert (await run_hypothesis_pipeline(fake, state)).completed
+        assert len(calls) == calls_before
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_frozen_delivery_blocks_new_models_and_supplements(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    await db.connect()
+    try:
+        await db.create_run("run", "owner/repo", 1, "abc")
+        state, fake = state_and_fake(tmp_path, db=db)
+        await run_hypothesis_pipeline(fake, state)
+        next(iter(state.ledger.items.values())).status = HypothesisStatus.OPEN
+        fake._pipeline_v4_config.mode = "hypothesis"
+        fake._model_router.get_llm = lambda name: pytest.fail("models ran before delivery reconciliation")
+        await db.prepare_v4_publication(
+            "run", "abc", {"comments": [], "body": "unconfirmed", "coverage": {"confirmed_ids": []}}
+        )
+        await db.claim_v4_publication("run")
+        fake._gateway.invoke = AsyncMock(return_value={})
+        health = await run_hypothesis_pipeline(fake, state)
+        assert not health.completed and health.delivery.retryable
+        assert fake._gateway.invoke.call_args.args[1]["reconcile_only"] is True
+        assert len(await db.list_v4_publications("run")) == 1
+        assert next(iter(state.ledger.items.values())).status == HypothesisStatus.OPEN
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_completed_investigation_is_durable_while_another_is_cancelled(tmp_path, monkeypatch):
     from copy import deepcopy
 

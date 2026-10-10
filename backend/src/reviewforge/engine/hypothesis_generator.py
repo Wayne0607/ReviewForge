@@ -1,8 +1,9 @@
 """Hypothesis generator for the hypothesis pipeline.
 
 One bounded pass over the whole PR: the deterministic context pack plus the
-before/after diff and RIGHT-side anchors are rendered per semantic unit (risk-ordered, chunked when the
-input exceeds the configured budget) and the model proposes testable
+before/after hunks are shared once per file in each block, with separate
+RIGHT-side anchors per semantic unit (risk-ordered, chunked when the input
+exceeds the configured budget), and the model proposes testable
 hypotheses.  The generator only *proposes*; it never investigates and never
 retries with a "look harder" signal — explicit clean assessments are valid
 NO_ISSUE results. Units omitted from an otherwise valid response, or in a
@@ -28,7 +29,7 @@ from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import extract_code_definitions
-from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
+from reviewforge.engine.detectors.unified_diff import iter_right_lines, render_numbered_diff, select_diff_hunks
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
@@ -110,7 +111,7 @@ def _unit_right_lines(
     return sorted(by_line.items())[:max_lines]
 
 
-def _unit_patch(unit: SemanticUnit, diff: str, max_lines: int) -> str:
+def _shared_patch(units: list[SemanticUnit], diff: str) -> str:
     """Keep both sides of intersecting hunks, including deletion-only changes.
 
     This is source material, not an anchor map: only ``iter_right_lines`` may
@@ -118,31 +119,29 @@ def _unit_patch(unit: SemanticUnit, diff: str, max_lines: int) -> str:
     be visible when reasoning about the behavior introduced by the PR.
     """
 
-    start = max(1, unit.start_line - 3)
-    end = max(start, unit.end_line + 3)
-    selected = select_diff_hunks(diff, [(start, end)])
-    # Resource/file units may not have symbol coordinates.
-    if not selected and not unit.start_line:
-        selected = select_diff_hunks(diff, [(0, 2**63 - 1)])
-    lines = selected.splitlines()
-    rendered = "\n".join(lines[:max_lines])
-    if len(lines) > max_lines:
-        rendered += "\n(diff truncated; remaining changes unchecked)"
-    return rendered
+    ranges = [(max(1, unit.start_line - 3), max(1, unit.end_line + 3)) for unit in units]
+    # Resource/file units may not have symbol coordinates. Keep their complete
+    # changes, even when other units in the same file have narrower windows.
+    if any(not unit.start_line for unit in units):
+        ranges.append((0, 2**63 - 1))
+    return select_diff_hunks(diff, ranges)
 
 
-def _render_changes(
-    units: list[SemanticUnit], right_lines: dict[str, dict[int, str]], max_lines: int, diffs: dict[str, str]
-) -> str:
-    """Render before/after hunks separately from commentable RIGHT-side lines."""
+def _render_changes(units: list[SemanticUnit], right_lines: dict[str, dict[int, str]], diffs: dict[str, str]) -> str:
+    """Share each hunk once while retaining each unit's identity and anchors."""
 
     sections: list[str] = []
+    by_path: dict[str, list[SemanticUnit]] = {}
     for unit in units:
-        lines = _unit_right_lines(unit, right_lines, max_lines)
+        by_path.setdefault(unit.path, []).append(unit)
+    for path, file_units in by_path.items():
+        patch = _shared_patch(file_units, diffs.get(path, "") or "")
+        sections.append(f"### Shared before/after diff: {path}\n{render_numbered_diff(patch) or '(no matching hunk)'}")
+    for unit in units:
+        lines = _unit_right_lines(unit, right_lines, max(1, len(diffs.get(unit.path, "").splitlines())))
         header = f"### {unit.path} — symbol={unit.symbol or '-'} unit_id={unit.id}"
-        patch = _unit_patch(unit, diffs.get(unit.path, "") or "", max_lines)
-        body = "\n".join(f"{line:>5} | {content}" for line, content in lines) or "(no RIGHT-side lines)"
-        sections.append(f"{header}\nBefore/after diff:\n{patch}\nRIGHT-side anchors:\n{body}")
+        body = ", ".join(str(line) for line, _content in lines) or "(no RIGHT-side lines)"
+        sections.append(f"{header}\nRIGHT-side anchor lines (code in shared diff above): {body}")
     return "\n\n".join(sections)
 
 
@@ -282,10 +281,6 @@ class HypothesisGenerator:
 
         right_lines = _right_lines_by_path(state)
         diffs = state.file_diffs or {}
-        changes_by_unit = {
-            unit.id: _render_changes([unit], right_lines, max(1, len(diffs.get(unit.path, "").splitlines())), diffs)
-            for unit in units
-        }
         # Match the pack's global, risk-ordered water filling. A per-unit floor
         # multiplied by many units must not exceed the advertised pack budget.
         pack.render_all(max_chars=self._context_max_chars)
@@ -296,10 +291,10 @@ class HypothesisGenerator:
             context_by_unit[unit.id] = context
             remaining -= len(context) + (2 if context else 0)
 
-        blocks = self._chunk_units(units, changes_by_unit, context_by_unit)
+        blocks = self._chunk_units(units, right_lines, diffs, pack, context_by_unit)
         while blocks:
             block = blocks.pop(0)
-            user = self._render_user_message(pack, block, changes_by_unit, context_by_unit, ledger)
+            user = self._render_user_message(pack, block, right_lines, diffs, context_by_unit, ledger)
             if len(user) > self._max_input_chars and len(block) > 1:
                 split = len(block) // 2
                 blocks[0:0] = [block[:split], block[split:]]
@@ -352,20 +347,27 @@ class HypothesisGenerator:
     def _chunk_units(
         self,
         units: list[SemanticUnit],
-        changes_by_unit: dict[str, str],
+        right_lines: dict[str, dict[int, str]],
+        diffs: dict[str, str],
+        pack: ContextPack,
         context_by_unit: dict[str, str],
     ) -> list[list[SemanticUnit]]:
         blocks: list[list[SemanticUnit]] = []
         current: list[SemanticUnit] = []
-        current_chars = _BLOCK_OVERHEAD
         for unit in units:
-            unit_chars = len(changes_by_unit.get(unit.id, "")) + len(context_by_unit.get(unit.id, ""))
-            if current and current_chars + unit_chars > self._max_input_chars:
+            candidate = [*current, unit]
+            # Summing standalone unit inputs would count a shared hunk many
+            # times and split a PR that actually fits in one generation pass.
+            candidate_chars = (
+                _BLOCK_OVERHEAD
+                + len(_render_changes(candidate, right_lines, diffs))
+                + len(pack.render_shared((item.id for item in candidate), context_by_unit))
+            )
+            if current and candidate_chars > self._max_input_chars:
                 blocks.append(current)
-                current = []
-                current_chars = _BLOCK_OVERHEAD
-            current.append(unit)
-            current_chars += unit_chars
+                current = [unit]
+            else:
+                current = candidate
         if current:
             blocks.append(current)
         return blocks
@@ -374,13 +376,14 @@ class HypothesisGenerator:
         self,
         pack: ContextPack,
         block: list[SemanticUnit],
-        changes_by_unit: dict[str, str],
+        right_lines: dict[str, dict[int, str]],
+        diffs: dict[str, str],
         context_by_unit: dict[str, str],
         ledger: HypothesisLedger,
     ) -> str:
         sections: list[str] = []
         sections.append("## PR intent\n" + (pack.pr_intent or "（无）/(none)"))
-        changes = "\n\n".join(changes_by_unit[unit.id] for unit in block)
+        changes = _render_changes(block, right_lines, diffs)
         allowed = ", ".join(unit.id for unit in block)
         sections.append(
             "## Changes\nAllowed unit_id values (copy exactly; do not construct a file:symbol ID):\n"
@@ -388,7 +391,7 @@ class HypothesisGenerator:
             + "\n\n"
             + changes
         )
-        context = "\n\n".join(context_by_unit[unit.id] for unit in block if context_by_unit.get(unit.id))
+        context = pack.render_shared((unit.id for unit in block), context_by_unit)
         sections.append("## Context\n" + (context or "（无）/(none)"))
         sections.append("## Unchecked\n" + _render_unchecked(pack))
         sections.append("## Existing hypotheses\n" + _render_existing(ledger))

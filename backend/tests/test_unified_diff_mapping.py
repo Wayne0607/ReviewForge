@@ -1,4 +1,40 @@
-from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
+from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines, render_numbered_diff
+
+
+def test_numbered_diff_keeps_deleted_guards_and_exact_source_coordinates():
+    patch = "@@ -10,3 +20,2 @@\n def f():\n-    validate(user_input)\n+    return user_input\n"
+    rendered = render_numbered_diff(patch)
+    assert rendered.splitlines() == [
+        "@@ -10,3 +20,2 @@",
+        "    20 | def f():",
+        "-    validate(user_input)",
+        "+   21 |     return user_input",
+    ]
+    assert iter_right_lines(patch) == [(20, "def f():"), (21, "    return user_input")]
+
+
+def test_numbered_diff_does_not_assign_coordinates_by_repeated_text():
+    patch = (
+        "+same_text\n@@ -1 +1 @@\n+same_text\n@@ malformed\n+same_text\n"
+        "diff --git a/a.py b/b.py\n+++ b/b.py\n@@ -10 +20 @@\n+same_text\n"
+    )
+    rendered = render_numbered_diff(patch)
+    assert rendered.count("+same_text") == 2  # Both unanchored copies stay unnumbered.
+    assert "+    1 | same_text" in rendered
+    assert "+   20 | same_text" in rendered
+    assert "+++ b/b.py" in rendered
+
+
+def test_numbered_deletion_only_hunk_has_no_right_anchors():
+    patch = "@@ -10,2 +9,0 @@\n-old_guard()\n-old_lock()"
+    assert render_numbered_diff(patch) == patch
+    assert iter_right_lines(patch) == []
+
+
+def test_numbered_diff_preserves_blank_code_lines_and_trailing_whitespace():
+    patch = "@@ -0,0 +1,2 @@\n+key=value  \n+"
+    assert render_numbered_diff(patch).splitlines() == ["@@ -0,0 +1,2 @@", "+    1 | key=value  ", "+    2 | "]
+    assert iter_right_lines(patch) == [(1, "key=value  "), (2, "")]
 
 
 def test_maps_multiple_hunks_with_context_and_deletions():

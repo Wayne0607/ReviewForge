@@ -228,8 +228,8 @@ class HypothesisLedger:
 **输入渲染（顺序固定）。**
 1. 系统提示（§5.1）。
 2. `## PR intent`：`pack.pr_intent`。
-3. `## Changes`：每个 unit 的 diff hunk（RIGHT 侧带行号）。
-4. `## Context`：`pack.render_all()`；每个 slice 以 `### {kind} {path}:{start}-{end} — {reason}` 开头。
+3. `## Changes`：本块各文件的 before/after diff hunk，每个 hunk 只呈现一次；可评论行就地标注 `RIGHT行号 | 原代码`，保留新增/删除标记与源码顺序，不再复制一整份右侧代码。之后逐 unit 保留独立 ID、符号和可用 RIGHT 行号。分块预算按共享 hunk 的实际渲染长度计量，同一 hunk 不能因多个 unit 重复入账。被删除的 guard/lock 等左侧代码与各 unit 的右侧锚点均不可省略，跨块仍需要各自携带相关完整变更。
+4. `## Context`：按 `pack.render_all()` 的原风险顺序和全局字符预算选出的视图；每个 slice 以 `### {kind} {path}:{start}-{end} — {reason}` 开头。同一块内 path / 行范围 / SHA / 已交付文本均相同的片段可引用前一个 unit 的 source，保留当前 kind/reason/header；引用不能增加字符数或恢复预算外正文，不能跨块引用。独立 investigator 仍使用原 `render_for_unit()`。
 5. `## Unchecked`：`truncated_kinds` 汇总——告诉模型哪些上下文没给到，这些方向只能提 `open_question` 不能下结论。
 6. `## Existing hypotheses`（分块或 lens 时）：identity / claim 列表。
 7. `## Required assessments`：本块 unit ID 清单与数量，要求每个 ID 返回 hypothesis 或带 checked 边界的 no_issue（包括测试与 fixture）；不得由上下文或旧账本代替本轮返回。清单计入既有输入字符上限，省略仍进入 unresolved，不做补找重试。

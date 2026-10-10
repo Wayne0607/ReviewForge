@@ -9,6 +9,50 @@ from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitConte
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 
 
+def _shared_pack():
+    text = "shared_source_fact\n" * 200
+    slices = [
+        ContextSlice("caller", "caller.py", 1, 60, "run", text, "first caller relation", "head"),
+        ContextSlice("callee", "caller.py", 1, 60, "run", text, "second callee relation", "head"),
+    ]
+    pack = ContextPack(units={f"u{i}": UnitContext(f"u{i}", [slice_], ["schema"]) for i, slice_ in enumerate(slices)})
+    views = {identity: pack.render_for_unit(identity, max_chars=10000) for identity in pack.units}
+    return pack, views, text
+
+
+def test_shared_context_preserves_unit_relations_and_fits_original_budget():
+    pack, views, text = _shared_pack()
+    result = pack.render_shared(["u0", "u1"], views)
+    assert result.count(text) == 1
+    assert "first caller relation" in result and "second callee relation" in result
+    assert "Same source as Unit u0, slice 1 (caller caller.py:1-60)" in result
+    assert len(result) < len("\n\n".join(views.values()))
+    assert all(context.truncated_kinds == ["schema"] for context in pack.units.values())
+    assert pack.render_shared(["u1"], views) == views["u1"]  # References never cross a block.
+
+
+@pytest.mark.parametrize("field", ["path", "start_line", "sha", "text"])
+def test_shared_context_never_merges_different_source(field):
+    pack, _, text = _shared_pack()
+    slice_ = pack.units["u1"].slices[0]
+    value = getattr(slice_, field)
+    setattr(slice_, field, value + 1 if isinstance(value, int) else value + "changed")
+    views = {identity: pack.render_for_unit(identity, max_chars=10000) for identity in pack.units}
+    result = pack.render_shared(["u0", "u1"], views)
+    assert "Same source as" not in result
+    assert result.count(text) == 2
+
+
+def test_shared_context_never_restores_text_after_a_truncation_boundary():
+    pack, views, text = _shared_pack()
+    views["u0"] = views["u0"][:300]
+    views["u1"] = views["u1"][:250]
+    result = pack.render_shared(["u0", "u1"], views)
+    assert result == "\n\n".join(views.values())
+    assert text not in result
+    assert "Same source as" not in result
+
+
 @dataclass
 class _Hit:
     path: str

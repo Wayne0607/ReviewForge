@@ -203,3 +203,17 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 - 提示词要求候选以已观察的不一致为起点，比较 before/after，核对负向测试预期、合并相同 trigger/impact/事实问题；调查直接读取已知行窗口，回答问题后停止扩展探索。
 
 新增 6 项调查回归，并强化分块清单只包含本块 ID 的预算检查。覆盖提前收尾、未保存/未找到的证据不能确认、结论 provider 失败可重试、单步预算、工具参数预测及真实 usage 校正。完整本地检查 `1512 passed, 1 skipped, 6 warnings`；ruff / format / spec-check 与严格裁判算法回归通过。将使用新的冻结提交和输出目录，在相同模型与 PR head 上做预检；尚无本轮真实质量分。
+
+冻结 `33deded` 实测同一个 head，结果位于 `.reviewforge/benchmarks/v4-convergence-20261010-234459/`。49 次请求全部成功，58 个单元均返回判断，unresolved 从 4 降至 0；12 条调查全部在预算内返回三值结论，`token-exhausted` / `ungrounded` 均从 8 / 2 降到 0。账本为 6 CONFIRMED / 1 REFUTED / 24 UNKNOWN，其中 19 条未获调查预算、5 条调查后证据不足。实际行内评论 3 条，用量 318883 tokens（GEN 71243 / lens 63362 / INV 173490 / editor 10788），仍超过 250000，耗时 1888.61 秒。候选从 28 增至 31，说明提示词调整尚未解决噪音；不能把更多 CONFIRMED 当作质量更高。内层仍 partial，严格准入拒绝评分，未运行 legacy 或 holdout。
+
+## 2026-10-11 共享变更与上下文呈现
+
+回查 blame 与模块注释：此前 `c50ed3b` / `bc9bc15` 补回 before/after hunks 是为保留被删 guard/lock 的行为变化，这个约束仍成立；但为每个 unit 复制完整 hunk 和全部右侧代码不必要，也让同一根因在多个单位里反复出现。当前预检的离线审计发现 GEN 两个块重复 hunk 33845 字符。只加提示词没有解决该输入结构问题。
+
+改为每块每文件共享 hunk，RIGHT 坐标在代码旁就地标注，各 unit 保留独立 ID/符号/可用行号。坐标仍由既有统一 diff 解析器生成，删除、metadata、畸形未映射行保持原文且不发明坐标；重复代码按 patch index 区分，不按文本匹配。分块按共享渲染后的长度计量，不能在估算时又重复累计。跨块仍各自携带需要的完整变更。
+
+对已按原 40000 字符水位交付的 ContextPack 视图，块内相同 path/范围/SHA/正文的 source 仅交付一次，其它 unit 保留 kind/reason/header 并引用前方片段；不扩大预算、不恢复截断正文、不跨块引用，investigator 的独立上下文不变。既有单元漏答门槛、每次最多 12 条候选、每 PR 12 条调查与 grounding 校验均保留。
+
+离线按捕获输入压缩（不调用模型、不打质量分）保留全部 units / hunks 与相同 RIGHT 坐标正文，五个输入合计节省 80016 字符，记录 `shared-input-audit.json`。这不是实际 token 消耗或质量成绩；下一轮需冻结新提交重新实测。新增测试覆盖共享 hunk/预算、跨块源码、删除 guard、元数据/畸形重复行、空行/尾空格、共享上下文边界、来源差异与截断不复原。
+
+本轮新增 14 个参数化/独立回归；完整本地 `1526 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。检查结束后再建立新的源码快照和输出目录，模型、数据集、预算与资源限制保持一致。

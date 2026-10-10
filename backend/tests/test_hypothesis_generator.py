@@ -10,7 +10,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ConfigDict, Field
 
 from reviewforge.core.state import StateStore
-from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus, Mechanism
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
@@ -395,6 +395,104 @@ async def test_generator_sees_removed_guard_and_patch_markers() -> None:
     assert "-    if owner_id is None:" in prompt
     assert "@@ -1,4 +1,2 @@" in prompt
     assert "2 |     return create_resource(owner_id)" in prompt
+
+
+@pytest.mark.asyncio
+async def test_shared_hunk_is_rendered_once_and_budgeted_once_for_distinct_units():
+    first = _unit("big.py", "first", end_line=2)
+    last = _unit("big.py", "last", end_line=150)
+    last.start_line = 149
+    source = ["def first():", *["    # " + "padding" * 42 for _ in range(148)], "def last():"]
+    patch = _diff("big.py", *source)
+    response = json.dumps(
+        {"hypotheses": [], "no_issue_units": [{"unit_id": unit.id, "checked": "checked"} for unit in (first, last)]}
+    )
+    llm = _ScriptedLLM(responses=[response])
+    ledger = HypothesisLedger("run", "abc", "digest")
+    result = await HypothesisGenerator(llm, max_input_chars=60000).run(
+        StateStore(file_diffs={"big.py": patch}), ContextPack(), _changeset(first, last), ledger
+    )
+    assert result.blocks == 1 and len(llm.calls) == 1
+    prompt = llm.calls[0][1].content
+    assert len(prompt) <= 60000
+    assert prompt.count("@@ -0,0 +1,150 @@") == 1
+    assert "1 | def first():" in prompt and "150 | def last():" in prompt
+    assert prompt.count("def first():") == 1 and prompt.count("def last():") == 1
+    assert set(ledger.no_issue_units) == {first.id, last.id}
+    assert not ledger.unresolved_units
+
+
+@pytest.mark.asyncio
+async def test_shared_diff_preserves_removed_guards_without_unrelated_hunks():
+    first = _unit("service.py", "first", end_line=2)
+    last = _unit("service.py", "last", end_line=20)
+    last.start_line = 20
+    patch = (
+        "@@ -1,3 +1,2 @@\n def first():\n-    validate(user_input)\n+    return user_input\n"
+        "@@ -20,2 +20,1 @@\n-    check_owner(owner)\n+    return create_resource(owner_id)\n"
+        "@@ -900 +900 @@\n+UNRELATED_CHANGE\n"
+    )
+    llm = _ScriptedLLM(responses=['{"hypotheses":[],"no_issue_units":[]}'])
+    await HypothesisGenerator(llm).run(
+        StateStore(file_diffs={"service.py": patch}),
+        ContextPack(),
+        _changeset(first, last),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+    prompt = llm.calls[0][1].content
+    assert prompt.count("-    validate(user_input)") == 1
+    assert prompt.count("-    check_owner(owner)") == 1
+    assert "UNRELATED_CHANGE" not in prompt
+    assert "2 |     return user_input" in prompt
+    assert "20 |     return create_resource(owner_id)" in prompt
+
+
+@pytest.mark.asyncio
+async def test_shared_diff_retains_code_in_every_block_that_needs_it():
+    first = _unit("big.py", "first", end_line=1)
+    last = _unit("big.py", "last", end_line=300)
+    last.start_line = 300
+    patch = "@@ -0,0 +1,1 @@\n+" + "x" * 1500 + "\n@@ -299,0 +300,1 @@\n+" + "y" * 1500
+    llm = _ScriptedLLM(responses=['{"hypotheses":[],"no_issue_units":[]}'] * 2)
+    await HypothesisGenerator(llm, max_input_chars=2800).run(
+        StateStore(file_diffs={"big.py": patch}),
+        ContextPack(),
+        _changeset(first, last),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+    assert len(llm.calls) == 2
+    for call, code in zip(llm.calls, ("x" * 1500, "y" * 1500), strict=True):
+        assert call[1].content.count(code) == 1
+        assert len(call[1].content) <= 2800
+
+
+@pytest.mark.asyncio
+async def test_block_budget_counts_shared_context_once_without_restoring_omissions():
+    first = _unit("a.py", "first")
+    second = _unit("b.py", "second")
+    shared = ContextSlice("caller", "caller.py", 1, 60, "run", "source_fact\n" * 900, "caller", "head")
+    pack = ContextPack(units={unit.id: UnitContext(unit.id, [shared], ["schema"]) for unit in (first, second)})
+    llm = _ScriptedLLM(
+        responses=[
+            json.dumps(
+                {
+                    "hypotheses": [],
+                    "no_issue_units": [{"unit_id": u.id, "checked": "caller checked"} for u in (first, second)],
+                }
+            )
+        ]
+    )
+    result = await HypothesisGenerator(llm, max_input_chars=18000).run(
+        StateStore(file_diffs={"a.py": _diff("a.py", "def first():"), "b.py": _diff("b.py", "def second():")}),
+        pack,
+        _changeset(first, second),
+        HypothesisLedger("run", "abc", "digest"),
+    )
+    assert result.blocks == 1 and len(llm.calls) == 1
+    assert llm.calls[0][1].content.count(shared.text) == 1
+    assert len(llm.calls[0][1].content) <= 18000
+    assert "Same source as Unit a.py:first" in llm.calls[0][1].content
+    assert all(context.truncated_kinds == ["schema"] for context in pack.units.values())
 
 
 @pytest.mark.asyncio

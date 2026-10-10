@@ -167,6 +167,51 @@ class ContextPack:
             return ""
         return _render_unit(context, max(0, int(max_chars)))
 
+    def render_shared(self, unit_ids: Iterable[str], views: dict[str, str]) -> str:
+        """Compact already-budgeted views, sharing identical source in a block.
+
+        Keep each unit/kind/reason header and its truncation boundary. A source
+        reference replaces text only when it is shorter, and only refers to a
+        preceding slice in this call. No omitted slice is restored from the pack.
+        """
+        seen: dict[tuple[str, int, int, str, str], tuple[str, int, str]] = {}
+        rendered: list[str] = []
+        for unit_id in unit_ids:
+            view = views.get(unit_id, "")
+            if not view:
+                continue
+            context = self.units.get(unit_id)
+            parts = _render_unit_parts(context) if context is not None else []
+            if not parts or "\n\n".join(parts)[: len(view)] != view:
+                rendered.append(view)
+                continue
+            pieces = []
+            offset = 0
+            for index, part in enumerate(parts):
+                piece = ("\n\n" if index else "") + part
+                visible = view[offset : offset + len(piece)]
+                if index and len(visible) > 2:
+                    header, separator, body = visible[2:].partition("\n\n")
+                    if separator and body:
+                        slice_ = context.slices[index - 1]
+                        key = (slice_.path, slice_.start_line, slice_.end_line, slice_.sha, body)
+                        if key in seen:
+                            first_unit, first_index, first_kind = seen[key]
+                            reference = (
+                                f"Same source as Unit {first_unit}, slice {first_index} "
+                                f"({first_kind} {slice_.path}:{slice_.start_line}-{slice_.end_line})."
+                            )
+                            if len(reference) < len(body):
+                                visible = "\n\n" + header + separator + reference
+                        else:
+                            seen[key] = (unit_id, index, slice_.kind)
+                pieces.append(visible)
+                offset += len(piece)
+                if offset >= len(view):
+                    break
+            rendered.append("".join(pieces))
+        return "\n\n".join(rendered)
+
     def render_all(self, *, max_chars: int) -> str:
         """Render units by descending risk, filling the global char budget."""
 

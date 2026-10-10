@@ -42,17 +42,17 @@ def select_diff_hunks(diff: str, ranges: Iterable[tuple[int, int]]) -> str:
     return "\n".join(selected)
 
 
-def _iter_right_lines(diff: str) -> list[tuple[int, str, bool]]:
-    """Return mapped post-image lines as ``(line, content, is_added)``."""
+def _right_records(diff: str) -> list[tuple[int, int, str, bool]]:
+    """Return ``(patch_index, RIGHT line, content, is_added)`` records."""
 
-    right_lines: list[tuple[int, str, bool]] = []
+    right_lines: list[tuple[int, int, str, bool]] = []
     old_line = 0
     new_line = 0
     old_remaining = 0
     new_remaining = 0
     in_hunk = False
 
-    for raw_line in (diff or "").splitlines():
+    for patch_index, raw_line in enumerate((diff or "").splitlines()):
         header = _HUNK_HEADER.match(raw_line)
         if header:
             old_line = int(header.group("old_start"))
@@ -82,7 +82,7 @@ def _iter_right_lines(diff: str) -> list[tuple[int, str, bool]]:
             if new_remaining <= 0:
                 in_hunk = False
                 continue
-            right_lines.append((new_line, raw_line[1:], True))
+            right_lines.append((patch_index, new_line, raw_line[1:], True))
             new_line += 1
             new_remaining -= 1
         elif prefix == "-":
@@ -95,7 +95,7 @@ def _iter_right_lines(diff: str) -> list[tuple[int, str, bool]]:
             if old_remaining <= 0 or new_remaining <= 0:
                 in_hunk = False
                 continue
-            right_lines.append((new_line, raw_line[1:], False))
+            right_lines.append((patch_index, new_line, raw_line[1:], False))
             old_line += 1
             new_line += 1
             old_remaining -= 1
@@ -118,7 +118,21 @@ def iter_right_lines(diff: str) -> list[tuple[int, str]]:
     ignored instead of inventing coordinates.
     """
 
-    return [(line_no, content) for line_no, content, _is_added in _iter_right_lines(diff)]
+    return [(line_no, content) for _index, line_no, content, _is_added in _right_records(diff)]
+
+
+def render_numbered_diff(diff: str) -> str:
+    """Annotate valid RIGHT lines in place, preserving before/after order.
+
+    Deletions, metadata and malformed/unmapped text retain their original
+    contents and receive no comment coordinates. Patch indexes, rather than
+    code-text matching, distinguish identical lines in different hunks.
+    """
+    mapped = {index: (line, content) for index, line, content, _added in _right_records(diff)}
+    return "\n".join(
+        f"{raw[:1]}{mapped[index][0]:>5} | {mapped[index][1]}" if index in mapped else raw
+        for index, raw in enumerate((diff or "").splitlines())
+    )
 
 
 def iter_added_lines(diff: str) -> list[tuple[int, str]]:
@@ -133,4 +147,4 @@ def iter_added_lines(diff: str) -> list[tuple[int, str]]:
     their line numbers are fully determined by the hunk's ``+<start>`` coordinate.
     """
 
-    return [(line_no, content) for line_no, content, is_added in _iter_right_lines(diff) if is_added]
+    return [(line_no, content) for _index, line_no, content, is_added in _right_records(diff) if is_added]

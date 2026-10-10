@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.prompts_v4 import load_prompt
 
 _LOCALIZATION_PATH = re.compile(r"\.(properties|po)$|messages_[^/]+\.json$|/locale/", re.IGNORECASE)
@@ -36,6 +37,15 @@ def python_concurrency_guidance() -> str:
 
 def defect_scope_guidance() -> str:
     return load_prompt("defect_scope")
+
+
+def has_state_navigation(pack: ContextPack, unit_id: str) -> bool:
+    context = pack.units.get(unit_id)
+    return bool(context and any("State navigation (not evidence;" in slice_.reason for slice_ in context.slices))
+
+
+def state_guidance() -> str:
+    return load_prompt("state_contracts")
 
 
 def investigation_capabilities() -> str:

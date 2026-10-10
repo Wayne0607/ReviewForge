@@ -158,6 +158,8 @@ Java 的限定检索是源码导航，不是完整类型/继承或反射分析�
 
 被调 Java 方法涉及可变 static 字段时，callee 的 reason 可附 `State navigation`：检查该方法及一层同类 helper，列出相关字段声明和同类方法引用位置，每条索引 ≤600 字符、最多 4 字段/每字段 6 方法，遗漏明确标示。它用来发现 configure/init/reset 等替代入口，不声明写入事实、调用顺序或完整性；仍计入原渲染预算，不新建工具、Observation 或 verdict。调查需用既有工具窄读取证。
 
+有这类索引的 unit 在生成、lens 和调查阶段共用 `state_contracts.md`：定位替代 producer，证明目标输入的值绑定及实际入口顺序，不能仅凭初始化名称、注册注解或一次 configure 调用推断时序。指南只按该 unit 的已编译 reason 选择，不从源码正文中的同名文本触发；生成分块计入其字符，调查收尾保留同份规则，无关 unit 不额外交付。它是取证方法，不能作为 Observation，不改变既有证明门槛或预算。
+
 **失败。** workspace 降级时 pack 只含 `pr_intent` 与 diff 内可得信息，`truncated_kinds=["all"]`；不阻断 run。
 
 **测试。** 用 4.1 的 fixture 仓库，断言每种 kind 至少一个用例能取到正确片段；断言限额与排序确定性（同输入两次渲染字节相同）。

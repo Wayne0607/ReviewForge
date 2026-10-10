@@ -334,6 +334,56 @@ def test_discovery_scope_survives_investigation_closure_and_is_not_source_eviden
     assert not investigator._observations
 
 
+@pytest.mark.parametrize("related", [False, True])
+def test_state_proof_guidance_survives_closure_only_for_the_related_unit(related):
+    from reviewforge.engine.context_pack import ContextSlice, UnitContext
+    from reviewforge.engine.verification_guidance import state_guidance
+
+    hypothesis = _hypothesis()
+    identity = hypothesis.unit_id if related else "unrelated"
+    pack = ContextPack(
+        units={
+            identity: UnitContext(
+                identity,
+                [
+                    ContextSlice(
+                        "callee",
+                        "Gate.java",
+                        1,
+                        1,
+                        "check",
+                        "return CURRENT;",
+                        "State navigation (not evidence; order unproved): CURRENT@2: configure@8",
+                        "head-sha",
+                    )
+                ],
+            )
+        }
+    )
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}))
+    user = investigator._render_user(hypothesis, _state(), pack)
+    guide = state_guidance()
+    assert (guide in user) is related
+    closure = investigator._closing_chat([AIMessage(content=user)], 24000)
+    assert "\n\n".join(message.content for message in closure).count(guide) == int(related)
+    assert not investigator._observations
+    result = investigator._finalize(
+        {
+            "assessment": {
+                "expected": "The CLI must update state before execution",
+                "actual": "A configuration method exists",
+                "expected_evidence": ["obs_0:e1"],
+                "actual_evidence": ["obs_0:e1"],
+                "comparison": "compatible",
+            }
+        },
+        hypothesis,
+        {"a.py"},
+        steps=0,
+    )
+    assert result.verdict == "unknown" and result.reason == "ungrounded-assessment"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", ["step=安裝手機應用程式", "No results"])
 async def test_locale_boundary_still_requires_recorded_source_evidence(content):

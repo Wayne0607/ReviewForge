@@ -40,9 +40,11 @@ from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
 from reviewforge.engine.verification_guidance import (
     defect_scope_guidance,
     has_python_concurrency,
+    has_state_navigation,
     is_localization_path,
     localization_guidance,
     python_concurrency_guidance,
+    state_guidance,
 )
 from reviewforge.tools.workspace import _bounded_range
 
@@ -422,6 +424,8 @@ class Investigator:
             sections.append("## Verification guidance\n" + localization_guidance())
         if any(has_python_concurrency(path, diffs.get(path, "")) for path in ranges):
             sections.append("## Verification guidance\n" + python_concurrency_guidance())
+        if has_state_navigation(pack, hypothesis.unit_id):
+            sections.append("## Verification guidance\n" + state_guidance())
         return "\n\n".join(sections)
 
     def _resource_boundary(self, hypothesis: Hypothesis) -> str:

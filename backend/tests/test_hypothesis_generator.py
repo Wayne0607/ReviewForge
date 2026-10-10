@@ -64,7 +64,7 @@ def test_general_generation_contract_guidance_is_scoped_to_each_block():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("contract", ["localization", "python-concurrency"])
+@pytest.mark.parametrize("contract", ["localization", "python-concurrency", "shared-state"])
 async def test_generation_contract_guidance_counts_toward_each_block_budget(contract):
     if contract == "localization":
         paths = ("messages_en.properties", "messages_fr.properties")
@@ -72,11 +72,14 @@ async def test_generation_contract_guidance_counts_toward_each_block_budget(cont
             f"key_{index}=A long translated message with enough source text to exercise the input budget."
             for index in range(32)
         ]
-    else:
+    elif contract == "python-concurrency":
         paths = ("first.py", "second.py")
         lines = ["import multiprocessing"] + [
             f"process_{index} = multiprocessing.get_context('spawn').Process(target=run_worker)" for index in range(31)
         ]
+    else:
+        paths = ("First.java", "Second.java")
+        lines = [f"    consumeState(value_{index});" for index in range(32)]
     units = [_unit(path, "", end_line=32) for path in paths]
     diffs = {unit.path: _diff(unit.path, *lines) for unit in units}
     right = {unit.path: dict(enumerate(lines, start=1)) for unit in units}
@@ -88,14 +91,34 @@ async def test_generation_contract_guidance_counts_toward_each_block_budget(cont
         ]
     )
     generator = HypothesisGenerator(llm, context_max_chars=0)
+    pack = ContextPack()
+    if contract == "shared-state":
+        pack.units = {
+            unit.id: UnitContext(
+                unit.id,
+                [
+                    ContextSlice(
+                        "callee",
+                        "Gate.java",
+                        1,
+                        1,
+                        "Gate.check",
+                        "return CURRENT;",
+                        "State navigation (not evidence; order unproved): CURRENT@2: configure@8",
+                        "abc",
+                    )
+                ],
+            )
+            for unit in units
+        }
 
     def render(block):
-        return generator._render_user_message(ContextPack(), block, right, diffs, {}, ledger)
+        return generator._render_user_message(pack, block, right, diffs, {}, ledger)
 
     limit = max(len(render([unit])) for unit in units) + 1
     assert len(render(units)) > limit
     generator._max_input_chars = limit
-    result = await generator.run(StateStore(file_diffs=diffs), ContextPack(), _changeset(*units), ledger)
+    result = await generator.run(StateStore(file_diffs=diffs), pack, _changeset(*units), ledger)
     assert result.blocks == 2 and result.failed_blocks == 0 and len(llm.calls) == 2
     assert set(ledger.no_issue_units) == {unit.id for unit in units}
     assert not ledger.unresolved_units
@@ -124,6 +147,31 @@ def test_generation_supplies_python_contracts_only_to_relevant_blocks(path, sour
     if expected:
         assert "BaseProcess" in user and "total attempts" in user
     assert source in user and user.endswith(unit.id)
+
+
+@pytest.mark.parametrize("template", ["generator", "lens"])
+def test_generation_and_lenses_share_scoped_state_proof_guidance(template):
+    from reviewforge.engine.verification_guidance import state_guidance
+
+    unit = _unit("Command.java", "run", end_line=1)
+    related = ContextSlice(
+        "callee",
+        "Gate.java",
+        1,
+        1,
+        "Gate.check",
+        "return CURRENT;",
+        "State navigation (not evidence; order unproved): CURRENT@2: configure@8",
+        "abc",
+    )
+    pack = ContextPack(units={unit.id: UnitContext(unit.id, [related])})
+    generator = HypothesisGenerator(_ScriptedLLM(), prompt_template=template)
+    guide = state_guidance()
+    assert generator._verification_guidance([unit], {}, pack).count(guide) == 1
+    assert generator._verification_guidance([_unit("Unrelated.java", "run")], {}, pack) == ""
+    related.text = related.reason
+    related.reason = "defines a method"
+    assert generator._verification_guidance([unit], {}, pack) == ""
 
 
 def _server_diff() -> dict[str, str]:

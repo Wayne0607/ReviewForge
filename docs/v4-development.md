@@ -357,4 +357,10 @@ Sentry 的 error 重启计数候选出现 `comparison=compatible` / `verdict=con
 
 同一被调方法另附有界的可变 static 字段导航，覆盖当前方法及一层同类 helper，再列同类引用方法位置；因此可发现 configure / init / reset，避免调查只沿偶然看到的一个入口走下去。索引是导航，不是执行顺序证明，不生成 Observation，不代替调查员判定，仍受 12 slices / 60 行 / 40000 字符原限额。新增端到端 Manifest→SemanticChangeSet→ContextPack、嵌套 owner、包歧义、遮蔽、变量作用域、负向解析、字段导航隔离及限额回归。注解起始行还需按声明的 start_line 定位，已补真实 caller 回归；相关 122 项通过，完整检查为 `1666 passed, 1 skipped, 6 warnings`，ruff / 199 文件 format / spec-check / 严格裁判回归均通过。旧 v4 精确字典断言已按新增元数据更新，legacy 精确三字段断言保留；独立定向实跑待完成。
 
+冻结 `21cd037` 的独立 INV 诊断位于 `.reviewforge/benchmarks/v4-java-navigation-20261011-063745/`。两条原 CLI 候选在调用前声明，新输入不带旧 verdict/observations，不续跑或重开原账本。23 个实现/配置文件逐一对 Git 摘要；额外诊断 driver 另存摘要，模型/语言/thinking/retries/每候选原预算与前轮一致，不经过 GEN、editor 或裁判。完整 workspace 摘要仍为 `0a35ee26...`、20 units / 40000 字符，两条相关 unit 为 6 / 8 slices，均仅定位正确 Profile callee，configure/init/reset 导航及无关路径排除断言先于付费调用。
+
+实跑完成 9 次成功请求 / 37869 tokens，Job 返回 0、峰值 402296832 bytes、评测锁释放，两个原始结果均为 REFUTED。一条仍只沿 Recorder 路径假定启动顺序；另一条已找到 configure，但用单条 Environment 调用同时证明 CLI 值绑定和执行顺序。语义复查未通过，`semantic-audit.json` 标明缺失的前提，原结果摘要和响应保留，不把 REFUTED 数量当进步，不生成 pipeline 质量分或宣称验收通过。
+
+再回查规则交付：已有初始索引说明仍未使调查员完成实际路径取证。现把共享状态的证明要求贯通相关生成块、lens、调查与收尾；要求证明输入绑定、producer 与入口顺序，初始化名称/注册标签/配置调用本身不足以闭合。索引是导航，规则不是证据；按编译 reason 选择，源码中的同名字符串不能触发，字符计入分块且不加模型阶段或预算。新增 5 项跨阶段隔离、收尾保留、不得凭指南构造引用及分块预算回归；相关 164 项通过，完整 `1671 passed, 1 skipped, 6 warnings`，ruff / format 通过，同预算独立复测待完成。
+
 新增 20 项单一关系协议回归，先复现旧实现 9 项失败，再验证三值映射、空/畸形关系、两前提、负向/未知引用、无效旧引用与旧矛盾 verdict，以及原 4000 token 单步取证→收尾。相关共 170 项通过；完整 `1643 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。共享审查范围与本协议变更只用于下一份独立源码快照。`decision-duplication-audit.json` 记录两条真实矛盾响应及账本 hash，两前提引用均已精确保存；历史 verdict 保持原值。

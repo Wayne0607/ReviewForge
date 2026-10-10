@@ -37,10 +37,12 @@ from reviewforge.engine.symbol_extractor import _find_enclosing_function
 from reviewforge.engine.verification_guidance import (
     defect_scope_guidance,
     has_python_concurrency,
+    has_state_navigation,
     investigation_capabilities,
     is_localization_path,
     localization_guidance,
     python_concurrency_guidance,
+    state_guidance,
 )
 from reviewforge.tools.workspace import WorkspaceUnavailable
 
@@ -370,7 +372,7 @@ class HypothesisGenerator:
                 _BLOCK_OVERHEAD
                 + len(_render_changes(candidate, right_lines, diffs))
                 + len(pack.render_shared((item.id for item in candidate), context_by_unit))
-                + len(self._verification_guidance(candidate, diffs))
+                + len(self._verification_guidance(candidate, diffs, pack))
             )
             if current and candidate_chars > self._max_input_chars:
                 blocks.append(current)
@@ -381,16 +383,19 @@ class HypothesisGenerator:
             blocks.append(current)
         return blocks
 
-    def _verification_guidance(self, units: list[SemanticUnit], diffs: dict[str, str]) -> str:
-        # A lens already carries its own guide in the system prompt. General
-        # generation receives guides only in blocks with relevant changes.
-        if self._prompt_template != "generator":
-            return ""
+    def _verification_guidance(
+        self, units: list[SemanticUnit], diffs: dict[str, str], pack: ContextPack | None = None
+    ) -> str:
+        # Lenses carry their domain guides in the system prompt. State-flow
+        # proof rules follow collected navigation in all discovery roles.
         guides = []
-        if any(is_localization_path(unit.path) for unit in units):
-            guides.append(localization_guidance())
-        if any(has_python_concurrency(unit.path, diffs.get(unit.path, "")) for unit in units):
-            guides.append(python_concurrency_guidance())
+        if self._prompt_template == "generator":
+            if any(is_localization_path(unit.path) for unit in units):
+                guides.append(localization_guidance())
+            if any(has_python_concurrency(unit.path, diffs.get(unit.path, "")) for unit in units):
+                guides.append(python_concurrency_guidance())
+        if pack is not None and any(has_state_navigation(pack, unit.id) for unit in units):
+            guides.append(state_guidance())
         return "## Verification guidance\n" + "\n\n".join(guides) if guides else ""
 
     def _render_user_message(
@@ -416,7 +421,7 @@ class HypothesisGenerator:
         sections.append("## Context\n" + (context or "（无）/(none)"))
         sections.append("## Unchecked\n" + _render_unchecked(pack))
         sections.append("## Existing hypotheses\n" + _render_existing(ledger))
-        guidance = self._verification_guidance(block, diffs)
+        guidance = self._verification_guidance(block, diffs, pack)
         if guidance:
             sections.append(guidance)
         sections.append(

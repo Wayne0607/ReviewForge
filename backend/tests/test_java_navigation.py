@@ -284,3 +284,24 @@ def test_state_navigation_masks_literals_and_excludes_nested_class_state():
     assert "configure" in result and "init" in result and "reset" in result
     assert "UNRELATED" not in result and "example" not in result and "nestedConfigure" not in result
     assert len(navigation.state_navigation(definition, max_chars=110)) <= 110
+
+
+@pytest.mark.asyncio
+async def test_annotated_unit_start_still_resolves_the_declared_caller(java_workspace):
+    sources = {
+        **SOURCES,
+        "cli/Command.java": SOURCES["cli/Command.java"].replace(
+            "    public void run() {", "    @Deprecated\n    public void run() {"
+        ),
+    }
+    workspace = await PRHeadWorkspace.build(
+        _state(files_changed=["cli/Command.java"]), _TarballGitHub(_archive(sources))
+    )
+    try:
+        changeset = _changeset({"callee": "isEnabled", "receiver": "Gate", "line": 6})
+        changeset.units[0].added_lines = [6]
+        changeset.units[0].end_line = 7
+        pack = ContextPack.build(changeset, workspace)
+        assert [s.path for s in pack.units["cmd"].slices if s.kind == "caller"] == ["cli/Entry.java"]
+    finally:
+        workspace.cleanup()

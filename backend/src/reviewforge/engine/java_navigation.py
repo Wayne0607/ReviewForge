@@ -68,7 +68,7 @@ class JavaSource:
         return ".".join(filter(None, [self.class_name(self.owner(definition.line)), definition.name]))
 
     def definition_at(self, name: str, line: int):
-        containing = [d for d in self.definitions if d.name == name and d.line <= line <= d.end_line]
+        containing = [d for d in self.definitions if d.name == name and (d.start_line or d.line) <= line <= d.end_line]
         return min(containing, key=lambda d: d.end_line - d.line, default=None)
 
     def _function(self, line: int):

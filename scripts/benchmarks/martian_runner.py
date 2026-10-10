@@ -6,19 +6,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import faulthandler
-import fcntl
 import hashlib
 import json
 import logging
 import os
 import signal
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+from benchmark_support import is_complete_result, read_metadata, validate_resume_metadata, wait_for_request_slot
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 from pydantic import PrivateAttr
@@ -54,7 +56,8 @@ logger = logging.getLogger("martian_runner")
 _SCHEDULER_CONCURRENCY = 4
 _PUBLICATION_GATE_CONCURRENCY = 1
 _SEARCH_INTERVAL_SECONDS = 7.0
-_SEARCH_RATE_FILE = Path("/tmp/reviewforge-martian-search-rate")
+_SEARCH_RATE_FILE = Path(tempfile.gettempdir()) / "reviewforge-martian-search-rate"
+_LLM_RATE_FILE = Path(tempfile.gettempdir()) / "reviewforge-martian-llm-rate"
 
 
 class BenchmarkLLM(BaseChatModel):
@@ -127,19 +130,7 @@ class BenchmarkLLM(BaseChatModel):
 
 
 def _wait_for_llm_slot(interval: float) -> None:
-    if interval <= 0:
-        return
-    with Path("/tmp/reviewforge-martian-llm-rate").open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.seek(0)
-        previous = float(handle.read().strip() or 0)
-        delay = interval - (time.monotonic() - previous)
-        if delay > 0:
-            time.sleep(delay)
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(time.monotonic()))
-        handle.flush()
+    wait_for_request_slot(_LLM_RATE_FILE, interval)
 
 
 class BenchmarkScheduler(Scheduler):
@@ -203,20 +194,7 @@ class ReadOnlyGitHub:
 
 
 def _wait_for_search_slot() -> None:
-    _SEARCH_RATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with _SEARCH_RATE_FILE.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.seek(0)
-        raw = handle.read().strip()
-        previous = float(raw) if raw else 0.0
-        delay = _SEARCH_INTERVAL_SECONDS - (time.monotonic() - previous)
-        if delay > 0:
-            time.sleep(delay)
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(time.monotonic()))
-        handle.flush()
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    wait_for_request_slot(_SEARCH_RATE_FILE, _SEARCH_INTERVAL_SECONDS)
 
 
 def _capture_invalid_reviewer_outputs(root: Path) -> None:
@@ -436,7 +414,13 @@ async def _run_one(
 async def main_async(args: argparse.Namespace) -> None:
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    except NotImplementedError:
+        # Windows uses process signals rather than Unix event-loop handlers.
+        signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(task.cancel))
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, lambda *_: loop.call_soon_threadsafe(task.cancel))
     global _PUBLICATION_GATE_CONCURRENCY, _SCHEDULER_CONCURRENCY
     _SCHEDULER_CONCURRENCY = args.reviewer_concurrency
     _PUBLICATION_GATE_CONCURRENCY = args.publication_gate_concurrency
@@ -452,7 +436,27 @@ async def main_async(args: argparse.Namespace) -> None:
         workload = workload[: args.limit]
     output_path = Path(args.output).resolve()
     existing = json.loads(output_path.read_text(encoding="utf-8")) if output_path.exists() else []
-    results = {str(item["golden_url"]): item for item in existing if item.get("status") == "completed"}
+    results = {str(item["golden_url"]): item for item in existing if is_complete_result(item)}
+
+    metadata = {
+        "pipeline": args.pipeline,
+        "model": args.model_override,
+        "output_language": args.output_language,
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "support_sha256": hashlib.sha256(Path(__file__).with_name("benchmark_support.py").read_bytes()).hexdigest(),
+        "config_sha256": hashlib.sha256((REPO_ROOT / "reviewforge.yaml").read_bytes()).hexdigest(),
+        "workload_sha256": hashlib.sha256(Path(args.workload).read_bytes()).hexdigest(),
+        "github_writes": "blocked",
+        "source_revision": os.environ.get("REVIEWFORGE_SOURCE_REVISION", ""),
+        "reasoning_effort": args.reasoning_effort or "provider-default",
+        "llm_min_interval": args.llm_min_interval,
+        "thinking": args.thinking,
+        "reviewer_concurrency": args.reviewer_concurrency,
+        "publication_gate_concurrency": args.publication_gate_concurrency,
+        "shard_count": args.shard_count,
+        "shard_index": args.shard_index,
+        "limit": args.limit,
+    }
 
     orchestrator, db, raw_github = await _build_runtime(
         root,
@@ -463,23 +467,19 @@ async def main_async(args: argparse.Namespace) -> None:
         args.llm_min_interval,
         args.thinking,
     )
-    metadata = {
-        "pipeline": args.pipeline,
-        "model": args.model_override,
-        "output_language": args.output_language,
-        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "workload_sha256": hashlib.sha256(Path(args.workload).read_bytes()).hexdigest(),
-        "github_writes": "blocked",
-        "source_revision": os.environ.get("REVIEWFORGE_SOURCE_REVISION", ""),
-        "reasoning_effort": args.reasoning_effort or "provider-default",
-        "llm_min_interval": args.llm_min_interval,
-        "thinking": args.thinking,
-    }
-    _atomic_json(root / "metadata.json", metadata)
     try:
+        effective = orchestrator._model_router._config
+        endpoint = urlsplit(effective.base_url)
+        metadata["provider"] = {"host": endpoint.hostname, "path": endpoint.path}
+        metadata["effective_model"] = effective.model
+        validate_resume_metadata(read_metadata(root / "metadata.json"), metadata, has_results=output_path.exists())
+        _atomic_json(root / "metadata.json", metadata)
         for index, item in enumerate(workload, 1):
             key = str(item["golden_url"])
             if key in results:
+                current = await raw_github.get_pr_info(str(item["repo"]), int(item["pr_number"]))
+                if results[key]["head_sha"] != current["head"]["sha"]:
+                    raise RuntimeError("PR head changed since the saved result; use a new output directory")
                 print(f"SKIP {index}/{len(workload)} {key}", flush=True)
                 continue
             print(

@@ -1,6 +1,6 @@
 # Read-only quality benchmarks
 
-Run on Linux using the backend environment. The runner reads GitHub PR heads,
+Run on Linux or Windows using the backend environment. The runner reads GitHub PR heads,
 intercepts review writes into local receipts, and blocks any other GitHub HTTP
 method except GET/HEAD. Results score actual emitted comments rather than the
 legacy finding store. `summary.status` retains operational partial/failed state;
@@ -71,16 +71,27 @@ delegation cannot bypass it. Judge requests must also respect the provider's
 quota; do not run the judge while review workers are using the same quota.
 
 `llm-traces/` contains public benchmark source and model responses. Keep credential
-files outside the output directory. Each process uses its own SQLite DB; completed
-results are skipped on restart. Diagnose partial execution before treating a
-zero-comment result as successful review coverage.
+files outside the output directory. Each process uses its own SQLite DB. Restart
+skips only operationally complete reviews; inner partial/failed/duplicate-skipped
+results are reattempted. Saved results require identical code, workload, provider
+and run parameters, and the PR head is rechecked before skipping. Changed
+provenance requires a new output directory.
+
+The judge requires every requested PR to be operationally complete before it
+calls the model or produces scores. It refuses to quietly exclude missing or
+partial reviews. Judge resume is tied to exact input hashes and parameters.
+Diagnose partial execution before treating a zero-comment result as successful
+review coverage. The matching prompts, confidence threshold and one-to-one
+matching remain unchanged.
 
 For an OpenAI-compatible provider supporting DeepSeek's thinking parameter,
 `--thinking disabled` requests the non-thinking model. Apply it identically to
 both review sides and the judge, and label this experiment separately from the
 provider-default runs. `--profile` enables periodic Python stack dumps; ordinary
 runs keep them disabled. SIGTERM cancels the benchmark task and cleans its known
-workspaces and connections.
+workspaces and connections. Windows also handles Ctrl+Break; forcefully terminating
+a Windows process cannot promise Python cleanup. Request pacing uses a portable
+process lock and discards stale monotonic timestamps from before a host reboot.
 
 The strict judge preserves the existing matching prompts, threshold, one-to-one
 matching and duplicate penalties. Its settings-path adapter permits use of the

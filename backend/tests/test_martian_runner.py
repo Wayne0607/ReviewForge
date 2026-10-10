@@ -1,4 +1,4 @@
-"""Linux benchmark bootstrap and write-interception regressions."""
+"""Benchmark bootstrap and write-interception regressions on both platforms."""
 
 from __future__ import annotations
 
@@ -9,12 +9,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-pytest.importorskip("fcntl", reason="benchmark search coordination uses Linux flock")
-
 
 @pytest.fixture
 def runner(monkeypatch):
     root = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(root / "scripts/benchmarks"))
     monkeypatch.setenv("REVIEWFORGE_REPO_ROOT", str(root))
     # The runner intentionally sets process-local overrides. Register them
     # with pytest's environment restoration before invoking its bootstrap.

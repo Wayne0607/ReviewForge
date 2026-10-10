@@ -96,6 +96,14 @@ Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复�
 
 本轮 Windows 全量测试 `1455 passed, 2 skipped, 6 warnings`；ruff / format 通过。新增资源边界、内核限额拒绝、运行中断/失败记账和跨进程独占锁测试；Linux flock 的两项测试由 dev CI 验证，Windows 跳过。
 
+09:34 恢复核实：SSH 正常、HTTP 200、reviewforge.service active/enabled，生产 SHA 仍为上文 main。实例物理内存约 1.6 GiB，当时 available 约 1.1 GiB；旧评测进程均不存在。前一 boot 的已读取内核日志未发现明确 OOM 记录，尚不确定平台告警具体是哪项资源。初次 502 对应开机时后端尚在初始化，随后自行恢复，未改生产配置或代码。
+
+`bac4959` 的 Linux dev CI 为 `1459 passed, 6 warnings`。09:35–09:36 在服务器上运行两个小型限额探针：实际 cgroup memory.max=64 MiB、memory.swap.max=0、cpu.max=10000/100000；另一个等待任务在 3 秒上限后终止，子进程也退出，记录为 failed，生产服务保持 active。上述限额保护已在该主机验证；探针不下载仓库、不调用模型，不计入质量成绩。
+
+后续大仓库工作转到本机串行执行。评测工具适配 Windows 文件锁与信号处理，不改变模型提示、审查配置或裁判口径。顺便修正两个结果协议缺口：外层 completed 不能掩盖内层 partial；续跑不得混用不同代码/模型/工作集/参数或变化的 PR head。严格裁判要求请求集合全部运行完整后再计分，输入与裁判参数改变也不能复用旧判断，避免把缺失样本静默排除。
+
+本轮 Windows 全量测试 `1469 passed, 1 skipped, 6 warnings`，原来只在 Linux 跑的 3 项 benchmark bootstrap 回归现在也在 Windows 通过；新增跨进程互斥、重启时间戳、混合配置拒绝与不完整样本拒绝回归。ruff / format 和两项严格裁判算法回归通过。
+
 还需补齐的运行协议缺口：当前 frozen outbox 会在恢复时跳过所有 LLM 阶段；若第一次已发布部分结果，但仍有 OPEN/可重试 UNKNOWN，就无法继续调查并发布新增确认问题。需实现不修改已发送负载、仅补充未发布假设的恢复协议，并验证丢回执与重复恢复。此项未完成，v4 不可进入生产。
 
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。

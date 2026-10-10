@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from benchmark_support import require_complete_results, validate_resume_metadata
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -334,24 +335,29 @@ def _metrics(completed: dict[str, Any], tool: str) -> dict[str, Any]:
 
 async def main_async(args: argparse.Namespace) -> None:
     workload = json.loads(Path(args.workload).read_text(encoding="utf-8"))
-    reviewforge = {
-        row["golden_url"]: row
-        for row in json.loads(Path(args.reviewforge_results).read_text(encoding="utf-8"))
-        if row.get("status") == "completed"
-    }
+    selected = workload[: args.limit or None]
+    reviewforge = require_complete_results(
+        json.loads(Path(args.reviewforge_results).read_text(encoding="utf-8")), selected
+    )
     qodo = json.loads(Path(args.qodo_candidates).read_text(encoding="utf-8"))
     output = Path(args.output)
     state = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {"completed": {}}
     completed = state.setdefault("completed", {})
     judge = Judge(args.concurrency, thinking=args.thinking, min_interval=args.llm_min_interval)
-    state["judge_parameters"] = {
+    parameters = {
         "model": judge.model,
         "thinking": args.thinking,
         "llm_min_interval": args.llm_min_interval,
         "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "support_sha256": hashlib.sha256(Path(__file__).with_name("benchmark_support.py").read_bytes()).hexdigest(),
+        "workload_sha256": hashlib.sha256(Path(args.workload).read_bytes()).hexdigest(),
+        "results_sha256": hashlib.sha256(Path(args.reviewforge_results).read_bytes()).hexdigest(),
+        "qodo_sha256": hashlib.sha256(Path(args.qodo_candidates).read_bytes()).hexdigest(),
+        "limit": args.limit,
     }
     try:
-        selected = workload[: args.limit or None]
+        validate_resume_metadata(state.get("judge_parameters"), parameters, has_results=bool(completed))
+        state["judge_parameters"] = parameters
         batch_size = max(1, min(args.concurrency // 2, 8))
         for start in range(0, len(selected), batch_size):
             jobs = []

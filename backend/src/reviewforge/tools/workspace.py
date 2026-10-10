@@ -383,7 +383,9 @@ class PRHeadWorkspace:
                 max_bytes=max_bytes,
             )
         except Exception as exc:
-            logger.warning("Unable to build PR head tarball for %s@%s: %s", head_repo, head_sha, exc)
+            logger.warning(
+                "Unable to build PR head tarball for %s@%s: %s: %s", head_repo, head_sha, type(exc).__name__, exc
+            )
             # A malformed archive can fail after writing a few members.  Do
             # not expose that partial world under the degraded identity.
             shutil.rmtree(root, ignore_errors=True)

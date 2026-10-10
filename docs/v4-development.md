@@ -138,6 +138,8 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 补齐可执行的 Phase 2 测量入口：严格裁判新增显式 `--ledger-recall`，重用原 claim 池选择，并用相同裁判和一对一匹配分别测 CONFIRMED+OPEN+UNKNOWN、CONFIRMED、REFUTED；生成/确认召回与误杀数单独写入 `ledger_metrics`，不混入发布评论 F1。拒绝 head 不一致或畸形账本；参数与 helper hash 固定续跑身份。同时修正裁判请求失败后静默排除样本的缺口：所有请求成功前只保存 partial 诊断、不输出完整集合质量分，失败请求可在同输入下重试。新增 5 项回归（含失败后恢复），完整检查为 `1497 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。恢复期间核对生产仍 active、HTTP 200、main SHA 未变。
 
+冻结对照前发现旧 benchmark 的 model override 只改了 legacy profiles 的模型名，仍留下 fast/accurate 的不同温度和输出预算；SPEC §7 明确要求清空 profiles。现只在显式 `--model-override` 下清空角色覆盖与旧 profiles，所有角色走同一全局模型；增强现有 bootstrap 回归验证实际路由，无生产路由变更。`fcdac99` 的 dev CI 成功；此修正后完整测试仍为 `1497 passed, 1 skipped, 6 warnings`，ruff / format 通过。旧单 PR 回执继续仅作诊断，不与新协议混成成绩。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

@@ -35,6 +35,12 @@ async def test_benchmark_runtime_loads_config_and_blocks_all_real_github_writes(
     try:
         assert orchestrator._pipeline_v4_config.mode == "hypothesis"
         assert orchestrator._gateway._pipeline_mode == "hypothesis"
+        router = orchestrator._model_router
+        assert not router._config.profiles
+        for agent in ("planner", "security_reviewer", "verifier", "hypothesis_generator", "investigator", "editor"):
+            _, effective, profile, _, max_tokens = router._resolve(agent)
+            assert effective["model"] == "test-model"
+            assert profile is None and max_tokens is None
         with pytest.raises(RuntimeError, match="blocked a GitHub write"):
             await raw._client.post("/repos/example/repo/issues", json={"title": "should be blocked"})
         client = orchestrator._gateway._github

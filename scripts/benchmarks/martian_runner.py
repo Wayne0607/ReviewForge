@@ -267,10 +267,9 @@ async def _build_runtime(
     if model_override:
         cfg.llm.model = model_override
         cfg.llm.role_overrides = {}
-        for profile in cfg.llm.profiles.values():
-            profile.model = model_override
-            profile.base_url = cfg.llm.base_url
-            profile.api_key = cfg.llm.api_key
+        # SPEC §7 requires plain global routing on both paired sides. Keeping
+        # legacy profiles would retain their separate temperature/output caps.
+        cfg.llm.profiles = {}
     db = None
     raw_github = None
     try:

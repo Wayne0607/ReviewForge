@@ -71,7 +71,7 @@ Environment variables:
 
 Use `--pipeline legacy|shadow|hypothesis`, `--model-override`, and
 `--output-language en`. A model override also clears role-specific model/endpoint
-overrides and aligns every profile with the global provider. Record the optional
+overrides and clears legacy profiles, as required by SPEC §7. Record the optional
 `--reasoning-effort` identically for both sides. Never compare runs with different
 PR head SHAs or change parameters between paired runs.
 

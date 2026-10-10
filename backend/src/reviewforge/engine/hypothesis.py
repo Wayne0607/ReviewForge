@@ -60,6 +60,62 @@ class Observation:
             raise ValueError("observation excerpt exceeds 1200 characters")
 
 
+@dataclass(frozen=True)
+class EvidenceCitation:
+    observation_id: str
+    quote: str
+
+
+@dataclass(frozen=True)
+class ContractAssessment:
+    """Keep the contract premise separate from the observed behavior.
+
+    This is a model assessment, not a code-proved semantic conclusion. The
+    investigator validates each citation against its own saved observations.
+    """
+
+    expected: str
+    actual: str
+    comparison: str
+    expected_evidence: list[EvidenceCitation]
+    actual_evidence: list[EvidenceCitation]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> ContractAssessment:
+        if not isinstance(raw, dict):
+            raise ValueError("assessment must be an object")
+        fields = {}
+        for key in ("expected", "actual", "comparison"):
+            value = raw.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"assessment requires {key}")
+            fields[key] = value.strip()
+        if fields["comparison"] not in {"conflict", "compatible", "unresolved"}:
+            raise ValueError("unsupported assessment comparison")
+        for key in ("expected_evidence", "actual_evidence"):
+            values = raw.get(key)
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"assessment requires {key}")
+            citations = []
+            for value in values:
+                if not isinstance(value, dict):
+                    raise ValueError("assessment citation must be an object")
+                identity, quote = value.get("observation_id"), value.get("quote")
+                if (
+                    not isinstance(identity, str)
+                    or not identity.strip()
+                    or not isinstance(quote, str)
+                    or not quote.strip()
+                ):
+                    raise ValueError("assessment citation requires an observation and quote")
+                citations.append(EvidenceCitation(identity.strip(), quote.strip()))
+            fields[key] = citations
+        return cls(**fields)
+
+
 @dataclass
 class Hypothesis:
     id: str
@@ -82,6 +138,7 @@ class Hypothesis:
     investigation_steps: int = 0
     investigation_tokens: int = 0
     retryable: bool = False
+    assessment: ContractAssessment | None = None
 
     def __post_init__(self) -> None:
         if self.severity not in _SEVERITY_RANK:
@@ -126,6 +183,7 @@ class Hypothesis:
             investigation_steps=int(data.get("investigation_steps", 0)),
             investigation_tokens=int(data.get("investigation_tokens", 0)),
             retryable=bool(data.get("retryable", False)),
+            assessment=ContractAssessment.from_dict(data["assessment"]) if data.get("assessment") is not None else None,
         )
 
 
@@ -181,6 +239,7 @@ class HypothesisLedger:
         investigation_steps: int = 0,
         investigation_tokens: int = 0,
         retryable: bool = False,
+        assessment: ContractAssessment | None = None,
     ) -> Hypothesis:
         """Apply an investigation verdict to one hypothesis.
 
@@ -204,6 +263,7 @@ class HypothesisLedger:
             current.investigation_steps = investigation_steps
             current.investigation_tokens = investigation_tokens
             current.retryable = retryable
+            current.assessment = copy.deepcopy(assessment)
             if observations:
                 known = {observation.id for observation in current.observations}
                 for observation in observations:

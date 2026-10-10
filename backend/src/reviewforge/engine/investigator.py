@@ -25,7 +25,7 @@ from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
-from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Observation, Site
+from reviewforge.engine.hypothesis import ContractAssessment, Hypothesis, HypothesisLedger, Mechanism, Observation, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
 from reviewforge.engine.verification_guidance import is_localization_path, localization_guidance
@@ -60,6 +60,7 @@ class InvestigationResult:
     tokens: int = 0
     observations: list[Observation] = field(default_factory=list)
     retryable: bool = False
+    assessment: ContractAssessment | None = None
 
 
 def budget_steps(hypothesis: Hypothesis) -> int:
@@ -312,6 +313,8 @@ class Investigator:
             "## Diff hunk(s)\n" + diff_section,
             "## Context\n" + (context or "（无）/(none)"),
         ]
+        if pack.pr_intent:
+            sections.append("## PR intent (author context, not defect evidence)\n" + pack.pr_intent[:2_000])
         boundary = self._resource_boundary(hypothesis)
         if boundary:
             sections.append(boundary)
@@ -567,6 +570,7 @@ class Investigator:
         additional_sites = _parse_additional_sites(parsed.get("additional_sites"), self._state)
 
         strength = "none"
+        assessment = None
         if verdict in {"confirmed", "refuted"}:
             by_id = {observation.id: observation for observation in self._observations}
             cited = [by_id[identity] for identity in evidence_ids if identity in by_id]
@@ -579,10 +583,28 @@ class Investigator:
                 reason = "ungrounded"
                 evidence_ids, evidence_quote = [], ""
             else:
-                outside_diff = any(
-                    self._quote_outside_diff(observation, evidence_quote, changed) for observation in grounded
-                )
-                strength = "strong" if (outside_diff or hypothesis.source.startswith("detector")) else "weak"
+                try:
+                    assessment = ContractAssessment.from_dict(parsed.get("assessment"))
+                except ValueError:
+                    verdict, reason = "unknown", "incomplete-assessment"
+                if assessment is not None:
+                    required = "conflict" if verdict == "confirmed" else "compatible"
+                    proof = [*assessment.expected_evidence, *assessment.actual_evidence]
+                    if any(
+                        citation.observation_id not in by_id
+                        or by_id[citation.observation_id].status != "success"
+                        or citation.quote not in by_id[citation.observation_id].excerpt
+                        for citation in proof
+                    ):
+                        verdict, reason = "unknown", "ungrounded-assessment"
+                    elif assessment.comparison != required:
+                        verdict, reason = "unknown", "inconsistent-assessment"
+                    else:
+                        outside_diff = any(
+                            self._quote_outside_diff(by_id[citation.observation_id], citation.quote, changed)
+                            for citation in proof
+                        )
+                        strength = "strong" if (outside_diff or hypothesis.source.startswith("detector")) else "weak"
 
         return self._result(
             verdict=verdict,
@@ -594,6 +616,7 @@ class Investigator:
             additional_sites=additional_sites,
             strength=strength,
             steps=steps,
+            assessment=assessment,
         )
 
     @staticmethod
@@ -630,6 +653,7 @@ class Investigator:
         strength: str = "none",
         steps: int = 0,
         retryable: bool = False,
+        assessment: ContractAssessment | None = None,
     ) -> InvestigationResult:
         return InvestigationResult(
             verdict=verdict,
@@ -644,6 +668,7 @@ class Investigator:
             tokens=self._tokens,
             observations=list(self._observations),
             retryable=retryable,
+            assessment=assessment,
         )
 
     async def run(
@@ -720,6 +745,7 @@ class Investigator:
                 investigation_steps=result.steps,
                 investigation_tokens=result.tokens,
                 retryable=result.retryable,
+                assessment=result.assessment,
             )
             if on_update is not None:
                 await on_update(ledger)

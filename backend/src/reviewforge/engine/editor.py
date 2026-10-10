@@ -137,6 +137,8 @@ def split_for_publication(
 
 def _evidence_text(hypothesis: Hypothesis) -> str:
     lines = []
+    if hypothesis.assessment is not None:
+        lines.append("Contract assessment:\n" + json.dumps(hypothesis.assessment.to_dict(), ensure_ascii=False))
     for observation in hypothesis.observations:
         if observation.status != "success":
             continue
@@ -189,6 +191,8 @@ def confirmed_fact_digest(hypothesis: Hypothesis) -> str:
         "strength": hypothesis.evidence_strength,
         "sites": sorted((site.path, site.line, site.excerpt) for site in hypothesis.sites),
     }
+    if hypothesis.assessment is not None:
+        facts["assessment"] = hypothesis.assessment.to_dict()
     return hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 

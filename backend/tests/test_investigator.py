@@ -317,6 +317,7 @@ async def test_long_tool_output_identifies_saved_citation_boundary_and_narrow_re
             "verdict": "confirmed",
             "evidence_ids": ["obs_1"],
             "evidence_quote": "important_fact()",
+            "assessment": _assessment("important_fact()", "obs_1"),
         },
         _hypothesis(),
         {"a.py"},
@@ -394,6 +395,7 @@ async def test_grounded_confirmed_keeps_strength() -> None:
                     "severity": "error",
                     "additional_sites": [],
                     "reason": "缺少校验",
+                    "assessment": _assessment("return user_input"),
                 }
             ),
         ]
@@ -424,6 +426,7 @@ async def test_outside_diff_evidence_is_strong() -> None:
                     "severity": "warning",
                     "additional_sites": [],
                     "reason": "调用方已校验",
+                    "assessment": _assessment("return x is not None", comparison="compatible"),
                 }
             ),
         ]
@@ -515,6 +518,18 @@ def test_concurrent_upsert_never_loses_sites() -> None:
     assert len(ledger.items["a.py:f::null-path::f"].sites) == 20
 
 
+def _assessment(quote: str, identity: str = "obs_0", comparison: str = "conflict") -> dict:
+    # These existing tests exercise citation layout, strength and budgets.
+    # Independent-premise semantic fixtures live in test_investigation_assessment.
+    return {
+        "expected": "The quoted contract governs the claimed behavior.",
+        "actual": "The quoted source establishes the behavior under review.",
+        "comparison": comparison,
+        "expected_evidence": [{"observation_id": identity, "quote": quote}],
+        "actual_evidence": [{"observation_id": identity, "quote": quote}],
+    }
+
+
 def _verdict(*, quote: str, ids: list[str] | None = None, sites: list[dict] | None = None) -> str:
     return json.dumps(
         {
@@ -522,6 +537,7 @@ def _verdict(*, quote: str, ids: list[str] | None = None, sites: list[dict] | No
             "evidence_ids": ids or ["obs_0"],
             "evidence_quote": quote,
             "additional_sites": sites or [],
+            "assessment": _assessment(quote, (ids or ["obs_0"])[0]),
         }
     )
 
@@ -659,7 +675,15 @@ async def test_windowed_source_supports_exact_multiline_citation(tmp_path) -> No
     assert observation.line_range == (2, 4)
     assert "footer" not in observation.excerpt
     result = investigator._finalize(
-        {"verdict": "refuted", "evidence_ids": ["obs_0"], "evidence_quote": quote}, _hypothesis(), {"a.py"}, steps=1
+        {
+            "verdict": "refuted",
+            "evidence_ids": ["obs_0"],
+            "evidence_quote": quote,
+            "assessment": _assessment(quote, comparison="compatible"),
+        },
+        _hypothesis(),
+        {"a.py"},
+        steps=1,
     )
     assert result.verdict == "refuted"
     fabricated = investigator._finalize(
@@ -722,7 +746,12 @@ async def test_diff_window_records_before_after_evidence_past_the_full_diff_limi
     assert "@@ -1 +1 @@" not in result
     assert old in investigator._observations[1].excerpt and new in investigator._observations[1].excerpt
     verdict = investigator._finalize(
-        {"verdict": "refuted", "evidence_ids": ["obs_1"], "evidence_quote": old},
+        {
+            "verdict": "refuted",
+            "evidence_ids": ["obs_1"],
+            "evidence_quote": old,
+            "assessment": _assessment(old, "obs_1", "compatible"),
+        },
         _hypothesis(),
         {"a.py"},
         steps=2,

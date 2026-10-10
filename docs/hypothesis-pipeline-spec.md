@@ -282,7 +282,7 @@ budget_steps = base(severity) + bonus
 
 **工具（通过 gateway，绑定 workspace）。** `read_file(path, start, end)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path, start?, end?)`。diff 行窗口选择与指定 RIGHT 行相交的完整 before/after hunk，保留删除行与上下文；省略窗口保留原完整 diff 行为，未命中为空/`not_found`，不得用作反证。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
 
-**输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。
+**输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。额外交付 `pack.pr_intent` 的前 2000 字符；作者意图是理解行为变化的背景，不能作为正确性证据或豁免契约。收尾保留这份背景。
 
 `i18n` 的主 unit 为 resource 时，额外交付该 unit 与 sites 对应 resource 的 path/provenance，逐文件保留已编译的 locale 信息。直接语言/字形违规以声明 locale 和变更文本为本地契约，无需页面引用；格式语法/参数和运行时后果仍需实际消费端及输入契约。生成器/lens 的问题与反证必须决定所述契约，而非无关调用方事实。metadata 不构成 defect evidence，Observation、精确引用及 UNKNOWN 门槛不变。
 
@@ -296,9 +296,20 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
  "evidence_quote":"...",               // 必须是某 observation.excerpt 的子串
  "severity":"error|warning|info",      // 可修正
  "additional_sites":[{"path":"...","line":1,"excerpt":"..."}],
+ "assessment": {
+   "expected":"同一受支持输入的预期行为或契约",
+   "actual":"本次变更的实际行为或反证",
+   "expected_evidence":[{"observation_id":"obs_0","quote":"契约或实际标准绑定的精确引用"}],
+   "actual_evidence":[{"observation_id":"obs_1","quote":"实际行为或反证的精确引用"}],
+   "comparison":"conflict|compatible|unresolved"
+ },
  "reason":"..."}
 ```
 校验：`confirmed`/`refuted` 必须引用 ≥1 个 `status=success` 的 observation 且 `evidence_quote` 在其 excerpt 内，否则降级为 `unknown`，reason `ungrounded`。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，保留空白和真正的数字前缀，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）——若 evidence 全是 not_found 则降为 `unknown`。
+
+事实回答不等于缺陷成立。新调查的 `confirmed/refuted` 还必须分别交付 expected 与 actual 的非空陈述和引用；每条引用必须精确命中其指定的成功 Observation，而不能用一个无关成功读取掩盖另一前提的缺失。同一 Observation 能证明两者时可复用，但不能把实际 throw 当成“必须收集消息”的契约。标准库的预期行为可来自已文档化契约，引用需绑定实际类型/配置/数据流，无需本地包含库源码。`confirmed` 仅接受 `conflict`，`refuted` 仅接受 `compatible`；结构缺失、引用无效、关系与 verdict 矛盾分别降为 UNKNOWN（`incomplete-assessment` / `ungrounded-assessment` / `inconsistent-assessment`）。UNKNOWN 不要求完整 assessment，也不会因附带证明被自动提升。代码核实引用和关系一致性，语义判断仍由调查员承担。
+
+`ContractAssessment` 随假设落入现有 JSON 账本/checkpoint，交付 editor 和失败模板；不增加数据库表或 LLM 阶段。旧 checkpoint 缺少该字段仍可加载，不重开已有 CONFIRMED/REFUTED。证据强度按通过校验的两组引用判断 diff 外来源，而非无关 observation。预算、UNKNOWN 准入和严格裁判保持原值。
 
 **evidence_strength。** `strong` = 引用 ≥1 个 diff 外文件的 observation 或 detectors 命中；`weak` = 仅 diff 内 observation；`none` = unknown。
 
@@ -316,6 +327,8 @@ v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路
 3. 取前 `publish.max_inline`（默认 5）为 inline 候选；`error` + `strong` 溢出到 `publish.max_inline_overflow`（默认 8）。
 
 **LLM 任务。** 对 inline 候选写评论；对余下 confirmed 写一行摘要；标出它认为应合并的候选对（跨簇同根因）。输出 schema：
+
+修复应保留 PR 的有效新行为，只修已证实的不一致。不能整段恢复旧文本并重新引入有意移除的非法内容；证据不足以确定改法时描述目标契约，不编造 suggestion patch。
 ```json
 {"comments":[{"hypothesis_ids":["h_..."],"path":"...","line":93,
    "title":"≤60 字符","body":"issue / why / where / fix 四段","suggestion_patch":"可选"}],

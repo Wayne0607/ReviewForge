@@ -278,3 +278,13 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 另一个真实输入缺口是 generator/lens 不知道调查工具能力，曾提出外部 CVE 查询，而 Investigator 只有五个固定仓库读取工具。新增共享能力卡，并通过回归核对实际工具名称；外部事实必须已有具体材料，不能凭新依赖猜测漏洞。提示补充同一对象在检查/读取之间的状态推进、基于实际类型的 [Java Matcher 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/regex/Matcher.html)，以及比较同一输入的实际/预期失败结果，避免仅以异常传播判缺陷。未增加工具、执行能力或模型阶段。
 
 新增 5 项并发/严重级别/单机制/零预算/闭合状态预算回归和 1 项工具边界回归；完整本地 `1559 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。补充 existing 状态呈现后，相关 63 项回归通过。需新的干净快照实测候选、调查和实际评论；尚不能以离线排序回放推导质量分。
+
+冻结 `4315a6c` 的第六轮位于 `.reviewforge/benchmarks/v4-mechanism-breadth-20261011-031314/`。候选增至 28 条；“anchor Matcher 跨 key 泄漏”被源码反证，但并未提出真实的 anchor 数量验证缺陷。原异常传播候选再次 CONFIRMED，reason 只有“调用方没捕获所以确认”，没有预期错误处理契约。fixture 英文文件存在性候选产生不可重试的 error UNKNOWN/ungrounded，严格准入已不能通过，停止余下请求并保留回执；37 个成功请求记录 256860 tokens，账本为 4 CONFIRMED / 3 REFUTED / 17 UNKNOWN / 4 OPEN，进行中的请求可能有未记录用量。Job Object 返回 125，峰值约 358 MiB，评测锁已释放。本轮不打质量分，不以候选确认数量表示进步，未用 holdout。
+
+## 2026-10-11 调查结论的契约前提
+
+两问回查 `7db82230` / `c50ed3b7` 与 §4.6：最初的精确 quote 校验用于阻止伪造源码，但隐含“一条真实引用足以支持整个 verdict”的假设。连续真实回执证明，真实 throw 或 import 可以被引用，却不证明候选声称的义务。这不是再加一条异常提示就能保证的输入/输出问题；Issue/开放 PR 库仍为空。
+
+在既有调查阶段增加结构化 `ContractAssessment`：先分别写 expected/actual 的事实和各自 Observation 引用，再写二者关系，最后选择 verdict。代码逐条核实指定 Observation 成功、quote 精确保存、关系与 verdict 一致；缺项或无效仍是 UNKNOWN，不转成 no_issue、不补重试。标准契约允许引用实际类型/配置的绑定，同一 Observation 能证明两前提时可复用；语义是否真的支持义务仍需调查员判断，不能宣称代码已证明语义。assessment 经现有 JSON 账本进入 editor/失败模板与续跑事实摘要；旧闭合 checkpoint 保持兼容，不重新调查。
+
+另补交调查员遗漏的 PR intent（最多 2000 字符），明确仅作作者背景，不能免责；编辑修复须保留有效新行为，避免正确的 locale 评论建议恢复旧 HTML。调查和发布预算、主模型、goldens/裁判阈值、legacy 与 main 均不变。先新增回归复现 9 项旧行为失败，再实现；新增 13 项独立/参数化回归覆盖两前提引用、关系矛盾、UNKNOWN 不提升、真实 DB/ledger/editor/失败模板/续跑交付与旧 checkpoint 兼容。缩短提示正文而非扩大预算，单步读取后收尾回归继续通过。完整检查为 `1572 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过；新冻结实测仍待完成。

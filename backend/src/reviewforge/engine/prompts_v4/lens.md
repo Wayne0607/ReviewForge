@@ -65,5 +65,6 @@
 - `mechanism` 只能是：`wrong-argument` / `wrong-operator` / `null-path` / `contract-mismatch` / `missing-await` / `lock-scope` / `state-leak` / `error-path` / `regression-removed` / `security-sink` / `i18n` / `a11y` / `perf` / `test-gap` / `doc`。
 - `severity` 只能是 `error` / `warning` / `info`。
 - `sites[].line` 必须来自 `## Changes` 中列出的行号；`sites[].excerpt` 必须逐字等于该行子串（≥12 字符）。
+- 本块每个 Allowed unit_id 都必须出现在 `hypotheses` 或 `no_issue_units` 中；没有本维度的新假设时，在 `checked` 写明检查边界或已有假设的覆盖。省略不表示已检查无问题，不要为了覆盖单元编造假设。
 
 输出语言：{{output_language}}；代码标识符保持原样。

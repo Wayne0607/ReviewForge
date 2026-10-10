@@ -457,3 +457,97 @@ async def test_lens_no_issue_does_not_erase_unresolved_generator_boundary():
     )
     assert unit.id in ledger.unresolved_units
     assert unit.id not in ledger.no_issue_units
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["generator", "lens:localization"])
+async def test_valid_json_cannot_hide_units_omitted_from_the_response(source: str):
+    # The real Keycloak response omitted these four changed test methods while
+    # returning a valid JSON object for the other units in the same block.
+    first = _unit("service.py", "get_or_create_resource")
+    omitted = [
+        _unit("tests.py", symbol)
+        for symbol in (
+            "verifyNoChangedAnchors",
+            "verifyIllegalHtmlTagDetected",
+            "verifyNoHtmlAllowed",
+            "verifyDuplicateKeysDetected",
+        )
+    ]
+    llm = _ScriptedLLM(responses=[json.dumps({"hypotheses": [_hypothesis("wrong-argument")], "no_issue_units": []})])
+    ledger = HypothesisLedger("run", "abc", "digest")
+    ledger.no_issue_units[omitted[0].id] = "earlier pass was clean"
+    saved = []
+
+    async def checkpoint(current):
+        saved.append(current.to_dict())
+
+    result = await HypothesisGenerator(llm, source=source, on_update=checkpoint).run(
+        StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(first, *omitted), ledger
+    )
+
+    assert result.accepted == 1
+    assert result.failed_blocks == 1
+    assert set(result.unresolved_units) == {unit.id for unit in omitted}
+    assert ledger.unresolved_units == {unit.id: f"{source} missing unit assessment" for unit in omitted}
+    assert not ledger.no_issue_units
+    assert len(llm.calls) == 1  # No "look harder" or formatting-repair call.
+    assert saved[-1]["unresolved_units"] == ledger.unresolved_units
+
+
+@pytest.mark.asyncio
+async def test_explicit_clean_assessments_complete_a_block_without_hypotheses():
+    units = [_unit("service.py", "get_or_create_resource"), _unit("helper.py", "normalize")]
+    llm = _ScriptedLLM(
+        responses=[
+            json.dumps(
+                {
+                    "hypotheses": [],
+                    "no_issue_units": [{"unit_id": unit.id, "checked": "changed lines inspected"} for unit in units],
+                }
+            )
+        ]
+    )
+    ledger = HypothesisLedger("run", "abc", "digest")
+    result = await HypothesisGenerator(llm).run(
+        StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(*units), ledger
+    )
+    assert result.failed_blocks == 0
+    assert not ledger.unresolved_units
+    assert set(ledger.no_issue_units) == {unit.id for unit in units}
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_assessment_does_not_clear_a_previous_failure_for_an_omitted_unit():
+    first = _unit("service.py", "get_or_create_resource")
+    second = _unit("helper.py", "normalize")
+    ledger = HypothesisLedger("run", "abc", "digest")
+    ledger.unresolved_units = {unit.id: "generator parse failure" for unit in (first, second)}
+    llm = _ScriptedLLM(responses=[json.dumps({"hypotheses": [_hypothesis("wrong-argument")], "no_issue_units": []})])
+    await HypothesisGenerator(llm).run(
+        StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(first, second), ledger
+    )
+    assert ledger.unresolved_units == {second.id: "generator missing unit assessment"}
+
+
+@pytest.mark.asyncio
+async def test_empty_or_unknown_clean_assessments_do_not_acknowledge_a_real_unit():
+    unit = _unit("service.py", "get_or_create_resource")
+    llm = _ScriptedLLM(
+        responses=[
+            json.dumps(
+                {
+                    "hypotheses": [],
+                    "no_issue_units": [
+                        {"unit_id": unit.id, "checked": " "},
+                        {"unit_id": "invented", "checked": "looks clean"},
+                    ],
+                }
+            )
+        ]
+    )
+    ledger = HypothesisLedger("run", "abc", "digest")
+    await HypothesisGenerator(llm).run(StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(unit), ledger)
+    assert ledger.unresolved_units == {unit.id: "generator missing unit assessment"}
+    assert not ledger.no_issue_units

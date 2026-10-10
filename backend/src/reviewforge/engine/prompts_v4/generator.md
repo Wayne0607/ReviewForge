@@ -71,4 +71,5 @@
 - `severity` 只能是 `error` / `warning` / `info`。
 - `sites[].line` 必须来自 `## Changes` 中列出的行号；`sites[].excerpt` 必须逐字等于该行的子串（≥12 字符）。
 - 对一个 unit 没有发现时，不要编造；把它放进 `no_issue_units` 并写明你检查的边界。
+- 本块每个 Allowed unit_id 都必须出现在 `hypotheses` 或 `no_issue_units` 中。省略表示未返回判断，不表示已经检查无问题；不要为了覆盖单元编造假设。
 - `--- 输出语言 ---`：{{output_language}}。`claim` / `trigger` / `impact` / `open_question` / `refutation` / `checked` 必须使用该语言；代码标识符保持原样。

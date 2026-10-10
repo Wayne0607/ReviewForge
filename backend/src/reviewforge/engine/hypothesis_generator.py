@@ -4,8 +4,9 @@ One bounded pass over the whole PR: the deterministic context pack plus the
 before/after diff and RIGHT-side anchors are rendered per semantic unit (risk-ordered, chunked when the
 input exceeds the configured budget) and the model proposes testable
 hypotheses.  The generator only *proposes*; it never investigates and never
-retries with a "look harder" signal — a block with no hypotheses is a valid
-NO_ISSUE result, and a block that fails to parse is marked ``unresolved``.
+retries with a "look harder" signal — explicit clean assessments are valid
+NO_ISSUE results. Units omitted from an otherwise valid response, or in a
+block that fails to parse, are marked ``unresolved``.
 
 The generator writes into the shared ``HypothesisLedger``.  Every emitted
 hypothesis is ``OPEN`` by construction; investigation (a later stage) is the
@@ -325,8 +326,21 @@ class HypothesisGenerator:
                 if self._on_update is not None:
                     await self._on_update(ledger)
                 continue
+            reported = self._reported_units(parsed)
+            missing = [unit for unit in block if unit.id not in reported]
+            if missing:
+                result.failed_blocks += 1
+                logger.warning("%s response omitted %d unit assessment(s)", self._source, len(missing))
             for unit in block:
-                if ledger.unresolved_units.get(unit.id, "").startswith(f"{self._source} "):
+                previous = ledger.unresolved_units.get(unit.id, "")
+                if unit.id not in reported:
+                    # An omitted answer is not a clean assessment. Preserve a
+                    # failure from another pass (e.g. generator vs. lens).
+                    if not previous or previous.startswith(f"{self._source} "):
+                        ledger.unresolved_units[unit.id] = f"{self._source} missing unit assessment"
+                    ledger.no_issue_units.pop(unit.id, None)
+                    result.unresolved_units.append(unit.id)
+                elif previous.startswith(f"{self._source} "):
                     ledger.unresolved_units.pop(unit.id)
             result.dropped_overflow += await self._consume(
                 parsed, ledger, result, right_lines, {unit.id: unit for unit in block}
@@ -415,6 +429,26 @@ class HypothesisGenerator:
         if not isinstance(parsed.get("no_issue_units", []), list):
             return None
         return parsed
+
+    @staticmethod
+    def _reported_units(parsed: dict[str, Any]) -> set[str]:
+        """Count explicit unit answers separately from candidate acceptance.
+
+        A reported hypothesis may be dropped by the SPEC's existing site,
+        schema or overflow rules; that does not make it an omitted answer.
+        A clean answer must carry its checked boundary. Earlier ledger rows
+        cannot stand in for an answer to the current block/pass.
+        """
+
+        reported = {
+            str(item.get("unit_id") or "").strip() for item in parsed.get("hypotheses", []) if isinstance(item, dict)
+        }
+        reported.update(
+            str(item.get("unit_id") or "").strip()
+            for item in parsed.get("no_issue_units", [])
+            if isinstance(item, dict) and str(item.get("checked") or "").strip()
+        )
+        return reported
 
     async def _consume(
         self,

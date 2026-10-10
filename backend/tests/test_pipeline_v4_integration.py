@@ -212,6 +212,65 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("all_reported", [False, True])
+async def test_unit_coverage_controls_pipeline_health_and_benchmark_admission(tmp_path, monkeypatch, all_reported):
+    import importlib
+    from pathlib import Path
+
+    state = StateStore(
+        repo="owner/repo",
+        pr_number=1,
+        head_sha="abc",
+        file_diffs={"app.py": _diff("def f(x):", "    return x.name", "def g(x):", "    return x.name")},
+        impact_manifest={
+            "version": 1,
+            "files": [
+                {
+                    "path": "app.py",
+                    "changed_symbols": [
+                        {"name": "f", "type": "function", "start_line": 1, "end_line": 2, "added_lines": [1, 2]},
+                        {"name": "g", "type": "function", "start_line": 3, "end_line": 4, "added_lines": [3, 4]},
+                    ],
+                }
+            ],
+        },
+    )
+    units = compile_semantic_changeset(state).units
+    reported = units if all_reported else units[:1]
+    llm = _ScriptedLLM(
+        responses=[
+            json.dumps(
+                {
+                    "hypotheses": [],
+                    "no_issue_units": [{"unit_id": unit.id, "checked": "changed lines inspected"} for unit in reported],
+                }
+            )
+        ]
+    )
+    info = WorkspaceInfo("owner/repo", "owner/repo", "abc", tmp_path, 1, 10, "d", False, "api-fallback")
+    fake = SimpleNamespace(
+        _gateway=SimpleNamespace(workspace_for=AsyncMock(return_value=SimpleNamespace(info=info, digest="d"))),
+        _events=EventBus(),
+        _pipeline_v4_config=PipelineV4Config(mode="hypothesis"),
+        _model_router=SimpleNamespace(get_llm=lambda name: llm),
+        _db=None,
+    )
+
+    health = await run_hypothesis_pipeline(fake, state)
+    assert health.completed is all_reported
+    assert health.hypothesis.failures == (0 if all_reported else 1)
+    summary = health.apply_to_summary({"total_findings": 0, "tasks_failed": 0})
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts/benchmarks"))
+    support = importlib.import_module("benchmark_support")
+    row = {"golden_url": "pr", "status": "completed", "summary": summary}
+    if all_reported:
+        assert support.require_complete_results([row], [{"golden_url": "pr"}]) == {"pr": row}
+    else:
+        with pytest.raises(RuntimeError, match="incomplete; no quality score produced"):
+            support.require_complete_results([row], [{"golden_url": "pr"}])
+
+
+@pytest.mark.asyncio
 async def test_fresh_pipeline_populates_symbol_inputs_before_context_pack(tmp_path, monkeypatch) -> None:
     source = (
         "class BaseService:\n"

@@ -157,3 +157,17 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。
 
 然后按 SPEC 运行：相同模型、英文输出，dev10 上 legacy 对照与 shadow 调查漏斗；抽查 keycloak#36880、grafana#97529、sentry#80168 的实际 ContextPack。达标后才进行 holdout40 两轮配对验收；holdout 不用于调参。记录账本召回、调查误杀、发布遗漏、重复误报与 token 消耗。通过质量与运行可靠性门槛后，才把 v4 推入 `main` 并切换生产默认。
+
+## 2026-10-10 开始验收：运行完整性与覆盖检查
+
+用户要求开始验收，冻结 `8db1e4e`（审查代码与 `3170802` 相同），继续采用已授权的 `deepseek-v4-flash`、英文、非思考模式、全局统一路由、SDK 重试 0。计划先 dev10，再按门槛进入 holdout40 两轮；原 SPEC 的 MiniMax-M3 最终验收仍单独待完成。协议与诊断位于 `.reviewforge/benchmarks/v4-acceptance-deepseek-20261010-154929/`，旧中断记录不复用为成绩。
+
+本机启动 keycloak#37429 的 legacy 对照，固定 head `02f48f776f43734d1ac8914d3ad6a7115acdcb33`，请求间隔 65 秒，进程树上限 2 GiB / CPU 10%，不在生产同机运行，也不写 GitHub。必要的 Planner 请求（30459 输入字符）被 HTTP 429 / `429003: inference exceeds tpm/rpm limit` 拒绝；两个较小的 localization 请求成功，共记录 2701 tokens。不能据此判定具体 TPM/RPM 上限。由于必要阶段已失败，停止验证过的工作进程；启动器关闭资源组，峰值约 125 MiB。`outcome.json` 明确记录 0 个有效配对、0 次裁判、未使用 holdout，未输出 P/R/F1。首个启动尝试发生日志文件名冲突、未发模型请求；失败记录保留，第二次启动采用独立记录文件。
+
+离线核对旧生成回执：两个成功响应合计交付 58 个 units，其中一块 38 个只返回 34 个 unit 判断。省略的四个是 `VerifyMessagePropertiesTest.java` 的 `verifyNoChangedAnchors`、`verifyIllegalHtmlTagDetected`、`verifyNoHtmlAllowed`、`verifyDuplicateKeysDetected`，不属于风格排除项。原设计假设是“JSON 解析成功就可清除整个块的 unresolved”，但 prompt 已要求每个无问题 unit 返回带 checked 边界的 `no_issue_units`；真实回执证明两者不能等同。
+
+修正 generator 与共用该实现的 lens：按本次响应的 unit 判断记账，只有明确返回的 unit 才能清除本来源的失败；省略项进入 unresolved 并使 run partial，不能沿用旧 no_issue 冒充本轮检查。保留其它来源的失败；有效候选仍按既有 schema / RIGHT site / 数量上限处理，候选丢弃与 unit 是否返回判断分开计量。明确无问题的响应正常完成，不增加“再找一次”或格式修复调用。两份 prompt 明确每个 Allowed unit_id 的返回约束。
+
+先以回归复现 4 项失败，再修正；新增 7 项覆盖测试（含 generator/lens、省略四个真实方法、明确无问题、恢复不清空漏报失败、空/未知 ID、pipeline health 与严格裁判准入）。离线回执审计 `coverage-ack-audit.json` 保留输入/输出 hash，无新 LLM 调用。完整检查为 `1506 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。生产复核仍 active、HTTP 200、main SHA `00c667556c88241d72d96f24430c7c16b4add24e`。
+
+当前结论：覆盖完整性修正通过本地检查；真实质量验收尚未完成，模型服务限流仍阻止有效配对。默认 legacy、main 部署与阈值均未改，未调整 goldens。下一次真实对照必须冻结修正后的提交、使用新输出目录，并在获得稳定模型额度后运行完整 dev10。

@@ -24,9 +24,9 @@ from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
-from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Observation, Site
+from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Observation, Site
 from reviewforge.engine.prompts_v4 import load_prompt
-from reviewforge.engine.semantic_diff import SemanticChangeSet
+from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
 from reviewforge.tools.workspace import _bounded_range
 
 logger = logging.getLogger(__name__)
@@ -305,12 +305,40 @@ class Investigator:
         diff_section = "\n\n".join(sections) or "(no matching hunk; use read_diff to inspect the file's changes)"
         context = pack.render_for_unit(hypothesis.unit_id, max_chars=12_000)
         hypothesis_body = json.dumps(hypothesis.to_dict(), ensure_ascii=False, indent=2)
-        return "\n\n".join(
-            [
-                "## Hypothesis\n" + hypothesis_body,
-                "## Diff hunk(s)\n" + diff_section,
-                "## Context\n" + (context or "（无）/(none)"),
-            ]
+        sections = [
+            "## Hypothesis\n" + hypothesis_body,
+            "## Diff hunk(s)\n" + diff_section,
+            "## Context\n" + (context or "（无）/(none)"),
+        ]
+        boundary = self._resource_boundary(hypothesis)
+        if boundary:
+            sections.append(boundary)
+        return "\n\n".join(sections)
+
+    def _resource_boundary(self, hypothesis: Hypothesis) -> str:
+        # Resource contents can violate a local contract without a runtime
+        # caller. Supply compiler facts, not a verdict or a blanket i18n waiver.
+        if hypothesis.mechanism is not Mechanism.I18N or self._changeset is None:
+            return ""
+        unit = next((unit for unit in self._changeset.units if unit.id == hypothesis.unit_id), None)
+        if unit is None or unit.kind is not UnitKind.RESOURCE:
+            return ""
+        paths = {unit.path, *(site.path for site in hypothesis.sites)}
+        facts = {
+            item.path: {"path": item.path, "provenance": item.provenance.note}
+            for item in self._changeset.units
+            if item.kind is UnitKind.RESOURCE and item.path in paths
+        }
+        return (
+            "## Verification boundary\n"
+            + json.dumps(list(facts.values()), ensure_ascii=False)
+            + "\nFor a direct language/script violation, compare changed text with each resource's declared locale. "
+            "A runtime consumer reference is not needed to establish this local contract violation. "
+            "Do not invent an absent locale or apply one site's locale to another. "
+            "Format/parameter claims still require the actual runtime consumer and formatter contract. "
+            "If the open_question asks only about an ancillary caller, answer it honestly but judge the claim "
+            "at its relevant contract. Record the changed source/diff as exact Observation evidence; "
+            "these metadata alone prove no defect."
         )
 
     async def investigate(

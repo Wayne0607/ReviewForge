@@ -13,7 +13,7 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.investigator import Investigator, budget_steps, build_workspace_executor
-from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
+from reviewforge.engine.semantic_diff import Provenance, SemanticChangeSet, SemanticUnit, UnitKind
 
 
 def _hypothesis(*, severity: str = "warning", refutation: str = "", open_question: str = "") -> Hypothesis:
@@ -128,6 +128,85 @@ def test_investigation_input_selects_unit_hunks_and_all_additional_sites():
     assert "-validate(user_input)" in user and "+skip_validation()" in user
     assert "### b.py\n@@ -20 +20 @@" in user
     assert "UNRELATED" not in user
+
+
+def _locale_hypothesis():
+    path = "messages_zh_CN.properties"
+    unit = SemanticUnit(
+        id="resource-cn",
+        path=path,
+        kind=UnitKind.RESOURCE,
+        start_line=1,
+        end_line=1,
+        provenance=Provenance(source="resource-suffix", note="locale=zh_CN"),
+    )
+    hypothesis = _hypothesis(severity="error")
+    hypothesis.unit_id = unit.id
+    hypothesis.mechanism = Mechanism.I18N
+    hypothesis.claim = "A changed Simplified Chinese entry uses Traditional Chinese."
+    hypothesis.open_question = "Is this key referenced by a template?"
+    hypothesis.sites = [Site(path=path, line=1, excerpt="step=安裝手機應用程式")]
+    return hypothesis, unit
+
+
+def test_resource_verification_boundary_preserves_local_contracts_per_site():
+    hypothesis, unit = _locale_hypothesis()
+    sibling = SemanticUnit(
+        id="resource-tw",
+        path="messages_zh_TW.properties",
+        kind=UnitKind.RESOURCE,
+        provenance=Provenance(note="locale=zh_TW,entries=1"),
+    )
+    unrelated = SemanticUnit(
+        id="resource-en",
+        path="messages_en.properties",
+        kind=UnitKind.RESOURCE,
+        provenance=Provenance(note="locale=en"),
+    )
+    hypothesis.sites.append(Site(path=sibling.path, line=1, excerpt="step=安裝手機應用程式"))
+    investigator = Investigator(
+        _ScriptedToolLLM(), _executor({}), changeset=SemanticChangeSet(units=[unit, sibling, unrelated])
+    )
+    prompt = investigator._render_user(hypothesis, _state(), ContextPack())
+    boundary = prompt.split("## Verification boundary\n", 1)[1]
+    facts = json.loads(boundary.split("\n", 1)[0])
+    assert facts == [
+        {"path": unit.path, "provenance": "locale=zh_CN"},
+        {"path": sibling.path, "provenance": "locale=zh_TW,entries=1"},
+    ]
+    assert unrelated.path not in boundary
+    assert "runtime consumer" in boundary and "formatter" in boundary
+    assert "## Verification boundary" in str(investigator._closing_chat([AIMessage(content=prompt)], 24000))
+
+
+@pytest.mark.parametrize("case", ["symbol", "null-path", "wrong-argument", "missing-unit"])
+def test_resource_boundary_does_not_waive_runtime_or_unmatched_contracts(case):
+    hypothesis, unit = _locale_hypothesis()
+    if case == "symbol":
+        unit.kind = UnitKind.SYMBOL
+    elif case == "missing-unit":
+        hypothesis.unit_id = "absent"
+    else:
+        hypothesis.mechanism = Mechanism(case)
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}), changeset=SemanticChangeSet(units=[unit]))
+    assert "## Verification boundary" not in investigator._render_user(hypothesis, _state(), ContextPack())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["step=安裝手機應用程式", "No results"])
+async def test_locale_boundary_still_requires_recorded_source_evidence(content):
+    hypothesis, unit = _locale_hypothesis()
+    patch = "@@ -1 +1 @@\n-step=安装手机应用程序\n+step=安裝手機應用程式\n"
+    llm = _ScriptedToolLLM(turns=[_read_file_call(unit.path), _verdict(quote=hypothesis.sites[0].excerpt)])
+    executor = _executor({("read_file", (("path", unit.path),)): content})
+    result = await Investigator(llm, executor, changeset=SemanticChangeSet(units=[unit])).investigate(
+        hypothesis, _state(paths=[unit.path], diffs={unit.path: patch}), ContextPack()
+    )
+    if content == "No results":
+        assert result.verdict == "unknown" and result.reason == "ungrounded"
+    else:
+        assert result.verdict == "confirmed" and result.strength == "weak"
+    assert len(result.observations) == 1 and result.observations[0].path == unit.path
 
 
 @pytest.mark.asyncio

@@ -246,3 +246,13 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 生成器与 lens 要求拒绝“陌生 token 就不支持”及“非法输入有异常就有缺陷”的无事实前提候选，仍完整返回每个 unit 的检查边界；未新增发现重试或代码侧类别过滤。编辑规则允许同一具体错误及修复策略覆盖多处，避免把“不同文件”本身当作反向证据；不同原因的同类问题保持分开。
 
 新增 3 项真实 workspace 的多行精确引用、数字前缀/空白保真、未保存内容拒绝回归，以及 1 项 v4 专项上下文隔离回归。已先复现原行号污染，再修正；小预算读证据后收尾的回归继续通过。完整本地 `1540 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过，待新提交独立冻结实测；不复用第三轮 partial 为成绩。
+
+冻结 `27f2bc4` 的第四轮位于 `.reviewforge/benchmarks/v4-source-evidence-20261011-015203/`。生成/lens 共 26 条候选，58 units 无漏答；已保存的多行源码引用可以通过 grounding。但中文 account 的直接字形契约被调查员误要求提供模板引用，仍产生不可重试的 error UNKNOWN。该轮已无法通过严格准入，遂停止剩余调查，Job Object 返回 125，评测锁已释放。取消时记录 35 个成功请求、220345 tokens，账本为 3 CONFIRMED / 1 REFUTED / 16 UNKNOWN / 6 OPEN；无完整 review、发布或成绩，进行中的请求可能有未记录用量。原始记录保留，不拼接前轮结果。
+
+## 2026-10-11 本地资源与运行时验证边界
+
+两问回溯：上一批要求“受支持输入/调用方”是为了排除预期 fail-fast 和陌生 formatter 猜测，这个运行时约束仍成立；但原 localization skill 已把声明 locale 视为本地内容契约，直接语言/字形错误不需要模板调用方证明。Issue 库仍为空。问题在调查输入和问题设计，不能通过放宽 UNKNOWN 或自动确认 i18n 来解决。
+
+调查输入对主 unit 为 resource 的 i18n 候选额外交付相关文件的 path/provenance，保留每个 site 自己的 locale；metadata 本身不可作缺陷证据。直接字形/语言违规比较变更文本与声明契约；格式参数/语法和运行时后果仍要求实际消费端。生成器/lens 的 open_question 与 refutation 必须决定 claim 的契约，避免以无关页面引用为前提。共享 skill 与 legacy 保持原版本，Observation 精确引用、预算及严格裁判不变。
+
+新增 7 项回归覆盖多文件 locale 不串用、无关资源不注入、runtime/nonresource/unmatched 不免检、收尾保留契约，以及没有成功源码 Observation 仍拒绝确认。完整本地 `1547 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 和严格裁判回归通过。生产检查为 service active / HTTP 200，main SHA 仍为 `00c6675`。下一轮须从新的干净提交独立冻结，不使用 holdout，不把取消的第四轮算作完整质量结果。

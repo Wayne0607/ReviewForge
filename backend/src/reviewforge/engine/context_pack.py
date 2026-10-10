@@ -21,6 +21,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from reviewforge.engine.declarations_v4 import extract_code_definitions as extract_definitions
+from reviewforge.engine.java_navigation import JavaSource
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 
 _DEFAULT_MAX_SLICES = 12
@@ -295,6 +296,8 @@ class _PackBuilder:
             or str(_value(changeset, "head_sha", "") or "")
         )
         self.degraded = _workspace_degraded(workspace)
+        self._unchecked: list[str] = []
+        self._java_sources: dict[str, JavaSource] = {}
 
     def build_unit(self, unit: SemanticUnit, unit_id: str) -> UnitContext:
         context = UnitContext(unit_id=unit_id, pr_intent=self.pr_intent)
@@ -303,6 +306,7 @@ class _PackBuilder:
             return context
 
         candidates: list[ContextSlice] = []
+        self._unchecked = []
         candidates.extend(self._collect_callers(unit))
         candidates.extend(self._collect_callees(unit))
         base, interfaces = self._collect_inheritance(unit)
@@ -322,7 +326,16 @@ class _PackBuilder:
         if len(candidates) > self.max_slices:
             kept = len(context.slices)
             context.truncated_kinds = _ordered_unique(slice_.kind for slice_ in candidates[kept:])
+        context.truncated_kinds = _ordered_unique([*self._unchecked, *context.truncated_kinds])
         return context
+
+    def _java_source(self, path: str) -> JavaSource | None:
+        if path not in self._java_sources:
+            source = self._read(path)
+            if source is None:
+                return None
+            self._java_sources[path] = JavaSource(source, path)
+        return self._java_sources[path]
 
     def _read(self, path: str) -> str | None:
         path = str(path or "")
@@ -396,6 +409,14 @@ class _PackBuilder:
         symbol = str(_value(unit, "symbol", "") or "")
         if not symbol or self.max_callers <= 0:
             return []
+        if str(_value(unit, "language", "") or "").lower() == "java":
+            navigation = self._java_source(str(_value(unit, "path", "") or ""))
+            definition = navigation.definition_at(symbol, _unit_anchor_line(unit)) if navigation else None
+            if definition and definition.symbol_type == "function":
+                symbol = navigation.qualified_definition(definition)
+            else:
+                self._unchecked.append("caller")
+                return []
         hits = _workspace_call(
             self.workspace,
             "find_callers",
@@ -407,6 +428,8 @@ class _PackBuilder:
             (_normalise_hit(hit) for hit in hits),
             key=lambda hit: (hit["path"], hit["line"], hit["symbol"], hit["text"]),
         )
+        if not normalised and str(_value(unit, "language", "") or "").lower() == "java":
+            self._unchecked.append("caller")
         result: list[ContextSlice] = []
         for hit in normalised[: self.max_callers]:
             path = hit["path"] or str(_value(unit, "path", "") or "")
@@ -442,7 +465,15 @@ class _PackBuilder:
         language = str(_value(unit, "language", "") or "")
         for call in calls:
             raw_name = call["callee"]
-            lookup_names = _lookup_symbol_names(raw_name)
+            if language.lower() == "java":
+                navigation = self._java_source(str(_value(unit, "path", "") or ""))
+                raw_name = navigation.call_target(call) if navigation else None
+                if not raw_name:
+                    self._unchecked.append("callee")
+                    continue
+                lookup_names = [raw_name]
+            else:
+                lookup_names = _lookup_symbol_names(raw_name)
             hits: list[Any] = []
             resolved_name = raw_name
             for lookup_name in lookup_names:
@@ -455,7 +486,11 @@ class _PackBuilder:
                 if hits:
                     resolved_name = lookup_name
                     break
-            if not hits or resolved_name in seen_symbols:
+            if not hits:
+                if language.lower() == "java":
+                    self._unchecked.append("callee")
+                continue
+            if resolved_name in seen_symbols:
                 continue
             seen_symbols.add(resolved_name)
             normalised = sorted(
@@ -471,13 +506,22 @@ class _PackBuilder:
                     continue
                 definition_start = hit["start_line"] or definition_line
                 source = self._read(path)
+                reason = f"defines {resolved_name}"
+                if language.lower() == "java":
+                    navigation = self._java_source(path)
+                    definition = (
+                        navigation.definition_at(_simple_name(resolved_name), definition_line) if navigation else None
+                    )
+                    state_navigation = navigation.state_navigation(definition) if definition else ""
+                    if state_navigation:
+                        reason += "; " + state_navigation
                 result_slice = self._slice_from_source(
                     kind="callee",
                     path=path,
                     start_line=definition_start,
                     end_line=definition_line + 8,
                     symbol=resolved_name,
-                    reason=f"defines {resolved_name}",
+                    reason=reason,
                     source=source,
                     fallback_text=hit["text"],
                 )
@@ -896,6 +940,8 @@ def _normalise_call(call: Any) -> dict[str, Any]:
         "callee": str(_value(call, "callee", _value(call, "name", "")) or ""),
         "line": _to_int(_value(call, "line", 0)),
         "path": str(_value(call, "file_path", _value(call, "path", "")) or ""),
+        "receiver": str(_value(call, "receiver", "") or ""),
+        "receiver_type": str(_value(call, "receiver_type", "") or ""),
     }
 
 

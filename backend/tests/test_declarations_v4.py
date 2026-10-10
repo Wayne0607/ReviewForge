@@ -108,5 +108,12 @@ async def test_v4_manifest_preserves_real_calls_and_legacy_behavior():
     assert {"caller": "run", "callee": "of", "line": 5} in legacy.calls
     v4 = await ContextEngine(gateway, v4_declarations=True)._inspect_file("Real.java", state)
     assert {item["name"] for item in v4.changed_symbols} == {"Real", "run"}
-    assert {"caller": "run", "callee": "of", "line": 5} in v4.calls
+    assert {
+        "caller": "run",
+        "callee": "of",
+        "line": 5,
+        "column": 16,
+        "receiver": "",
+        "receiver_type": "",
+    } in v4.calls
     assert (await ContextEngine(gateway)._inspect_file("Real.java", state)).calls == legacy.calls

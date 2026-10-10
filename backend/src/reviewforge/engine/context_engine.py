@@ -230,7 +230,16 @@ class ContextEngine:
                 for item in imports[:_MAX_SYMBOLS_PER_FILE]
             ],
             calls=[
-                {"caller": item.caller, "callee": item.callee, "line": item.line}
+                {
+                    "caller": item.caller,
+                    "callee": item.callee,
+                    "line": item.line,
+                    **(
+                        {"column": item.column, "receiver": item.receiver, "receiver_type": item.receiver_type}
+                        if self._v4_declarations
+                        else {}
+                    ),
+                }
                 for item in relevant_calls[:_MAX_SYMBOLS_PER_FILE]
             ],
             sibling_invariants=sibling_invariants,

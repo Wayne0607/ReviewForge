@@ -144,8 +144,8 @@ class ContextPack:
 
 | kind | 来源 | 规则 |
 |---|---|---|
-| `caller` | `workspace.find_callers(unit.symbol)` | 取最多 `max_callers`（默认 4）处，每处取调用行 ±12 行 |
-| `callee` | `unit.calls`（已有）| 对 diff 新增行中的每个被调符号，`find_symbol_definitions` 取定义签名 + 前 8 行（含 docstring）|
+| `caller` | `workspace.find_callers(unit.symbol)` | 取最多 `max_callers`（默认 4）处，每处取调用行 ±12 行；Java 方法使用固定源码的 package / 所属类限定，避免普通 `run` 调用混入 |
+| `callee` | `unit.calls`（已有）| 对 diff 新增行中的每个被调符号，`find_symbol_definitions` 取定义签名 + 前 8 行（含 docstring）；Java 保留 receiver，并按源码的 import、所属类、可见参数/字段限定目标，不回退到全库同名方法 |
 | `base_class` / `interface` | `symbol_extractor.extract_definitions` 解析 unit 所在类的 extends/implements | 取父类/接口定义的方法签名列表（去掉方法体），Python/Java/TS/Go/Ruby 各写一个 regex 提取器 |
 | `sibling` | 同文件、同类、同前缀（`getX`/`setX`、`Create/Get/Update/Delete`）的其它方法 | 取最多 3 个，每个取头 20 行。目的：暴露"其它方法用 V2 flag，这个用 V1"这类不一致 |
 | `lock_usage` / `field_usage` | diff 新增行中出现的 `mu`/`Mutex`/`lock`/`sync.` 或类字段名 | 同文件所有使用点 ±3 行 |
@@ -153,6 +153,10 @@ class ContextPack:
 | `schema` / `config` | unit.kind 为 RESOURCE 时 | 同名 schema/迁移/配置的相关段 |
 
 **限额。** 每 unit ≤ `context_pack.max_slices`（默认 12）、每 slice ≤ 60 行、全包渲染 ≤ `context_pack.max_chars`（默认 40 000）。超限按 `unit.risk_score` 降序保留，被砍的 kind 写入 `truncated_kinds`（生成阶段会把它作为"未检查项"告诉模型）。
+
+Java 的限定检索是源码导航，不是完整类型/继承或反射分析；解析不了接收者、不存在已定位的声明或缺少静态调用命中时，对应方向记为未检查，不能把无命中当作反证。v4 Impact Manifest 保留 column/receiver/receiver_type，但定位重新检查固定源码中的可见声明，不相信其它方法的同名变量类型；legacy Manifest 仍用原三字段。Java workspace 的 `find_definition` / `find_callers` 接受 `类.方法` 或 `包.类.方法`，短类限定允许包歧义，但不能匹配嵌套类的另一个 owner。纯名称查询的原行为不变。
+
+被调 Java 方法涉及可变 static 字段时，callee 的 reason 可附 `State navigation`：检查该方法及一层同类 helper，列出相关字段声明和同类方法引用位置，每条索引 ≤600 字符、最多 4 字段/每字段 6 方法，遗漏明确标示。它用来发现 configure/init/reset 等替代入口，不声明写入事实、调用顺序或完整性；仍计入原渲染预算，不新建工具、Observation 或 verdict。调查需用既有工具窄读取证。
 
 **失败。** workspace 降级时 pack 只含 `pr_intent` 与 diff 内可得信息，`truncated_kinds=["all"]`；不阻断 run。
 

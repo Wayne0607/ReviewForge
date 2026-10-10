@@ -26,6 +26,7 @@ from typing import Any
 from reviewforge.core.state import StateStore
 from reviewforge.engine import symbol_extractor
 from reviewforge.engine.declarations_v4 import extract_code_definitions
+from reviewforge.engine.java_navigation import JavaSource, matches_qualified
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +342,7 @@ class PRHeadWorkspace:
         self._github = github
         self._fallback_repo = fallback_repo
         self._temp_dir = temp_dir
+        self._java_navigation_cache: dict[str, JavaSource] = {}
         self._fallback_error = fallback_error
         self._content_cache: dict[str, str] = {}
         self._definition_cache: dict[tuple[str, str], tuple[symbol_extractor.SymbolInfo, ...]] = {}
@@ -567,11 +569,12 @@ class PRHeadWorkspace:
         return hits
 
     def find_symbol_definitions(self, symbol: str, *, language: str) -> list[SymbolHit]:
-        """Find definitions using the language-aware symbol extractor cache."""
+        """Find declarations; qualified Java queries retain package/class scope."""
 
         if self._closed or self.info.source == "api-fallback":
             return []
         target = str(symbol)
+        simple_target = target.rsplit(".", 1)[-1]
         wanted_language = _language_name(language)
         hits: list[SymbolHit] = []
         for relative, candidate in self._iter_files():
@@ -585,8 +588,15 @@ class PRHeadWorkspace:
                 definitions = tuple(extract_code_definitions(content, relative))
                 self._definition_cache[key] = definitions
             for definition in definitions:
-                if definition.name != target:
+                qualified_java = detected == "java" and "." in target
+                if definition.name != (simple_target if qualified_java else target):
                     continue
+                if qualified_java:
+                    navigation = self._java_source(relative, candidate)
+                    if not matches_qualified(
+                        navigation.qualified_definition(definition), target, package=navigation.package
+                    ):
+                        continue
                 start_line = definition.start_line or definition.line
                 end_line = definition.end_line or definition.line
                 lines = self._read_local(relative, candidate).splitlines()
@@ -619,12 +629,35 @@ class PRHeadWorkspace:
             return []
         wanted_language = _language_name(language)
         hits: list[GrepHit] = []
+        java_targets: set[str] = set()
+        if "." in target and wanted_language in {"", "java"}:
+            for definition in self.find_symbol_definitions(target, language="java"):
+                navigation = self._java_source(definition.path, self.info.root / definition.path)
+                declaration = navigation.definition_at(definition.symbol, definition.line)
+                if declaration:
+                    java_targets.add(navigation.qualified_definition(declaration))
+            if wanted_language == "java" and not java_targets:
+                return []
         for relative, candidate in self._iter_files():
             detected = _language_name(symbol_extractor.detect_language(relative))
             if wanted_language and detected != wanted_language:
                 continue
             content = self._read_local(relative, candidate)
             lines = content.splitlines()
+            if detected == "java" and "." in target:
+                method = target.rsplit(".", 1)[-1]
+                if not re.search(rf"\b{re.escape(method)}\s*\(", content):
+                    continue
+                navigation = self._java_source(relative, candidate)
+                for call in navigation.calls:
+                    actual = navigation.call_target(call)
+                    if call.callee == method and actual in java_targets:
+                        hit = GrepHit(path=relative, line=call.line, text=lines[call.line - 1])
+                        if hit not in hits:
+                            hits.append(hit)
+                        if len(hits) >= max_hits:
+                            return hits
+                continue
             definition_lines = {
                 definition.line
                 for definition in self._definitions_for(relative, detected, content)
@@ -648,6 +681,7 @@ class PRHeadWorkspace:
         shutil.rmtree(self._temp_dir, ignore_errors=True)
         self._content_cache.clear()
         self._definition_cache.clear()
+        self._java_navigation_cache.clear()
         self._file_entries = None
         self._glob_cache.clear()
         self._grep_cache.clear()
@@ -741,6 +775,14 @@ class PRHeadWorkspace:
             definitions = tuple(extract_code_definitions(content, relative))
             self._definition_cache[key] = definitions
         return definitions
+
+    def _java_source(self, relative: str, candidate: Path) -> JavaSource:
+        if relative not in self._java_navigation_cache:
+            content = self._read_local(relative, candidate)
+            self._java_navigation_cache[relative] = JavaSource(
+                content, relative, self._definitions_for(relative, "java", content)
+            )
+        return self._java_navigation_cache[relative]
 
 
 def _glob_matches(path: str, pattern: str) -> bool:

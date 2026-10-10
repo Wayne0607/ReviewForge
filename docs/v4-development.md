@@ -347,4 +347,14 @@ Sentry 的 error 重启计数候选出现 `comparison=compatible` / `verdict=con
 
 两问回查 `0c59514` 的关系一致性校验：它防止矛盾结论通过，约束继续成立；但新 schema 让模型把同一三值判断写成 comparison/verdict 两份，又产生冗余转抄错误。新响应只写 comparison，由代码在两前提与原引用校验后确定 verdict；旧显式 verdict 矛盾继续拒收，旧 UNKNOWN 不提升，已有闭合账本不重开，不修正这轮历史输出。未放宽 SOURCE/UNKNOWN/严格裁判门槛，也不解决语义推理本身。
 
+### Java 符号定位与共享状态入口（2026-10-11）
+
+`5e5f6c0` 的同一两 PR 开发检查目录为 `.reviewforge/benchmarks/v4-dev-breadth-5e5f6c0-20261011-055942/`。Keycloak GEN 接受 7 条候选，调查到 2 REFUTED / 1 UNKNOWN / 4 OPEN 时停止；error CLI 配置候选缺少初始化顺序证据，另一条类似候选却在相同证据缺口下推断 Quarkus 启动顺序并予以推翻。整组不能严格评分。记录 17 个成功请求 / 83088 tokens（GEN 19812 / INV 63276）；Job 返回 125、峰值 370847744 bytes、评测锁释放，进行中调用仍可能有未记录用量。未重写原结论；无本轮质量分、legacy 配对或 holdout。提交前完整检查已达 `1643 passed, 1 skipped, 6 warnings`。
+
+直接检查该 PR 固定 head 的 `Profile.java` 发现 `configure(...)` 和 `init(...)` 均赋值 CURRENT，`getInstance()` 本身只返回 CURRENT。`Environment.getCurrentOrCreateFeatureProfile()` 另有 configure 路径，CLI 的 mapper 清理调用该 helper；应继续调查实际配置绑定与执行顺序，不凭 init 名称假定唯一入口。源码及摘要保存在本轮 source-audit，不能用手工诊断替换旧账本或强制对齐 golden。
+
+实录 Context 中，`run` 的前四个 caller 来自无关 Runnable，`isFeatureEnabled` 的 callee 还混入 TracingPropertyMappers / ProfileAssume 的同名方法。两问回查 `dc0d43c2` / `acd1339b`：原接口假定方法短名足以导航，在多类 Java 仓库不成立；Impact Manifest 和 ContextPack 两处均丢掉了 extractor 已提取的接收者。现在 v4 保留接收者元数据，Java 检索保留 package / class owner，并重新核对源码中的可见声明；不使用跨方法的同名变量类型，不把未解析调用回退为全库同名方法，相关方向明确记未检查。legacy Manifest 和其它语言规则不变。
+
+同一被调方法另附有界的可变 static 字段导航，覆盖当前方法及一层同类 helper，再列同类引用方法位置；因此可发现 configure / init / reset，避免调查只沿偶然看到的一个入口走下去。索引是导航，不是执行顺序证明，不生成 Observation，不代替调查员判定，仍受 12 slices / 60 行 / 40000 字符原限额。新增端到端 Manifest→SemanticChangeSet→ContextPack、嵌套 owner、包歧义、遮蔽、变量作用域、负向解析、字段导航隔离及限额回归；相关 121 项通过，完整检查为 `1665 passed, 1 skipped, 6 warnings`，ruff / 199 文件 format / spec-check / 严格裁判回归均通过。旧 v4 精确字典断言已按新增元数据更新，legacy 精确三字段断言保留；独立定向实跑待完成。
+
 新增 20 项单一关系协议回归，先复现旧实现 9 项失败，再验证三值映射、空/畸形关系、两前提、负向/未知引用、无效旧引用与旧矛盾 verdict，以及原 4000 token 单步取证→收尾。相关共 170 项通过；完整 `1643 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。共享审查范围与本协议变更只用于下一份独立源码快照。`decision-duplication-audit.json` 记录两条真实矛盾响应及账本 hash，两前提引用均已精确保存；历史 verdict 保持原值。

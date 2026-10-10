@@ -144,6 +144,10 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 根本修正为在构造 provider 客户端前传入重试策略：ModelRouter 新增显式参数，默认仍为 2；仅 benchmark 使用 0，严格裁判的 Anthropic 分支也显式为 0。metadata 记录 `sdk_max_retries: 0`。新增实际 SDK 的 429 回归验证恰好一次 HTTP 与可见失败记录，原默认 OpenAI/Anthropic 行为回归保留为 2。完整测试为 `1498 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。下一次对照使用新的提交和输出目录，不续用此中断诊断。
 
+`017afde` dev CI 成功。新实跑已无 SDK 重试突发，但 60 秒间隔下两个生成块和首个 localization 块返回 429；小块 localization 与调查请求能够成功。生成失败留下 58 个 unresolved units，停止继续消耗额度并保留中断诊断（进程组峰值约 333 MiB）。单请求原始错误核实为 `429003: inference exceeds tpm/rpm limit`，不能仅据文本确定是 TPM 还是 RPM。独立接入探针约 31k 输入 tokens 的长请求被拒绝，约 13k 输入 tokens 的较短请求成功；探针截断输入、输出仅 16 tokens，明确不作为代码审查或质量成绩。
+
+据此增加显式开发消融参数 `--generator-max-input-chars`（0 保持现有配置），接入既有语义单元分块；metadata 固定原始 override 和 effective budget。同时修正专项 lens 未继承 generator 输入与 ContextPack 字符预算的接线缺口，默认值均不变。新增小预算下所有单元、完整变更与 no_issue 覆盖仍保留的回归，增强 bootstrap 验证实际配置；完整测试为 `1499 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。接下来用 50000 字符输入块、65 秒请求间隔进行新的单 PR 开发诊断；不复用旧目录或旧成绩。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

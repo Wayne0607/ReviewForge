@@ -253,6 +253,7 @@ async def _build_runtime(
     reasoning_effort: str = "",
     llm_min_interval: float = 30.0,
     thinking: str = "default",
+    generator_max_input_chars: int = 0,
 ) -> tuple[Orchestrator, Database, GitHubClient]:
     os.environ["REVIEWFORGE_PIPELINE"] = pipeline
     if output_language:
@@ -262,6 +263,10 @@ async def _build_runtime(
         # per-run override cannot leak into another benchmark invocation.
         os.environ["REVIEWFORGE_OUTPUT_LANGUAGE"] = output_language
     cfg = ReviewForgeConfig.load(REPO_ROOT / "reviewforge.yaml")
+    if generator_max_input_chars < 0:
+        raise ValueError("generator input budget must be nonnegative")
+    if generator_max_input_chars:
+        cfg.pipeline_v4.generator_max_input_chars = generator_max_input_chars
     runtime_dir = Path(os.environ.get("REVIEWFORGE_SETTINGS_DIR", str(Path(cfg.events_dir).parent)))
     cfg.llm = apply_override(cfg.llm, EncryptedLLMSettingsStore(runtime_dir).load())
     if model_override:
@@ -467,6 +472,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "shard_count": args.shard_count,
         "shard_index": args.shard_index,
         "limit": args.limit,
+        "generator_max_input_chars_override": args.generator_max_input_chars,
     }
 
     orchestrator, db, raw_github = await _build_runtime(
@@ -477,12 +483,14 @@ async def main_async(args: argparse.Namespace) -> None:
         args.reasoning_effort,
         args.llm_min_interval,
         args.thinking,
+        args.generator_max_input_chars,
     )
     try:
         effective = orchestrator._model_router._config
         endpoint = urlsplit(effective.base_url)
         metadata["provider"] = {"host": endpoint.hostname, "path": endpoint.path}
         metadata["effective_model"] = effective.model
+        metadata["effective_generator_max_input_chars"] = orchestrator._pipeline_v4_config.generator_max_input_chars
         validate_resume_metadata(read_metadata(root / "metadata.json"), metadata, has_results=output_path.exists())
         _atomic_json(root / "metadata.json", metadata)
         for index, item in enumerate(workload, 1):
@@ -533,6 +541,9 @@ def main() -> None:
     parser.add_argument("--publication-gate-concurrency", type=int, default=1)
     parser.add_argument("--capture-invalid-outputs", action="store_true")
     parser.add_argument("--model-override", default="")
+    parser.add_argument(
+        "--generator-max-input-chars", type=int, default=0, help="Dev ablation; 0 keeps the YAML budget"
+    )
     parser.add_argument("--pipeline", choices=("legacy", "shadow", "hypothesis"), default="legacy")
     parser.add_argument("--reasoning-effort", choices=("", "low", "high", "max"), default="")
     parser.add_argument("--llm-min-interval", type=float, default=30.0)

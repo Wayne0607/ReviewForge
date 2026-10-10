@@ -203,6 +203,8 @@ async def _run_llm_stages(
                 max_hypotheses=config.generator_max_hypotheses,
                 on_update=checkpoint,
                 anchor_resolver=anchor_resolver,
+                max_input_chars=config.generator_max_input_chars,
+                context_max_chars=config.context_pack_max_chars,
             )
 
     executor = build_workspace_executor(workspace, state)

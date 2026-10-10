@@ -112,9 +112,11 @@ def test_max_three_lenses_by_risk() -> None:
 
 class _ScriptedLLM(BaseChatModel):
     responses: list[str] = Field(default_factory=list)
+    calls: list[list] = Field(default_factory=list)
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.calls.append(messages)
         content = self.responses.pop(0) if self.responses else "{}"
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
@@ -164,3 +166,34 @@ async def test_run_lens_upserts_with_lens_source() -> None:
     assert result.accepted == 1
     identity = f"{unit.id}::security-sink::f"
     assert ledger.items[identity].source == "lens:security"
+
+
+@pytest.mark.asyncio
+async def test_lens_smaller_input_budget_splits_without_losing_changed_units() -> None:
+    units = [_unit("first.py"), _unit("second.py")]
+    diffs = {unit.path: _diff(unit.path, "import pickle", "data = pickle.loads(user_input)") for unit in units}
+    llm = _ScriptedLLM(
+        responses=[
+            json.dumps({"hypotheses": [], "no_issue_units": [{"unit_id": unit.id, "checked": "both lines inspected"}]})
+            for unit in units
+        ]
+    )
+    ledger = HypothesisLedger("run", "abc", "digest")
+    selection = LensSelection(name="security", units=[unit.id for unit in units], reason="security", risk=1)
+    result = await run_lens(
+        llm,
+        "security",
+        selection,
+        StateStore(file_diffs=diffs),
+        ContextPack(),
+        _changeset(*units),
+        ledger,
+        max_input_chars=1000,
+        context_max_chars=0,
+    )
+    assert result.blocks == 2 and result.failed_blocks == 0
+    assert set(ledger.no_issue_units) == {unit.id for unit in units}
+    assert not ledger.unresolved_units
+    assert all(len(call[1].content) <= 1000 for call in llm.calls)
+    for unit in units:
+        assert any(unit.path in call[1].content and "pickle.loads(user_input)" in call[1].content for call in llm.calls)

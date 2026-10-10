@@ -145,9 +145,13 @@ def build_lens_generator(
     output_language: str = "en",
     on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
     anchor_resolver: AnchorResolver | None = None,
+    max_input_chars: int = 120_000,
+    context_max_chars: int = 40_000,
 ) -> HypothesisGenerator:
     return HypothesisGenerator(
         llm,
+        max_input_chars=max_input_chars,
+        context_max_chars=context_max_chars,
         max_hypotheses=max_hypotheses,
         output_language=output_language,
         source=f"lens:{name}",
@@ -171,6 +175,8 @@ async def run_lens(
     max_hypotheses: int = 12,
     on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
     anchor_resolver: AnchorResolver | None = None,
+    max_input_chars: int = 120_000,
+    context_max_chars: int = 40_000,
 ) -> HypothesisGenerationResult:
     """Execute one lens over the units that triggered it and upsert into the ledger."""
 
@@ -188,6 +194,8 @@ async def run_lens(
         output_language=output_language,
         on_update=on_update,
         anchor_resolver=anchor_resolver,
+        max_input_chars=max_input_chars,
+        context_max_chars=context_max_chars,
     )
     return await generator.run(state, pack, filtered, ledger)
 

@@ -75,6 +75,14 @@ overrides and clears legacy profiles, as required by SPEC §7. Record the option
 `--reasoning-effort` identically for both sides. Never compare runs with different
 PR head SHAs or change parameters between paired runs.
 
+For dev-only input-size ablations, `--generator-max-input-chars N` overrides the
+v4 generator's existing block budget; zero keeps the YAML value. The same input
+and ContextPack budgets are also passed to every lens, which previously kept
+constructor defaults. Blocks split at semantic-unit boundaries, preserving their
+full changes; an individually oversized unit remains unresolved. Record the
+override on both paired sides. Metadata records its effective value. Changing it
+requires a new output directory; it does not change production defaults or scores.
+
 `--llm-min-interval` defaults to 30 seconds between request starts across all
 benchmark processes on the host. The benchmark disables SDK automatic retries;
 the zero-retry option is supplied before constructing provider clients, and its

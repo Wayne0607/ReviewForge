@@ -31,9 +31,12 @@ async def test_benchmark_runtime_loads_config_and_blocks_all_real_github_writes(
     monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
     monkeypatch.setenv("LLM_API_KEY", "test-placeholder")
     monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
-    orchestrator, db, raw = await runner._build_runtime(tmp_path, "test-model", "en", "hypothesis")
+    orchestrator, db, raw = await runner._build_runtime(
+        tmp_path, "test-model", "en", "hypothesis", generator_max_input_chars=50_000
+    )
     try:
         assert orchestrator._pipeline_v4_config.mode == "hypothesis"
+        assert orchestrator._pipeline_v4_config.generator_max_input_chars == 50_000
         assert orchestrator._gateway._pipeline_mode == "hypothesis"
         router = orchestrator._model_router
         assert not router._config.profiles

@@ -50,6 +50,18 @@ The disk reserve is a preflight free-space check, not a filesystem quota; monito
 artifact growth and clean only known evaluation workspaces. Unit completion
 indicates process exit, not that an inner partial review passed quality gates.
 
+On Windows, use `launch_windows.py` with the same explicit arguments. It holds a
+per-user evaluation lock and checks free memory/disk reserves. A named Job Object
+caps aggregate committed memory and CPU use for the workload and descendants,
+including Python virtual-environment redirectors. The workload assigns itself to
+the job and verifies actual limits before loading the benchmark script. The job
+uses lower priority and kill-on-close; timeout or launcher death terminates the
+workload tree. Unsupported kernel controls cause failure, with no unbounded
+fallback. Windows CPU percentage is relative to the system (or a containing job),
+as described in [Microsoft's Job Objects documentation](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+and [CPU rate control](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_cpu_rate_control_information).
+Keep both comparison sides on the same host and with identical resource limits.
+
 Environment variables:
 
 - `REVIEWFORGE_REPO_ROOT`: isolated source checkout.
@@ -103,7 +115,9 @@ captures a pinned workspace, semantic units, every collected source slice and th
 bounded rendered pack without invoking an LLM. It records omitted context kinds,
 source/head/script hashes and checks repeat rendering for determinism. Use the
 same isolated environment variables as the runner; cleanup always releases the
-workspace. The snapshot describes supplied context, not review quality.
+workspace. Its runtime initializes only the repository gateway and database;
+model clients and LLM credentials are not required. The snapshot describes
+supplied context, not review quality.
 
 The v4 delivery recovery protocol matches the hidden marker against submitted
 reviews at the same commit, following the [GitHub review listing API](https://docs.github.com/en/rest/pulls/reviews?apiVersion=2022-11-28).

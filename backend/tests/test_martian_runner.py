@@ -80,3 +80,52 @@ async def test_provider_trace_survives_token_wrapper_private_call(runner, tmp_pa
     outputs = list(tmp_path.glob("*-output.json"))
     assert len(inputs) == len(outputs) == 1
     assert json.loads(outputs[0].read_text())["responses"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_failure_closes_database_thread_and_http_client(runner, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "test-placeholder")
+    monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
+    databases, clients = [], []
+    original_database, original_client = runner.Database, runner.GitHubClient
+
+    class Database(original_database):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            databases.append(self)
+
+    class Client(original_client):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            clients.append(self)
+
+    class FailingRouter(runner.ModelRouter):
+        def get_llm(self, *args, **kwargs):
+            raise RuntimeError("Model initialization failed")
+
+    monkeypatch.setattr(runner, "Database", Database)
+    monkeypatch.setattr(runner, "GitHubClient", Client)
+    monkeypatch.setattr(runner, "ModelRouter", FailingRouter)
+    with pytest.raises(RuntimeError, match="Model initialization failed"):
+        await runner._build_runtime(tmp_path)
+    assert databases[0]._db is None
+    assert clients[0]._client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_context_runtime_needs_no_model_key_and_blocks_github_writes(runner, tmp_path, monkeypatch):
+    import importlib
+
+    module = importlib.import_module("context_snapshot")
+    monkeypatch.setattr(module, "REPO_ROOT", runner.REPO_ROOT)
+    monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    gateway, config, db, github = await module.build_context_runtime(tmp_path)
+    try:
+        assert gateway._pipeline_mode == "hypothesis"
+        with pytest.raises(RuntimeError, match="blocked a GitHub write"):
+            await github._client.post("/repos/example/repo/issues", json={"title": "blocked"})
+    finally:
+        await db.close()
+        await github.close()

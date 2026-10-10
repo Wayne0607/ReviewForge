@@ -104,6 +104,12 @@ Linux CI 随后发现 benchmark bootstrap 测试的进程环境变量未恢复�
 
 本轮 Windows 全量测试 `1469 passed, 1 skipped, 6 warnings`，原来只在 Linux 跑的 3 项 benchmark bootstrap 回归现在也在 Windows 通过；新增跨进程互斥、重启时间戳、混合配置拒绝与不完整样本拒绝回归。ruff / format 和两项严格裁判算法回归通过。
 
+首次本机 context 试启动未进入仓库抽查：模型客户端初始化报缺凭据，而已打开的数据库线程没有释放，进程未正常结束。该尝试已停止，不能计作抽查或质量结果。修正 benchmark bootstrap 的失败清理；context 抽查改用独立的仓库 gateway/数据库运行时，不创建无用的模型客户端。另发现 Windows virtualenv 的 Python redirector 会派生真实解释器，不能只监控父 PID 的内存；新增 Windows Job Object 启动器，子进程导入任务前必须绑定并核对内核限额，整棵工作进程树受总内存/CPU限制和超时约束。
+
+Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128 MiB 工作组中被拒绝、3 秒超时终止孙进程及 redirector；7 项限额回归通过。新增 bootstrap 失败释放数据库/HTTP 与 context 不依赖 LLM 凭据的回归也通过。生产主机没有启动真实评测。
+
+本轮 Windows 全量测试 `1478 passed, 1 skipped, 6 warnings`，ruff / format 和严格裁判回归通过。`a5112d5` 的 Linux dev CI 为 `1470 passed, 6 warnings`。恢复后的再次外部检查仍为 HTTP 200。
+
 还需补齐的运行协议缺口：当前 frozen outbox 会在恢复时跳过所有 LLM 阶段；若第一次已发布部分结果，但仍有 OPEN/可重试 UNKNOWN，就无法继续调查并发布新增确认问题。需实现不修改已发送负载、仅补充未发布假设的恢复协议，并验证丢回执与重复恢复。此项未完成，v4 不可进入生产。
 
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。

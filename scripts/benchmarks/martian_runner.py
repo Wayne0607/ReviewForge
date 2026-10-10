@@ -193,6 +193,11 @@ class ReadOnlyGitHub:
         }
 
 
+async def block_github_writes(request: httpx.Request) -> None:
+    if request.method not in {"GET", "HEAD"}:
+        raise RuntimeError("Benchmark blocked a GitHub write")
+
+
 def _wait_for_search_slot() -> None:
     wait_for_request_slot(_SEARCH_RATE_FILE, _SEARCH_INTERVAL_SECONDS)
 
@@ -266,101 +271,108 @@ async def _build_runtime(
             profile.model = model_override
             profile.base_url = cfg.llm.base_url
             profile.api_key = cfg.llm.api_key
-    registry = build_registry()
-    errors = registry.validate()
-    if errors:
-        raise RuntimeError(f"Spec validation failed: {errors}")
+    db = None
+    raw_github = None
+    try:
+        registry = build_registry()
+        errors = registry.validate()
+        if errors:
+            raise RuntimeError(f"Spec validation failed: {errors}")
 
-    raw_github = GitHubClient(token=cfg.github.token)
+        raw_github = GitHubClient(token=cfg.github.token)
 
-    async def block_writes(request: httpx.Request) -> None:
-        if request.method not in {"GET", "HEAD"}:
-            raise RuntimeError("Benchmark blocked a GitHub write")
+        raw_github._client.event_hooks["request"].append(block_github_writes)
+        github = ReadOnlyGitHub(raw_github)
+        router = ModelRouter(cfg.llm)
+        original_get_llm = router.get_llm
+        traced = {}
 
-    raw_github._client.event_hooks["request"].append(block_writes)
-    github = ReadOnlyGitHub(raw_github)
-    router = ModelRouter(cfg.llm)
-    original_get_llm = router.get_llm
-    traced = {}
-
-    def traced_llm(name, *args, **kwargs):
-        if name in traced:
+        def traced_llm(name, *args, **kwargs):
+            if name in traced:
+                return traced[name]
+            llm = original_get_llm(name, *args, **kwargs)
+            if thinking != "default":
+                llm.extra_body = {"thinking": {"type": thinking}}
+            if thinking == "disabled":
+                llm.reasoning_effort = None
+            elif reasoning_effort:
+                llm.reasoning_effort = reasoning_effort
+            llm.max_retries = 0
+            traced[name] = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
             return traced[name]
-        llm = original_get_llm(name, *args, **kwargs)
-        if thinking != "default":
-            llm.extra_body = {"thinking": {"type": thinking}}
-        if thinking == "disabled":
-            llm.reasoning_effort = None
-        elif reasoning_effort:
-            llm.reasoning_effort = reasoning_effort
-        llm.max_retries = 0
-        traced[name] = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
-        return traced[name]
 
-    router.get_llm = traced_llm
-    policy_cfg = PublicationPolicyConfig(
-        enabled=cfg.publication_policy.enabled,
-        mode=cfg.publication_policy.mode,
-        budget_enabled=cfg.publication_policy.budget_enabled,
-        max_comments=cfg.publication_policy.max_comments,
-        high_risk_overflow=cfg.publication_policy.high_risk_overflow,
-    )
-    # A benchmark process can be terminated deliberately by a production
-    # deployment. A fixed DB would leave the interrupted run in "running" and
-    # the immediate retry would be deduplicated as already in progress,
-    # producing a false zero-comment completion. Each process attempt gets an
-    # isolated DB; durable completion/skip state lives in result.json.
-    db = Database(root / f"reviewforge-martian-{os.getpid()}.db")
-    await db.connect()
-    events = EventBus(log_dir=root / "events")
-    orchestrator = Orchestrator(
-        registry=registry,
-        gateway=ToolGateway(registry, github, pipeline_mode=cfg.pipeline_v4.mode),
-        event_bus=events,
-        planner_llm=router.get_llm("planner"),
-        reviewer_llm=router.get_llm("reviewer"),
-        calibrator_llm=router.get_llm("verifier"),
-        db=db,
-        cross_pr_llm=router.get_llm("verifier"),
-        github_client=github,
-        model_router=router,
-        agentic_reviewers=cfg.agentic_reviewers,
-        agentic_default=cfg.agentic_default,
-        escalation_enabled=cfg.escalation_enabled,
-        escalation_confidence_min=cfg.escalation_confidence_min,
-        escalation_confidence_max=cfg.escalation_confidence_max,
-        escalation_max_steps=cfg.escalation_max_steps,
-        escalation_max_tokens=cfg.escalation_max_tokens,
-        escalation_llm=router.get_llm("verifier"),
-        publication_gate_enabled=cfg.publication_gate_enabled,
-        publication_gate_max_steps=cfg.publication_gate_max_steps,
-        publication_gate_max_tokens=cfg.publication_gate_max_tokens,
-        publication_gate_concurrency=_PUBLICATION_GATE_CONCURRENCY,
-        publication_gate_dedup=cfg.publication_gate_dedup,
-        root_cause_extended_families=cfg.root_cause_extended_families,
-        publication_triage_enabled=cfg.publication_triage_enabled,
-        publication_triage_batch_size=cfg.publication_triage_batch_size,
-        publication_triage_concurrency=cfg.publication_triage_concurrency,
-        publication_triage_max_candidates=cfg.publication_triage_max_candidates,
-        publication_triage_context_lines=cfg.publication_triage_context_lines,
-        publication_triage_max_tokens=cfg.publication_triage_max_tokens,
-        publication_gate_llm=router.get_llm("publication_gate"),
-        publication_policy=PublicationPolicy(policy_cfg),
-        coverage_gap_enabled=cfg.coverage_gap_enabled,
-        coverage_gap_min_risk_score=cfg.coverage_gap_min_risk_score,
-        coverage_gap_max_cards=cfg.coverage_gap_max_cards,
-        coverage_gap_min_confidence=cfg.coverage_gap_min_confidence,
-        skills_dir=cfg.skills_dir,
-        v3_enabled=cfg.v3.enabled,
-        v3_coverage_min_risk_score=cfg.v3.coverage_min_risk_score,
-        v3_coverage_max_cells_per_round=cfg.v3.coverage_max_cells_per_round,
-        v3_coverage_max_attempts=cfg.v3.coverage_max_attempts,
-        v3_evidence_mode=cfg.v3.evidence_mode,
-        v3_evidence_max_candidates=cfg.v3.evidence_max_candidates,
-        output_language=cfg.output_language,
-        pipeline_v4_config=cfg.pipeline_v4,
-    )
-    return orchestrator, db, raw_github
+        router.get_llm = traced_llm
+        policy_cfg = PublicationPolicyConfig(
+            enabled=cfg.publication_policy.enabled,
+            mode=cfg.publication_policy.mode,
+            budget_enabled=cfg.publication_policy.budget_enabled,
+            max_comments=cfg.publication_policy.max_comments,
+            high_risk_overflow=cfg.publication_policy.high_risk_overflow,
+        )
+        # A benchmark process can be terminated deliberately by a production
+        # deployment. A fixed DB would leave the interrupted run in "running" and
+        # the immediate retry would be deduplicated as already in progress,
+        # producing a false zero-comment completion. Each process attempt gets an
+        # isolated DB; durable completion/skip state lives in result.json.
+        db = Database(root / f"reviewforge-martian-{os.getpid()}.db")
+        await db.connect()
+        events = EventBus(log_dir=root / "events")
+        orchestrator = Orchestrator(
+            registry=registry,
+            gateway=ToolGateway(registry, github, pipeline_mode=cfg.pipeline_v4.mode),
+            event_bus=events,
+            planner_llm=router.get_llm("planner"),
+            reviewer_llm=router.get_llm("reviewer"),
+            calibrator_llm=router.get_llm("verifier"),
+            db=db,
+            cross_pr_llm=router.get_llm("verifier"),
+            github_client=github,
+            model_router=router,
+            agentic_reviewers=cfg.agentic_reviewers,
+            agentic_default=cfg.agentic_default,
+            escalation_enabled=cfg.escalation_enabled,
+            escalation_confidence_min=cfg.escalation_confidence_min,
+            escalation_confidence_max=cfg.escalation_confidence_max,
+            escalation_max_steps=cfg.escalation_max_steps,
+            escalation_max_tokens=cfg.escalation_max_tokens,
+            escalation_llm=router.get_llm("verifier"),
+            publication_gate_enabled=cfg.publication_gate_enabled,
+            publication_gate_max_steps=cfg.publication_gate_max_steps,
+            publication_gate_max_tokens=cfg.publication_gate_max_tokens,
+            publication_gate_concurrency=_PUBLICATION_GATE_CONCURRENCY,
+            publication_gate_dedup=cfg.publication_gate_dedup,
+            root_cause_extended_families=cfg.root_cause_extended_families,
+            publication_triage_enabled=cfg.publication_triage_enabled,
+            publication_triage_batch_size=cfg.publication_triage_batch_size,
+            publication_triage_concurrency=cfg.publication_triage_concurrency,
+            publication_triage_max_candidates=cfg.publication_triage_max_candidates,
+            publication_triage_context_lines=cfg.publication_triage_context_lines,
+            publication_triage_max_tokens=cfg.publication_triage_max_tokens,
+            publication_gate_llm=router.get_llm("publication_gate"),
+            publication_policy=PublicationPolicy(policy_cfg),
+            coverage_gap_enabled=cfg.coverage_gap_enabled,
+            coverage_gap_min_risk_score=cfg.coverage_gap_min_risk_score,
+            coverage_gap_max_cards=cfg.coverage_gap_max_cards,
+            coverage_gap_min_confidence=cfg.coverage_gap_min_confidence,
+            skills_dir=cfg.skills_dir,
+            v3_enabled=cfg.v3.enabled,
+            v3_coverage_min_risk_score=cfg.v3.coverage_min_risk_score,
+            v3_coverage_max_cells_per_round=cfg.v3.coverage_max_cells_per_round,
+            v3_coverage_max_attempts=cfg.v3.coverage_max_attempts,
+            v3_evidence_mode=cfg.v3.evidence_mode,
+            v3_evidence_max_candidates=cfg.v3.evidence_max_candidates,
+            output_language=cfg.output_language,
+            pipeline_v4_config=cfg.pipeline_v4,
+        )
+        return orchestrator, db, raw_github
+    except BaseException:
+        try:
+            if db is not None:
+                await db.close()
+        finally:
+            if raw_github is not None:
+                await raw_github.close()
+        raise
 
 
 async def _run_one(

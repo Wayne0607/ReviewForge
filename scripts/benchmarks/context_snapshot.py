@@ -9,16 +9,39 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 
-from martian_runner import StateStore, _atomic_json, _build_runtime
+from martian_runner import REPO_ROOT, ReadOnlyGitHub, StateStore, _atomic_json, block_github_writes
 
+from reviewforge.core.config import ReviewForgeConfig
+from reviewforge.core.database import Database
+from reviewforge.core.specs import build_registry
 from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.semantic_diff import compile_semantic_changeset
+from reviewforge.tools.gateway import ToolGateway
+from reviewforge.tools.github_api import GitHubClient
+
+
+async def build_context_runtime(root: Path):
+    """Context collection requires repository access, not model credentials."""
+    config = ReviewForgeConfig.load(REPO_ROOT / "reviewforge.yaml")
+    github = GitHubClient(token=config.github.token)
+    github._client.event_hooks["request"].append(block_github_writes)
+    db = Database(root / f"reviewforge-context-{os.getpid()}.db")
+    try:
+        await db.connect()
+        gateway = ToolGateway(build_registry(), ReadOnlyGitHub(github), pipeline_mode="hypothesis")
+        return gateway, config.pipeline_v4, db, github
+    except BaseException:
+        try:
+            await db.close()
+        finally:
+            await github.close()
+        raise
 
 
 async def capture(args: argparse.Namespace) -> None:
     output = Path(args.output).resolve()
-    orchestrator, db, github = await _build_runtime(output.parent, "", "en", "hypothesis")
+    gateway, config, db, github = await build_context_runtime(output.parent)
     state = None
     try:
         pr = await github.get_pr_info(args.repo, args.pr)
@@ -39,10 +62,9 @@ async def capture(args: argparse.Namespace) -> None:
                 for file in files
             ),
         )
-        workspace = await orchestrator._gateway.workspace_for(state)
-        await ContextEngine(orchestrator._gateway, db).build(state)
+        workspace = await gateway.workspace_for(state)
+        await ContextEngine(gateway, db).build(state)
         changeset = compile_semantic_changeset(state)
-        config = orchestrator._pipeline_v4_config
         pack = ContextPack.build(changeset, workspace, state, max_slices=config.context_pack_max_slices)
         rendered = pack.render_all(max_chars=config.context_pack_max_chars)
         assert rendered == pack.render_all(max_chars=config.context_pack_max_chars), "nondeterministic rendering"
@@ -65,7 +87,7 @@ async def capture(args: argparse.Namespace) -> None:
         print(f"Saved {state.repo}#{state.pr_number}@{state.head_sha}: {len(pack.units)} units, {len(rendered)} chars")
     finally:
         if state is not None:
-            await orchestrator._gateway.cleanup_workspace(state)
+            await gateway.cleanup_workspace(state)
         await db.close()
         await github.close()
 

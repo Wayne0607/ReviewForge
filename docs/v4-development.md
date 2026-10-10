@@ -171,3 +171,22 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 先以回归复现 4 项失败，再修正；新增 7 项覆盖测试（含 generator/lens、省略四个真实方法、明确无问题、恢复不清空漏报失败、空/未知 ID、pipeline health 与严格裁判准入）。离线回执审计 `coverage-ack-audit.json` 保留输入/输出 hash，无新 LLM 调用。完整检查为 `1506 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。生产复核仍 active、HTTP 200、main SHA `00c667556c88241d72d96f24430c7c16b4add24e`。
 
 当前结论：覆盖完整性修正通过本地检查；真实质量验收尚未完成，模型服务限流仍阻止有效配对。默认 legacy、main 部署与阈值均未改，未调整 goldens。下一次真实对照必须冻结修正后的提交、使用新输出目录，并在获得稳定模型额度后运行完整 dev10。
+
+## 2026-10-10 新中转站开发集预检
+
+用户在控制台完成中转站切换后，复核五个角色均使用 `deepseek-v4-flash-0731`，无独立角色端点、模型或密钥覆盖。非思考模式接入探针返回 HTTP 200、实际模型标识与请求一致，记录 10 tokens。生产服务仍 active、根页面 HTTP 200，main SHA `00c667556c88241d72d96f24430c7c16b4add24e` 不变。
+
+冻结审查源码 `987a574`，从 Git 创建独立快照；Windows 归档关闭 autocrlf 转换以保留源文件字节与固定 hash。新输出位于 `.reviewforge/benchmarks/v4-acceptance-new-relay-20261010-173510/`。本轮使用代码默认的 120000 字符生成输入预算、30 秒请求间隔、英文、非思考模式、统一模型路由、SDK 重试 0。旧站 50000/65 秒消融与中断数据不复用为成绩。评测在本机 Job Object 中运行，进程树上限 2 GiB / CPU 10%，保留内存与磁盘余量，不写 GitHub，也不在生产服务器运行审查任务。
+
+完成 dev10 首个 PR `keycloak/keycloak#37429` 的 hypothesis 预检，head 固定为 `02f48f776f43734d1ac8914d3ad6a7115acdcb33`。完整仓库 10310 个文件、约 89.3 MB，未截断；ContextPack 包含 58 个 units / 168 个 slices，按现有预算渲染 40000 字符。47 次模型请求全部成功，支持大输入与工具调用；流程耗时约 1768 秒，进程组峰值约 357 MiB。接入与资源隔离正常，先前的旧站 429 不再是本轮阻塞原因。
+
+本轮审查仍为 `partial`，不是通过验收：
+
+- 生成器两个响应共接受 15 条假设，localization lens 接受 13 条，账本合计 28 条；每 PR 调查预算 12 条，16 条以 `budget-exhausted` 留为 UNKNOWN。
+- 已调查的 12 条中，2 条 CONFIRMED、8 条 `token-exhausted`、2 条 `ungrounded`；42 次调查请求共记录 175690 tokens。UNKNOWN 总数 26，未将预算耗尽或证据不足当作无问题。
+- 38-unit 生成块只明确返回 34 个 unit 判断，漏答仍是 `VerifyMessagePropertiesTest.java` 的四个方法：`verifyNoChangedAnchors`、`verifyIllegalHtmlTagDetected`、`verifyNoHtmlAllowed`、`verifyDuplicateKeysDetected`。原始输入确实包含它们，响应 finish_reason 为 stop，四个 ID 在 hypotheses 与 no_issue_units 中都不存在。完整性修正正确拦住了这种省略。
+- 实际输出 1 条行内评论，记录用量 304631 tokens（输入 281038 / 输出 23593）：生成器 70180、lens 54242、调查 175690、editor 4519。超过每 PR 250000 tokens 的目标，费用没有从 token 数推算。
+
+`outcome.json`、`usage-report.json`、原始回执与 `unit-coverage-audit.json` 已保存。严格裁判准入确认该 review 未完成，未调用裁判、未输出 P/R/F1，0 个有效配对。未启动 legacy 对照、未扩量到完整 dev10、未使用 holdout。评测进程正常退出、资源组关闭；生产 main、部署和默认 legacy 未变。
+
+下一步应优先改善生成单元覆盖、候选质量与预算内的调查收敛，再用新输出目录完成预检和 dev10 对照。不能删除 UNKNOWN、把漏答改成 no_issue、提高分数准入宽容度，或用放大调查预算掩盖当前问题。MiniMax-M3 的原规格最终验收仍未完成。

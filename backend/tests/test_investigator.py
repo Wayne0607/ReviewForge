@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ConfigDict, Field
 
@@ -1089,3 +1089,52 @@ def test_input_forecast_includes_tool_arguments_and_measured_provider_overhead()
     investigator._record_tokens(response, small, schema_tokens=500)
     assert investigator._tokens == 3550
     assert investigator._estimate_input_tokens(small) + 500 + investigator._input_overhead == 3500
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "minimum_tokens"), [("x" * 8000, 2000), ("推理" * 1000, 2000)], ids=["ascii", "unicode"]
+)
+def test_input_forecast_counts_opaque_assistant_reasoning(reasoning, minimum_tokens):
+    plain = AIMessage(content="", tool_calls=[_read_file_call()])
+    replayed = plain.model_copy(update={"additional_kwargs": {"reasoning_content": reasoning}})
+
+    # The compatibility adapter replays this provider field in tool history.
+    # Its size must affect the next request even though visible content is empty.
+    assert Investigator._estimate_input_tokens([replayed]) >= (
+        Investigator._estimate_input_tokens([plain]) + minimum_tokens
+    )
+
+
+def test_known_reasoning_input_does_not_become_fixed_provider_overhead():
+    plain = AIMessage(content="", tool_calls=[_read_file_call()])
+    replayed = plain.model_copy(update={"additional_kwargs": {"reasoning_content": "x" * 8000}})
+    measured_input = Investigator._estimate_input_tokens([plain]) + 2100 + 500
+    response = AIMessage(
+        content="ok",
+        usage_metadata={"input_tokens": measured_input, "output_tokens": 20, "total_tokens": measured_input + 20},
+    )
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}))
+    investigator._record_tokens(response, [replayed], schema_tokens=500)
+
+    # Only the residual provider envelope is fixed overhead. Closure discards
+    # the speculative assistant history, so charging its size again is wrong.
+    assert 0 <= investigator._input_overhead <= 100
+    assert investigator._tokens == measured_input + 20
+
+
+def test_missing_provider_usage_still_counts_generated_reasoning():
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}))
+    response = AIMessage(content="ok", additional_kwargs={"reasoning_content": "x" * 8000})
+    investigator._record_tokens(response, [HumanMessage(content="inspect")])
+
+    assert investigator._tokens >= 2000
+
+
+def test_input_forecast_ignores_metadata_the_adapter_does_not_replay():
+    assistant = AIMessage(content="ok")
+    metadata = assistant.model_copy(update={"additional_kwargs": {"debug": "x" * 8000}})
+    human = HumanMessage(content="inspect")
+    human_metadata = human.model_copy(update={"additional_kwargs": {"reasoning_content": "x" * 8000}})
+
+    assert Investigator._estimate_input_tokens([metadata]) == Investigator._estimate_input_tokens([assistant])
+    assert Investigator._estimate_input_tokens([human_metadata]) == Investigator._estimate_input_tokens([human])

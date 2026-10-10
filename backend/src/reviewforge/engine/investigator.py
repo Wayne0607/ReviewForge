@@ -19,7 +19,7 @@ from itertools import groupby, zip_longest
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from reviewforge.core.json_output import extract_json_value
@@ -631,6 +631,13 @@ class Investigator:
                 "content": message.content,
                 "tool_calls": getattr(message, "tool_calls", []),
                 "tool_call_id": getattr(message, "tool_call_id", ""),
+                # The provider adapter replays this opaque assistant field.
+                # Count it as variable history, not fixed provider overhead.
+                **(
+                    {"reasoning_content": message.additional_kwargs["reasoning_content"]}
+                    if isinstance(message, AIMessage) and "reasoning_content" in message.additional_kwargs
+                    else {}
+                ),
             }
             for message in chat
         ]

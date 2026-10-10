@@ -384,3 +384,13 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 新增 6 项回归，其中 5 项先在旧实现失败；验证实际字段、局部/参数/初始化块隔离、同一行修饰符不串扰、精确大小写/owner、字面量不能触发，以及跨 unit 的 callee 状态隔离和禁止凭 Context 构造引用。既有源码导航与片段预算测试扩充真实 configure/init/reset 片段及截断标记。相关 156 项通过，完整 `1684 passed, 1 skipped, 6 warnings`，ruff / 200 文件 format / spec-check / 严格裁判回归通过。新源码的真实生成与判断效果尚待冻结检查；生产 main 未更新，服务 active / HTTP 200，服务器仍为 `00c667556c88241d72d96f24430c7c16b4add24e`。
 
 新增 20 项单一关系协议回归，先复现旧实现 9 项失败，再验证三值映射、空/畸形关系、两前提、负向/未知引用、无效旧引用与旧矛盾 verdict，以及原 4000 token 单步取证→收尾。相关共 170 项通过；完整 `1643 passed, 1 skipped, 6 warnings`，ruff / 197 文件 format / spec-check 与严格裁判回归通过，新冻结实跑待完成。共享审查范围与本协议变更只用于下一份独立源码快照。`decision-duplication-audit.json` 记录两条真实矛盾响应及账本 hash，两前提引用均已精确保存；历史 verdict 保持原值。
+
+### 完整单 PR 检查与推理输入预算（2026-10-11）
+
+冻结 `f0be264`，在付费请求前单独声明 keycloak#36882，完整运行目录为 `.reviewforge/benchmarks/v4-java-navigation-20261011-072611/`。固定 head / workspace 摘要、20 units 与原预算通过预检；真实 GEN 输入已有正确的 CURRENT 赋值与限定 Profile 调用，不再包含 `uses return`。GEN 接受 9 条候选、11 个 no_issue units、0 unresolved；全流程完成为 2 CONFIRMED / 4 REFUTED / 3 UNKNOWN，2 条实际评论，无 error UNKNOWN。27 次成功请求 / 103383 tokens（GEN 19868 / INV 78968 / editor 4547），956.781 秒；Job 正常退出、峰值 399114240 bytes，锁释放。
+
+固定裁判及账本召回另消耗 1714 tokens，结果为 0 TP / 2 FP / 1 FN，F1=0；账本与 REFUTED 均未覆盖 golden。该 PR 的历史 Qodo-v2 候选为空，不能由此作工具优劣比较。原结果 SHA256 `dba6e1b2...` 与原 verdict 保留：两条确认均未证明有效契约冲突，把“某策略需要启用”推成“其它策略不应启用”，或把示例启用必要 feature 推成违反 feature 前提。两条 error 的 REFUTED 又把 Configuration 的 persisted/raw API 名称当作 config-file/CLI 绑定，并缺少实际入口顺序证明。`semantic-audit.json` 记录四项诊断；流程完整不代表语义验收通过，没有 legacy 配对、完整 dev10 或 holdout。
+
+继续排查模型模式之前，两问回查 `33deded0` 的预算预测与 `892de6af` 的服务商适配器：适配器本来会回传 assistant 的 `reasoning_content`，预测却只计正文/工具字段，把推理历史漏算，并可能把其用量误学为固定 provider overhead。这个假设在非思考模式成立，在已有推理兼容路径不成立。现在预测纳入适配器实际回传的 opaque assistant 字段；真实 provider usage 继续优先，无 usage 时也计入推理输出，其它 metadata 和 human 字段不参与。它仍是预测器，不承诺替代服务商 tokenizer；原总预算、收尾与 SOURCE/UNKNOWN 门槛不变，也不自动开启推理。[DeepSeek 官方工具协议](https://api-docs.deepseek.com/guides/thinking_mode/) 说明带工具的历史推理内容会进入后续上下文。
+
+新增 5 项预算回归，其中 4 项先在旧实现失败，覆盖 ASCII/Unicode 推理、固定 overhead 的分离、缺失 usage 及非回传 metadata 隔离；相关 77 项通过。完整 `1689 passed, 1 skipped, 6 warnings`，ruff / 200 文件 format / spec-check 与严格裁判回归通过。下一步仅对两条事先选定的误报候选作独立模式诊断，固定源码/初始 prompt/原预算；不向调查员交付 golden 或历史 verdict，不重开原账本，不将定向诊断当作整体质量分。

@@ -25,6 +25,7 @@ from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.hypothesis_generator import AnchorResolver, HypothesisGenerationResult, HypothesisGenerator
+from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 
 _LOCALIZATION_PATH = re.compile(r"\.(properties|po)$|messages_[^/]+\.json$|/locale/", re.IGNORECASE)
@@ -128,13 +129,16 @@ def select_lenses(state: StateStore, changeset: SemanticChangeSet, *, max_lenses
 
 
 def lens_skill_body(name: str) -> str:
-    """Return the SKILL.md body for a lens, or an empty string."""
+    """Reuse the shared skill, with contract guidance confined to the v4 lens."""
 
     directory = _LENS_SKILLS.get(name)
     if not directory:
         return ""
     path = Path(__file__).resolve().parent.parent / "skills" / directory / "SKILL.md"
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    body = path.read_text(encoding="utf-8") if path.exists() else ""
+    if name == "localization":
+        body += "\n\n" + load_prompt("localization_contracts")
+    return body
 
 
 def build_lens_generator(

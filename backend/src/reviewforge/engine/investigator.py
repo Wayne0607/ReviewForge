@@ -27,6 +27,7 @@ from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_d
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Observation, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet
+from reviewforge.tools.workspace import _bounded_range
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +131,19 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
 
     async def _execute(name: str, args: dict[str, Any]) -> str:
         if name == "read_file":
+            # Read pinned source, then select the window locally. Workspace's
+            # display-oriented range reader inserts "N: " on every line, which
+            # is not source and breaks exact multiline Observation citations.
+            # Keep source whitespace intact and location in separate metadata.
             if getattr(workspace, "source", "") == "api-fallback":
-                content = await workspace.read_async(args["path"], start=args.get("start"), end=args.get("end"))
+                content = await workspace.read_async(args["path"])
             else:
-                content = workspace.read(args["path"], start=args.get("start"), end=args.get("end"))
-            return content or ""
+                content = workspace.read(args["path"])
+            if content is None or (args.get("start") is None and args.get("end") is None):
+                return content or ""
+            lines = content.splitlines(keepends=True)
+            first, last = _bounded_range(lines, args.get("start") or 1, args.get("end") or len(lines))
+            return "".join(lines[first - 1 : last])
         if name == "grep":
             globs = [args["glob"]] if args.get("glob") else None
             hits = workspace.grep(args["pattern"], globs=globs, max_hits=int(args.get("max_hits", 10)))
@@ -263,15 +272,18 @@ class Investigator:
         )
         self._obs_counter += 1
         self._observations.append(observation)
+        label = f"[{observation.id}]"
+        if name == "read_file" and observation.line_range:
+            label += f" {observation.path} (requested lines {observation.line_range[0]}-{observation.line_range[1]})"
         if len(text) > _OBS_EXCERPT_CHARS:
             return (
-                f"[{observation.id}] Saved evidence excerpt (cite only this section):\n"
+                f"{label} Saved evidence excerpt (cite only this section):\n"
                 f"{observation.excerpt}\n[End saved evidence excerpt]\n"
                 "Additional context (not citable under this observation; use read_file with a narrower "
                 "line range or a more specific search to record it as evidence):\n"
                 f"{text[_OBS_EXCERPT_CHARS:]}"
             )[:_TOOL_RESULT_CHARS]
-        return f"[{observation.id}] {text}" if text else f"[{observation.id}] (no content)"
+        return f"{label}\n{text}" if text else f"{label} (no content)"
 
     def _system_prompt(self) -> str:
         return load_prompt("investigator", output_language=_language_directive(self._output_language))
@@ -412,6 +424,7 @@ class Investigator:
                 "tool": obs.tool,
                 "query": obs.query,
                 "path": obs.path,
+                "line_range": obs.line_range,
                 "status": obs.status,
                 "excerpt": obs.excerpt,
             }

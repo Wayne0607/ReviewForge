@@ -11,7 +11,7 @@ from pydantic import ConfigDict, Field
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.hypothesis import HypothesisLedger
-from reviewforge.engine.lenses import LensSelection, run_lens, select_lenses
+from reviewforge.engine.lenses import LensSelection, build_lens_generator, run_lens, select_lenses
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 
 
@@ -127,6 +127,22 @@ class _ScriptedLLM(BaseChatModel):
     @property
     def _identifying_params(self):
         return {}
+
+
+def test_format_contract_context_is_confined_to_the_v4_localization_lens() -> None:
+    from pathlib import Path
+
+    import reviewforge.engine.lenses as lens_module
+
+    reference = "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/text/MessageFormat.html"
+    shared = Path(lens_module.__file__).parent.parent / "skills/localization_rules/SKILL.md"
+    original = shared.read_bytes()
+    localization = build_lens_generator(_ScriptedLLM(), "localization")._system_prompt()
+    security = build_lens_generator(_ScriptedLLM(), "security")._system_prompt()
+
+    assert "declared locale" in localization and reference in localization
+    assert reference not in security and reference not in original.decode("utf-8")
+    assert shared.read_bytes() == original
 
 
 @pytest.mark.asyncio

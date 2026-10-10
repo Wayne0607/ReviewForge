@@ -294,7 +294,7 @@ budget_steps = base(severity) + bonus
  "additional_sites":[{"path":"...","line":1,"excerpt":"..."}],
  "reason":"..."}
 ```
-校验：`confirmed`/`refuted` 必须引用 ≥1 个 `status=success` 的 observation 且 `evidence_quote` 在其 excerpt 内，否则降级为 `unknown`，reason `ungrounded`。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）——若 evidence 全是 not_found 则降为 `unknown`。
+校验：`confirmed`/`refuted` 必须引用 ≥1 个 `status=success` 的 observation 且 `evidence_quote` 在其 excerpt 内，否则降级为 `unknown`，reason `ungrounded`。`read_file` 从固定 workspace 原始正文按范围切片，保存不含展示行号的源码；path / line_range 为独立元数据，保留空白和真正的数字前缀，不做模糊引用匹配。`refuted` 不能仅基于 `not_found`（"没搜到"不是反证）——若 evidence 全是 not_found 则降为 `unknown`。
 
 **evidence_strength。** `strong` = 引用 ≥1 个 diff 外文件的 observation 或 detectors 命中；`weak` = 仅 diff 内 observation；`none` = unknown。
 

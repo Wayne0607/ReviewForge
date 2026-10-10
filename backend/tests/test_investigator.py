@@ -43,6 +43,14 @@ def _state(paths: list[str] | None = None, *, diffs: dict[str, str] | None = Non
     )
 
 
+def _source_workspace(tmp_path, source: str):
+    from reviewforge.tools.workspace import PRHeadWorkspace, WorkspaceInfo
+
+    (tmp_path / "a.py").write_text(source, encoding="utf-8")
+    info = WorkspaceInfo("owner/repo", "owner/repo", "abc123", tmp_path, 1, len(source), "d", False, "tarball")
+    return PRHeadWorkspace(info, None, fallback_repo="owner/repo", temp_dir=tmp_path)
+
+
 class _ScriptedToolLLM(BaseChatModel):
     turns: list = Field(default_factory=list)
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -464,11 +472,70 @@ async def test_api_fallback_executor_uses_async_pinned_reader() -> None:
     workspace = SimpleNamespace(
         source="api-fallback",
         read=Mock(side_effect=AssertionError("sync API read")),
-        read_async=AsyncMock(return_value="pinned content"),
+        read_async=AsyncMock(return_value="line 1\nline 2\npinned content\nline 4\nline 5"),
     )
     result = await build_workspace_executor(workspace, _state())("read_file", {"path": "a.py", "start": 3, "end": 5})
-    assert result == "pinned content"
-    workspace.read_async.assert_awaited_once_with("a.py", start=3, end=5)
+    assert result == "pinned content\nline 4\nline 5"
+    workspace.read_async.assert_awaited_once_with("a.py")
+
+
+@pytest.mark.asyncio
+async def test_windowed_source_supports_exact_multiline_citation(tmp_path) -> None:
+    source = "header\n    verifySafeHtml();\n} catch (IOException e) {\n    throw error;\nfooter\n"
+    workspace = _source_workspace(tmp_path, source)
+    investigator = Investigator(_ScriptedToolLLM(), build_workspace_executor(workspace, _state()))
+    await investigator._run_tool("read_file", {"path": "a.py", "start": 2, "end": 4})
+    observation = investigator._observations[0]
+    quote = "verifySafeHtml();\n} catch (IOException e) {\n    throw error;"
+
+    assert quote in observation.excerpt
+    assert observation.line_range == (2, 4)
+    assert "footer" not in observation.excerpt
+    result = investigator._finalize(
+        {"verdict": "refuted", "evidence_ids": ["obs_0"], "evidence_quote": quote}, _hypothesis(), {"a.py"}, steps=1
+    )
+    assert result.verdict == "refuted"
+    fabricated = investigator._finalize(
+        {
+            "verdict": "refuted",
+            "evidence_ids": ["obs_0"],
+            "evidence_quote": quote.replace("throw error", "return safely"),
+        },
+        _hypothesis(),
+        {"a.py"},
+        steps=1,
+    )
+    assert fabricated.verdict == "unknown" and fabricated.reason == "ungrounded"
+
+
+@pytest.mark.asyncio
+async def test_windowed_source_preserves_real_numeric_prefixes_and_whitespace(tmp_path) -> None:
+    source = "ignore\n42: literal prefix  \n\n    indented content\n"
+    workspace = _source_workspace(tmp_path, source)
+    executor = build_workspace_executor(workspace, _state())
+
+    assert (
+        await executor("read_file", {"path": "a.py", "start": 2, "end": 4})
+        == "42: literal prefix  \n\n    indented content\n"
+    )
+    assert await executor("read_file", {"path": "a.py"}) == source
+
+
+@pytest.mark.asyncio
+async def test_raw_source_citation_still_rejects_unsaved_context(tmp_path) -> None:
+    source = "x" * 1500 + "\nnot_saved_proof()\n"
+    workspace = _source_workspace(tmp_path, source)
+    investigator = Investigator(_ScriptedToolLLM(), build_workspace_executor(workspace, _state()))
+    await investigator._run_tool("read_file", {"path": "a.py", "start": 1, "end": 2})
+
+    assert len(investigator._observations[0].excerpt) == 1200
+    result = investigator._finalize(
+        {"verdict": "confirmed", "evidence_ids": ["obs_0"], "evidence_quote": "not_saved_proof()"},
+        _hypothesis(),
+        {"a.py"},
+        steps=1,
+    )
+    assert result.verdict == "unknown" and result.reason == "ungrounded"
 
 
 @pytest.mark.asyncio

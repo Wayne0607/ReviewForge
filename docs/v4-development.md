@@ -232,3 +232,17 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 - 一条 formatter 候选真实响应的 reason 明确推翻，但 verdict 填 confirmed；改为先写事实与理由、最后选一致的三值结论。仅引用 import/构造/方法名不足以证明 API 能力。这是提示词改进，不能声称已在代码层解决语义矛盾，需新冻结轮次实测。
 
 新增 3 项窄 diff 回归及 7 项编辑聚类/降级回归；六项旧实现的错误合并已先复现，再修正，原同文件命名符号合并和全部 sites 校验继续通过。完整本地 `1536 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。尚待新的冻结提交真实预检，不提高预算、不改数据集/goldens/裁判阈值，main 仍保留 legacy 生产版本。
+
+冻结 `3bcbca0` 的第三轮结果位于 `.reviewforge/benchmarks/v4-grounded-publication-20261011-010626/`。同一 head / 完整仓库摘要 / 58 units / 模型与限制，47 次请求均成功；GEN 17 + lens 9 条，共 26 条候选，无漏答。调查 4 CONFIRMED / 4 REFUTED / 18 UNKNOWN（14 条超 PR 候选预算、2 条无充分契约证据、2 条 ungrounded）。编辑实际保留 4 条独立评论，空 anchor 不再压成一簇；4 条 error-severity UNKNOWN 使内层 partial，严格裁判拒绝评分。用量回到 270232（GEN 50604 / lens 44082 / INV 168946 / editor 6600），耗时 1858.922 秒，峰值约 358 MiB。这一轮在发布覆盖上验证了修正，在运行完整性和用量上仍失败；没有质量分、legacy 配对或 holdout。
+
+## 2026-10-11 原始源码证据与格式契约
+
+回查 `7db82230` 的 Observation 捕获与 workspace 的 range reader：原设计保存带逐行 `N: ` 前缀的展示文本，隐含假设是模型多行引用也会包含这些展示前缀。两条真实结论的引用是正确的源码子串，却被该表示差异判为 ungrounded。`evidence-layout-audit.json` 保存原始输入/输出 hash，仅离线验证这两条 quote 去掉展示前缀后与已保存源码一致；不修改旧 verdict、完成状态或成绩。
+
+调查员改从固定 workspace 读取正文，再用原范围边界逻辑本地切片。Observation 保存原始正文，path / line_range 为独立元数据；保留缩进、空行、尾空白、真正的数字前缀，不猜测剥除源码中的内容。API fallback 仍走异步固定 SHA 读取，workspace 的原带行号展示 API 和 legacy 均保留。证据仍须精确命中成功 Observation 的已保存 1200 字符，未保存文字和伪造代码继续拒收；工具 6000 字符、调查总预算、候选上限和 UNKNOWN gate 不变。
+
+另两条关键 UNKNOWN 来自无具体消费端冲突的格式语法猜测。上一轮新增“必须有 implementation/test”的提示过于限制标准库契约：库源码不一定包含在目标仓库中。调整为追踪实际消费端，再核对其实现或已文档化的标准契约；import 或类名不能单独证明数据流。依据 [Java SE MessageFormat 官方语法与使用说明](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/text/MessageFormat.html)，明确 choice 子格式与重复 argument index 是受支持的能力，不能将邻接格式项误认为非法嵌套；这个规则不能套用于未核实的前端消费端。指南以 `prompts_v4/localization_contracts.md` 仅注入 v4 localization lens，共享 SKILL.md 未改，保留 legacy 对照边界。
+
+生成器与 lens 要求拒绝“陌生 token 就不支持”及“非法输入有异常就有缺陷”的无事实前提候选，仍完整返回每个 unit 的检查边界；未新增发现重试或代码侧类别过滤。编辑规则允许同一具体错误及修复策略覆盖多处，避免把“不同文件”本身当作反向证据；不同原因的同类问题保持分开。
+
+新增 3 项真实 workspace 的多行精确引用、数字前缀/空白保真、未保存内容拒绝回归，以及 1 项 v4 专项上下文隔离回归。已先复现原行号污染，再修正；小预算读证据后收尾的回归继续通过。完整本地 `1540 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过，待新提交独立冻结实测；不复用第三轮 partial 为成绩。

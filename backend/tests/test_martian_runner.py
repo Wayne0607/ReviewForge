@@ -297,16 +297,18 @@ async def test_benchmark_workspace_preflight_precedes_models_and_reuses_one_snap
     )
     orchestrator = Orchestrator(gateway)
     item = {"repo": "owner/repo", "pr_number": 1, "golden_url": "https://example.test/pr/1"}
+    preflight_dir = tmp_path / "new" / "workspace-preflight"
+    assert not preflight_dir.exists()
     if case == "complete":
-        row = await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=tmp_path)
+        row = await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=preflight_dir)
         assert row["summary"]["status"] == "completed" and row["tokens"] == 0
     else:
         with pytest.raises(RuntimeError, match="graph interrupted" if case == "run-error" else "before model calls"):
-            await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=tmp_path)
+            await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=preflight_dir)
     assert github.downloads == 1
     assert orchestrator.model_calls == (1 if case in {"complete", "run-error"} else 0)
     assert not gateway._workspaces and not gateway._workspace_states
-    receipt = json.loads(next(tmp_path.glob("*.json")).read_text())
+    receipt = json.loads(next(preflight_dir.glob("*.json")).read_text())
     assert receipt["head_sha"] == "head" and receipt["before_model_requests"]
     assert receipt["source"] == ("api-fallback" if case == "download-error" else "tarball")
     assert receipt["truncated"] == (case == "truncated")

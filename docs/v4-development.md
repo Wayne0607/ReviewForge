@@ -306,3 +306,5 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 回查 benchmark `_run_one` 与 `ToolGateway.workspace_for`：原评测沿用产品允许的 API 降级行为，付费调用前不区分完整/退化源码。这适合产品可用性，但不满足当前固定输入的质量对照。新增显式 `--require-complete-workspace`，仅用于评测：在任何 graph/model 调用之前取得固定 head 的 tarball，校验来源、截断标记和 SHA，并保存预检诊断；不满足则失败且没有模型调用。使用现有 run-scoped workspace cache，后续 v4 复用同一对象、不再次下载；拒收和 graph 异常时释放该 state 的 workspace，legacy 预检缓存也显式清理。默认关闭，产品降级路径保持原行为。开关写入续跑 provenance，避免混用输入协议。
 
 新增 4 项真实 tarball/gateway 回归，验证完整源码复用一次下载、网络降级/截断均先于 graph 拒收、graph 失败清理和诊断保留；相关 11 项通过，完整检查为 `1589 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。下一次固定输入预检及后续配对显式开启此开关。
+
+冻结 `03960a8` 的首次预检位于 `.reviewforge/benchmarks/v4-workspace-preflight-20261011-041438/`。实跑暴露诊断父目录未初始化，写回执时失败；0 次模型请求、0 tokens，严格准入拒收且没有质量分。runner 进程返回 0 只是逐 PR 错误已被记录，不代表 review 完成。补上递归创建诊断目录，将原 4 项回归改为尚不存在的嵌套路径，覆盖真实启动场景；相关 11 项再次通过。保留失败回执，下一次使用新的冻结提交与独立目录，不复用失败结果。

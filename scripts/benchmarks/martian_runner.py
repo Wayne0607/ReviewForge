@@ -408,6 +408,7 @@ async def _run_one(
         file_diffs={str(file["filename"]): str(file.get("patch") or "") for file in files},
     )
     if workspace_preflight_dir is not None:
+        workspace_preflight_dir.mkdir(parents=True, exist_ok=True)
         try:
             workspace = await orchestrator._gateway.workspace_for(state)
             info = workspace.info

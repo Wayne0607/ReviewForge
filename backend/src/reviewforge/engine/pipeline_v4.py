@@ -16,6 +16,7 @@ from typing import Any
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.declarations_v4 import compile_changeset_v4
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.editor import (
     Editor,
@@ -34,7 +35,7 @@ from reviewforge.engine.phase0 import scan_changed_files
 from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
 from reviewforge.engine.run_health import RunHealth
 from reviewforge.engine.security_categories import is_security_category
-from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, compile_semantic_changeset
+from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 
 logger = logging.getLogger(__name__)
@@ -360,12 +361,13 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     workspace_payload["ms"] = int((time.perf_counter() - started) * 1000)
     workspace_event = orchestrator._events.emit("workspace.built", workspace_payload)
 
-    # The compiler consumes ContextEngine's manifest; it does not extract
-    # symbols itself. Shadow can inherit one from legacy, but a fresh primary
-    # run must build it through the gateway pinned to this PR head first.
-    if state.files_changed and not state.impact_manifest:
-        await ContextEngine(orchestrator._gateway, getattr(orchestrator, "_db", None)).build(state)
-    changeset = compile_semantic_changeset(state)
+    # Rebuild through the pinned gateway, including after legacy shadow: v4
+    # declarations must be code-backed, independent of legacy regex heuristics.
+    if state.files_changed:
+        await ContextEngine(orchestrator._gateway, getattr(orchestrator, "_db", None), v4_declarations=True).build(
+            state
+        )
+    changeset = compile_changeset_v4(state)
     config = orchestrator._pipeline_v4_config
     pack = ContextPack.build(
         changeset,

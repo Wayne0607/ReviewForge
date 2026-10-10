@@ -18,6 +18,7 @@ from typing import Any
 
 from reviewforge.core.database import Database
 from reviewforge.core.state import StateStore
+from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.detectors.unified_diff import iter_added_lines
 from reviewforge.engine.sibling_invariants import analyze_sibling_invariants
 from reviewforge.engine.symbol_extractor import (
@@ -84,9 +85,13 @@ class ImpactFile:
 class ContextEngine:
     """Create a small, evidence-oriented Impact Manifest for one PR."""
 
-    def __init__(self, gateway: ToolGateway, db: Database | None = None) -> None:
+    def __init__(self, gateway: ToolGateway, db: Database | None = None, *, v4_declarations: bool = False) -> None:
         self._gateway = gateway
         self._db = db
+        self._v4_declarations = v4_declarations
+
+    def _definitions(self, content: str, path: str) -> list[SymbolInfo]:
+        return extract_code_definitions(content, path) if self._v4_declarations else extract_definitions(content, path)
 
     async def build(self, state: StateStore) -> dict[str, Any]:
         await self._gateway.ensure_file_diffs(state)
@@ -159,7 +164,7 @@ class ContextEngine:
         imports: list[ImportInfo]
         calls: list[CallInfo]
         if content:
-            definitions = extract_definitions(content, path)
+            definitions = self._definitions(content, path)
             imports = extract_imports(content, path)
             calls = extract_calls(content, path)
             changed = [symbol for symbol in definitions if _touches_changed_line(symbol, added_lines)]
@@ -169,7 +174,7 @@ class ContextEngine:
 
         # A hunk may modify module-level code without touching a declaration.
         # Keep diff-level definitions as a fallback for incomplete/truncated file reads.
-        if not changed:
+        if not changed and (not self._v4_declarations or not content):
             changed, _diff_imports = extract_diff_symbols(diff, path)
 
         changed_names = {item.name for item in changed}
@@ -389,7 +394,7 @@ class ContextEngine:
             calls = extract_calls(content, path)
             caller_names = {call.caller for call in calls if call.callee == symbol and call.caller != "<module>"}
             definitions = [
-                item for item in extract_definitions(content, path) if item.name == symbol or item.name in caller_names
+                item for item in self._definitions(content, path) if item.name == symbol or item.name in caller_names
             ]
             changed_symbols = [
                 {

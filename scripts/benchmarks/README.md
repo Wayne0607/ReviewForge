@@ -118,7 +118,15 @@ same isolated environment variables as the runner; cleanup always releases the
 workspace. Its runtime initializes only the repository gateway and database;
 model clients and LLM credentials are not required. The snapshot describes
 supplied context, not review quality.
+Use `--require-tarball` for repository context audits; API fallback still saves a
+diagnostic artifact but exits unsuccessfully. The log reports snapshot source,
+file/unit/slice counts so a zero-slice degraded pack cannot look like a passed audit.
 
 The v4 delivery recovery protocol matches the hidden marker against submitted
 reviews at the same commit, following the [GitHub review listing API](https://docs.github.com/en/rest/pulls/reviews?apiVersion=2022-11-28).
 An absent marker after an ambiguous write does not authorize another POST.
+Confirmed facts discovered after the first publication use separate immutable
+supplement batches. Resume reconciles all existing batches before new model work
+or writes, retains run-wide inline limits, and does not rerun the editor LLM.
+Historical development outboxes without coverage metadata cannot safely continue
+remaining hypotheses; start a new isolated run instead of guessing coverage.

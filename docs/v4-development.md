@@ -124,6 +124,12 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 
 真实大仓库重新采集：`74058dc` 首次 keycloak 请求发生空消息异常并保存降级诊断，新增异常类型日志后固定 `18bf939` 重试。后者 keycloak 为 10252 文件 / 68 pack units / 624 slices，grafana 为 16203 文件 / 8 units / 94 slices，均为 tarball。内容抽查发现注释被误认作定义，以及同名声明共用 unit ID、后者在 ContextPack 字典覆盖前者；接下来只在 v4 分支校正声明与唯一单元交付，legacy 的符号/manifest 行为保持原样。此轮抽查尚不能判定全部质量门槛通过。
 
+`18bf939` 三个采集均完成，Sentry 为 15464 文件 / 22 pack units / 248 slices；工作组峰值内存约 317 / 362 / 414 MiB。实际 keycloak 输入是 77 个语义单元，但 pack 字典只保留 68 个；Sentry 是 23 → 22。重复来自同名类/构造函数/重载。另一个直接证据：AuthenticationError.java 的 `subclass of this interface` 被旧 `class\s+(\w+)` 正则识别成名为 `of` 的类，作为 `Map.of` 的 callee 交付了整段无关注释。
+
+新增 v4 专用 `declarations_v4.py`：沿用语言提取与源码范围，但声明名字必须位于代码，而非注释/字符串；普通 unit IDs 保持一致，同名冲突按声明类型与范围区分，完全重复的 manifest 行合并且保留全部 RIGHT 行。ContextPack 遇到重复 ID 明确拒绝，不再静默覆盖。workspace、pack 与新的 v4 manifest 使用相同声明规则；`ContextEngine` 只新增显式 v4 分支，shadow 在 legacy 发布后重新构建 v4 manifest。legacy 的 extractor/compiler、默认 ContextEngine 调用及评测口径未改。
+
+新增 4 项源码/重载/重复行/manifest 回归，验证真实注释误识别、所有行保留、同 head 重编译稳定，以及 legacy 行为不变。串行采集结束后 7 项 Windows 限额探针通过；本轮完整检查为 `1489 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判算法回归通过。`8bc641d` Linux CI 为 `1483 passed, 3 skipped, 6 warnings`。下一步固定声明修正的提交，复查实际上下文与开发集对照，质量结论仍待完整评测。
+
 1. 大型 PR 分块和截断覆盖的真实边界、调查输入与 unit hunk 的一致性。
 2. 复核 detector 种子的确认语义与未映射类别，避免未经验证的命中直接成为强证据问题。
 3. 完成开发集漏斗诊断、配对指标和 ContextPack 实例抽查，达标后再进入 holdout。

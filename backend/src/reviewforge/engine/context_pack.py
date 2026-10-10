@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
+from reviewforge.engine.declarations_v4 import extract_code_definitions as extract_definitions
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
-from reviewforge.engine.symbol_extractor import extract_definitions
 
 _DEFAULT_MAX_SLICES = 12
 _DEFAULT_MAX_SLICE_LINES = 60
@@ -153,6 +153,8 @@ class ContextPack:
         units = _value(changeset, "units", []) or []
         for unit in units:
             unit_id = _unit_id(unit)
+            if unit_id in pack.units:
+                raise ValueError(f"ContextPack requires unique semantic unit IDs: {unit_id}")
             pack.units[unit_id] = pack_builder.build_unit(unit, unit_id)
             pack._unit_risks[unit_id] = _unit_risk(unit)
         return pack

@@ -25,6 +25,7 @@ from typing import Any
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine import symbol_extractor
+from reviewforge.engine.declarations_v4 import extract_code_definitions
 
 logger = logging.getLogger(__name__)
 
@@ -581,7 +582,7 @@ class PRHeadWorkspace:
             definitions = self._definition_cache.get(key)
             if definitions is None:
                 content = self._read_local(relative, candidate)
-                definitions = tuple(symbol_extractor.extract_definitions(content, relative))
+                definitions = tuple(extract_code_definitions(content, relative))
                 self._definition_cache[key] = definitions
             for definition in definitions:
                 if definition.name != target:
@@ -737,7 +738,7 @@ class PRHeadWorkspace:
         key = (relative, language)
         definitions = self._definition_cache.get(key)
         if definitions is None:
-            definitions = tuple(symbol_extractor.extract_definitions(content, relative))
+            definitions = tuple(extract_code_definitions(content, relative))
             self._definition_cache[key] = definitions
         return definitions
 

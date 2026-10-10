@@ -16,7 +16,7 @@ from reviewforge.core.database import Database
 from reviewforge.core.specs import build_registry
 from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.semantic_diff import compile_semantic_changeset
+from reviewforge.engine.declarations_v4 import compile_changeset_v4
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.github_api import GitHubClient
 
@@ -68,8 +68,8 @@ async def capture(args: argparse.Namespace) -> None:
             ),
         )
         workspace = await gateway.workspace_for(state)
-        await ContextEngine(gateway, db).build(state)
-        changeset = compile_semantic_changeset(state)
+        await ContextEngine(gateway, db, v4_declarations=True).build(state)
+        changeset = compile_changeset_v4(state)
         pack = ContextPack.build(changeset, workspace, state, max_slices=config.context_pack_max_slices)
         rendered = pack.render_all(max_chars=config.context_pack_max_chars)
         assert rendered == pack.render_all(max_chars=config.context_pack_max_chars), "nondeterministic rendering"

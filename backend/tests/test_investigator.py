@@ -192,6 +192,29 @@ def test_resource_boundary_does_not_waive_runtime_or_unmatched_contracts(case):
     assert "## Verification boundary" not in investigator._render_user(hypothesis, _state(), ContextPack())
 
 
+@pytest.mark.parametrize(
+    ("mechanism", "kind", "path", "expected"),
+    [
+        (Mechanism.CONTRACT_MISMATCH, UnitKind.RESOURCE, "messages_en.properties", True),
+        (Mechanism.I18N, UnitKind.SYMBOL, "formatter.java", True),
+        (Mechanism.CONTRACT_MISMATCH, UnitKind.RESOURCE, "package.json", False),
+        (Mechanism.NULL_PATH, UnitKind.SYMBOL, "service.py", False),
+    ],
+)
+def test_investigation_receives_relevant_contract_knowledge_through_closure(mechanism, kind, path, expected):
+    hypothesis = _hypothesis()
+    hypothesis.mechanism = mechanism
+    unit = SemanticUnit(id=hypothesis.unit_id, path=path, kind=kind)
+    investigator = Investigator(_ScriptedToolLLM(), _executor({}), changeset=SemanticChangeSet(units=[unit]))
+    user = investigator._render_user(hypothesis, _state(), ContextPack())
+    assert ("## Verification guidance" in user) is expected
+    if expected:
+        assert "i18next-icu" in user and "{{name}}" in user
+        assert "import-only hits" in user
+        closing = investigator._closing_chat([AIMessage(content=user)], 24000)
+        assert str(closing).count("## Verification guidance") == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", ["step=安裝手機應用程式", "No results"])
 async def test_locale_boundary_still_requires_recorded_source_evidence(content):

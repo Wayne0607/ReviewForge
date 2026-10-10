@@ -25,10 +25,9 @@ from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_added_lines
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.hypothesis_generator import AnchorResolver, HypothesisGenerationResult, HypothesisGenerator
-from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
+from reviewforge.engine.verification_guidance import is_localization_path, localization_guidance
 
-_LOCALIZATION_PATH = re.compile(r"\.(properties|po)$|messages_[^/]+\.json$|/locale/", re.IGNORECASE)
 _MANIFEST_PATH = re.compile(
     r"(^|/)(package\.json|requirements[^/]*\.txt|setup\.py|pyproject\.toml|poetry\.lock|pipfile(\.lock)?|"
     r"go\.mod|go\.sum|gemfile(\.lock)?|cargo\.toml|cargo\.lock|yarn\.lock|package-lock\.json|pnpm-lock\.yaml)$",
@@ -81,7 +80,7 @@ def _security_trigger(unit: SemanticUnit, added: str) -> bool:
 
 
 def _localization_trigger(unit: SemanticUnit, _added: str) -> bool:
-    return bool(_LOCALIZATION_PATH.search(unit.path))
+    return is_localization_path(unit.path)
 
 
 def _accessibility_trigger(unit: SemanticUnit, added: str) -> bool:
@@ -129,7 +128,7 @@ def select_lenses(state: StateStore, changeset: SemanticChangeSet, *, max_lenses
 
 
 def lens_skill_body(name: str) -> str:
-    """Reuse the shared skill, with contract guidance confined to the v4 lens."""
+    """Reuse the shared skill, with the same contract guidance as other v4 stages."""
 
     directory = _LENS_SKILLS.get(name)
     if not directory:
@@ -137,7 +136,7 @@ def lens_skill_body(name: str) -> str:
     path = Path(__file__).resolve().parent.parent / "skills" / directory / "SKILL.md"
     body = path.read_text(encoding="utf-8") if path.exists() else ""
     if name == "localization":
-        body += "\n\n" + load_prompt("localization_contracts")
+        body += "\n\n" + localization_guidance()
     return body
 
 

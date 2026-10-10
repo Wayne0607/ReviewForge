@@ -256,3 +256,13 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 调查输入对主 unit 为 resource 的 i18n 候选额外交付相关文件的 path/provenance，保留每个 site 自己的 locale；metadata 本身不可作缺陷证据。直接字形/语言违规比较变更文本与声明契约；格式参数/语法和运行时后果仍要求实际消费端。生成器/lens 的 open_question 与 refutation 必须决定 claim 的契约，避免以无关页面引用为前提。共享 skill 与 legacy 保持原版本，Observation 精确引用、预算及严格裁判不变。
 
 新增 7 项回归覆盖多文件 locale 不串用、无关资源不注入、runtime/nonresource/unmatched 不免检、收尾保留契约，以及没有成功源码 Observation 仍拒绝确认。完整本地 `1547 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 和严格裁判回归通过。生产检查为 service active / HTTP 200，main SHA 仍为 `00c6675`。下一轮须从新的干净提交独立冻结，不使用 holdout，不把取消的第四轮算作完整质量结果。
+
+冻结 `48803c9` 的第五轮位于 `.reviewforge/benchmarks/v4-contract-boundary-20261011-022153/`。35 个请求全部成功，58 units 无漏答，23 条候选 → 4 CONFIRMED / 4 REFUTED / 15 UNKNOWN（11 条 PR 调查预算外、3 条契约证据不足、1 条 warning ungrounded）。error UNKNOWN 为 0，内层 completed，严格裁判准入通过；实际发布 3 条评论，立陶宛 login/account 同错误合并且保留两处位置，中文 account 独立发布。中文调查由 16902 降至 8369 tokens，立陶宛 login 由 18003 降至 5965；全 PR 222319（GEN 52042 / lens 45205 / INV 118954 / editor 6118），1194.375 秒。候选噪音仍包含测试缺口、CVE 猜测与格式猜测，尚无本轮质量分，不能把候选确认数量当作质量成绩。
+
+## 2026-10-11 专项契约知识的阶段交付
+
+第五轮有一条 frontend 格式候选被推翻，理由把 react-i18next 当成单花括号 ICU，且引用只有其它资源文本和 import，没有目标消费配置。`contract-proof-audit.json` 保存原始请求/响应 hash 和诊断，不改原 verdict 或裁判。依据 [i18next 插值文档](https://www.i18next.com/translation-function/interpolation) 与 [react-i18next ICU 设置文档](https://react.i18next.com/misc/using-with-icu-format)，默认双花括号、可配置前后缀、ICU 需另行启用；这些事实不能代替目标仓库的实际配置证明。
+
+回溯 `7db82230` 的调查输入与 `27f2bc4` 的专项规则注入：指南只在 lens 中交付，通用 generator 和最终 investigator 会丢掉这份知识，这是输入/输出不衔接的问题。新增 v4 `verification_guidance.py`，沿用原 localization 路径匹配，不改变 lens 触发；生成器只在相关块交付且计入预算，lens 系统规则交付一次，调查员按 i18n 或相关 resource 交付并在收尾保留。指南说明 Java/i18next/ICU 默认与配置边界，要求追踪加载/转换、实际格式调用及初始化，import 或无匹配搜索不足以建立反证。仍由调查员判断，精确 Observation 校验与 UNKNOWN 门槛不变；共享 legacy skill 未改，未新增模型阶段或发现重试。
+
+新增 6 项上下文交付/隔离回归，强化 lens 指南仅出现一次、真实双花括号文本保真、收尾保留及分块水位计量。完整本地 `1553 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 和严格裁判回归通过；下一次真实运行需要新的源码快照，不能将第五轮当成此批交付修正的测评。

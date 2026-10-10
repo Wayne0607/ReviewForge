@@ -34,6 +34,7 @@ from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanis
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 from reviewforge.engine.symbol_extractor import _find_enclosing_function
+from reviewforge.engine.verification_guidance import is_localization_path, localization_guidance
 from reviewforge.tools.workspace import WorkspaceUnavailable
 
 _EXCERPT_MIN_CHARS = 12
@@ -362,6 +363,7 @@ class HypothesisGenerator:
                 _BLOCK_OVERHEAD
                 + len(_render_changes(candidate, right_lines, diffs))
                 + len(pack.render_shared((item.id for item in candidate), context_by_unit))
+                + len(self._verification_guidance(candidate))
             )
             if current and candidate_chars > self._max_input_chars:
                 blocks.append(current)
@@ -371,6 +373,13 @@ class HypothesisGenerator:
         if current:
             blocks.append(current)
         return blocks
+
+    def _verification_guidance(self, units: list[SemanticUnit]) -> str:
+        # A lens already carries its own guide in the system prompt. General
+        # generation receives the guide only in blocks with relevant resources.
+        if self._prompt_template != "generator" or not any(is_localization_path(unit.path) for unit in units):
+            return ""
+        return "## Verification guidance\n" + localization_guidance()
 
     def _render_user_message(
         self,
@@ -395,6 +404,9 @@ class HypothesisGenerator:
         sections.append("## Context\n" + (context or "（无）/(none)"))
         sections.append("## Unchecked\n" + _render_unchecked(pack))
         sections.append("## Existing hypotheses\n" + _render_existing(ledger))
+        guidance = self._verification_guidance(block)
+        if guidance:
+            sections.append(guidance)
         sections.append(
             f"## Required assessments ({len(block)})\n"
             "Return each ID in hypotheses or no_issue_units.checked, including tests/fixtures. "

@@ -27,6 +27,7 @@ from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_d
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Observation, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
+from reviewforge.engine.verification_guidance import is_localization_path, localization_guidance
 from reviewforge.tools.workspace import _bounded_range
 
 logger = logging.getLogger(__name__)
@@ -313,6 +314,15 @@ class Investigator:
         boundary = self._resource_boundary(hypothesis)
         if boundary:
             sections.append(boundary)
+        unit = (
+            next((unit for unit in self._changeset.units if unit.id == hypothesis.unit_id), None)
+            if self._changeset
+            else None
+        )
+        if hypothesis.mechanism is Mechanism.I18N or (
+            unit is not None and unit.kind is UnitKind.RESOURCE and is_localization_path(unit.path)
+        ):
+            sections.append("## Verification guidance\n" + localization_guidance())
         return "\n\n".join(sections)
 
     def _resource_boundary(self, hypothesis: Hypothesis) -> str:

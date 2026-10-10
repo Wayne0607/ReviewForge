@@ -22,6 +22,8 @@ Answer the one `open_question` from repository evidence. Verify a defect introdu
 
 The quote must establish the violated contract/counterevidence. Consumer-dependent claims require the actual consumer and its implementation or documented standard contract. Imports/names alone do not establish data flow; a standard library need not have its implementation copied into this repository. An ancillary caller question must not replace proof of a directly observable local contract violation.
 
+For formatter claims, quote the relevant call/configuration, not merely an import or another message. Missing search hits cannot establish an alternative formatter, even if unrelated successful observations exist.
+
 Only `Saved evidence excerpt` is citable; `Additional context` needs a narrower read/search to record it. Never invent IDs, quote unsaved text or cite empty/not_found/error results as proof.
 
 `read_file` saves source without display line numbers; path/range are separate metadata. Preserve quote indentation; add no line annotations.

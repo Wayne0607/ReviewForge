@@ -141,6 +141,8 @@ def test_format_contract_context_is_confined_to_the_v4_localization_lens() -> No
     security = build_lens_generator(_ScriptedLLM(), "security")._system_prompt()
 
     assert "declared locale" in localization and reference in localization
+    assert "{{name}}" in localization and "i18next-icu" in localization
+    assert localization.count("https://www.i18next.com/translation-function/interpolation") == 1
     assert reference not in security and reference not in original.decode("utf-8")
     assert shared.read_bytes() == original
 

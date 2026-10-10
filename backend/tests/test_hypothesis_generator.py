@@ -44,6 +44,58 @@ def _unit(path: str, symbol: str, *, risk: float = 1.0, end_line: int = 4) -> Se
     )
 
 
+def test_general_generation_contract_guidance_is_scoped_to_each_block():
+    generator = HypothesisGenerator(_ScriptedLLM())
+    ledger = HypothesisLedger("run", "abc", "digest")
+    for path, expected in [("messages_en.properties", True), ("package.json", False), ("service.py", False)]:
+        unit = _unit(path, "")
+        user = generator._render_user_message(
+            ContextPack(),
+            [unit],
+            {path: {1: "key=Example"}},
+            {path: _diff(path, "key=Example")},
+            {},
+            ledger,
+        )
+        assert ("## Verification guidance" in user) is expected
+        assert user.endswith(unit.id)
+        if expected:
+            assert "{{name}}" in user and "i18next-icu" in user
+
+
+@pytest.mark.asyncio
+async def test_generation_contract_guidance_counts_toward_each_block_budget():
+    units = [_unit(path, "", end_line=32) for path in ("messages_en.properties", "messages_fr.properties")]
+    lines = [
+        f"key_{index}=A long translated message with enough source text to exercise the input budget."
+        for index in range(32)
+    ]
+    diffs = {unit.path: _diff(unit.path, *lines) for unit in units}
+    right = {unit.path: dict(enumerate(lines, start=1)) for unit in units}
+    ledger = HypothesisLedger("run", "abc", "digest")
+    llm = _ScriptedLLM(
+        responses=[
+            json.dumps({"hypotheses": [], "no_issue_units": [{"unit_id": unit.id, "checked": "resource checked"}]})
+            for unit in units
+        ]
+    )
+    generator = HypothesisGenerator(llm, context_max_chars=0)
+
+    def render(block):
+        return generator._render_user_message(ContextPack(), block, right, diffs, {}, ledger)
+
+    limit = max(len(render([unit])) for unit in units) + 1
+    assert len(render(units)) > limit
+    generator._max_input_chars = limit
+    result = await generator.run(StateStore(file_diffs=diffs), ContextPack(), _changeset(*units), ledger)
+    assert result.blocks == 2 and result.failed_blocks == 0 and len(llm.calls) == 2
+    assert set(ledger.no_issue_units) == {unit.id for unit in units}
+    assert not ledger.unresolved_units
+    for messages in llm.calls:
+        assert len(messages[-1].content) <= limit
+        assert messages[-1].content.count("## Verification guidance") == 1
+
+
 def _server_diff() -> dict[str, str]:
     return {
         "service.py": _diff(

@@ -286,6 +286,8 @@ budget_steps = base(severity) + bonus
 
 `i18n` 的主 unit 为 resource 时，额外交付该 unit 与 sites 对应 resource 的 path/provenance，逐文件保留已编译的 locale 信息。直接语言/字形违规以声明 locale 和变更文本为本地契约，无需页面引用；格式语法/参数和运行时后果仍需实际消费端及输入契约。生成器/lens 的问题与反证必须决定所述契约，而非无关调用方事实。metadata 不构成 defect evidence，Observation、精确引用及 UNKNOWN 门槛不变。
 
+v4 的格式契约指南由 `verification_guidance.py` 共用，localization 路径判定保持既有 lens 规则。生成器仅在包含相关资源的块中交付指南并计入块预算；localization lens 仍在系统规则中交付一次；调查员对 i18n 或对应 localization resource 的候选交付同一指南，收尾保留。指南解释标准默认值与配置边界，不证明目标资源实际使用了该标准；引用必须证明具体消费调用/初始化，import、邻近文本或未搜索到其它库不足以推翻格式缺陷。共享 legacy SKILL.md 不变，未新增独立模型阶段或发现重试；增加的指南仍受原块预算约束，可能影响分块。
+
 **输出 schema。**
 ```json
 {"verdict":"confirmed|refuted|unknown",

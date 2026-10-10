@@ -34,7 +34,11 @@ from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanis
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 from reviewforge.engine.symbol_extractor import _find_enclosing_function
-from reviewforge.engine.verification_guidance import is_localization_path, localization_guidance
+from reviewforge.engine.verification_guidance import (
+    investigation_capabilities,
+    is_localization_path,
+    localization_guidance,
+)
 from reviewforge.tools.workspace import WorkspaceUnavailable
 
 _EXCERPT_MIN_CHARS = 12
@@ -163,7 +167,7 @@ def _render_existing(ledger: HypothesisLedger) -> str:
     items = sorted(ledger.items.values(), key=lambda hypothesis: hypothesis.identity)
     if not items:
         return "（无）/(none)"
-    lines = [f"- {hypothesis.identity} :: {hypothesis.claim}" for hypothesis in items]
+    lines = [f"- {hypothesis.identity} [{hypothesis.status.value}] :: {hypothesis.claim}" for hypothesis in items]
     return "\n".join(lines)
 
 
@@ -266,7 +270,7 @@ class HypothesisGenerator:
         )
         if self._skill_body:
             prompt = f"{prompt}\n\n## 本维度专项规则\n{self._skill_body}"
-        return prompt
+        return prompt + "\n\n" + investigation_capabilities()
 
     async def run(
         self,

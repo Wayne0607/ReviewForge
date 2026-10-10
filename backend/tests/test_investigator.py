@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 
 import pytest
 from langchain_core.language_models import BaseChatModel
@@ -11,7 +12,7 @@ from pydantic import ConfigDict, Field
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
+from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.investigator import Investigator, budget_steps, build_workspace_executor
 from reviewforge.engine.semantic_diff import Provenance, SemanticChangeSet, SemanticUnit, UnitKind
 
@@ -99,6 +100,70 @@ def test_budget_by_severity() -> None:
         severity="error", refutation="caller already validates", open_question="does the schema allow null?"
     )
     assert budget_steps(boosted) == 8
+
+
+def _ranked_hypothesis(identity: str, mechanism: Mechanism, sites: int, severity: str = "warning"):
+    return replace(
+        _hypothesis(severity=severity),
+        id=identity,
+        identity=identity,
+        unit_id=identity,
+        mechanism=mechanism,
+        sites=[Site(path=f"{identity}.py", line=line, excerpt="return user_input") for line in range(1, sites + 1)],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [1, 3])
+async def test_investigation_cap_preserves_severity_and_mechanism_breadth(monkeypatch, concurrency):
+    items = [
+        _ranked_hypothesis("critical", Mechanism.NULL_PATH, 1, "error"),
+        *[_ranked_hypothesis(f"resource-{i}", Mechanism.I18N, 10 - i) for i in range(5)],
+        _ranked_hypothesis("single-site-code", Mechanism.WRONG_ARGUMENT, 1),
+    ]
+    calls = []
+
+    async def investigate(worker, hypothesis, *args, **kwargs):
+        calls.append(hypothesis.identity)
+        return worker._result(verdict="unknown", reason="checked", severity=hypothesis.severity)
+
+    monkeypatch.setattr(Investigator, "investigate", investigate)
+    ledger = HypothesisLedger("run", "head", "digest")
+    for item in reversed(items):
+        ledger.upsert(item)
+    results = await Investigator(_ScriptedToolLLM(), _executor({})).run(
+        ledger, _state(), ContextPack(), max_hypotheses_per_pr=3, concurrency=concurrency
+    )
+    assert calls == ["critical", "resource-0", "single-site-code"]
+    assert len(results) == len(items)
+    assert all(item.status is HypothesisStatus.UNKNOWN for item in ledger.items.values())
+    assert all(ledger.items[f"resource-{i}"].verdict_reason == "budget-exhausted" for i in range(1, 5))
+    assert ledger.items["single-site-code"].verdict_reason == "checked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [0, -1, 2])
+async def test_investigation_order_keeps_single_mechanism_priority_and_closed_items(monkeypatch, cap):
+    items = [_ranked_hypothesis(f"error-{i}", Mechanism.I18N, 10 - i, "error") for i in range(3)]
+    items += [_ranked_hypothesis("warning", Mechanism.SECURITY_SINK, 20)]
+    closed = _ranked_hypothesis("closed", Mechanism.LOCK_SCOPE, 50, "error")
+    closed.status = HypothesisStatus.REFUTED
+    calls = []
+
+    async def investigate(worker, hypothesis, *args, **kwargs):
+        calls.append(hypothesis.identity)
+        return worker._result(verdict="unknown", reason="checked", severity=hypothesis.severity)
+
+    monkeypatch.setattr(Investigator, "investigate", investigate)
+    ledger = HypothesisLedger("run", "head", "digest")
+    for item in [closed, *reversed(items)]:
+        ledger.upsert(item)
+    await Investigator(_ScriptedToolLLM(), _executor({})).run(
+        ledger, _state(), ContextPack(), max_hypotheses_per_pr=cap, concurrency=3
+    )
+    assert calls == [f"error-{i}" for i in range(max(0, cap))]
+    assert ledger.items["closed"].status is HypothesisStatus.REFUTED
+    assert ledger.items["warning"].verdict_reason == "budget-exhausted"
 
 
 def test_investigation_input_selects_unit_hunks_and_all_additional_sites():

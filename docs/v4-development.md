@@ -266,3 +266,15 @@ Windows 内核探针已验证：实际工作进程受限、512 MiB 分配在 128
 回溯 `7db82230` 的调查输入与 `27f2bc4` 的专项规则注入：指南只在 lens 中交付，通用 generator 和最终 investigator 会丢掉这份知识，这是输入/输出不衔接的问题。新增 v4 `verification_guidance.py`，沿用原 localization 路径匹配，不改变 lens 触发；生成器只在相关块交付且计入预算，lens 系统规则交付一次，调查员按 i18n 或相关 resource 交付并在收尾保留。指南说明 Java/i18next/ICU 默认与配置边界，要求追踪加载/转换、实际格式调用及初始化，import 或无匹配搜索不足以建立反证。仍由调查员判断，精确 Observation 校验与 UNKNOWN 门槛不变；共享 legacy skill 未改，未新增模型阶段或发现重试。
 
 新增 6 项上下文交付/隔离回归，强化 lens 指南仅出现一次、真实双花括号文本保真、收尾保留及分块水位计量。完整本地 `1553 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 和严格裁判回归通过；下一次真实运行需要新的源码快照，不能将第五轮当成此批交付修正的测评。
+
+第五轮固定裁判已结束，额外用量 4970 tokens：实际评论为 2 TP / 1 FP / 2 FN，P=0.6667、R=0.5、F1=0.5714；同一 PR 的历史 Qodo-v2 为 1 TP / 1 FP / 3 FN，F1=0.3333。仍只是一个开发集 PR，没有 legacy 配对、完整 dev10 或 holdout。误报是“缺 English 文件时未捕获 RuntimeException”，原证据证明了传播，但没证明失败方式违反约定。漏报一个 anchor 验证问题；另一 golden 是纯方法命名建议，现有规范排除该项，仍按原裁判计 FN，不调整 goldens、阈值或分母。
+
+## 2026-10-11 调查预算覆盖与可回答的问题
+
+回查 `7db82230` 的 severity → sites → identity 排序：有限预算下按位置数和哈希身份排列，同类候选易占满名额。第五轮 23 条候选实际上均只有一个 site，anchor 数量验证候选为 budget-exhausted；此样本的偏置来自同类数量和 identity，而非较多 sites。按同一严重级别内的 mechanism 轮转，组内仍 sites → identity；error 始终优先，12 条上限、闭合候选不重跑、超出 UNKNOWN 均保持。
+
+`allocation-audit.json` 只在内存中回放旧候选排序，无模型调用、原 verdict 不改。新规则仅多选了 normalizeValue 候选，仍未选到 anchor；它证明了机制覆盖变化，不能宣称已修复该漏报。生成器现有跨块输入只提供已有 identity/claim，输出候选必须使用本块 unit，跨 unit 追加 sites 的操作没有完整协议；本批没有通过放松范围校验去实现跨块合并。先明确已有候选的 status 和当前 unit 可用 checked 引用覆盖，保留这个接口限制。
+
+另一个真实输入缺口是 generator/lens 不知道调查工具能力，曾提出外部 CVE 查询，而 Investigator 只有五个固定仓库读取工具。新增共享能力卡，并通过回归核对实际工具名称；外部事实必须已有具体材料，不能凭新依赖猜测漏洞。提示补充同一对象在检查/读取之间的状态推进、基于实际类型的 [Java Matcher 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/regex/Matcher.html)，以及比较同一输入的实际/预期失败结果，避免仅以异常传播判缺陷。未增加工具、执行能力或模型阶段。
+
+新增 5 项并发/严重级别/单机制/零预算/闭合状态预算回归和 1 项工具边界回归；完整本地 `1559 passed, 1 skipped, 6 warnings`，ruff / format / spec-check 与严格裁判回归通过。补充 existing 状态呈现后，相关 63 项回归通过。需新的干净快照实测候选、调查和实际评论；尚不能以离线排序回放推导质量分。

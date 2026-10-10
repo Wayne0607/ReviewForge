@@ -14,6 +14,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from itertools import groupby, zip_longest
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -664,7 +665,7 @@ class Investigator:
         """
 
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
-        targets = sorted(
+        ranked = sorted(
             ledger.open(),
             key=lambda hypothesis: (
                 -_SEVERITY_RANK.get(hypothesis.severity, 0),
@@ -672,6 +673,16 @@ class Investigator:
                 hypothesis.identity,
             ),
         )
+        targets = []
+        # Site count alone lets one widespread mechanism consume the entire
+        # cap. Preserve severity and within-mechanism rank, then take one item
+        # per mechanism per round. This selects work; it never filters verdicts.
+        for _, severity_items in groupby(ranked, key=lambda item: _SEVERITY_RANK.get(item.severity, 0)):
+            mechanisms: dict[Mechanism, list[Hypothesis]] = {}
+            for item in severity_items:
+                mechanisms.setdefault(item.mechanism, []).append(item)
+            for round_items in zip_longest(*mechanisms.values()):
+                targets.extend(item for item in round_items if item is not None)
         semaphore = asyncio.Semaphore(max(1, concurrency))
 
         async def _investigate(index: int, hypothesis: Hypothesis) -> InvestigationResult:

@@ -10,6 +10,10 @@ Answer the one `open_question` from repository evidence. Verify a defect introdu
 4. Record attribution with `read_diff(path, start, end)` at the site's RIGHT lines. It preserves the full before/after hunk. Head alone cannot establish a new defect. Narrow long results to save the relevant evidence.
 5. Budget includes closure. When asked to finish, return JSON without tools; insufficient evidence means `unknown`.
 
+Compare actual/expected error outcomes for the same input. If both reject it, require an observed error-type/recovery contract; propagation alone proves no defect.
+
+Track state changes between checks and uses. For a proven Java `java.util.regex.Matcher`, `find()` advances state; `group()` needs the latest successful match. Read the full loop/check.
+
 ## Verdicts
 
 - `confirmed`: the changed contents directly violate their declared local contract, or a supported input/caller reaches changed behavior that violates its runtime contract. An exception on invalid input, intentional fail-fast validation or a negative test is not itself a defect.
@@ -20,9 +24,7 @@ Answer the one `open_question` from repository evidence. Verify a defect introdu
 
 `confirmed` / `refuted` require a recorded, successful `obs_N` and an exact `evidence_quote` substring in its saved excerpt. Context alone is not citable: record the needed fact with a narrow tool read.
 
-The quote must establish the violated contract/counterevidence. Consumer-dependent claims require the actual consumer and its implementation or documented standard contract. Imports/names alone do not establish data flow; a standard library need not have its implementation copied into this repository. An ancillary caller question must not replace proof of a directly observable local contract violation.
-
-For formatter claims, quote the relevant call/configuration, not merely an import or another message. Missing search hits cannot establish an alternative formatter, even if unrelated successful observations exist.
+Quotes must establish the contract/counterevidence. For consumer-dependent claims, prove the actual type/configuration/data flow, then apply its implementation or documented standard contract. Library source need not be in this repository. Imports, neighboring messages or missing search hits prove no formatter configuration, even alongside unrelated successful observations. Ancillary caller questions cannot replace direct local contract proof.
 
 Only `Saved evidence excerpt` is citable; `Additional context` needs a narrower read/search to record it. Never invent IDs, quote unsaved text or cite empty/not_found/error results as proof.
 

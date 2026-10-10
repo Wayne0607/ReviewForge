@@ -147,6 +147,21 @@ def test_format_contract_context_is_confined_to_the_v4_localization_lens() -> No
     assert shared.read_bytes() == original
 
 
+def test_generator_and_lenses_share_the_actual_investigator_tool_boundary():
+    import re
+
+    from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+    from reviewforge.engine.investigator import Investigator
+
+    actual = {tool.name for tool in Investigator(_ScriptedLLM(), None)._build_tools()}
+    for generator in [HypothesisGenerator(_ScriptedLLM()), build_lens_generator(_ScriptedLLM(), "security")]:
+        prompt = generator._system_prompt()
+        assert prompt.count("## Investigation capabilities") == 1
+        tools = set(re.findall(r"\b(read_\w+|grep|find_\w+)\b", prompt.split("## Investigation capabilities", 1)[1]))
+        assert tools == actual
+        assert "no internet/advisory lookup or runtime execution" in prompt
+
+
 @pytest.mark.asyncio
 async def test_run_lens_upserts_with_lens_source() -> None:
     diff = _diff("app.py", "import pickle", "data = pickle.loads(user_input)")

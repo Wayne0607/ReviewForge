@@ -20,3 +20,14 @@ def is_localization_path(path: str) -> bool:
 
 def localization_guidance() -> str:
     return load_prompt("localization_contracts")
+
+
+def investigation_capabilities() -> str:
+    return (
+        "## Investigation capabilities\n"
+        "The investigator can read the pinned PR repository with read_file, read_diff, grep, "
+        "find_definition and find_callers. It has no internet/advisory lookup or runtime execution. "
+        "Questions must be answerable from repository evidence and supplied contracts. "
+        "An external claim such as a CVE needs a concrete advisory already supplied; "
+        "a new dependency alone is not evidence."
+    )

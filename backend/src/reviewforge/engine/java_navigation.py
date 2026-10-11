@@ -4,6 +4,7 @@ Keep the declared owner when looking up common method names. Unresolved
 receivers, inherited dispatch and reflection must remain unchecked; a missing
 syntactic hit cannot disprove a runtime call. State pointers help an investigator
 locate alternative configuration paths without deciding initialization order.
+Explicit superclass member declarations can guide Context without proving dispatch.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ class JavaField:
     line: int
     owner: symbol_extractor.SymbolInfo
     mutable_static: bool
+    type_name: str = ""
+    access: str = "package"
 
 
 class JavaSource:
@@ -119,9 +122,54 @@ class JavaSource:
                     line,
                     owner,
                     bool(re.search(r"\bstatic\b", modifiers) and not re.search(r"\bfinal\b", modifiers)),
+                    type_name=match.group(1),
+                    access=next(
+                        (word for word in ("private", "protected", "public") if re.search(rf"\b{word}\b", modifiers)),
+                        "package",
+                    ),
                 )
             )
         return tuple(fields)
+
+    def _plain_class_header(self, owner) -> str | None:
+        if owner is None:
+            return None
+        offset = sum(len(row) for row in self.mask.splitlines(keepends=True)[: owner.line - 1])
+        declaration = re.search(rf"\bclass\s+{re.escape(owner.name)}\b", self.mask[offset:])
+        if declaration is None or self.mask.count("\n", 0, offset + declaration.start()) + 1 != owner.line:
+            return None
+        start = offset + declaration.start()
+        end = self.mask.find("{", start)
+        if end < 0:
+            return None
+        header = self.mask[start:end]
+        # Generic substitution, interfaces and runtime dispatch need a type
+        # system. This pointer only follows plain, explicit class declarations.
+        if "<" in header or re.search(r"\bimplements\b", header):
+            return None
+        return header
+
+    def supports_member_ancestry(self, owner) -> bool:
+        return self._plain_class_header(owner) is not None
+
+    def superclass(self, owner) -> str | None:
+        """One explicit plain class ancestor for declaration navigation."""
+        header = self._plain_class_header(owner)
+        if header is None:
+            return None
+        parent = re.search(rf"\bextends\s+({_NAME}(?:\.{_NAME})*)\b", header)
+        return self._type_name(parent.group(1)) if parent else None
+
+    def inherited_receiver_name(self, receiver: str, line: int) -> str | None:
+        """A member name with no closer local/current-class binding."""
+        name = receiver.removeprefix("this.")
+        if name in {"this", "super"} or not re.fullmatch(_NAME, name):
+            return None
+        bound, _ = self._receiver_type(receiver, line)
+        return None if bound else name
+
+    def field_type(self, field: JavaField) -> str | None:
+        return self._type_name(field.type_name) if field.type_name else None
 
     @cached_property
     def bindings(self):

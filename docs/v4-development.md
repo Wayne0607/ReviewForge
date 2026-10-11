@@ -394,3 +394,13 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 继续排查模型模式之前，两问回查 `33deded0` 的预算预测与 `892de6af` 的服务商适配器：适配器本来会回传 assistant 的 `reasoning_content`，预测却只计正文/工具字段，把推理历史漏算，并可能把其用量误学为固定 provider overhead。这个假设在非思考模式成立，在已有推理兼容路径不成立。现在预测纳入适配器实际回传的 opaque assistant 字段；真实 provider usage 继续优先，无 usage 时也计入推理输出，其它 metadata 和 human 字段不参与。它仍是预测器，不承诺替代服务商 tokenizer；原总预算、收尾与 SOURCE/UNKNOWN 门槛不变，也不自动开启推理。[DeepSeek 官方工具协议](https://api-docs.deepseek.com/guides/thinking_mode/) 说明带工具的历史推理内容会进入后续上下文。
 
 新增 5 项预算回归，其中 4 项先在旧实现失败，覆盖 ASCII/Unicode 推理、固定 overhead 的分离、缺失 usage 及非回传 metadata 隔离；相关 77 项通过。完整 `1689 passed, 1 skipped, 6 warnings`，ruff / 200 文件 format / spec-check 与严格裁判回归通过。下一步仅对两条事先选定的误报候选作独立模式诊断，固定源码/初始 prompt/原预算；不向调查员交付 golden 或历史 verdict，不重开原账本，不将定向诊断当作整体质量分。
+
+### 模式诊断与继承成员声明的上下文（2026-10-11）
+
+`8013b6a` 独立模式诊断位于 `.reviewforge/benchmarks/v4-reasoning-modes-20261011-075615/`。两条候选在调用前声明，各条件初始 prompt 逐字摘要与原完整 review 一致；固定 27 个实现/配置摘要、相同 head / 完整源码摘要与原 16000/8000 token 预算，条件为 disabled 与 enabled / requested effort=low。disabled 为 1 REFUTED / 1 CONFIRMED，6 请求 / 15447 tokens；enabled 为 2 REFUTED，5 请求 / 16082 tokens，5 个响应确实带推理内容、无截断或协议错误。合计 31529 tokens，Job 正常退出、峰值 377212928 bytes、锁释放。
+
+相同初始输入的 disabled 重跑已把原 Dockerfile CONFIRMED 改为 REFUTED，说明变化不能全归因于 thinking。enabled 的模板 REFUTED 消除了那条错误确认，但其 expected 引用只有禁用 feature 的错误消息，测试常量也不能证明所有参数组合均接受该 flag；`semantic-audit.json` 记录该推翻理由仍缺少证明，原结果不改。两条诊断不经过 GEN/editor/质量裁判，没有 pipeline 分数或整体验收结论。
+
+同时核对真实 GEN 输入：出现两次 `picocli.exit(...)`，但没有 `System.exit(...)` 的实际方法体。两问回查 `dceb58fd` 的绑定限定与模块边界：限定 owner 阻止无关同名方法的导航，这个约束成立；接收者是基类的声明成员时，当前文件绑定表没有满足 callee 定位输入。扩展 Context 的显式父类成员声明导航，不推断继承方法派发。声明文件提供字段类型与可见性，逐层限定 class / package，原未检查、片段与字符限制保留；不会把 Context 当作缺陷证据，也不把某个 System.exit 调用自动判为缺陷。
+
+新增 19 项回归，最初 3 项复现原 callee 缺口，后续 2 项复现跨包再进入和接口歧义误绑定；覆盖显式 this、声明/局部遮蔽、private/package 权限、泛型、缺失/重复/环/上限、同包字段、动态方法保持未检查，以及 Manifest→SemanticChangeSet→Context 完整交付。相关 144 项通过；完整 `1708 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check 与严格裁判回归通过。模式诊断使用旧不可变快照，此批上下文改动未混入其结果，新的独立冻结实跑待完成。

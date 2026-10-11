@@ -298,6 +298,7 @@ class _PackBuilder:
         self.degraded = _workspace_degraded(workspace)
         self._unchecked: list[str] = []
         self._java_sources: dict[str, JavaSource] = {}
+        self._inherited_receivers: dict[tuple[str, str, str], dict[str, Any] | None] = {}
         self._callee_state: list[ContextSlice] = []
 
     def build_unit(self, unit: SemanticUnit, unit_id: str) -> UnitContext:
@@ -468,9 +469,13 @@ class _PackBuilder:
         language = str(_value(unit, "language", "") or "")
         for call in calls:
             raw_name = call["callee"]
+            inherited = None
             if language.lower() == "java":
                 navigation = self._java_source(str(_value(unit, "path", "") or ""))
                 raw_name = navigation.call_target(call) if navigation else None
+                inherited = self._inherited_receiver(navigation, call) if navigation else None
+                if inherited is not None:
+                    raw_name = f"{inherited['type']}.{_simple_name(call['callee'])}" if inherited["type"] else None
                 if not raw_name:
                     self._unchecked.append("callee")
                     continue
@@ -510,6 +515,8 @@ class _PackBuilder:
                 definition_start = hit["start_line"] or definition_line
                 source = self._read(path)
                 reason = f"defines {resolved_name}"
+                if inherited is not None:
+                    reason += f"; declared inherited receiver {inherited['symbol']}; runtime dispatch unproved"
                 if language.lower() == "java":
                     navigation = self._java_source(path)
                     definition = (
@@ -530,6 +537,17 @@ class _PackBuilder:
                 )
                 if result_slice is not None:
                     result.append(result_slice)
+                    if inherited is not None:
+                        binding_slice = self._slice_from_source(
+                            kind="field_usage",
+                            path=inherited["path"],
+                            start_line=max(1, inherited["line"] - 3),
+                            end_line=inherited["line"] + 3,
+                            symbol=inherited["symbol"],
+                            reason=f"declared inherited receiver for {resolved_name}; navigation, not evidence",
+                        )
+                        if binding_slice is not None:
+                            self._callee_state.append(binding_slice)
                     if language.lower() == "java" and definition:
                         indexed = navigation.state_references(definition)
                         if len(indexed) > 4 or any(len(references) > 6 for _, references in indexed):
@@ -550,6 +568,70 @@ class _PackBuilder:
                                 if state_slice:
                                     self._callee_state.append(state_slice)
         return result
+
+    def _inherited_receiver(self, navigation: JavaSource, call: dict[str, Any]) -> dict[str, Any] | None:
+        receiver = call["receiver"]
+        if not receiver and "." in call["callee"]:
+            receiver = call["callee"].rsplit(".", 1)[0]
+        name = navigation.inherited_receiver_name(receiver, call["line"])
+        owner = navigation.owner(call["line"])
+        if name is None or owner is None:
+            return None
+        key = (navigation.path, navigation.class_name(owner), name)
+        if key in self._inherited_receivers:
+            return self._inherited_receivers[key]
+
+        self._inherited_receivers[key] = None
+        visited = {navigation.class_name(owner)}
+        packages = {navigation.package}
+        parent_source = navigation
+        for _ in range(4):
+            parent_name = parent_source.superclass(owner)
+            if not parent_name or parent_name in visited:
+                return None
+            visited.add(parent_name)
+            hits = [
+                hit
+                for hit in _workspace_call(self.workspace, "find_symbol_definitions", parent_name, language="java")
+                if _value(hit, "symbol_type", "") == "class"
+            ]
+            if len(hits) != 1:
+                return None
+            hit = _normalise_hit(hits[0])
+            parent_source = self._java_source(hit["path"])
+            if parent_source is None:
+                return None
+            owner = next(
+                (
+                    definition
+                    for definition in parent_source.classes
+                    if definition.line == hit["line"] and parent_source.class_name(definition) == parent_name
+                ),
+                None,
+            )
+            if owner is None:
+                return None
+            if not parent_source.supports_member_ancestry(owner):
+                return None
+            packages.add(parent_source.package)
+            fields = [
+                field for field in parent_source.field_declarations if field.owner == owner and field.name == name
+            ]
+            if fields:
+                # A nearer inaccessible declaration blocks an ancestor too;
+                # never skip it to manufacture a binding from farther up.
+                field = fields[0]
+                accessible = len(fields) == 1 and field.access != "private"
+                accessible &= field.access != "package" or len(packages) == 1
+                result = {
+                    "path": parent_source.path,
+                    "line": field.line,
+                    "symbol": f"{parent_name}.{name}",
+                    "type": parent_source.field_type(field) if accessible else None,
+                }
+                self._inherited_receivers[key] = result
+                return result
+        return None
 
     def _collect_inheritance(self, unit: SemanticUnit) -> tuple[list[ContextSlice], list[ContextSlice]]:
         path = str(_value(unit, "path", "") or "")

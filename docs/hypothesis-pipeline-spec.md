@@ -15,7 +15,7 @@
 1. 每个 Phase 独立可合并、独立可回退。不要跨 Phase 合并 PR。
 2. 新代码放在新模块里；改动旧模块只允许"加分支"，不允许改旧分支行为。`REVIEWFORGE_PIPELINE=legacy` 时所有测试结果必须与改动前完全一致。
 3. 所有 LLM 调用经 `ModelRouter`，agent 名字见 §4.9；不得直接构造 `ChatOpenAI`。
-4. 所有 LLM 输出走 JSON schema 校验；解析失败 → 一次修复重试 → 仍失败则该次调用结果为 `unknown`，**绝不**变成"无问题"或"已拒绝"。
+4. 所有 LLM 输出走 JSON schema 校验；有原文的解析失败 → 一次格式修复重试 → 仍失败则该次调用结果为 `unknown`，**绝不**变成"无问题"或"已拒绝"。生成/lens 的空正文或纯空白没有可修复内容，直接记为未完成。
 5. 不用 `confidence` 做任何分支条件。
 6. 每个模块先写 `tests/test_<module>.py` 的确定性测试（用 `engine/mock_llm.py`），再接入 orchestrator。
 7. 提交前跑：`cd backend && uv run ruff check . && uv run ruff format --check . && uv run reviewforge spec-check && uv run pytest -q`。
@@ -253,7 +253,7 @@ class HypothesisLedger:
 ```
 校验：`sites[].excerpt` 必须是该 path 的 diff RIGHT 侧某行的子串（≥12 字符），否则该 site 丢弃；无有效 site 的假设丢弃并计 `generator.dropped_unanchored`。`mechanism` 必须在枚举内。每次调用最多接受 `generator.max_hypotheses`（默认 12）条，超出按 severity 保留并记 telemetry。
 
-**失败。** 解析失败一次修复重试；再失败 → 该块 `unknown`，其 unit 进入 `ledger.no_issue_units` 不允许，而是记为 `unresolved_units`，run `partial`。
+**失败。** 非空正文解析失败一次格式修复重试；再失败 → 该块 `unknown`，其 unit 进入 `ledger.no_issue_units` 不允许，而是记为 `unresolved_units`，run `partial`。空正文/纯空白直接记 `empty model response`，同样保留 unresolved，不调用无原文的格式修复；8192 输出上限不变。
 
 **禁止。** 不做"没发现就再来一次"的重试。没有假设就是没有。
 

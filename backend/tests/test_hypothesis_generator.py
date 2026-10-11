@@ -422,6 +422,27 @@ async def test_parse_failure_marks_the_units_unresolved() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("original", ["", " \n\t"])
+@pytest.mark.parametrize("source", ["generator", "lens:security"])
+async def test_empty_output_is_unresolved_without_a_format_repair(original, source):
+    llm = _ScriptedLLM(responses=[original, "null"])
+    generator = HypothesisGenerator(
+        llm, source=source, prompt_template="lens" if source.startswith("lens:") else "generator"
+    )
+    unit = _unit("service.py", "get_or_create_resource")
+    ledger = HypothesisLedger("run", "abc", "digest")
+
+    result = await generator.run(StateStore(file_diffs=_server_diff()), ContextPack(), _changeset(unit), ledger)
+
+    assert len(llm.calls) == 1
+    assert llm.output_limits == [8192]
+    assert result.accepted == 0 and result.failed_blocks == 1
+    assert result.unresolved_units == [unit.id]
+    assert ledger.unresolved_units[unit.id] == f"{source} empty model response"
+    assert not ledger.items and not ledger.no_issue_units
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("template", ["generator", "lens"])
 async def test_generation_prompt_delivers_configured_output_bound(template: str) -> None:
     llm = _ScriptedLLM(responses=['{"hypotheses": [], "no_issue_units": []}'])

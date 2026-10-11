@@ -412,3 +412,13 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 现允许提供由真实父类字段类型指向的候选 callee，保留接口未检查和动态派发未证明。直接接口同名字段仍拒绝绑定；v4 原提取器没有 interface 索引，因此补入 code-backed 的 class-like interface owner，标明字段隐式 public/final，并排除无方法体声明的参数。legacy 提取器不变，不引入接口全集解析、类型推断或新模型阶段；片段、字符、调查及证据门槛仍用原值。
 
 新增 3 项实际执行的回归，覆盖未知接口下的候选交付、注释/字面量与 legacy 隔离、接口参数及字段属性；已检查收集结果，避免将测试代码误放进源码 fixture。相关 147 项通过。修正后的零模型真实源码检查保存 `working-tree-result.json`，确实交付 `AbstractCommand.picocli` 和 `Picocli.exit` 中的退出 guard / System.exit，同时保留未检查标记；它不证明调用有缺陷。完整检查为 `1711 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check / 严格裁判回归通过；生产 service active / HTTP 200，main 仍为 `00c6675`。新的冻结全流程待完成，尚未达到真实质量验收。
+
+### 分阶段推理和空响应处理（2026-10-11）
+
+冻结 `fa8f14f`，在请求前声明 keycloak#36882 全流程，目录为 `.reviewforge/benchmarks/v4-inheritance-reasoning-20261011-084410/`。固定 head / 完整 workspace 摘要通过预检，28 个实现/配置文件逐一对 Git 摘要。真实 GEN 输入含限定的 `Picocli.exit` 方法体及退出 guard，父类成员导航交付有效；但启用 requested effort=low 后，原 8192 输出额度全部成为推理，正文为空且 finish=length。无原文的格式修复另返回 null；共 2 个成功请求 / 25857 tokens，20 units 全部 unresolved，无 INV/editor/实际评论。Job 返回 0、峰值 372047872 bytes、锁释放；内层 partial / DB failed，旧外层 completed 不能代表完成。严格准入已拒收，`generation-mode-audit.json` 保存原始结果/响应摘要，无质量分、legacy 配对或 holdout。
+
+两问回查 `ac634dbd` 的忠实 JSON 修复与 ModelRouter 全局缓存：格式修复不能从空正文恢复不存在的候选，全局同实例也不能承载不同阶段的可变请求配置。生成/lens 空正文或纯空白现在直接保留 unresolved，非空格式修复保持；不提高输出额度或变为 no_issue。评测增加显式 `--investigator-thinking`，默认继承原全局选项；启用阶段覆盖时复制模型设置、共用 SDK transport，实际 interleaved SDK 请求验证 GEN/editor 不被 INV 配置污染。该选项仅作开发集消融，并保存到续跑 provenance；不自动更改产品模型模式。runner 按原严格完成判定将未完成 review 标为 partial，裁判规则不变。
+
+同时移除普通 Java 文件为接口索引重复计算 ranges 的开销。四份真实 class 源码加两份接口/嵌套 fixture 的声明和范围逐项与 `fa8f14f` 一致；本机 7 组各 40 次提取的中位耗时下降 26.4%，仅是小规模提取计时，不宣称整条流水线加速。零模型回执保存在 `declaration-cost-audit.json`，正在运行的旧冻结评测未混入改动。
+
+新增 10 项回归：实际 SDK 三种阶段模式、非法模式先于客户端创建、partial 状态、provenance 隔离及 generator/lens 空/空白响应；其中 9 项先在原实现失败。相关 91 / 104 项通过。此前全量的三处 Windows Job smoke 失败来自付费评测独占锁冲突；锁释放后 7 项资源回归已通过，未削弱保护。新完整检查为 `1721 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check / 严格裁判回归通过；下一轮预声明 GEN/editor disabled、INV enabled/requested low，原预算、同一模型与固定 head 保持。

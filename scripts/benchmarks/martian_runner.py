@@ -254,7 +254,10 @@ async def _build_runtime(
     llm_min_interval: float = 30.0,
     thinking: str = "default",
     generator_max_input_chars: int = 0,
+    investigator_thinking: str = "default",
 ) -> tuple[Orchestrator, Database, GitHubClient]:
+    if investigator_thinking not in {"default", "enabled", "disabled"}:
+        raise ValueError("investigator thinking must be default, enabled, or disabled")
     os.environ["REVIEWFORGE_PIPELINE"] = pipeline
     if output_language:
         # The legacy prompt builder has no runtime-config argument yet; keep
@@ -295,9 +298,17 @@ async def _build_runtime(
             if name in traced:
                 return traced[name]
             llm = original_get_llm(name, *args, **kwargs)
-            if thinking != "default":
-                llm.extra_body = {"thinking": {"type": thinking}}
-            if thinking == "disabled":
+            if investigator_thinking != "default":
+                # Global routing can return one cached instance for all agents.
+                # Copy settings while sharing the SDK transports; per-stage
+                # request fields must not mutate another agent's configuration.
+                llm = llm.model_copy()
+            stage_thinking = (
+                investigator_thinking if name == "investigator" and investigator_thinking != "default" else thinking
+            )
+            if stage_thinking != "default":
+                llm.extra_body = {"thinking": {"type": stage_thinking}}
+            if stage_thinking == "disabled":
                 llm.reasoning_effort = None
             elif reasoning_effort:
                 llm.reasoning_effort = reasoning_effort
@@ -441,7 +452,7 @@ async def _run_one(
     runs = await db.get_runs(repo=repo, limit=5)
     run = next((row for row in runs if row.get("head_sha") == state.head_sha), {})
     token_rows = await db.get_token_usage(run_id=str(run.get("run_id") or "")) if run else []
-    return {
+    result = {
         **item,
         "head_sha": state.head_sha,
         "base_sha": state.base_sha,
@@ -456,6 +467,9 @@ async def _run_one(
         "duration_seconds": round(time.monotonic() - started, 3),
         "status": "completed",
     }
+    if not is_complete_result(result):
+        result["status"] = "partial"
+    return result
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -499,6 +513,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "llm_min_interval": args.llm_min_interval,
         "sdk_max_retries": 0,
         "thinking": args.thinking,
+        "investigator_thinking": args.investigator_thinking,
         "reviewer_concurrency": args.reviewer_concurrency,
         "publication_gate_concurrency": args.publication_gate_concurrency,
         "shard_count": args.shard_count,
@@ -517,6 +532,7 @@ async def main_async(args: argparse.Namespace) -> None:
         args.llm_min_interval,
         args.thinking,
         args.generator_max_input_chars,
+        args.investigator_thinking,
     )
     try:
         effective = orchestrator._model_router._config
@@ -592,6 +608,12 @@ def main() -> None:
     parser.add_argument("--reasoning-effort", choices=("", "low", "high", "max"), default="")
     parser.add_argument("--llm-min-interval", type=float, default=30.0)
     parser.add_argument("--thinking", choices=("default", "enabled", "disabled"), default="default")
+    parser.add_argument(
+        "--investigator-thinking",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help="Dev stage ablation; default inherits --thinking, without changing the model or budgets",
+    )
     parser.add_argument(
         "--output-language",
         choices=("auto", "en", "zh-CN"),

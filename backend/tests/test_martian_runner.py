@@ -102,6 +102,68 @@ async def test_benchmark_actual_sdk_sends_one_http_attempt_on_429(runner, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "global_mode,investigator_mode", [("disabled", "enabled"), ("enabled", "disabled"), ("disabled", "default")]
+)
+async def test_benchmark_stage_modes_stay_isolated_in_actual_sdk_requests(
+    runner, monkeypatch, tmp_path, global_mode, investigator_mode
+):
+    from langchain_core.messages import HumanMessage
+
+    from reviewforge.engine import model_router
+
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "mode-probe",
+                "object": "chat.completion",
+                "model": "test-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "[]"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    original = model_router.ChatOpenAI
+    monkeypatch.setattr(model_router, "ChatOpenAI", lambda **kwargs: original(**kwargs, http_async_client=http))
+    monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "test-placeholder")
+    monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
+    orchestrator, db, raw = await runner._build_runtime(
+        tmp_path,
+        "test-model",
+        llm_min_interval=0,
+        thinking=global_mode,
+        reasoning_effort="low",
+        investigator_thinking=investigator_mode,
+    )
+    try:
+        agents = ["hypothesis_generator", "investigator", "editor", "hypothesis_generator", "investigator"]
+        for agent in agents:
+            await orchestrator._model_router.get_llm(agent).ainvoke([HumanMessage(content="probe")])
+        for agent, payload in zip(agents, requests, strict=True):
+            expected = investigator_mode if agent == "investigator" and investigator_mode != "default" else global_mode
+            assert payload["thinking"] == {"type": expected}
+            assert payload.get("reasoning_effort") == ("low" if expected == "enabled" else None)
+            assert payload["model"] == "test-model"
+    finally:
+        await db.close()
+        await raw.close()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_investigator_mode_is_rejected_before_opening_clients(runner, monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "GitHubClient", lambda *args, **kwargs: pytest.fail("client opened"))
+    with pytest.raises(ValueError, match="investigator thinking"):
+        await runner._build_runtime(tmp_path, investigator_thinking="invalid")
+
+
+@pytest.mark.asyncio
 async def test_read_only_wrapper_preserves_head_tarball_transport(runner):
     from reviewforge.tools.github_api import GitHubClient
 
@@ -234,7 +296,7 @@ async def test_context_audit_saves_degradation_but_does_not_report_success(runne
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["complete", "download-error", "truncated", "run-error"])
+@pytest.mark.parametrize("case", ["complete", "partial", "download-error", "truncated", "run-error"])
 async def test_benchmark_workspace_preflight_precedes_models_and_reuses_one_snapshot(runner, tmp_path, case):
     import io
     import tarfile
@@ -289,7 +351,7 @@ async def test_benchmark_workspace_preflight_precedes_models_and_reuses_one_snap
             assert workspace.read("src/f.py") == data.decode()
             if case == "run-error":
                 raise RuntimeError("graph interrupted")
-            return {"status": "completed"}
+            return {"status": "partial" if case == "partial" else "completed"}
 
     github = GitHub()
     gateway = ToolGateway(
@@ -299,14 +361,15 @@ async def test_benchmark_workspace_preflight_precedes_models_and_reuses_one_snap
     item = {"repo": "owner/repo", "pr_number": 1, "golden_url": "https://example.test/pr/1"}
     preflight_dir = tmp_path / "new" / "workspace-preflight"
     assert not preflight_dir.exists()
-    if case == "complete":
+    if case in {"complete", "partial"}:
         row = await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=preflight_dir)
-        assert row["summary"]["status"] == "completed" and row["tokens"] == 0
+        assert row["summary"]["status"] == ("partial" if case == "partial" else "completed")
+        assert row["status"] == row["summary"]["status"] and row["tokens"] == 0
     else:
         with pytest.raises(RuntimeError, match="graph interrupted" if case == "run-error" else "before model calls"):
             await runner._run_one(item, orchestrator, DB(), github, workspace_preflight_dir=preflight_dir)
     assert github.downloads == 1
-    assert orchestrator.model_calls == (1 if case in {"complete", "run-error"} else 0)
+    assert orchestrator.model_calls == (1 if case in {"complete", "partial", "run-error"} else 0)
     assert not gateway._workspaces and not gateway._workspace_states
     receipt = json.loads(next(preflight_dir.glob("*.json")).read_text())
     assert receipt["head_sha"] == "head" and receipt["before_model_requests"]

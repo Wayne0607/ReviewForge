@@ -318,7 +318,10 @@ class HypothesisGenerator:
                 try:
                     parsed, original = await self._invoke_once(user)
                     if parsed is None:
-                        parsed = await self._invoke_repair(original)
+                        if isinstance(original, str) and not original.strip():
+                            failure = f"{self._source} empty model response"
+                        else:
+                            parsed = await self._invoke_repair(original)
                 except Exception as exc:
                     parsed = None
                     failure = f"{self._source} provider error: {type(exc).__name__}"

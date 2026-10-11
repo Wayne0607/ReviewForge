@@ -70,9 +70,14 @@ def test_inner_partial_is_not_a_completed_review_even_if_runner_returned(support
     assert not support.is_complete_result({"status": "completed", "summary": {}})
 
 
-@pytest.mark.parametrize("changed", ["source_revision", "model", "thinking", "workload_sha256", "provider"])
+@pytest.mark.parametrize(
+    "changed", ["source_revision", "model", "thinking", "investigator_thinking", "workload_sha256", "provider"]
+)
 def test_resume_refuses_mixed_evaluation_provenance(support, changed):
-    expected = {key: "original" for key in ["source_revision", "model", "thinking", "workload_sha256", "provider"]}
+    expected = {
+        key: "original"
+        for key in ["source_revision", "model", "thinking", "investigator_thinking", "workload_sha256", "provider"]
+    }
     previous = {**expected, changed: "other"}
     with pytest.raises(RuntimeError, match="provenance changed"):
         support.validate_resume_metadata(previous, expected, has_results=True)

@@ -436,3 +436,11 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 另对 Java 定义检索使用字面名称的廉价排除，保留实际解析/owner 校验与文件名无关的行为，单次查询未命中不会污染后续定义缓存。四份 Git 校验源码加 100 份无关合成文件，8 类定义/10 类 caller 查询结果逐字一致；5 组冷查询中位耗时下降 24.1%。`lookup-cost-audit.json` 明确为小规模混合样本，未测完整工作区或整条流水线加速。
 
 全量 `1734 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check / 2 项严格裁判回归通过。生产只读核实服务 active、HTTP 200、仍为原 main `00c6675`。下一步只冻结同一失败候选做一次新的独立 INV 诊断，原 24000 tokens 与 enabled/requested low 保持；不重开原 UNKNOWN 账本，不加生成或编辑调用，不给单候选诊断计质量分。新增 checkpoint 元数据可由新代码读取旧记录；回退旧 v4 代码时应继续使用该旧版本自己的诊断账本，不在旧解析器中复用新记录。
+
+`ce0738b` 已推送 dev，CI 通过。独立诊断在 `.reviewforge/benchmarks/v4-read-window-20261011-094241/`：28 个实现/配置摘要、固定完整 workspace、原始初始提示 SHA 均通过预检；只调查预声明的一条候选，4 次成功请求 / 22516 tokens / 3 steps / 8 observations，4 次响应均带推理，无截断，仍为 error UNKNOWN。Job 返回 0、峰值 391106560 bytes、锁释放。这个 completed 指诊断完成，不是 PR 流水线通过，没有质量分或验收结论。
+
+本次模型选择 Environment 的 220–260 行，实际保存 220–257，configure 及 guard 已交付；该窗口的原始前缀本来就包含它，因此不能把不同工具轨迹或 token 消耗归因于中心窗口修复。只有另行逐字回放旧 200–270 请求的零模型检查隔离了交付改动。`semantic-audit.json` 保留这项归因限制，未重开旧账本，未追加模型重试。
+
+随后使用同一 head 的 10 份 Git blob 校验源码，回查实际入口、包装函数、回调和配置绑定。已有静态导航的 6 条查询全部定位：Profile.configure → Environment.getCurrentOrCreateFeatureProfile → 内层 MappersConfig.sanitizeDisabledMappers → 外层 PropertyMappers.sanitizeDisabledMappers → Picocli.parseAndRun → KeycloakMain.main；另定位 main 的 parseArgs 调用。零模型回执为 `entry-navigation-audit.json`。这证明既有查询可以沿包装层导航，不能把当前 UNKNOWN 归因于这些链接查找失效，也不证明该子集是完整 caller 集合。
+
+源码中的正常 CLI 分支先 parseArgs / setCliArgs，再 parseAndRun；非 rebuild-check 分支在 cmd.execute 前 sanitize。内层 sanitize 有 parsed-command guard，DisabledMappersInterceptor 的两分支均同步执行 Runnable，Profile 创建另有 null guard，resolver 优先持久化配置。自动调查未走到上述包装链；后续需改善这类跨模块状态路径的有界上下文交付，而非再次只改窄读或从 init/注册名称推断顺序。framework 实际命令派发、具体输入的配置条件及完整 expected/actual 比较仍需新的成功 Observation，手工查阅不能替代模型账本 verdict；不放宽预算或强行写 REFUTED。

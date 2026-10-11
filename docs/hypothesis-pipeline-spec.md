@@ -156,7 +156,7 @@ class ContextPack:
 
 Java 的限定检索是源码导航，不是完整类型/继承或反射分析；解析不了接收者、不存在已定位的声明或缺少静态调用命中时，对应方向记为未检查，不能把无命中当作反证。v4 Impact Manifest 保留 column/receiver/receiver_type，但定位重新检查固定源码中的可见声明，不相信其它方法的同名变量类型；legacy Manifest 仍用原三字段。Java workspace 的 `find_definition` / `find_callers` 接受 `类.方法` 或 `包.类.方法`，短类限定允许包歧义，但不能匹配嵌套类的另一个 owner。纯名称查询的原行为不变。
 
-Context 的 Java callee 定位可沿显式的普通类父链读取接收者成员声明，最多 4 层，每层须唯一匹配固定源码中的限定 class。局部/当前类绑定优先；最近声明的 private 字段、跨包中断的 package 字段、泛型/接口歧义、缺失或重复声明、环与层数上限均不猜测。按字段声明文件的 import/package 查找声明类型的方法，callee 标注 `runtime dispatch unproved`，另将成员声明 ±3 行交给原 `field_usage` 阶段。沿途包可见性和接口同名字段遵循 [JLS §8.3](https://docs.oracle.com/javase/specs/jls/se17/html/jls-8.html#jls-8.3)；这仍非完整类型检查，不解析继承方法的动态派发，不声称 caller 集合完整。原 12 slices / 60 行 / 40000 字符及 Observation 门槛不变，legacy 不使用此 Context 路径。
+Context 的 Java callee 定位可沿显式的普通类父链读取接收者成员声明，最多 4 层，每层须唯一匹配固定源码中的限定 class。局部/当前类绑定优先；最近声明的 private 字段、跨包中断的 package 字段、泛型、缺失或重复声明、环与层数上限均不猜测。沿途 implements 不再阻止父链导航，但保留 callee 未检查标记，片段明确为 `candidate only, interface members unchecked`；发现直接接口声明的同名字段则拒绝绑定。v4 将真实 interface 声明加入现有 class-like owner 索引，接口字段隐式 public/final，方法参数不作为成员；不递归证明接口成员全集。按字段声明文件的 import/package 查找声明类型的方法，callee 标注 `runtime dispatch unproved`，另将成员声明 ±3 行交给原 `field_usage` 阶段。沿途包可见性和接口同名字段遵循 [JLS §8.3](https://docs.oracle.com/javase/specs/jls/se17/html/jls-8.html#jls-8.3)；这仍非完整类型检查，不解析继承方法的动态派发，不声称 caller 集合完整。原 12 slices / 60 行 / 40000 字符及 Observation 门槛不变，legacy 不使用此 Context 路径。
 
 被调 Java 方法涉及可变 static 字段时，callee 的 reason 可附 `State navigation`：检查该方法及一层同类 helper，列出相关字段声明和同类方法引用位置，每条索引 ≤600 字符、最多 4 字段/每字段 6 方法，遗漏明确标示。它用来发现 configure/init/reset 等替代入口，不声明写入事实、调用顺序或完整性；仍计入原渲染预算，不新建工具、Observation 或 verdict。调查需用既有工具窄读取证。
 

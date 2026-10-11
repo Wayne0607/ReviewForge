@@ -404,3 +404,11 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 同时核对真实 GEN 输入：出现两次 `picocli.exit(...)`，但没有 `System.exit(...)` 的实际方法体。两问回查 `dceb58fd` 的绑定限定与模块边界：限定 owner 阻止无关同名方法的导航，这个约束成立；接收者是基类的声明成员时，当前文件绑定表没有满足 callee 定位输入。扩展 Context 的显式父类成员声明导航，不推断继承方法派发。声明文件提供字段类型与可见性，逐层限定 class / package，原未检查、片段与字符限制保留；不会把 Context 当作缺陷证据，也不把某个 System.exit 调用自动判为缺陷。
 
 新增 19 项回归，最初 3 项复现原 callee 缺口，后续 2 项复现跨包再进入和接口歧义误绑定；覆盖显式 this、声明/局部遮蔽、private/package 权限、泛型、缺失/重复/环/上限、同包字段、动态方法保持未检查，以及 Manifest→SemanticChangeSet→Context 完整交付。相关 144 项通过；完整 `1708 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check 与严格裁判回归通过。模式诊断使用旧不可变快照，此批上下文改动未混入其结果，新的独立冻结实跑待完成。
+
+### 接口未检查与父类候选导航（2026-10-11）
+
+`098cc0d` 的真实源码子集复查暴露遗漏：`AbstractUpdatesCommand extends AbstractCommand implements Runnable` 被整类拒绝，仍未交付 `Picocli.exit`。四份固定 head 源码逐一核对 Git blob，旧冻结实现重现失败并保存在模式诊断目录 `inheritance-source-audit/attempt-098cc0d.json`；无模型调用，不是完整 workspace 或生成验收。两问回查该提交：禁止假定接口绑定仍成立，但“implements 就无法提供父类声明候选”的假设过强，混淆了导航与绑定证明。
+
+现允许提供由真实父类字段类型指向的候选 callee，保留接口未检查和动态派发未证明。直接接口同名字段仍拒绝绑定；v4 原提取器没有 interface 索引，因此补入 code-backed 的 class-like interface owner，标明字段隐式 public/final，并排除无方法体声明的参数。legacy 提取器不变，不引入接口全集解析、类型推断或新模型阶段；片段、字符、调查及证据门槛仍用原值。
+
+新增 3 项实际执行的回归，覆盖未知接口下的候选交付、注释/字面量与 legacy 隔离、接口参数及字段属性；已检查收集结果，避免将测试代码误放进源码 fixture。相关 147 项通过。修正后的零模型真实源码检查保存 `working-tree-result.json`，确实交付 `AbstractCommand.picocli` 和 `Picocli.exit` 中的退出 guard / System.exit，同时保留未检查标记；它不证明调用有缺陷。完整检查为 `1711 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check / 严格裁判回归通过；生产 service active / HTTP 200，main 仍为 `00c6675`。新的冻结全流程待完成，尚未达到真实质量验收。

@@ -106,6 +106,8 @@ class JavaSource:
             owner = self.owner(line)
             if owner is None or self._function(line) is not None:
                 continue
+            if self.mask.count("(", 0, offset) != self.mask.count(")", 0, offset):
+                continue
             class_start = sum(len(row) for row in self.mask.splitlines(keepends=True)[: owner.line - 1])
             body = self.mask.find("{", class_start)
             if body < 0 or body >= offset:
@@ -116,20 +118,29 @@ class JavaSource:
                 continue
             start = max(self.mask.rfind(token, 0, offset) for token in (";", "{", "}")) + 1
             modifiers = self.mask[start:offset]
+            interface = self.is_interface(owner)
             fields.append(
                 JavaField(
                     match.group(2),
                     line,
                     owner,
-                    bool(re.search(r"\bstatic\b", modifiers) and not re.search(r"\bfinal\b", modifiers)),
+                    bool(
+                        not interface and re.search(r"\bstatic\b", modifiers) and not re.search(r"\bfinal\b", modifiers)
+                    ),
                     type_name=match.group(1),
-                    access=next(
+                    access="public"
+                    if interface
+                    else next(
                         (word for word in ("private", "protected", "public") if re.search(rf"\b{word}\b", modifiers)),
                         "package",
                     ),
                 )
             )
         return tuple(fields)
+
+    def is_interface(self, owner) -> bool:
+        header = "\n".join(self.mask.splitlines()[(owner.start_line or owner.line) - 1 : owner.line])
+        return bool(re.search(rf"\binterface\s+{re.escape(owner.name)}\b", header))
 
     def _plain_class_header(self, owner) -> str | None:
         if owner is None:
@@ -143,9 +154,9 @@ class JavaSource:
         if end < 0:
             return None
         header = self.mask[start:end]
-        # Generic substitution, interfaces and runtime dispatch need a type
-        # system. This pointer only follows plain, explicit class declarations.
-        if "<" in header or re.search(r"\bimplements\b", header):
+        # Generic substitution and runtime dispatch need a type system.
+        # Interface members stay unchecked on any ancestor candidate pointer.
+        if "<" in header:
             return None
         return header
 
@@ -159,6 +170,13 @@ class JavaSource:
             return None
         parent = re.search(rf"\bextends\s+({_NAME}(?:\.{_NAME})*)\b", header)
         return self._type_name(parent.group(1)) if parent else None
+
+    def interface_names(self, owner) -> tuple[str, ...]:
+        header = self._plain_class_header(owner)
+        if header is None:
+            return ()
+        interfaces = re.search(r"\bimplements\s+(.+)", header, re.DOTALL)
+        return tuple(name.strip() for name in interfaces.group(1).split(",")) if interfaces else ()
 
     def inherited_receiver_name(self, receiver: str, line: int) -> str | None:
         """A member name with no closer local/current-class binding."""

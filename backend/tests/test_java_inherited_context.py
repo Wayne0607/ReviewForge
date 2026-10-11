@@ -5,9 +5,11 @@ from test_java_navigation import _archive
 from test_workspace import _state, _TarballGitHub
 
 from reviewforge.core.specs import build_registry
+from reviewforge.engine import symbol_extractor
 from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.declarations_v4 import compile_changeset_v4
+from reviewforge.engine.declarations_v4 import compile_changeset_v4, extract_code_definitions
+from reviewforge.engine.java_navigation import JavaSource
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.workspace import PRHeadWorkspace
@@ -46,6 +48,29 @@ public class Launcher {
 }
 """,
 }
+
+
+def test_v4_interface_declaration_is_real_code_and_keeps_legacy_extraction():
+    source = """// interface Commented { }
+public interface Extra {
+    String example = "interface Literal { }";
+    static int TOKEN = 1;
+}
+"""
+    assert symbol_extractor.extract_definitions(source, "Extra.java") == []
+    declarations = extract_code_definitions(source, "Extra.java")
+    assert [(d.name, d.symbol_type, d.line, d.end_line) for d in declarations] == [("Extra", "class", 2, 5)]
+
+
+def test_interface_fields_are_implicitly_public_final_and_parameters_are_not_members():
+    source = """package app;
+public interface Extra {
+    static int TOKEN = 1;
+    void process(Launcher launcher);
+}
+"""
+    navigation = JavaSource(source, "app/Extra.java")
+    assert [(f.name, f.access, f.mutable_static) for f in navigation.field_declarations] == [("TOKEN", "public", False)]
 
 
 async def _pack(sources, *, max_slices=12, receiver_override=None):
@@ -208,6 +233,19 @@ async def test_inherited_method_dispatch_is_not_resolved_as_a_field():
     pack = await _pack(sources, receiver_override="super")
     assert not any(s.kind == "callee" for s in pack.units["command"].slices)
     assert "callee" in pack.units["command"].truncated_kinds
+
+
+@pytest.mark.asyncio
+async def test_unknown_interface_keeps_a_declared_candidate_without_claiming_resolution():
+    sources = dict(SOURCES)
+    sources["app/Middle.java"] = sources["app/Middle.java"].replace("extends Base", "extends Base implements Runnable")
+    pack = await _pack(sources)
+    callees = [s for s in pack.units["command"].slices if s.kind == "callee"]
+    assert [s.path for s in callees] == ["engine/Launcher.java"]
+    assert "candidate" in callees[0].reason and "interface members unchecked" in callees[0].reason
+    assert "runtime dispatch unproved" in callees[0].reason
+    assert "callee" in pack.units["command"].truncated_kinds
+    assert any(s.symbol == "base.Base.launcher" for s in pack.units["command"].slices)
 
 
 @pytest.mark.asyncio

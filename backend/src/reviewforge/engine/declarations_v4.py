@@ -56,11 +56,28 @@ def extract_code_definitions(content: str, path: str) -> list[symbol_extractor.S
             if language == "java" and kind == "function" and prefix and prefix.group() in _JAVA_EXPRESSION_STARTS:
                 continue
             accepted.add((name, kind, content[: match.start(1)].count("\n") + 1))
-    return [
+    declarations = [
         item
         for item in symbol_extractor.extract_definitions(content, path)
         if (item.name, item.symbol_type, item.line) in accepted
     ]
+    if language == "java":
+        # The historical regex indexes classes only. Interface declarations
+        # need the same ranges/owner identity for v4's bounded member lookup.
+        for match in re.finditer(r"\binterface\s+([A-Za-z_$][\w$]*)", mask):
+            line = mask.count("\n", 0, match.start(1)) + 1
+            declarations.append(
+                symbol_extractor.SymbolInfo(
+                    name=match.group(1),
+                    symbol_type="class",
+                    file_path=path,
+                    line=line,
+                    start_line=mask.count("\n", 0, match.start()) + 1,
+                )
+            )
+        declarations.sort(key=lambda item: (item.line, item.symbol_type != "class", item.name))
+        symbol_extractor._populate_symbol_ranges(content, language, declarations)
+    return declarations
 
 
 def _union(first: list[Any], second: list[Any]) -> list[Any]:

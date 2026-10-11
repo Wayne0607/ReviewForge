@@ -475,6 +475,8 @@ class _PackBuilder:
                 raw_name = navigation.call_target(call) if navigation else None
                 inherited = self._inherited_receiver(navigation, call) if navigation else None
                 if inherited is not None:
+                    if inherited["interfaces_unchecked"]:
+                        self._unchecked.append("callee")
                     raw_name = f"{inherited['type']}.{_simple_name(call['callee'])}" if inherited["type"] else None
                 if not raw_name:
                     self._unchecked.append("callee")
@@ -517,6 +519,8 @@ class _PackBuilder:
                 reason = f"defines {resolved_name}"
                 if inherited is not None:
                     reason += f"; declared inherited receiver {inherited['symbol']}; runtime dispatch unproved"
+                    if inherited["interfaces_unchecked"]:
+                        reason += "; candidate only, interface members unchecked"
                 if language.lower() == "java":
                     navigation = self._java_source(path)
                     definition = (
@@ -584,8 +588,30 @@ class _PackBuilder:
         self._inherited_receivers[key] = None
         visited = {navigation.class_name(owner)}
         packages = {navigation.package}
+        interfaces_unchecked = False
         parent_source = navigation
         for _ in range(4):
+            interfaces = parent_source.interface_names(owner)
+            interfaces_unchecked |= bool(interfaces)
+            for interface in interfaces:
+                interface_name = parent_source._type_name(interface)
+                if not interface_name:
+                    continue
+                interface_hits = _workspace_call(
+                    self.workspace, "find_symbol_definitions", interface_name, language="java"
+                )
+                for interface_hit in interface_hits:
+                    if _value(interface_hit, "symbol_type", "") != "class":
+                        continue
+                    hit = _normalise_hit(interface_hit)
+                    interface_source = self._java_source(hit["path"])
+                    if interface_source and any(
+                        field.name == name and field.owner.line == hit["line"]
+                        for field in interface_source.field_declarations
+                    ):
+                        # The explicit parent field is not a unique binding.
+                        self._inherited_receivers[key] = {"type": None, "interfaces_unchecked": True}
+                        return self._inherited_receivers[key]
             parent_name = parent_source.superclass(owner)
             if not parent_name or parent_name in visited:
                 return None
@@ -628,6 +654,7 @@ class _PackBuilder:
                     "line": field.line,
                     "symbol": f"{parent_name}.{name}",
                     "type": parent_source.field_type(field) if accessible else None,
+                    "interfaces_unchecked": interfaces_unchecked,
                 }
                 self._inherited_receivers[key] = result
                 return result

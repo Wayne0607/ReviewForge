@@ -2,7 +2,7 @@
 
 The original state index stops at same-class references. Assignment-shaped
 references select navigation seeds here; they do not establish a writer set.
-One sampled, declared caller per seed is followed, with explicit bounds. No
+Two sampled, declared caller paths per seed are followed, with explicit bounds. No
 method name, directory named test, or framework registration decides a path.
 """
 
@@ -17,10 +17,11 @@ from typing import Any
 from reviewforge.engine.java_navigation import JavaSource
 
 MAX_PATH_DEPTH = 5
-MAX_UNIT_QUERIES = 12
-MAX_PACK_QUERIES = 24
+MAX_UNIT_QUERIES = 20
+MAX_PACK_QUERIES = 40
 MAX_ROOTS = 4
 MAX_PATH_CHARS = 2400
+PATH_WIDTH = 2
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,7 @@ class StatePaths:
             if not any(call.line == line and source.call_target(call) == target for call in source.calls):
                 continue
             edge = _Edge(path, line, source.qualified_definition(method))
-            if edge not in edges:
+            if not any(item.path == edge.path and item.caller == edge.caller for item in edges):
                 edges.append(edge)
         self._cache[target] = edges
         return edges
@@ -109,8 +110,8 @@ class StatePaths:
         key = (tuple(roots), anchor_path)
         if key in self._unit_results:
             return self._unit_results[key]
-        chains: dict[str, list[_Edge]] = {root: [] for root in roots[:MAX_ROOTS]}
-        active = list(chains)
+        active: dict[str, list[tuple[_Edge, ...]]] = {root: [()] for root in roots[:MAX_ROOTS]}
+        completed: dict[str, list[tuple[_Edge, ...]]] = {root: [] for root in active}
         anchor = PurePosixPath(anchor_path).parts[:-1]
 
         def proximity(edge: _Edge):
@@ -122,28 +123,41 @@ class StatePaths:
                 shared += 1
             return (-shared, len(parts) + len(anchor) - 2 * shared, edge.path, edge.line, edge.caller)
 
-        # Round-robin seeds so a long path does not hide other state producers.
+        def rank(chain: tuple[_Edge, ...]):
+            return (proximity(chain[-1]), -len(chain), tuple((e.path, e.line, e.caller) for e in chain))
+
+        # Keep a small beam: a nearer intermediate file may lead away from the
+        # changed command. Re-rank after expansion rather than committing to
+        # that first branch. Round-robin seeds still preserves alternatives.
         for _depth in range(MAX_PATH_DEPTH):
-            next_active = []
-            for root in active:
-                chain = chains[root]
-                target = chain[-1].caller if chain else root
-                if self._unit_queries >= MAX_UNIT_QUERIES:
-                    break
-                self._unit_queries += 1
-                edges = self._callers(target)
-                visited = {root, *(edge.caller for edge in chain)}
-                choices = sorted((edge for edge in edges or [] if edge.caller not in visited), key=proximity)
-                if choices:
-                    chain.append(choices[0])
-                    next_active.append(root)
+            next_active = {}
+            for root, chains in active.items():
+                expanded = []
+                for chain in chains:
+                    target = chain[-1].caller if chain else root
+                    if self._unit_queries >= MAX_UNIT_QUERIES:
+                        if chain:
+                            completed[root].append(chain)
+                        continue
+                    self._unit_queries += 1
+                    edges = self._callers(target)
+                    visited = {root, *(edge.caller for edge in chain)}
+                    choices = sorted((edge for edge in edges or [] if edge.caller not in visited), key=proximity)
+                    if choices:
+                        expanded.extend((*chain, edge) for edge in choices[:PATH_WIDTH])
+                    elif chain:
+                        completed[root].append(chain)
+                if expanded:
+                    next_active[root] = sorted(set(expanded), key=rank)[:PATH_WIDTH]
             active = next_active
             if not active or self._unit_queries >= MAX_UNIT_QUERIES:
                 break
+        for root, chains in active.items():
+            completed[root].extend(chains)
         entries = [
             root + " <- " + " <- ".join(f"{edge.path}:{edge.line} ({edge.caller})" for edge in chain)
-            for root, chain in chains.items()
-            if chain
+            for root, chains in completed.items()
+            for chain in sorted(set(chains), key=rank)[:PATH_WIDTH]
         ]
         if not entries:
             self._unit_results[key] = ("", True)

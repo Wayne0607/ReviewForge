@@ -70,7 +70,7 @@ async def test_five_hop_state_context_keeps_nested_wrapper_and_alternative_produ
         assert symbol in callee.reason
     assert "cli/Launcher.java:3 (cli.Launcher.main)" in callee.reason
     assert "runtime/Recorder.java:4 (runtime.Recorder.record)" in callee.reason
-    assert "aaa.Setup.setup" not in callee.reason  # Ranked by proximity; other paths explicitly unchecked.
+    assert "aaa.Setup.setup" in callee.reason  # A second sampled path, not a claim of complete coverage.
     assert "other callers/mutations unchecked" in callee.reason and "order unproved" in callee.reason
     assert "caller" in pack.units["cmd"].truncated_kinds
     assert len(pack.units["cmd"].slices) <= 12
@@ -95,6 +95,35 @@ async def test_paths_recheck_source_hits_and_break_cycles_without_proving_no_cal
     assert "cli.Parser.parse" in reason and "cli.Launcher.main" not in reason
     assert "other.Calls.execute" not in reason
     assert "unchecked" in reason and "caller" in pack.units["cmd"].truncated_kinds
+
+
+@pytest.mark.asyncio
+async def test_nearer_dead_end_does_not_hide_five_hop_entry_path():
+    # The lexically earlier, equally near source is a valid call, but its
+    # upstream path ends away from the command. A single greedy path loses
+    # the entry even though the caller tool can resolve every wrapper.
+    sources = {
+        **SOURCES,
+        **CHAIN,
+        "cli/Aardvark.java": """package cli;
+import core.Gate;
+class Aardvark {
+    static void setup() { Gate.configure(false); }
+}
+""",
+    }
+    workspace = await PRHeadWorkspace.build(
+        _state(files_changed=["cli/Command.java"]), _TarballGitHub(_archive(sources))
+    )
+    try:
+        pack = ContextPack.build(_changeset({"callee": "isEnabled", "receiver": "Gate", "line": 5}), workspace)
+        reason = next(s.reason for s in pack.units["cmd"].slices if s.kind == "callee")
+        assert "cli.Aardvark.setup" in reason
+        assert "cli/Launcher.java:3 (cli.Launcher.main)" in reason
+        assert "cli.Mappers.Inner.sanitize" in reason
+        assert "runtime.Recorder.record" in reason
+    finally:
+        workspace.cleanup()
 
 
 def _reader(sources):

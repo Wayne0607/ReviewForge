@@ -454,3 +454,11 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 7 项导航回归覆盖五层嵌套包装、替代 producer、源码重验、局部/字面量隔离、同包邻近排序、循环/缓存/查询限额、原渲染预算与关闭 caller；另 2 项固定 head 回归。完整 `1743 passed, 1 skipped, 6 warnings`，ruff / 203 文件 format / spec-check / 严格裁判回归通过。十份 Git blob 校验的真实源码子集在 `.reviewforge/eval-private/state-caller-audit-20261011.json` 保存，7 个 caller 查询交付 Environment → 内层 MappersConfig → 外层 PropertyMappers → Picocli → KeycloakMain 全部入口指针；零模型调用，不是完整 workspace 性能或质量证明。
 
 后续固定原 `dev10.json` 全部十条，不沿用旧单 PR 的 error UNKNOWN 即停策略；保持 DeepSeek 开发集授权、英语、原预算，GEN/lens/editor disabled，INV enabled/requested low。错误/未完成结果如实保留，严格完整队列准入和裁判不放宽，不能挑成功子集拼质量分。旧 MiniMax 最终门槛、legacy 配对及 holdout 仍单独待验收。生产读查 service active / HTTP 200，main 为 `00c6675`，未部署本轮改动。
+
+`457f8cb` 的旧快照批次在 `.reviewforge/benchmarks/v4-state-paths-dev10-20261011-164655/` 保留。第一条 keycloak#37429 结束为 partial（3 CONFIRMED / 2 REFUTED / 19 UNKNOWN，其中 1 error UNKNOWN），39 请求 / 264378 tokens，超过每 PR 250k 门槛；同类意大利语替换分别形成了两条评论。第二条的实际 GEN 输入核查发现单路径策略走向 IgnoredArtifacts → ClassLoaderPropertyMappers，没有交付 MappersConfig → Picocli → KeycloakMain。十源码子集缺少这个分叉，不能用其成功替代完整仓库交付验收。两问回查单路径近邻选择：中间文件更近并不保证最终更接近变更入口；假设不成立。
+
+停止原因是已证实的实现交付缺陷，不是 semantic UNKNOWN 即停。`implementation-stop.json` / `context-delivery-audit.json` 保留原回执；Job 返回 126、峰值 412131328 bytes，51 个成功响应 / 332724 recorded tokens，可能有未落盘的在途用量。旧账本与结果不重开、不改 verdict、不拼入新队列，没有完成十 PR、没有质量分。裁判阈值 protocol 标签曾误写 0.72，运行源一直为 0.7；另存 `judge-threshold-provenance-correction.json`，未改裁判、golden 或实际阈值。
+
+改为每种子最多两条路径、每层扩展后重排，先按实际 enclosing caller 方法去重，避免两个同函数的调用占满分叉名额；静态导航额度改为 unit 20 / pack 40，仍有明确截断、2400 字符/原 Context 水位，模型调查额度不增加。新增“最近分叉为死路但五层入口仍可达”的回归，相关 38 项通过；新版本需在完整固定源码上验证实际 Context / GEN 输入包含入口，再开启新的完整 dev10。本轮先前 332724 recorded tokens计入新批次总消耗保护，避免停止重跑绕过 2.5m 记录用量上限。
+
+分叉修复完整检查为 `1744 passed, 1 skipped, 6 warnings`，ruff / 203 文件 format / spec-check / 严格裁判回归通过。完整仓库输入的零模型预检及新十 PR 批次尚待完成。

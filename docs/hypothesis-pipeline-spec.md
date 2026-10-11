@@ -162,7 +162,7 @@ Context 的 Java callee 定位可沿显式的普通类父链读取接收者成�
 
 Java 字段使用从实际的类成员声明选择，排除方法局部变量、参数、初始化块、注释和字面量；匹配区分大小写并限定当前 unit 的所属类，避免 `return;` 被当成字段。可变 static 的索引使用同一声明事实源。索引命中的同类方法各取首个字段引用位置 ±3 行作为 `field_usage` 源码片段，位于原字段类别的收集阶段；每被调方法仍最多 4 字段/6 方法，溢出记未检查，最终继续受 12 slices / 60 行 / 40000 字符限制。片段和 owner 限定方法位置帮助定位替代路径，属于 Context 导航；未重新保存成成功 Observation 前不能引用，更不能仅凭赋值推断执行顺序。
 
-同一 callee 的 reason 还可附 `State caller navigation`：在上述字段/方法引用范围内，以赋值形状的代码 token 选择最多 4 个导航种子，排除被局部声明遮蔽的裸名；这不是 writer 集合或执行证明。用既有 qualified Java `find_callers` 每次最多 12 条、按文件轮转，重新核对固定源码的实际 call target 与 enclosing method（含嵌套 owner），每个种子只沿一条无环候选路径，最多 5 跳。候选按与变更文件的目录公共前缀、距离、path/line/symbol 排序，不按测试/生产文件名分类。种子间轮转；每 unit 最多 12 次导航扩展，全包最多 24 个不同 caller 查询并缓存，新增元数据每项最多 2400 字符，仍计入原渲染预算，不增加源码 slice、工具或模型阶段。`callee <- path:callsite (caller)` 帮助直接窄读外层包装/入口候选，所有其它 caller、别名 mutation、动态派发、回调执行和顺序均明确未检查；即使无命中、环或达到限额也不得作为反证。原 600 字符同类索引、调查预算和 Observation 门槛不变。
+同一 callee 的 reason 还可附 `State caller navigation`：在上述字段/方法引用范围内，以赋值形状的代码 token 选择最多 4 个导航种子，排除被局部声明遮蔽的裸名；这不是 writer 集合或执行证明。用既有 qualified Java `find_callers` 每次最多 12 条、按文件轮转，重新核对固定源码的实际 call target 与 enclosing method（含嵌套 owner），每个种子保留最多两条无环候选路径，最多 5 跳；同一 caller 方法的多个调用行只占一个分叉名额。每层扩展后按终点与变更文件的目录公共前缀、距离、path/line/symbol 重新排序，不按测试/生产文件名分类，不因一个更近的中间文件就永远丢弃另一条路径。种子间轮转；每 unit 最多 20 次导航扩展，全包最多 40 个不同 caller 查询并缓存，新增元数据每项最多 2400 字符，仍计入原渲染预算，不增加源码 slice、工具或模型阶段。`callee <- path:callsite (caller)` 帮助直接窄读外层包装/入口候选，所有其它 caller、别名 mutation、动态派发、回调执行和顺序均明确未检查；即使无命中、环或达到限额也不得作为反证。原 600 字符同类索引、调查预算和 Observation 门槛不变。
 
 有这类索引的 unit 在生成、lens 和调查阶段共用 `state_contracts.md`：定位替代 producer，证明目标输入的值绑定及实际入口顺序，不能仅凭初始化名称、注册注解或一次 configure 调用推断时序。指南只按该 unit 的已编译 reason 选择，不从源码正文中的同名文本触发；生成分块计入其字符，调查收尾保留同份规则，无关 unit 不额外交付。它是取证方法，不能作为 Observation，不改变既有证明门槛或预算。
 

@@ -462,3 +462,17 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 改为每种子最多两条路径、每层扩展后重排，先按实际 enclosing caller 方法去重，避免两个同函数的调用占满分叉名额；静态导航额度改为 unit 20 / pack 40，仍有明确截断、2400 字符/原 Context 水位，模型调查额度不增加。新增“最近分叉为死路但五层入口仍可达”的回归，相关 38 项通过；新版本需在完整固定源码上验证实际 Context / GEN 输入包含入口，再开启新的完整 dev10。本轮先前 332724 recorded tokens计入新批次总消耗保护，避免停止重跑绕过 2.5m 记录用量上限。
 
 分叉修复完整检查为 `1744 passed, 1 skipped, 6 warnings`，ruff / 203 文件 format / spec-check / 严格裁判回归通过。完整仓库输入的零模型预检及新十 PR 批次尚待完成。
+
+### Windows 固定源码在宿主隔离后的可用性（2026-10-11）
+
+`70e6409` 的完整固定仓库 Context / 实际 GEN 渲染零模型预检已经通过：10212 文件 / 88550621 bytes / 原完整 manifest 一致，20 units，真实生成输入含内层包装、Picocli.parseAndRun、KeycloakMain 和原 System.exit 正文；回执在 `.reviewforge/benchmarks/v4-state-paths-dev10-20261011-173528/source-check/`。资源 Job 返回 0、峰值 434196480 bytes，没有模型请求；这验证交付，未验证缺陷判断。
+
+随后同一冻结版本的完整 dev10 初次尝试，前六条在模型前遇到 GitHub ConnectError。本机系统代理连接终止，直接连接和任务内按域名排除均返回 200；六条 head 再次核验一致。只对源码域名应用任务内排除，同时显式保留其它域名原代理，模型路由不变。该版本还暴露独立的宿主源码问题：discourse-graphite#10 为 partial，17 UNKNOWN / 2 REFUTED、0 评论、215664 tokens；其搜索/定义/调用工具共出现 49 次 error。第八条有正常工具与判断记录，但在停止时未完成，不与后续版本拼接。
+
+同 head 和 manifest 的零模型复现定位 `config/initializers/logster.rb` 读取 OSError(22)，Defender 1116/1117 事件证实原快照及独立副本均被隔离。原预检只统计解压文件 size/mtime，不能证明后续读取继续可用；原工具捕获异常后又只交付空 error。停止原因是已证实的源码 I/O 缺陷，不是 semantic UNKNOWN。`implementation-stop.json` 保留原账本与实录；Job 返回 127、峰值 190685184 bytes，82 个成功响应 / 379523 recorded tokens；连同已停单路径版本共 712247 recorded tokens，可能另有在途用量。没有完整十 PR 或质量分，预备的源码失败子集续跑未启动。
+
+两问回查 `acd1339b`：临时解压目录被当作稳定的固定源码事实源，Windows 的隔离与大小写碰撞使该假设不成立。现在 Windows 从原始只读归档按需读取源码，不物化成员；Linux 原文件系统模式保留。两种模式共用原成员安全与容量选择，不跳过被隔离文件、不新增 API 搜索或模型阶段，既有预算、精确引用、UNKNOWN 和完整队列评分规则保留。测评预检新增 storage / archive_sha256，压缩流读取/关闭加锁，原压缩包驻留内存及随机解压耗时需继续通过实际资源记录观察。
+
+6 项回归覆盖宿主拒读下的搜索/定义/调用、与文件系统 manifest/换行/Unicode/空文件一致、大小写不同的文件、非法路径/链接、原容量选择/释放、并发文件绑定及坏正文降级；其中 4 项在旧实现失败。相关 103 项通过。相同真实 discourse head / 7578 文件 / 30782008 bytes / 原 manifest 的零模型复核，三项原失败搜索/定义均恢复，0 读取错误，源码未写盘；回执 `.reviewforge/eval-private/discourse10-archive-source-audit-20261011.json`。完整 `1750 passed, 1 skipped, 6 warnings`，ruff / 204 文件 format / spec-check / 2 项严格裁判回归通过；首次全量一项失败源于 Windows 子进程未继承 UTF-8，统一运行环境后通过，没有更改测试或业务代码。
+
+下一轮继续固定原十 PR、统一 DeepSeek、原调查额度与分阶段模式；所有旧成功响应用量纳入同一 2.5m 消耗保护，旧结果不重开、不复用。仍须新冻结完整测评，未验收或部署 main。

@@ -434,6 +434,8 @@ async def _run_one(
                 "pr_number": pr_number,
                 "head_sha": info.head_sha,
                 "source": info.source,
+                "storage": info.storage,
+                "archive_sha256": info.archive_sha256,
                 "file_count": info.file_count,
                 "byte_size": info.byte_size,
                 "digest": info.digest,

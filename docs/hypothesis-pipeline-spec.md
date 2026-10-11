@@ -80,7 +80,7 @@ REVIEWFORGE_PIPELINE = legacy | shadow | hypothesis     （默认 legacy）
 
 **职责。** 为一次 run 提供绑定 `head_sha` 的只读仓库快照，支持文件读取和符号级搜索。替代 `search_code` 走默认分支的问题。
 
-**实现。** 部署镜像无 git。用 GitHub `GET /repos/{head_repo}/tarball/{head_sha}` 下载到 `tempfile.mkdtemp()`，解压后计算 manifest。fork PR 用 `state.head_repo`。
+**实现。** 部署镜像无 git。用 GitHub `GET /repos/{head_repo}/tarball/{head_sha}` 获取固定源码，fork PR 用 `state.head_repo`。Linux 等主机解压到临时目录后计算 manifest；Windows 使用只读内存归档视图，不写入源码文件，避免宿主隔离或大小写冲突改变快照。归档视图按原安全成员/容量策略选取文件，先用 1 MiB 块检查成员正文完整性，再按需解码并复用原内容缓存；manifest 由所选成员的 path/size/mtime 计算。共享压缩流的读取与关闭串行化，代码只作为文本分析，不执行归档成员。Windows 会保留压缩包，占用由测评资源保护继续约束。
 
 ```python
 @dataclass(frozen=True)
@@ -91,6 +91,8 @@ class WorkspaceInfo:
     digest: str                     # sha256(sorted(path:size:mtime))
     truncated: bool                 # 超过上限时为 True
     source: str                     # "tarball" | "api-fallback"
+    storage: str                    # "filesystem" | "archive-memory"
+    archive_sha256: str             # 原始 tarball 摘要；API fallback / 旧手工快照为空
 
 class PRHeadWorkspace:
     async def build(cls, state: StateStore, github: GitHubClient, *, max_bytes: int) -> PRHeadWorkspace

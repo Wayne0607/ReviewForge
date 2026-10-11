@@ -1,8 +1,10 @@
 """Pinned, read-only repository workspace for hypothesis-pipeline runs.
 
 The review pipeline must inspect the same repository state that triggered a
-run.  ``PRHeadWorkspace`` materialises a GitHub tarball at the PR head SHA and
-offers deterministic, local read/search operations.  When a tarball cannot be
+run.  ``PRHeadWorkspace`` reads a GitHub tarball at the PR head SHA and offers
+deterministic, local read/search operations. Windows keeps a lazy archive view
+without writing source files; other hosts materialise a temporary snapshot.
+When a tarball cannot be
 downloaded, the workspace keeps the identity and uses the GitHub contents API
 for file reads; repository-wide searches deliberately return no results in
 that degraded mode because the API search endpoint is not SHA-scoped.
@@ -19,6 +21,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
@@ -60,6 +63,8 @@ class WorkspaceInfo:
     digest: str
     truncated: bool
     source: str
+    storage: str = "filesystem"
+    archive_sha256: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +164,69 @@ class _ArchiveFile:
 
     path: str
     member: tarfile.TarInfo
+
+
+def _use_archive_view() -> bool:
+    # A Windows filesystem is not an immutable source store: quarantine can
+    # remove members after preflight, and case-insensitive names can collide.
+    # Inspect untrusted source as data; do not materialize executable files.
+    return os.name == "nt"
+
+
+class _ArchiveView:
+    """Lazy, read-only source from the original pinned tarball, not host files."""
+
+    def __init__(self, archive: bytes, *, changed_paths: list[str], max_bytes: int) -> None:
+        self._buffer = io.BytesIO(archive)
+        self._lock = threading.Lock()
+        self._tar = None
+        try:
+            self._tar = tarfile.open(fileobj=self._buffer, mode="r:*")
+            selected, self.truncated = _select_archive_files(self._tar, changed_paths, max_bytes)
+            self.files = {item.path: item.member for item in selected}
+            # Check selected bodies before declaring a usable source. Stream
+            # by archive offset, retaining only a small block, not all text.
+            for member in sorted(self.files.values(), key=lambda item: item.offset_data):
+                extracted = self._tar.extractfile(member)
+                if extracted is None:
+                    raise WorkspaceUnavailable("missing archive member body")
+                consumed = 0
+                with extracted:
+                    while block := extracted.read(1024 * 1024):
+                        consumed += len(block)
+                if consumed != member.size:
+                    raise WorkspaceUnavailable("incomplete archive member body")
+        except BaseException:
+            self.close()
+            raise
+
+    def manifest(self) -> tuple[int, int, str]:
+        payload = "".join(f"{path}:{member.size}:{int(member.mtime)}\n" for path, member in sorted(self.files.items()))
+        return (
+            len(self.files),
+            sum(member.size for member in self.files.values()),
+            hashlib.sha256(payload.encode()).hexdigest(),
+        )
+
+    def read(self, path: str) -> str:
+        # TarFile's compressed stream has one seek position. Serialize reads
+        # including close, so concurrent tool users cannot cross file bodies.
+        with self._lock:
+            if self._tar is None:
+                raise WorkspaceUnavailable("archive view is closed")
+            extracted = self._tar.extractfile(self.files[path])
+            if extracted is None:
+                raise WorkspaceUnavailable("missing archive member body")
+            # Match Path.read_text's decoding and universal newline handling.
+            with io.TextIOWrapper(extracted, encoding="utf-8", errors="replace") as source:
+                return source.read()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._tar is not None:
+                self._tar.close()
+                self._tar = None
+            self._buffer.close()
 
 
 def _normalise_repo_path(path: str) -> str | None:
@@ -363,6 +431,7 @@ class PRHeadWorkspace:
         fallback_repo: str,
         temp_dir: Path,
         fallback_error: Exception | None = None,
+        archive_view: _ArchiveView | None = None,
     ) -> None:
         self.info = info
         self._github = github
@@ -370,6 +439,7 @@ class PRHeadWorkspace:
         self._temp_dir = temp_dir
         self._java_navigation_cache: dict[str, JavaSource] = {}
         self._fallback_error = fallback_error
+        self._archive_view = archive_view
         self._content_cache: dict[str, str] = {}
         self._definition_cache: dict[tuple[str, str], tuple[symbol_extractor.SymbolInfo, ...]] = {}
         self._file_entries: tuple[tuple[str, Path], ...] | None = None
@@ -403,14 +473,15 @@ class PRHeadWorkspace:
         head_repo = str(state.head_repo or state.repo or "")
         head_sha = str(state.head_sha or "")
 
+        archive_view = None
         try:
             archive = await _download_tarball(github, head_repo, head_sha)
-            truncated = _extract_archive(
-                archive,
-                root,
-                changed_paths=[str(path) for path in (state.files_changed or [])],
-                max_bytes=max_bytes,
-            )
+            changed_paths = [str(path) for path in (state.files_changed or [])]
+            if _use_archive_view():
+                archive_view = _ArchiveView(archive, changed_paths=changed_paths, max_bytes=max_bytes)
+                truncated = archive_view.truncated
+            else:
+                truncated = _extract_archive(archive, root, changed_paths=changed_paths, max_bytes=max_bytes)
         except Exception as exc:
             logger.warning(
                 "Unable to build PR head tarball for %s@%s: %s: %s", head_repo, head_sha, type(exc).__name__, exc
@@ -450,7 +521,7 @@ class PRHeadWorkspace:
             workspace._content_cache.update(fallback_contents)
             return workspace
 
-        file_count, byte_size, digest = _manifest(root)
+        file_count, byte_size, digest = archive_view.manifest() if archive_view else _manifest(root)
         info = WorkspaceInfo(
             repo=repo,
             head_repo=head_repo,
@@ -461,8 +532,10 @@ class PRHeadWorkspace:
             digest=digest,
             truncated=truncated,
             source="tarball",
+            storage="archive-memory" if archive_view else "filesystem",
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
         )
-        return cls(info, github, fallback_repo=head_repo, temp_dir=temp_dir)
+        return cls(info, github, fallback_repo=head_repo, temp_dir=temp_dir, archive_view=archive_view)
 
     @property
     def root(self) -> Path:
@@ -495,7 +568,8 @@ class PRHeadWorkspace:
             content = self._read_from_api_sync(relative)
         else:
             candidate = self._local_path(relative)
-            if candidate is None or not candidate.is_file():
+            exists = relative in self._archive_view.files if self._archive_view else candidate and candidate.is_file()
+            if candidate is None or not exists:
                 return None
             content = self._read_local(relative, candidate)
 
@@ -535,6 +609,8 @@ class PRHeadWorkspace:
         """Return whether *path* exists in the local snapshot."""
 
         relative = _normalise_repo_path(path)
+        if self._archive_view and not self._closed:
+            return relative in self._archive_view.files
         candidate = self._local_path(relative) if relative else None
         return bool(candidate and candidate.is_file())
 
@@ -706,6 +782,9 @@ class PRHeadWorkspace:
         if self._closed:
             return
         self._closed = True
+        if self._archive_view is not None:
+            self._archive_view.close()
+            self._archive_view = None
         shutil.rmtree(self._temp_dir, ignore_errors=True)
         self._content_cache.clear()
         self._definition_cache.clear()
@@ -730,7 +809,11 @@ class PRHeadWorkspace:
         cached = self._content_cache.get(relative)
         if cached is not None:
             return cached
-        content = candidate.read_text(encoding="utf-8", errors="replace")
+        content = (
+            self._archive_view.read(relative)
+            if self._archive_view is not None
+            else candidate.read_text(encoding="utf-8", errors="replace")
+        )
         self._content_cache[relative] = content
         return content
 
@@ -781,6 +864,9 @@ class PRHeadWorkspace:
             return []
         if self._file_entries is not None:
             return list(self._file_entries)
+        if self._archive_view is not None:
+            self._file_entries = tuple((path, self.info.root / path) for path in sorted(self._archive_view.files))
+            return list(self._file_entries)
         files: list[tuple[str, Path]] = []
         for candidate in self.info.root.rglob("*"):
             if not candidate.is_file() or candidate.is_symlink():
@@ -828,66 +914,66 @@ def _glob_matches(path: str, pattern: str) -> bool:
     return False
 
 
+def _select_archive_files(
+    tar: tarfile.TarFile, changed_paths: list[str], max_bytes: int
+) -> tuple[list[_ArchiveFile], bool]:
+    """Share the exact safe-member and capacity policy across source stores."""
+    members = tar.getmembers()
+    names = [name for member in members if (name := _normalise_repo_path(member.name)) is not None]
+    prefix = _archive_prefix(members, names)
+    files: dict[str, _ArchiveFile] = {}
+    for member in members:
+        relative = _relative_member_name(member.name, prefix)
+        if relative is None or not member.isfile() or member.size < 0:
+            continue
+        files.setdefault(relative, _ArchiveFile(relative, member))
+
+    total_size = sum(item.member.size for item in files.values())
+    truncated = total_size > max_bytes
+    selected = list(files.values())
+    if truncated:
+        changed = [_normalise_repo_path(path) for path in changed_paths]
+        changed = [path for path in changed if path]
+        changed_exact = set(changed)
+        changed_roots = {path.split("/", 1)[0] for path in changed}
+
+        def priority(item: _ArchiveFile) -> tuple[int, str]:
+            first = item.path.split("/", 1)[0]
+            if item.path in changed_exact:
+                rank = 0
+            elif first in changed_roots:
+                rank = 1
+            elif first in COMMON_SOURCE_DIRS:
+                rank = 2
+            else:
+                rank = 3
+            return rank, item.path
+
+        selected = sorted(selected, key=priority)
+        selected = [item for item in selected if priority(item)[0] <= 2]
+        bounded: list[_ArchiveFile] = []
+        consumed = 0
+        for item in selected:
+            size = int(item.member.size)
+            if consumed + size > max_bytes:
+                continue
+            bounded.append(item)
+            consumed += size
+        selected = bounded
+    else:
+        selected.sort(key=lambda item: item.path)
+    return selected, truncated
+
+
 def _extract_archive(archive: bytes, root: Path, *, changed_paths: list[str], max_bytes: int) -> bool:
     """Safely extract a bounded archive and return whether content was omitted."""
-
     try:
         tar = tarfile.open(fileobj=io.BytesIO(archive), mode="r:*")
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise WorkspaceUnavailable(f"invalid repository tarball: {exc}") from exc
 
     with tar:
-        members = tar.getmembers()
-        names = [name for member in members if (name := _normalise_repo_path(member.name)) is not None]
-        prefix = _archive_prefix(members, names)
-        files: dict[str, _ArchiveFile] = {}
-        for member in members:
-            relative = _relative_member_name(member.name, prefix)
-            if relative is None or not member.isfile():
-                continue
-            if member.size < 0:
-                continue
-            files.setdefault(relative, _ArchiveFile(relative, member))
-
-        total_size = sum(item.member.size for item in files.values())
-        truncated = total_size > max_bytes
-        selected = list(files.values())
-        if truncated:
-            changed = [_normalise_repo_path(path) for path in changed_paths]
-            changed = [path for path in changed if path]
-            changed_exact = set(changed)
-            changed_roots = {path.split("/", 1)[0] for path in changed}
-
-            def priority(item: _ArchiveFile) -> tuple[int, str]:
-                first = item.path.split("/", 1)[0]
-                if item.path in changed_exact:
-                    rank = 0
-                elif first in changed_roots:
-                    rank = 1
-                elif first in COMMON_SOURCE_DIRS:
-                    rank = 2
-                else:
-                    rank = 3
-                return rank, item.path
-
-            selected = sorted(selected, key=priority)
-            # The bounded mode is intentionally conservative: files outside
-            # the changed top-level directories and common source directories
-            # are omitted rather than spending the remaining budget on an
-            # unrelated tree.
-            selected = [item for item in selected if priority(item)[0] <= 2]
-            bounded: list[_ArchiveFile] = []
-            consumed = 0
-            for item in selected:
-                size = int(item.member.size)
-                if consumed + size > max_bytes:
-                    continue
-                bounded.append(item)
-                consumed += size
-            selected = bounded
-        else:
-            selected.sort(key=lambda item: item.path)
-
+        selected, truncated = _select_archive_files(tar, changed_paths, max_bytes)
         for item in selected:
             target = root.joinpath(*item.path.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)

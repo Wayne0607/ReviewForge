@@ -196,6 +196,7 @@ class Observation:                                # 与 floor-v2 §4.3 EvidenceO
     id: str; tool: str; query: str
     path: str; line_range: tuple[int, int] | None
     sha: str; result_digest: str; excerpt: str    # excerpt ≤ 1200 字符
+    excerpt_line_range: tuple[int, int] | None    # read_file 实际保存范围；旧记录可缺省
     status: str                                   # success | not_found | error
 
 @dataclass
@@ -293,6 +294,8 @@ budget_steps = base(severity) + bonus
 **工具（通过 gateway，绑定 workspace）。** `read_file(path, start?, end?)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path, start?, end?)`。diff 行窗口选择与指定 RIGHT 行相交的完整 before/after hunk，保留删除行与上下文；省略窗口保留原完整 diff 行为，未命中为空/`not_found`，不得用作反证。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
 
 v4 的 `read_file` 两个边界都省略时，优先使用该文件最近一个已保存的成功 grep/caller/definition 命中行；其次用 compiler 关联假设的 site，或该 unit 自己的 Context slice 起始行。默认请求该行前 3 / 后 8 行，把相关正文交付到现有 1200 字符保存区，避免整份文件的版权头占满证据。显式任一边界仍按原请求读取，无已知位置仍读原文件；工具描述和返回标签明确窗口，query/line_range 记录实际请求参数。只用已保存的正向命中，不从 not_found/error 或不可引用的 Additional context 猜位置。每个调查员独立计算窗口，不增加工具调用、预算或证据保存长度；workspace/legacy 的读取 API 不变。
+
+宽范围 `read_file` 的请求与原 6000 字符工具水位不变。在已返回的源码内部，若保存的成功搜索命中落在 1200 字符前缀之外，保存区优先选择该命中前 3 / 后 8 行；长前导行会再次挤掉命中时从命中行开始。不得补读工具水位之外的正文，也不得使用未保存、负向或请求窗口之外的位置。`excerpt_line_range` 独立记录实际保存的起止行，query/line_range 继续记录请求，收尾、editor 和失败模板使用实际位置；旧 checkpoint 缺该字段按原前缀位置展示。超出已返回源码的搜索命中只给窄读导航提示，无证据 ID，不能作为 verdict 引用。digest 仍取原有界工具结果，引用校验、UNKNOWN 门槛和预算不变。
 
 **输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。额外交付 `pack.pr_intent` 的前 2000 字符；作者意图是理解行为变化的背景，不能作为正确性证据或豁免契约。收尾保留这份背景。
 

@@ -320,6 +320,9 @@ class Investigator:
             status = "not_found"
         else:
             status = "success"
+        excerpt, excerpt_range = text[:_OBS_EXCERPT_CHARS], None
+        if name == "read_file" and status == "success":
+            excerpt, excerpt_range = self._saved_read_excerpt(text, args)
         observation = Observation(
             id=f"obs_{self._obs_counter}",
             tool=name,
@@ -328,8 +331,9 @@ class Investigator:
             line_range=_line_range(args),
             sha=self._state.head_sha if self._state else "",
             result_digest=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-            excerpt=text[:_OBS_EXCERPT_CHARS],
+            excerpt=excerpt,
             status=status,
+            excerpt_line_range=excerpt_range,
         )
         self._obs_counter += 1
         self._observations.append(observation)
@@ -341,13 +345,43 @@ class Investigator:
             return f"{label} status={status}\n{text}" if text else f"{label} status={status} (no content)"
         view = "\n\n".join(f"[{reference}]\n{citation.quote}" for reference, citation in segments.items())
         reply = f"{label} Saved evidence (copy the exact reference IDs into assessment):\n{view}"
+        if observation.excerpt_line_range:
+            start, saved_end = observation.excerpt_line_range
+            reply += f"\nSaved source lines {start}-{saved_end}; the last line may be incomplete."
         if len(text) > _OBS_EXCERPT_CHARS:
             reply += (
                 "\n[End saved evidence excerpt]\nResult exceeds the saved excerpt; omitted source is not shown. "
                 "Use read_file/read_diff with a narrower line range or a more specific search "
                 "to record the required evidence."
             )
+            if observation.excerpt_line_range:
+                requested_start, end = observation.line_range or (1, 0)
+                end = end or 2**63 - 1
+                focus = self._saved_read_focus(observation.path)
+                if focus is not None and saved_end < focus <= end:
+                    reply += (
+                        f"\nNavigation only: Saved search location {observation.path}:{focus} is outside this excerpt; "
+                        f"read_file start={max(1, requested_start, focus - 3)} end={min(end, focus + 8)} to record it."
+                    )
         return reply[:_TOOL_RESULT_CHARS]
+
+    def _saved_read_excerpt(self, text: str, args: dict[str, Any]) -> tuple[str, tuple[int, int]]:
+        # Read arguments, digest and the 6000-character tool cap stay intact.
+        # Within that returned source, prefer an already saved positive hit
+        # when the first 1200 characters would omit it. Never fetch extra text.
+        first = max(1, int(args.get("start") or 1))
+        lines = text.splitlines(keepends=True)
+        excerpt = text[:_OBS_EXCERPT_CHARS]
+        focus = self._saved_read_focus(str(args.get("path") or ""))
+        offset = focus - first if focus is not None else -1
+        if 0 <= offset < len(lines) and len("".join(lines[: offset + 1])) > _OBS_EXCERPT_CHARS:
+            begin = max(0, offset - 3)
+            # A very long preceding line must not displace the known hit again.
+            if len("".join(lines[begin:offset])) >= _OBS_EXCERPT_CHARS:
+                begin = offset
+            excerpt = "".join(lines[begin : offset + 9])[:_OBS_EXCERPT_CHARS]
+            first += begin
+        return excerpt, (first, first + len(excerpt.splitlines()) - 1)
 
     def _prepare_read_focus(self, hypothesis: Hypothesis, pack: ContextPack) -> None:
         self._read_focus = {}
@@ -366,7 +400,12 @@ class Investigator:
         if args.get("start") is not None or args.get("end") is not None:
             return args
         path = args.get("path")
-        focus = self._read_focus.get(path)
+        focus = self._saved_read_focus(path) or self._read_focus.get(path)
+        if focus is None:
+            return args
+        return {**args, "start": max(1, focus - 3), "end": focus + 8}
+
+    def _saved_read_focus(self, path: str) -> int | None:
         # Search scopes are not files. Use concrete locations in saved positive
         # hits, never an absent result or model-authored filename/line guess.
         for observation in reversed(self._observations):
@@ -378,11 +417,8 @@ class Investigator:
                 else:
                     match = re.match(r"^- (.+?):(\d+):", line)
                 if match and match[1] == path and int(match[2]) > 0:
-                    focus = int(match[2])
-                    return {**args, "start": max(1, focus - 3), "end": focus + 8}
-        if focus is None:
-            return args
-        return {**args, "start": max(1, focus - 3), "end": focus + 8}
+                    return int(match[2])
+        return None
 
     def _system_prompt(self) -> str:
         return load_prompt("investigator", output_language=_language_directive(self._output_language))
@@ -569,6 +605,7 @@ class Investigator:
                 "query": obs.query,
                 "path": obs.path,
                 "line_range": obs.line_range,
+                "excerpt_line_range": obs.excerpt_line_range,
                 "status": obs.status,
                 **(
                     {"evidence": {reference: citation.quote for reference, citation in _evidence_segments(obs).items()}}

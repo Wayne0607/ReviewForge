@@ -52,6 +52,9 @@ class Observation:
     result_digest: str
     excerpt: str
     status: str
+    # Actual saved read_file source; line_range remains the requested window.
+    # Missing in old checkpoints and in multi-location search observations.
+    excerpt_line_range: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"success", "not_found", "error"}:
@@ -161,8 +164,9 @@ class Hypothesis:
         observations = []
         for raw in data.get("observations", []):
             item = dict(raw)
-            if item.get("line_range") is not None:
-                item["line_range"] = tuple(item["line_range"])
+            for key in ("line_range", "excerpt_line_range"):
+                if item.get(key) is not None:
+                    item[key] = tuple(item[key])
             observations.append(Observation(**item))
         return cls(
             id=str(data["id"]),

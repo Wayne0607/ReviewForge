@@ -479,3 +479,36 @@ async def test_annotated_unit_start_still_resolves_the_declared_caller(java_work
         assert [s.path for s in pack.units["cmd"].slices if s.kind == "caller"] == ["cli/Entry.java"]
     finally:
         workspace.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_java_definition_queries_keep_filename_independence_and_query_history():
+    sources = {
+        "odd-name.java": "package app;\nclass Holder {\n    void run() {}\n}\n",
+        "another-name.java": "package other;\nclass Holder {\n    void run() {}\n}\n",
+        "noise.java": """package app;
+class Noise {
+    String text = "app.Holder.run";
+    // class Holder { void run() {} }
+}
+""",
+    }
+    workspace = await PRHeadWorkspace.build(_state(), _TarballGitHub(_archive(sources)))
+    try:
+        for _ in range(2):
+            assert workspace.find_symbol_definitions("app.Absent.run", language="java") == []
+            exact = workspace.find_symbol_definitions("app.Holder.run", language="java")
+            assert [(hit.path, hit.symbol, hit.line) for hit in exact] == [("odd-name.java", "run", 3)]
+            short = workspace.find_symbol_definitions("Holder.run", language="java")
+            assert {hit.path for hit in short} == {"odd-name.java", "another-name.java"}
+            assert {hit.path for hit in workspace.find_symbol_definitions("run", language="java")} == {
+                "odd-name.java",
+                "another-name.java",
+            }
+            assert [
+                (hit.path, hit.symbol) for hit in workspace.find_symbol_definitions("app.Holder", language="java")
+            ] == [
+                ("odd-name.java", "Holder"),
+            ]
+    finally:
+        workspace.cleanup()

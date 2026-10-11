@@ -343,3 +343,18 @@ def test_editor_receives_and_fallback_quotes_investigation_evidence() -> None:
     assert "publication=inline" in prompt
     comment = fallback_comment(clusters[0])
     assert "call_f(None)" in comment.body and "lib/caller.py:7" in comment.body
+
+
+def test_editor_and_fallback_use_the_saved_source_location_after_excerpt_selection() -> None:
+    hypothesis = _hyp(1, Mechanism.NULL_PATH, "f", "error", "strong")
+    hypothesis.observations = [
+        Observation(
+            "obs_0", "read_file", "q", "lib/caller.py", (1, 100), "abc", "d", "call_f(None)", "success", (80, 80)
+        )
+    ]
+    ledger = _ledger(hypothesis)
+    clusters = cluster_confirmed(ledger)
+    prompt = Editor(_ScriptedLLM())._render(clusters, clusters, [], None, ledger)
+    assert "lib/caller.py:80" in prompt and "lib/caller.py:1 (sha=" not in prompt
+    comment = fallback_comment(clusters[0])
+    assert "lib/caller.py:80" in comment.body and "lib/caller.py:1 (sha=" not in comment.body

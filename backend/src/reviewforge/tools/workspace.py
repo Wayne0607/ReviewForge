@@ -610,6 +610,12 @@ class PRHeadWorkspace:
             definitions = self._definition_cache.get(key)
             if definitions is None:
                 content = self._read_local(relative, candidate)
+                # A Java declaration and its literal qualifiers must occur in
+                # this source. Presence is only a cheap exclusion gate; all
+                # hits still require parsing and owner checks. A query miss
+                # must not cache the entire file as having no declarations.
+                if detected == "java" and any(part not in content for part in target.split(".")):
+                    continue
                 definitions = tuple(extract_code_definitions(content, relative))
                 self._definition_cache[key] = definitions
             for definition in definitions:

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from reviewforge.core.database import Database
-from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
+from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Observation, Site
 
 
 def _hypothesis(line: int, *, severity: str = "warning") -> Hypothesis:
@@ -40,6 +40,19 @@ def test_concurrent_upsert_does_not_lose_sites() -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda line: ledger.upsert(_hypothesis(line)), range(1, 41)))
     assert len(ledger.items[_hypothesis(1).identity].sites) == 40
+
+
+def test_saved_source_range_roundtrips_without_changing_the_requested_range() -> None:
+    hypothesis = _hypothesis(10)
+    hypothesis.observations = [
+        Observation("obs_0", "read_file", "q", "service.py", (1, 100), "sha", "d", "call()\n", "success", (80, 80))
+    ]
+    restored = Hypothesis.from_dict(hypothesis.to_dict())
+    assert restored.observations[0].line_range == (1, 100)
+    assert restored.observations[0].excerpt_line_range == (80, 80)
+    old = hypothesis.to_dict()
+    del old["observations"][0]["excerpt_line_range"]
+    assert Hypothesis.from_dict(old).observations[0].excerpt_line_range is None
 
 
 @pytest.mark.asyncio

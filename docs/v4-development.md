@@ -422,3 +422,17 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 同时移除普通 Java 文件为接口索引重复计算 ranges 的开销。四份真实 class 源码加两份接口/嵌套 fixture 的声明和范围逐项与 `fa8f14f` 一致；本机 7 组各 40 次提取的中位耗时下降 26.4%，仅是小规模提取计时，不宣称整条流水线加速。零模型回执保存在 `declaration-cost-audit.json`，正在运行的旧冻结评测未混入改动。
 
 新增 10 项回归：实际 SDK 三种阶段模式、非法模式先于客户端创建、partial 状态、provenance 隔离及 generator/lens 空/空白响应；其中 9 项先在原实现失败。相关 91 / 104 项通过。此前全量的三处 Windows Job smoke 失败来自付费评测独占锁冲突；锁释放后 7 项资源回归已通过，未削弱保护。新完整检查为 `1721 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check / 严格裁判回归通过；下一轮预声明 GEN/editor disabled、INV enabled/requested low，原预算、同一模型与固定 head 保持。
+
+### 保存证据的位置与检索开销（2026-10-11）
+
+`4137e66` 的分阶段单 PR 诊断保存在 `.reviewforge/benchmarks/v4-stage-thinking-20261011-085856/`。固定 head / 10212 文件 / workspace 摘要预检通过，GEN 为 12 hypotheses / 8 no_issue / 0 unresolved；已记录 15 个成功请求、80025 tokens。调查 `h_2c07cfbe` 未能证明 CLI features 配置在 run() 前生效，19950 tokens / 3 steps 后为不可重试 error UNKNOWN；按预声明规则停止其余调用。停止时账本 11 OPEN / 1 UNKNOWN，Job 返回 125、峰值 398675968 bytes、锁释放；无 editor / 完整评论 / 质量分，不能与历史失败或其它 PR 拼接计分，可能另有停止瞬间未记账的在途调用。
+
+两轮私有 protocol 曾把预算说明错误写成固定 16000/8000/4000。该标签未参与执行；原实现一直是 `budget_steps(h) * 4000`，基础 error/warning/info 为 6/4/2 steps，两类上下文 bonus 各 2、最多 8。本候选实际额度为 24000。已保留原 protocol，分别追加 `budget-provenance-correction.json`，并更正以后冻结脚本；没有改变运行预算或给失败结果补质量分。
+
+回查原 `7db82230` 的工具前缀保存与 `a20a1130` 的默认窄读：显式窗口应继续被尊重，但“搜索命中位于请求范围内”不等于“它已进入可引用保存区”。真实固定源码 Environment.java 的 243 行配置调用出现在成功 caller 观察中；请求 200–270 行后的原 1200 字符证据只到方法前半段。Git blob 校验与冻结 `4137e66` 的零模型回放逐字重现旧片段；新保存选择交付了 configure 调用及 null guard，请求参数、SHA、工具结果 digest 均一致。回执在 `read-window-source-audit/`，只证明这一个真实窗口的交付，未证明运行时先后顺序或缺陷成立。
+
+现在只在已返回正文内围绕已保存的成功命中选择原文；增加实际保存范围元数据，贯通账本往返、收尾、editor 和失败模板。原始请求保留，工具水位外命中仍只给导航，负向和未保存命中无效；不增加保存长度或模型调用，不放宽精确引用。相关 114 项回归通过，7 项新行为先在原实现失败。
+
+另对 Java 定义检索使用字面名称的廉价排除，保留实际解析/owner 校验与文件名无关的行为，单次查询未命中不会污染后续定义缓存。四份 Git 校验源码加 100 份无关合成文件，8 类定义/10 类 caller 查询结果逐字一致；5 组冷查询中位耗时下降 24.1%。`lookup-cost-audit.json` 明确为小规模混合样本，未测完整工作区或整条流水线加速。
+
+全量 `1734 passed, 1 skipped, 6 warnings`，ruff / 201 文件 format / spec-check / 2 项严格裁判回归通过。生产只读核实服务 active、HTTP 200、仍为原 main `00c6675`。下一步只冻结同一失败候选做一次新的独立 INV 诊断，原 24000 tokens 与 enabled/requested low 保持；不重开原 UNKNOWN 账本，不加生成或编辑调用，不给单候选诊断计质量分。新增 checkpoint 元数据可由新代码读取旧记录；回退旧 v4 代码时应继续使用该旧版本自己的诊断账本，不在旧解析器中复用新记录。

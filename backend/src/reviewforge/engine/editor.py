@@ -143,8 +143,9 @@ def _evidence_text(hypothesis: Hypothesis) -> str:
         if observation.status != "success":
             continue
         location = observation.path or observation.tool
-        if observation.line_range and observation.line_range[0]:
-            location += f":{observation.line_range[0]}"
+        source_range = observation.excerpt_line_range or observation.line_range
+        if source_range and source_range[0]:
+            location += f":{source_range[0]}"
         lines.append(f"{observation.id} {location} (sha={observation.sha}):\n{observation.excerpt}")
     return "\n".join(lines)
 

@@ -120,6 +120,107 @@ async def test_unfocused_long_read_does_not_silently_grow_saved_evidence(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["grep", "find_callers", "find_definition"])
+async def test_explicit_wide_read_saves_a_known_hit_without_changing_the_request(tmp_path, tool):
+    worker, _ = _worker(tmp_path, changeset=False)
+    hit = (
+        "- transform [function] caller.py:80\n  def transform(value):"
+        if tool == "find_definition"
+        else "- caller.py:80: def transform(value):"
+    )
+    worker._observations = [Observation("obs_0", tool, "q", "", None, "head", "d", hit, "success")]
+    output = await worker._run_tool("read_file", {"path": "caller.py", "start": 1, "end": 100})
+    observation = worker._observations[-1]
+    assert observation.line_range == (1, 100)
+    assert '"start": 1' in observation.query and '"end": 100' in observation.query
+    assert observation.excerpt_line_range == (77, 81)
+    assert "def transform(value):\n    return None" in observation.excerpt
+    assert "Saved source lines 77-81" in output
+    assert "Saved search location" not in output
+    assert len(observation.excerpt) <= 1200
+    # Closure must preserve the saved location as well as the original query.
+    closing = worker._closing_chat([], 24000)[-1].content
+    assert '"excerpt_line_range": [77, 81]' in closing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["not_found", "error"])
+async def test_negative_search_cannot_redirect_an_explicit_wide_read(tmp_path, status):
+    worker, _ = _worker(tmp_path, changeset=False)
+    worker._observations = [
+        Observation("obs_0", "grep", "q", "", None, "head", "d", "- caller.py:80: def transform(value):", status)
+    ]
+    output = await worker._run_tool("read_file", {"path": "caller.py", "start": 1, "end": 100})
+    assert "Saved search location" not in output
+    assert worker._observations[-1].line_range == (1, 100)
+
+
+@pytest.mark.asyncio
+async def test_saved_location_outside_the_requested_window_does_not_redirect(tmp_path):
+    worker, _ = _worker(tmp_path, changeset=False)
+    worker._observations = [
+        Observation("obs_0", "grep", "q", "", None, "head", "d", "- caller.py:80: def transform(value):", "success")
+    ]
+    output = await worker._run_tool("read_file", {"path": "caller.py", "start": 1, "end": 40})
+    assert "Saved search location" not in output
+
+
+@pytest.mark.asyncio
+async def test_navigation_hint_cannot_support_a_confirmed_verdict(tmp_path):
+    from test_investigator import _ScriptedToolLLM, _verdict
+
+    worker, hypothesis = _worker(tmp_path, changeset=False)
+    hypothesis.observations = [
+        Observation("obs_0", "grep", "q", "", None, "head", "d", "- caller.py:80: def transform(value):", "success")
+    ]
+    worker._llm = _ScriptedToolLLM(
+        turns=[
+            {"name": "read_file", "args": {"path": "caller.py", "start": 1, "end": 100}, "id": "wide"},
+            _verdict(quote="Saved source lines 77-81", ids=["obs_1"]),
+        ]
+    )
+    result = await worker.investigate(hypothesis, worker._state, ContextPack())
+    assert result.verdict == "unknown" and result.reason == "ungrounded"
+
+
+@pytest.mark.asyncio
+async def test_known_hit_outside_the_returned_tool_cap_remains_navigation_only(tmp_path):
+    worker, _ = _worker(tmp_path, changeset=False)
+    (tmp_path / "caller.py").write_text("# Header\n" * 800 + "return None\n", encoding="utf-8")
+    worker._observations = [
+        Observation("obs_0", "grep", "q", "", None, "head", "d", "- caller.py:801: return None", "success")
+    ]
+    output = await worker._run_tool("read_file", {"path": "caller.py", "start": 1, "end": 801})
+    observation = worker._observations[-1]
+    assert "return None" not in observation.excerpt
+    assert "Saved search location caller.py:801 is outside this excerpt" in output
+    assert observation.excerpt_line_range[1] < 801
+
+
+@pytest.mark.asyncio
+async def test_long_line_before_known_hit_does_not_consume_its_saved_window(tmp_path):
+    worker, _ = _worker(tmp_path, changeset=False)
+    (tmp_path / "caller.py").write_text("#" + "x" * 1300 + "\nreturn None\n", encoding="utf-8")
+    worker._observations = [
+        Observation("obs_0", "grep", "q", "", None, "head", "d", "- caller.py:2: return None", "success")
+    ]
+    await worker._run_tool("read_file", {"path": "caller.py", "start": 1, "end": 2})
+    observation = worker._observations[-1]
+    assert observation.excerpt == "return None\n" and observation.excerpt_line_range == (2, 2)
+
+
+@pytest.mark.asyncio
+async def test_narrow_saved_window_does_not_request_another_read(tmp_path):
+    worker, _ = _worker(tmp_path, changeset=False)
+    worker._observations = [
+        Observation("obs_0", "grep", "q", "", None, "head", "d", "- caller.py:80: def transform(value):", "success")
+    ]
+    output = await worker._run_tool("read_file", {"path": "caller.py", "start": 77, "end": 81})
+    assert "return None" in output
+    assert "Saved search location" not in output
+
+
+@pytest.mark.asyncio
 async def test_latest_saved_definition_can_change_the_same_files_focus(tmp_path):
     worker, hypothesis = _worker(tmp_path)
     with (tmp_path / "a.py").open("a", encoding="utf-8") as source:

@@ -23,6 +23,7 @@ from typing import Any
 from reviewforge.engine.declarations_v4 import extract_code_definitions as extract_definitions
 from reviewforge.engine.java_navigation import JavaSource
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
+from reviewforge.engine.state_paths import StatePaths
 
 _DEFAULT_MAX_SLICES = 12
 _DEFAULT_MAX_SLICE_LINES = 60
@@ -300,6 +301,7 @@ class _PackBuilder:
         self._java_sources: dict[str, JavaSource] = {}
         self._inherited_receivers: dict[tuple[str, str, str], dict[str, Any] | None] = {}
         self._callee_state: list[ContextSlice] = []
+        self._state_paths = StatePaths(workspace, self._java_source, max_callers)
 
     def build_unit(self, unit: SemanticUnit, unit_id: str) -> UnitContext:
         context = UnitContext(unit_id=unit_id, pr_intent=self.pr_intent)
@@ -310,6 +312,7 @@ class _PackBuilder:
         candidates: list[ContextSlice] = []
         self._unchecked = []
         self._callee_state = []
+        self._state_paths.begin_unit()
         candidates.extend(self._collect_callers(unit))
         candidates.extend(self._collect_callees(unit))
         base, interfaces = self._collect_inheritance(unit)
@@ -529,6 +532,13 @@ class _PackBuilder:
                     state_navigation = navigation.state_navigation(definition) if definition else ""
                     if state_navigation:
                         reason += "; " + state_navigation
+                        paths, unchecked = self._state_paths.navigation(
+                            navigation, definition, str(_value(unit, "path", "") or "")
+                        )
+                        if paths:
+                            reason += "; " + paths
+                        if unchecked:
+                            self._unchecked.append("caller")
                 result_slice = self._slice_from_source(
                     kind="callee",
                     path=path,

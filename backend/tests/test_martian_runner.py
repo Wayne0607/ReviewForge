@@ -164,6 +164,22 @@ async def test_invalid_investigator_mode_is_rejected_before_opening_clients(runn
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expected", ["b" * 40, "invalid"])
+async def test_changed_predeclared_head_stops_before_files_workspace_or_model(runner, expected):
+    class GitHub:
+        async def get_pr_info(self, repo, pr_number):
+            return {"head": {"sha": "a" * 40}}
+
+        async def get_pr_files(self, *args):
+            pytest.fail("Head mismatch must stop before fetching diff or running a model")
+
+    with pytest.raises(RuntimeError, match="predeclared workload; zero model calls"):
+        await runner._run_one(
+            {"repo": "owner/repo", "pr_number": 42, "expected_head_sha": expected}, None, None, GitHub()
+        )
+
+
+@pytest.mark.asyncio
 async def test_read_only_wrapper_preserves_head_tarball_transport(runner):
     from reviewforge.tools.github_api import GitHubClient
 

@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -401,6 +402,11 @@ async def _run_one(
     repo = str(item["repo"])
     pr_number = int(item["pr_number"])
     pr = await github.get_pr_info(repo, pr_number)
+    expected_head = item.get("expected_head_sha")
+    if expected_head is not None and (
+        not re.fullmatch(r"[0-9a-f]{40}", str(expected_head)) or pr["head"]["sha"] != expected_head
+    ):
+        raise RuntimeError("PR head differs from the predeclared workload; zero model calls")
     files = await github.get_pr_files(repo, pr_number)
     state = StateStore(
         pr_number=pr_number,

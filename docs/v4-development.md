@@ -444,3 +444,13 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 随后使用同一 head 的 10 份 Git blob 校验源码，回查实际入口、包装函数、回调和配置绑定。已有静态导航的 6 条查询全部定位：Profile.configure → Environment.getCurrentOrCreateFeatureProfile → 内层 MappersConfig.sanitizeDisabledMappers → 外层 PropertyMappers.sanitizeDisabledMappers → Picocli.parseAndRun → KeycloakMain.main；另定位 main 的 parseArgs 调用。零模型回执为 `entry-navigation-audit.json`。这证明既有查询可以沿包装层导航，不能把当前 UNKNOWN 归因于这些链接查找失效，也不证明该子集是完整 caller 集合。
 
 源码中的正常 CLI 分支先 parseArgs / setCliArgs，再 parseAndRun；非 rebuild-check 分支在 cmd.execute 前 sanitize。内层 sanitize 有 parsed-command guard，DisabledMappersInterceptor 的两分支均同步执行 Runnable，Profile 创建另有 null guard，resolver 优先持久化配置。自动调查未走到上述包装链；后续需改善这类跨模块状态路径的有界上下文交付，而非再次只改窄读或从 init/注册名称推断顺序。framework 实际命令派发、具体输入的配置条件及完整 expected/actual 比较仍需新的成功 Observation，手工查阅不能替代模型账本 verdict；不放宽预算或强行写 REFUTED。
+
+### 有界的跨模块状态调用导航与十 PR 复测准备（2026-10-11）
+
+用户要求解决当前取证瓶颈并跑 10 PR。两问回查 `dc0d43c2` 的确定性 Context 边界与 `dceb58fd` / `f0be264f` 的同类状态索引：限定 owner、Context 不能作证据的假设仍成立；只交付同类 producer 位置，却要求调查在原预算内重新发现多层包装入口，这个交付假设不适合当前跨模块状态路径。补充有界源码导航，不替调查决定 verdict，也不扩充调查额度。
+
+新增 `state_paths.py`，在已有可变 static 引用范围内选赋值形状的代码位置为候选种子，裸名局部遮蔽不参与；不按 configure/init 名称猜 writer。用原 qualified caller 工具重新核对实际调用和嵌套所属方法，按与变更文件的目录距离选择一条路径；保留其它路径、callback/dispatch/order 未检查说明。每种子最多 5 跳、4 种子轮转，每 unit 12 扩展、整包 24 不同 caller 查询/缓存、每项 2400 字符，原 slice/行/全包字符水位不变。路径作为 callee reason 交付 GEN/INV，仍不能创建 Observation。基准 runner 另校验预声明 head，变更或无效 SHA 在获取 diff / workspace / 模型调用前失败。
+
+7 项导航回归覆盖五层嵌套包装、替代 producer、源码重验、局部/字面量隔离、同包邻近排序、循环/缓存/查询限额、原渲染预算与关闭 caller；另 2 项固定 head 回归。完整 `1743 passed, 1 skipped, 6 warnings`，ruff / 203 文件 format / spec-check / 严格裁判回归通过。十份 Git blob 校验的真实源码子集在 `.reviewforge/eval-private/state-caller-audit-20261011.json` 保存，7 个 caller 查询交付 Environment → 内层 MappersConfig → 外层 PropertyMappers → Picocli → KeycloakMain 全部入口指针；零模型调用，不是完整 workspace 性能或质量证明。
+
+后续固定原 `dev10.json` 全部十条，不沿用旧单 PR 的 error UNKNOWN 即停策略；保持 DeepSeek 开发集授权、英语、原预算，GEN/lens/editor disabled，INV enabled/requested low。错误/未完成结果如实保留，严格完整队列准入和裁判不放宽，不能挑成功子集拼质量分。旧 MiniMax 最终门槛、legacy 配对及 holdout 仍单独待验收。生产读查 service active / HTTP 200，main 为 `00c6675`，未部署本轮改动。

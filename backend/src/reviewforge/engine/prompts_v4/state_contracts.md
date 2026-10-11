@@ -7,3 +7,7 @@ Inspect alternative indexed producers rather than treating a method named init a
 A registration annotation or a configuration call alone proves neither CLI value binding nor
 execution before the changed command. Read the resolver and actual entry path when those facts
 decide the claim. Cite saved observations for the binding and order; missing proof stays UNKNOWN.
+
+State caller navigation uses `callee <- path:callsite (declared caller)` to help jump to an
+outer wrapper or entry candidate. Read those locations directly, including guards and the
+value resolver; sampled edges prove neither callback execution nor framework dispatch.

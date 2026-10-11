@@ -310,7 +310,20 @@ class Investigator:
         failed = False
         try:
             text = str(await self._executor(name, args) or "")
-        except Exception:
+        except Exception as exc:
+            # Error bodies may contain credentials or arbitrary source. Keep
+            # them out of evidence and logs; retain only the trusted failure
+            # kind and internal origin so transport/allocation/parser failures
+            # can be diagnosed separately.
+            error_trace = exc.__traceback__
+            while error_trace is not None and error_trace.tb_next is not None:
+                error_trace = error_trace.tb_next
+            origin = "<unknown>"
+            origin_line = 0
+            if error_trace is not None:
+                origin = error_trace.tb_frame.f_code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+                origin_line = error_trace.tb_lineno
+            logger.warning("investigator tool %s failed: %s (%s:%d)", name, type(exc).__name__, origin, origin_line)
             text = ""
             failed = True
         text = text[:_TOOL_RESULT_CHARS]

@@ -682,6 +682,10 @@ class PRHeadWorkspace:
             detected = _language_name(symbol_extractor.detect_language(relative))
             if wanted_language and detected != wanted_language:
                 continue
+            # No parser can declare a symbol in these files. Keep assets in
+            # the complete workspace, but do not decode/cache them for lookup.
+            if not symbol_extractor.DEFINITION_PATTERNS.get(detected):
+                continue
             key = (relative, detected)
             definitions = self._definition_cache.get(key)
             if definitions is None:

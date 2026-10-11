@@ -45,9 +45,14 @@ _JAVA_EXPRESSION_STARTS = frozenset(
 
 def extract_code_definitions(content: str, path: str) -> list[symbol_extractor.SymbolInfo]:
     language = symbol_extractor.detect_language(path)
+    patterns = symbol_extractor.DEFINITION_PATTERNS.get(language, [])
+    # Unsupported files cannot yield declarations. Large assets must not
+    # allocate a lexical mask just to produce the same empty result.
+    if not patterns:
+        return []
     mask = symbol_extractor.mask_non_code(content, language)
     accepted = set()
-    for pattern, kind in symbol_extractor.DEFINITION_PATTERNS.get(language, []):
+    for pattern, kind in patterns:
         for match in re.finditer(pattern, content, re.MULTILINE):
             name = match.group(1)
             if mask[match.start(1) : match.end(1)] != name:

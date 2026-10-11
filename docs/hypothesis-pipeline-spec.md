@@ -108,6 +108,10 @@ class PRHeadWorkspace:
 
 **失败。** tarball 与 API 都失败 → run `failed`，原因 `workspace-unavailable`。
 
+定义查找在读取正文前检查现有 `DEFINITION_PATTERNS`：没有声明模式的文件不参与声明索引，`extract_code_definitions` 也在词法遮罩前返回空结果。完整 workspace 的成员、容量与摘要仍包含这些文件，资源单元和显式读取继续可用；通用 caller 的既有字面命中范围保留，只省去无可用声明解析器的遮罩。该优化避免视频、图片等资产为恒为空的声明结果分配大型字符数组，不推断新的语言语义。
+
+调查工具内部异常继续保存空的 `error` Observation，不能用于缺陷引用。诊断日志仅记录异常类型及内部代码文件名/行号；异常正文、参数值和完整 traceback 不进入日志或证据。旧实录没有异常类型时，不能事后将其空 error 改写成某一种根因。
+
 **接入。** `tools/gateway.py` 的 `_read_file` / `_search_code` 在 `REVIEWFORGE_PIPELINE != legacy` 时优先走 workspace；legacy 不变。
 
 **测试。** 用 `tests/fixtures/workspace_repo.tar.gz`（构造 3 种语言、含定义/调用/测试的迷你仓库）覆盖：读文件、找定义、找 caller、超限截断、fallback。

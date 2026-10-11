@@ -100,6 +100,22 @@ def test_budget_by_severity() -> None:
     assert budget_steps(_hypothesis(severity="error")) == 6
     assert budget_steps(_hypothesis(severity="warning")) == 4
     assert budget_steps(_hypothesis(severity="info")) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_logs_kind_and_origin_without_leaking_exception_body(caplog):
+    async def fail(name, args):
+        raise MemoryError("private-key-value-must-not-be-logged")
+
+    worker = Investigator(_ScriptedToolLLM(), fail)
+    with caplog.at_level("WARNING", logger="reviewforge.engine.investigator"):
+        assert await worker._run_tool("find_definition", {"symbol": "target"}) == "[obs_0] status=error (no content)"
+    observation = worker._observations[-1]
+    assert observation.status == "error"
+    assert observation.excerpt == ""
+    assert "MemoryError" in caplog.text
+    assert "test_investigator.py:" in caplog.text
+    assert "private-key-value-must-not-be-logged" not in caplog.text
     # bonuses (caller -> +2, schema in question -> +2) still cap at 8
     boosted = _hypothesis(
         severity="error", refutation="caller already validates", open_question="does the schema allow null?"

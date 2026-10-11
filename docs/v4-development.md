@@ -476,3 +476,45 @@ workspace 新增可选文件轮转，默认行为不变；仅 v4 Investigator �
 6 项回归覆盖宿主拒读下的搜索/定义/调用、与文件系统 manifest/换行/Unicode/空文件一致、大小写不同的文件、非法路径/链接、原容量选择/释放、并发文件绑定及坏正文降级；其中 4 项在旧实现失败。相关 103 项通过。相同真实 discourse head / 7578 文件 / 30782008 bytes / 原 manifest 的零模型复核，三项原失败搜索/定义均恢复，0 读取错误，源码未写盘；回执 `.reviewforge/eval-private/discourse10-archive-source-audit-20261011.json`。完整 `1750 passed, 1 skipped, 6 warnings`，ruff / 204 文件 format / spec-check / 2 项严格裁判回归通过；首次全量一项失败源于 Windows 子进程未继承 UTF-8，统一运行环境后通过，没有更改测试或业务代码。
 
 下一轮继续固定原十 PR、统一 DeepSeek、原调查额度与分阶段模式；所有旧成功响应用量纳入同一 2.5m 消耗保护，旧结果不重开、不复用。仍须新冻结完整测评，未验收或部署 main。
+
+### 原固定十 PR 的完整尝试结果（2026-10-12）
+
+冻结 `a68153f22131cb13e325e0ba804184c08e706ac6`，目录 `.reviewforge/benchmarks/v4-archive-source-dev10-20261011-185339/`。保留原 `dev10.json` 全部十条，预声明各 PR 的 head；请求模型统一 `deepseek-v4-flash-0731`，英语，GEN/lens/editor disabled、INV enabled/requested effort=low，原调查与 Context 水位不变。effective effort 未经中转站转发日志确认。31 份冻结源码摘要在运行中及汇总时验证一致；golden 未交付生成、调查或编辑阶段。后述资产解析优化仅在工作区完成，没有混入此快照。
+
+完整仓库的零模型输入预检位于 `source-check/`：keycloak#36882 的固定 head、10212 文件 / 88550621 bytes / 原完整 manifest 一致，20 units，真实 GEN 渲染交付内层 MappersConfig、Picocli.parseAndRun、KeycloakMain 与 System.exit 正文。Job 返回 0、峰值 426184704 bytes；这验证实际生成输入交付，不能代替调查输入与缺陷判断验收。
+
+10 条全部返回，8 条进入模型审查；结果为 8 partial / 2 failed，严格完成 0 条，6 条实际评论，未裁判为 TP。执行 Job 正常返回 0，运行时间约 5 小时 59 分钟，峰值 2148536320 bytes（约 2049 MiB，达到所配置 2 GiB 上限附近）；CPU 10%、2 GiB reserve 和独占锁保留，结束后锁释放。267 个成功模型请求 / 1635469 recorded tokens，provider error trace 为 0。两次已停止版本另记录 712247 tokens，合计 2347716，低于预声明 2.5m 记录用量上限；旧停止时可能另有未落盘在途用量。本轮无语义重试，没有旧结果或成功子集拼分。
+
+| PR | 结果 | CONFIRMED / REFUTED / UNKNOWN | error UNKNOWN | 未覆盖 units | 实际评论 | tokens |
+|---|---|---|---:|---:|---:|---:|
+| keycloak/keycloak#37429 | partial | 3 / 3 / 21 | 2 | 0 | 2 | 268748 |
+| keycloak/keycloak#36882 | partial | 0 / 3 / 8 | 4 | 0 | 0 | 176894 |
+| getsentry/sentry#93824 | partial | 0 / 3 / 10 | 2 | 0 | 0 | 206680 |
+| ai-code-review-evaluation/sentry-greptile#1 | partial | 2 / 1 / 6 | 1 | 0 | 2 | 140742 |
+| grafana/grafana#97529 | failed，模型前 | — | — | — | 0 | —（0 模型调用） |
+| grafana/grafana#90045 | failed，模型前 | — | — | — | 0 | —（0 模型调用） |
+| ai-code-review-evaluation/discourse-graphite#10 | partial | 0 / 2 / 3 | 0 | 50 | 0 | 116784 |
+| ai-code-review-evaluation/discourse-graphite#4 | partial | 1 / 4 / 10 | 3 | 0 | 1 | 234283 |
+| calcom/cal.com#14740 | partial | 0 / 3 / 7 | 3 | 0 | 0 | 200774 |
+| calcom/cal.com#10967 | partial | 1 / 4 / 9 | 4 | 0 | 1 | 290564 |
+
+keycloak#37429 与 calcom#10967 超过每 PR 250k 门槛；6 条其它已审查记录满足用量门槛，源码前置失败的两条没有可用的模型用量指标。104 条候选共 7 CONFIRMED / 23 REFUTED / 74 UNKNOWN，其中 19 条不可重试 error UNKNOWN；不能将 UNKNOWN 强制改为 REFUTED 或 no_issue。
+
+两个 Grafana 归档请求均为 `RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)`，分别等待 1065.766 / 703.312 秒。fallback 无完整归档，`--require-complete-workspace` 在模型前拒绝；不是已证明的 200 MB 容量失败。Cal.com 两条则通过完整预检：5823 文件 / 193288201 bytes，准备耗时 4838.375 秒；3725 文件 / 112780402 bytes，准备耗时 1439.781 秒。两者 head 匹配、未截断、storage=archive-memory，原归档与 manifest 摘要保存在逐 PR preflight。
+
+原始 `hypothesis/results.json`、实录、账本、源码预检与不可变汇总 `dev10-report.json` 均保留，汇总校验原结果路径/摘要、各 head 与模型用量总和。固定 `martian_judge.py` 的实际严格准入在客户端创建前拒绝全部十条未完成记录；`strict-judge/execution.json` 返回 1，输入/输出模型实录为 0，未产生质量分。因此没有本轮 F1、Qodo 优劣结论、legacy 配对、holdout 或旧 MiniMax 最终验收结论。
+
+实录定位的后续问题：
+
+- **调查上下文与候选锚点不一致。** keycloak#36882 的实际 GEN 输入与零模型渲染逐字一致，但类 unit 的两条调查初始输入缺少方法 unit 已有的状态 caller 导航。类与 run 方法各产生同一锚点、相同 claim / trigger / open_question 的候选，四次调查共 69206 tokens；正确方法输入也仍产生 UNKNOWN。`keycloak36882-investigator-input-audit.json` 保留这一交付差异，不能声称 GEN 输入完整就代表所有 INV 输入完整。下一轮需改善锚点上下文选择与重复调查，原 unit 身份和闭合账本保持。
+- **生成语法与修复可靠性。** discourse#10 的 16 次保存工具观察均成功，原宿主隔离导致的 I/O 失败没有在这些查询中重现；但 50 units 因 `generator parse failure` 未覆盖。GEN 与忠实 JSON 修复的正文摘要相同，均在第 56 行第 130 列报 `Expecting ',' delimiter`，finish=stop、thinking=0；不是已证明的输出截断。5 条可调查候选来自 security lens。原正文和结果未改，详情 `discourse10-generator-output-audit.json`；原生 JSON 交付尚未在中转站实跑验证。
+- **调查输入与推理输出占用。** INV 消耗 1216429 tokens，占本轮约 74.4%；其中输入 1004552，占 INV 约 82.6%。INV 响应有 17 次 length 截断、15 次无工具调用且正文为空，推理输出记录 171683 tokens。sentry#93824 的一个收尾请求原 4000 输出全部成为推理，正文为空、finish=length；`sentry93824-closure-response-audit.json` 保存该请求与用量。需要改善取证/收尾策略，不能据此断言中转站忽略 low，或用提高额度替代证明。
+- **定义查询的资产开销。** calcom#14740 最终保存 7 次 definition error / 1 次 caller error，普通窄读和 grep 有成功观察。旧工具把异常吞成空记录，实际异常类型无法从该实录恢复；同一期间内存峰值达到限制附近，不得将八条旧 error 事后全部标成 MemoryError。另取固定 head 的完整 Git tree 元数据，与两个归档的文件数/总 bytes 一致；首条中 1745 个无声明模式文件占 182166226 bytes，含 39079898 bytes 的视频，第二条无声明模式文件占 106991641 bytes。`calcom-source-size-audit.json` 明确是零模型元数据检查，未替换运行输入或验证文件正文。
+
+### 无可用声明解析器的文件开销与异常诊断（2026-10-12）
+
+两问回查 `e92e1367`：v4 的词法遮罩用于排除注释/字面量中的伪声明，这个约束在支持的语言仍成立；没有任何声明模式的文件最终恒为空，却先对视频、图片等完整正文创建字符遮罩，这个资源假设不成立。workspace 的全语言定义查询又先解码/cache 全部文件，放大了无效开销。Issue / PR 库开工与检查时均无开放记录，SPEC 的完整成员、容量与证据边界保留。
+
+现在无声明模式的 `extract_code_definitions` 在遮罩前返回空，workspace 定义查询在读取前跳过这些成员的声明索引。完整 workspace 仍保留所有成员与摘要，显式读取及资源上下文可用；caller 的既有字面命中范围保留。工具失败只新增异常类型与内部代码文件名/行号的日志，异常正文、参数与完整 traceback 不进入日志，原空 error Observation 与不可引用门槛保留。该改动没有修改候选身份、评分、模型预算、模式或旧结果。
+
+新增 8 项回归全部先在旧实现失败，覆盖四类无声明模式文件、归档/文件系统下不读取资产但保留其显式读取、caller 字面命中保留，以及异常种类/位置诊断与敏感正文隔离。相关 96 项通过；完整 `1758 passed, 1 skipped, 6 warnings`，ruff / 204 文件 format / spec-check / 2 项严格裁判回归通过。此修复晚于本轮模型快照，尚无新冻结的真实质量或峰值内存复测；不能将上述 2049 MiB 或十 PR 结果归为修复后的效果。生产只读核实 service active / HTTP 200，仍为 main `00c667556c88241d72d96f24430c7c16b4add24e`，v4 未部署。

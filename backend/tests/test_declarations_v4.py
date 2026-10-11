@@ -6,6 +6,18 @@ import pytest
 from reviewforge.engine.symbol_extractor import extract_definitions
 
 
+@pytest.mark.parametrize("path", ["image.png", "video.mp4", "README.md", "settings.yaml"])
+def test_v4_unsupported_definitions_do_not_allocate_a_code_mask(monkeypatch, path):
+    from reviewforge.engine import symbol_extractor
+    from reviewforge.engine.declarations_v4 import extract_code_definitions
+
+    def fail_mask(*args):
+        raise MemoryError("unsupported content must not be lexed")
+
+    monkeypatch.setattr(symbol_extractor, "mask_non_code", fail_mask)
+    assert extract_code_definitions("function imaginary() {}", path) == []
+
+
 def test_v4_declarations_exclude_comments_and_constructor_calls():
     from reviewforge.engine.declarations_v4 import extract_code_definitions
 

@@ -363,3 +363,65 @@ def test_fixture_tarball_contains_a_single_safe_wrapper() -> None:
         names = archive.getnames()
     assert names
     assert all(name == "workspace-repo-test" or name.startswith("workspace-repo-test/") for name in names)
+
+
+def _unsupported_asset_tarball() -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for path, body in {
+            "assets/demo.mp4": b"\x00target()\n",
+            "src/service.ts": b"export function target(value: string) { return value; }\n",
+        }.items():
+            member = tarfile.TarInfo("workspace-repo-test/" + path)
+            member.size = len(body)
+            archive.addfile(member, io.BytesIO(body))
+    return output.getvalue()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archive_view", [False, True])
+async def test_definition_search_keeps_assets_available_without_reading_them(monkeypatch, archive_view):
+    monkeypatch.setattr(workspace_module, "_use_archive_view", lambda: archive_view)
+    workspace = await PRHeadWorkspace.build(
+        _state(files_changed=["src/service.ts"]), _TarballGitHub(_unsupported_asset_tarball())
+    )
+    try:
+        original_read = workspace._read_local
+
+        def guarded_read(relative, candidate):
+            if relative == "assets/demo.mp4":
+                raise MemoryError("definition search must not read unsupported assets")
+            return original_read(relative, candidate)
+
+        monkeypatch.setattr(workspace, "_read_local", guarded_read)
+        assert [(h.path, h.symbol) for h in workspace.find_symbol_definitions("target", language="")] == [
+            ("src/service.ts", "target")
+        ]
+        assert "assets/demo.mp4" not in workspace._content_cache
+        assert workspace.info.file_count == 2
+        assert not workspace.info.truncated
+        monkeypatch.setattr(workspace, "_read_local", original_read)
+        assert workspace.read("assets/demo.mp4") == "\x00target()\n"
+    finally:
+        workspace.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_caller_search_preserves_unknown_file_hits_without_code_mask(monkeypatch):
+    original_mask = workspace_module.symbol_extractor.mask_non_code
+
+    def guarded_mask(content, language):
+        if language == "unknown":
+            raise MemoryError("unsupported declaration parsing is unnecessary")
+        return original_mask(content, language)
+
+    monkeypatch.setattr(workspace_module.symbol_extractor, "mask_non_code", guarded_mask)
+    workspace = await PRHeadWorkspace.build(
+        _state(files_changed=["src/service.ts"]), _TarballGitHub(_unsupported_asset_tarball())
+    )
+    try:
+        assert [(hit.path, hit.line) for hit in workspace.find_callers("target", language="", max_hits=10)] == [
+            ("assets/demo.mp4", 1)
+        ]
+    finally:
+        workspace.cleanup()

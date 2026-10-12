@@ -21,7 +21,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from benchmark_support import is_complete_result, read_metadata, validate_resume_metadata, wait_for_request_slot
+from benchmark_support import (
+    is_complete_result,
+    read_metadata,
+    validate_resume_metadata,
+    wait_for_request_slot,
+    wait_for_request_slot_async,
+)
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 from pydantic import PrivateAttr
@@ -45,6 +51,11 @@ from reviewforge.core.specs import build_registry
 from reviewforge.core.state import StateStore
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.orchestrator import Orchestrator
+from reviewforge.engine.provider_retry import (
+    RetryChatLLM,
+    RetryPolicy,
+    current_retry_attempt,
+)
 from reviewforge.engine.publication_policy import (
     PublicationPolicy,
     PublicationPolicyConfig,
@@ -71,16 +82,23 @@ class BenchmarkLLM(BaseChatModel):
 
     def __init__(self, inner, root, agent, interval):
         super().__init__()
-        self._inner, self._root, self._agent, self._interval = inner, root, agent, interval
+        self._inner, self._root, self._agent, self._interval = (
+            inner,
+            root,
+            agent,
+            interval,
+        )
         root.mkdir(parents=True, exist_ok=True)
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        await asyncio.to_thread(_wait_for_llm_slot, self._interval)
+        await wait_for_request_slot_async(_LLM_RATE_FILE, self._interval)
         request_id = uuid.uuid4().hex
+        attempt = current_retry_attempt()
         _atomic_json(
             self._root / f"{request_id}-input.json",
             {
                 "agent": self._agent,
+                "provider_attempt": attempt,
                 "messages": [{"role": m.type, "content": m.content} for m in messages],
                 "max_tokens": kwargs.get("max_tokens", getattr(self._inner, "max_tokens", None)),
                 "request_options": {
@@ -90,13 +108,15 @@ class BenchmarkLLM(BaseChatModel):
         )
         try:
             result = await self._inner._agenerate(messages, stop, run_manager, **kwargs)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             _atomic_json(
                 self._root / f"{request_id}-error.json",
                 {
                     "agent": self._agent,
+                    "provider_attempt": attempt,
                     "error_type": type(exc).__name__,
                     "status_code": getattr(exc, "status_code", None),
+                    "usage_status": "unknown",
                 },
             )
             raise
@@ -114,7 +134,10 @@ class BenchmarkLLM(BaseChatModel):
                     "tool_calls": getattr(message, "tool_calls", []),
                 }
             )
-        _atomic_json(self._root / f"{request_id}-output.json", {"agent": self._agent, "responses": records})
+        _atomic_json(
+            self._root / f"{request_id}-output.json",
+            {"agent": self._agent, "provider_attempt": attempt, "responses": records},
+        )
         return result
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -175,14 +198,22 @@ class ReadOnlyGitHub:
     async def post_review_comment(self, **kwargs: Any) -> dict[str, Any]:
         key = (kwargs["repo"], kwargs["pr_number"])
         self.comments.setdefault(key, []).append(
-            {"path": kwargs["file_path"], "line": kwargs["line"], "body": kwargs["body"]}
+            {
+                "path": kwargs["file_path"],
+                "line": kwargs["line"],
+                "body": kwargs["body"],
+            }
         )
         return {"id": 1, "benchmark_dry_run": True, **kwargs}
 
     async def post_review_comments(self, *, comments: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         key = (kwargs["repo"], kwargs["pr_number"])
         self.comments.setdefault(key, []).extend(
-            {"path": item.get("path", item.get("file_path", "")), "line": item["line"], "body": item["body"]}
+            {
+                "path": item.get("path", item.get("file_path", "")),
+                "line": item["line"],
+                "body": item["body"],
+            }
             for item in comments
         )
         if kwargs.get("body"):
@@ -259,7 +290,10 @@ async def _build_runtime(
     thinking: str = "default",
     generator_max_input_chars: int = 0,
     investigator_thinking: str = "default",
+    llm_max_attempts: int = 1,
+    llm_retry_404: bool = False,
 ) -> tuple[Orchestrator, Database, GitHubClient]:
+    retry_policy = RetryPolicy(max_attempts=llm_max_attempts, retry_404=llm_retry_404)
     if investigator_thinking not in {"default", "enabled", "disabled"}:
         raise ValueError("investigator thinking must be default, enabled, or disabled")
     os.environ["REVIEWFORGE_PIPELINE"] = pipeline
@@ -270,6 +304,10 @@ async def _build_runtime(
         # per-run override cannot leak into another benchmark invocation.
         os.environ["REVIEWFORGE_OUTPUT_LANGUAGE"] = output_language
     cfg = ReviewForgeConfig.load(REPO_ROOT / "reviewforge.yaml")
+    protocol_version = getattr(cfg.pipeline_v4, "protocol_version", 2)
+    if protocol_version >= 3:
+        cfg.pipeline_v4.provider_max_attempts = retry_policy.max_attempts
+        cfg.pipeline_v4.provider_retry_404 = retry_policy.retry_404
     if generator_max_input_chars < 0:
         raise ValueError("generator input budget must be nonnegative")
     if generator_max_input_chars:
@@ -298,9 +336,16 @@ async def _build_runtime(
         original_get_llm = router.get_llm
         traced = {}
 
+        async def record_attempt(event):
+            directory = root / "provider-attempts"
+            directory.mkdir(parents=True, exist_ok=True)
+            filename = f"{event['logical_request_id']}-{event['attempt']}-{event['phase']}.json"
+            _atomic_json(directory / filename, event)
+
         def traced_llm(name, *args, **kwargs):
-            if name in traced:
-                return traced[name]
+            cache_key = (name, kwargs.get("max_retries"))
+            if cache_key in traced:
+                return traced[cache_key]
             llm = original_get_llm(name, *args, **kwargs)
             if investigator_thinking != "default":
                 # Global routing can return one cached instance for all agents.
@@ -316,8 +361,19 @@ async def _build_runtime(
                 llm.reasoning_effort = None
             elif reasoning_effort:
                 llm.reasoning_effort = reasoning_effort
-            traced[name] = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
-            return traced[name]
+            wrapped = BenchmarkLLM(llm, root / "llm-traces", name, llm_min_interval)
+            # Protocol v3 owns its retry/budget ordering. Wrapping here would
+            # multiply attempts and hide each admission from its PR budget.
+            v4_agent = name in {
+                "hypothesis_generator",
+                "investigator",
+                "editor",
+            } or name.startswith("lens_")
+            product_retry = pipeline in {"hypothesis", "shadow"} and protocol_version >= 3 and v4_agent
+            if not product_retry and (retry_policy.max_attempts > 1 or retry_policy.retry_404):
+                wrapped = RetryChatLLM(wrapped, retry_policy, attempt_sink=record_attempt)
+            traced[cache_key] = wrapped
+            return wrapped
 
         router.get_llm = traced_llm
         policy_cfg = PublicationPolicyConfig(
@@ -523,6 +579,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "reasoning_effort": args.reasoning_effort or "provider-default",
         "llm_min_interval": args.llm_min_interval,
         "sdk_max_retries": 0,
+        "provider_retry": RetryPolicy(max_attempts=args.llm_max_attempts, retry_404=args.llm_retry_404).to_dict(),
         "thinking": args.thinking,
         "investigator_thinking": args.investigator_thinking,
         "reviewer_concurrency": args.reviewer_concurrency,
@@ -544,6 +601,8 @@ async def main_async(args: argparse.Namespace) -> None:
         args.thinking,
         args.generator_max_input_chars,
         args.investigator_thinking,
+        args.llm_max_attempts,
+        args.llm_retry_404,
     )
     try:
         effective = orchestrator._model_router._config
@@ -553,12 +612,16 @@ async def main_async(args: argparse.Namespace) -> None:
         metadata["effective_generator_max_input_chars"] = orchestrator._pipeline_v4_config.generator_max_input_chars
         if args.pipeline in {"hypothesis", "shadow"}:
             metadata["v4_protocol"] = {
-                "version": 2,
+                "version": getattr(orchestrator._pipeline_v4_config, "protocol_version", 2),
                 "json_output_mode": orchestrator._pipeline_v4_config.json_output_mode,
                 "investigator_closure_thinking": orchestrator._pipeline_v4_config.investigator_closure_thinking,
                 "max_tokens_per_pr": orchestrator._pipeline_v4_config.max_tokens_per_pr,
             }
-        validate_resume_metadata(read_metadata(root / "metadata.json"), metadata, has_results=output_path.exists())
+        validate_resume_metadata(
+            read_metadata(root / "metadata.json"),
+            metadata,
+            has_results=output_path.exists(),
+        )
         _atomic_json(root / "metadata.json", metadata)
         for index, item in enumerate(workload, 1):
             key = str(item["golden_url"])
@@ -587,14 +650,15 @@ async def main_async(args: argparse.Namespace) -> None:
                     flush=True,
                 )
             except Exception as exc:
-                logger.exception("Benchmark PR failed: %s", key)
+                logger.error("Benchmark PR failed: %s (%s)", key, type(exc).__name__)
                 results[key] = {
                     **item,
                     "status": "failed",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": type(exc).__name__,
+                    "status_code": getattr(exc, "status_code", None),
                 }
                 print(
-                    f"FAIL {index}/{len(workload)} {type(exc).__name__}: {exc}",
+                    f"FAIL {index}/{len(workload)} {type(exc).__name__}",
                     flush=True,
                 )
             _atomic_json(output_path, list(results.values()))
@@ -620,11 +684,26 @@ def main() -> None:
     )
     parser.add_argument("--model-override", default="")
     parser.add_argument(
-        "--generator-max-input-chars", type=int, default=0, help="Dev ablation; 0 keeps the YAML budget"
+        "--generator-max-input-chars",
+        type=int,
+        default=0,
+        help="Dev ablation; 0 keeps the YAML budget",
     )
     parser.add_argument("--pipeline", choices=("legacy", "shadow", "hypothesis"), default="legacy")
     parser.add_argument("--reasoning-effort", choices=("", "low", "high", "max"), default="")
     parser.add_argument("--llm-min-interval", type=float, default=30.0)
+    parser.add_argument(
+        "--llm-max-attempts",
+        type=int,
+        choices=(1, 2, 3),
+        default=1,
+        help="Finite attempts of the same provider request; SDK retries remain disabled",
+    )
+    parser.add_argument(
+        "--llm-retry-404",
+        action="store_true",
+        help="Opt into bounded 404 recovery only for a relay with known transient routing failures",
+    )
     parser.add_argument("--thinking", choices=("default", "enabled", "disabled"), default="default")
     parser.add_argument(
         "--investigator-thinking",

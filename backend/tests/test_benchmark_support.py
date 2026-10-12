@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +44,36 @@ def test_request_pacing_preserves_interval_and_locked_state(support, tmp_path, m
     assert state.read_text() == "160.0"
 
 
+@pytest.mark.asyncio
+async def test_async_request_pacing_cancels_without_claiming_slot_or_holding_lock(support, tmp_path):
+    state = tmp_path / "request-rate"
+    previous = str(support.time.monotonic())
+    state.write_text(previous)
+    task = asyncio.create_task(support.wait_for_request_slot_async(state, 30))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+    assert state.read_text() == previous
+    with support.exclusive_file_lock(state.with_suffix(".lock"), blocking=False):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_async_request_pacing_rechecks_shared_slot_after_wait(support, tmp_path, monkeypatch):
+    state = tmp_path / "request-rate"
+    state.write_text("100")
+    clocks, waits = iter([130.0, 160.0]), []
+    monkeypatch.setattr(support, "time", SimpleNamespace(monotonic=lambda: next(clocks)))
+
+    async def sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(support.asyncio, "sleep", sleep)
+    await support.wait_for_request_slot_async(state, 60)
+    assert waits == [30.0] and state.read_text() == "160.0"
+
+
 def test_portable_lock_excludes_other_process_then_releases(support, tmp_path):
     script = """
 import sys
@@ -71,12 +103,31 @@ def test_inner_partial_is_not_a_completed_review_even_if_runner_returned(support
 
 
 @pytest.mark.parametrize(
-    "changed", ["source_revision", "model", "thinking", "investigator_thinking", "workload_sha256", "provider"]
+    "changed",
+    [
+        "source_revision",
+        "model",
+        "thinking",
+        "investigator_thinking",
+        "workload_sha256",
+        "provider",
+        "provider_retry",
+        "v4_protocol",
+    ],
 )
 def test_resume_refuses_mixed_evaluation_provenance(support, changed):
     expected = {
         key: "original"
-        for key in ["source_revision", "model", "thinking", "investigator_thinking", "workload_sha256", "provider"]
+        for key in [
+            "source_revision",
+            "model",
+            "thinking",
+            "investigator_thinking",
+            "workload_sha256",
+            "provider",
+            "provider_retry",
+            "v4_protocol",
+        ]
     }
     previous = {**expected, changed: "other"}
     with pytest.raises(RuntimeError, match="provenance changed"):

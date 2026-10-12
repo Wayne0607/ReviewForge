@@ -101,7 +101,8 @@ class _ScriptedLLM(BaseChatModel):
 
 
 @pytest.mark.asyncio
-async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_llm_stages_wire_generator_and_investigator(tmp_path, protocol_version) -> None:
     diff = _diff("def f(x):", "    return x.name")
     state = StateStore(
         repo="owner/repo",
@@ -157,6 +158,16 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
                             "refutation": "if x is validated upstream it is fine",
                             "severity": "warning",
                             "sites": [{"path": "app.py", "line": 2, "excerpt": "return x.name"}],
+                            "behavior": {
+                                "before": "The new function did not exist.",
+                                "after": "The function reads the receiver name.",
+                                "observable": "A missing receiver raises on the property read.",
+                                "source_facts": [
+                                    {"side": "after", "path": "app.py", "line": 2, "excerpt": "return x.name"}
+                                ],
+                            },
+                            "discrepancy": "The new receiver read has no local guard.",
+                            "trigger_basis": {"side": "after", "path": "app.py", "line": 2, "excerpt": "return x.name"},
                         }
                     ],
                     "no_issue_units": [],
@@ -188,7 +199,7 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
     fake = SimpleNamespace(
         _gateway=SimpleNamespace(workspace_for=AsyncMock(return_value=workspace)),
         _events=events,
-        _pipeline_v4_config=PipelineV4Config(),
+        _pipeline_v4_config=PipelineV4Config(protocol_version=protocol_version),
         _model_router=SimpleNamespace(get_llm=get_llm),
         _db=None,
     )
@@ -209,11 +220,18 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path) -> None:
     hypothesis = state.ledger.items[f"{compile_semantic_changeset(state).units[0].id}::null-path::f"]
     assert hypothesis.status == HypothesisStatus.UNKNOWN
     assert hypothesis.attempts == 1
+    if protocol_version == 3:
+        assert state.ledger.discovery_blocks
+        assert state.ledger.request_budget["request_count"] > 0
+        assert "pipeline_v4.provider_attempt" in event_types
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("all_reported", [False, True])
-async def test_unit_coverage_controls_pipeline_health_and_benchmark_admission(tmp_path, monkeypatch, all_reported):
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_unit_coverage_controls_pipeline_health_and_benchmark_admission(
+    tmp_path, monkeypatch, all_reported, protocol_version
+):
     import importlib
     from pathlib import Path
 
@@ -242,7 +260,26 @@ async def test_unit_coverage_controls_pipeline_health_and_benchmark_admission(tm
             json.dumps(
                 {
                     "hypotheses": [],
-                    "no_issue_units": [{"unit_id": unit.id, "checked": "changed lines inspected"} for unit in reported],
+                    "no_issue_units": [
+                        {
+                            "unit_id": unit.id,
+                            "checked": "changed lines inspected",
+                            "behavior": {
+                                "before": "The function did not exist.",
+                                "after": "The function returns the receiver name.",
+                                "observable": "Valid named receivers return their name.",
+                                "source_facts": [
+                                    {
+                                        "side": "after",
+                                        "path": "app.py",
+                                        "line": unit.end_line,
+                                        "excerpt": "return x.name",
+                                    }
+                                ],
+                            },
+                        }
+                        for unit in reported
+                    ],
                 }
             )
         ]
@@ -251,7 +288,7 @@ async def test_unit_coverage_controls_pipeline_health_and_benchmark_admission(tm
     fake = SimpleNamespace(
         _gateway=SimpleNamespace(workspace_for=AsyncMock(return_value=SimpleNamespace(info=info, digest="d"))),
         _events=EventBus(),
-        _pipeline_v4_config=PipelineV4Config(mode="hypothesis"),
+        _pipeline_v4_config=PipelineV4Config(mode="hypothesis", protocol_version=protocol_version),
         _model_router=SimpleNamespace(get_llm=lambda name: llm),
         _db=None,
     )

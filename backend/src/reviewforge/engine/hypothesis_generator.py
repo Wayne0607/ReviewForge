@@ -16,6 +16,7 @@ only consumer allowed to move it away from ``OPEN``.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable
@@ -30,6 +31,7 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, render_numbered_diff, select_diff_hunks
+from reviewforge.engine.discovery import DiscoveryBlock, DiscoveryLimits, plan_discovery
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
@@ -93,6 +95,7 @@ class HypothesisGenerationResult:
     blocks: int = 0
     failed_blocks: int = 0
     unresolved_units: list[str] = field(default_factory=list)
+    capacity_deferred_units: list[str] = field(default_factory=list)
 
 
 def _right_lines_by_path(state: StateStore) -> dict[str, dict[int, str]]:
@@ -254,6 +257,12 @@ class HypothesisGenerator:
         on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
         anchor_resolver: AnchorResolver | None = None,
         json_object_output: bool | None = None,
+        discovery_target_input_chars: int = 32_000,
+        discovery_diff_max_chars: int = 20_000,
+        discovery_context_max_chars: int = 8_000,
+        discovery_max_units: int = 12,
+        discovery_max_blocks: int = 8,
+        discovery_max_hypotheses_per_block: int = 6,
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
@@ -268,6 +277,16 @@ class HypothesisGenerator:
         self._json_object_output = (
             bool(getattr(llm, "json_object_output", False)) if json_object_output is None else json_object_output
         )
+        self._discovery_limits = DiscoveryLimits(
+            target_input_chars=max(1, min(int(discovery_target_input_chars), self._max_input_chars)),
+            hard_input_chars=self._max_input_chars,
+            diff_max_chars=max(1, int(discovery_diff_max_chars)),
+            context_max_chars=max(0, int(discovery_context_max_chars)),
+            global_context_max_chars=max(0, int(context_max_chars)),
+            max_units=max(1, int(discovery_max_units)),
+        )
+        self._discovery_max_blocks = max(1, int(discovery_max_blocks))
+        self._discovery_max_hypotheses_per_block = max(1, int(discovery_max_hypotheses_per_block))
 
     def _system_prompt(self) -> str:
         lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
@@ -287,7 +306,14 @@ class HypothesisGenerator:
         pack: ContextPack,
         changeset: SemanticChangeSet,
         ledger: HypothesisLedger,
+        *,
+        resume: bool = False,
+        overview_changeset: SemanticChangeSet | None = None,
     ) -> HypothesisGenerationResult:
+        if ledger.protocol_version >= 3:
+            return await self._run_discovery(
+                state, pack, changeset, ledger, resume=resume, overview_changeset=overview_changeset
+            )
         units = sorted(changeset.units, key=lambda unit: (-unit.risk_score, unit.id))
         result = HypothesisGenerationResult()
         if not units:
@@ -360,6 +386,373 @@ class HypothesisGenerator:
             if self._on_update is not None:
                 await self._on_update(ledger)
         return result
+
+    def _discovery_system_prompt(self, allowance: int) -> str:
+        prompt = load_prompt(
+            "discovery_v3",
+            output_language=_language_directive(self._output_language),
+            max_hypotheses=allowance,
+            lens=self._source[len("lens:") :] if self._source.startswith("lens:") else "general correctness",
+        )
+        if self._skill_body:
+            prompt += f"\n\n## Specialist rules\n{self._skill_body}"
+        return prompt + "\n\n" + defect_scope_guidance() + "\n\n" + investigation_capabilities()
+
+    def _render_discovery_message(
+        self, block: DiscoveryBlock, ledger: HypothesisLedger, allowance: int, guidance: str = ""
+    ) -> str:
+        ids = ", ".join(unit.id for unit in block.units)
+        anchors = []
+        for unit in block.units:
+            lines = sorted(
+                {
+                    fact.line
+                    for fact in block.facts
+                    if fact.side == "after"
+                    and fact.path == unit.path
+                    and (not unit.start_line or max(1, unit.start_line - 3) <= fact.line <= unit.end_line + 3)
+                }
+            )
+            ranges = []
+            for line in lines:
+                if ranges and line == ranges[-1][1] + 1:
+                    ranges[-1][1] = line
+                else:
+                    ranges.append([line, line])
+            coordinates = ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in ranges)
+            anchors.append(
+                f"- {unit.id} {unit.path} symbol={unit.symbol or '-'} RIGHT lines: "
+                + (coordinates or "(none in this unit's range)")
+            )
+        # Cross-block rows retain identity/trigger/impact navigation but cannot
+        # consume the changed-source budget or count as a fresh assessment.
+        existing = []
+        for item in sorted(ledger.items.values(), key=lambda item: item.identity):
+            existing.append(f"- {item.identity} [{item.status.value}] trigger={item.trigger}; impact={item.impact}")
+        existing_text = "\n".join(existing)
+        if len(existing_text) > 2_000:
+            existing_text = (
+                existing_text[:1_900] + "\n(existing-hypothesis navigation truncated; not proof of coverage)"
+            )
+        sections = [
+            "## PR overview\n" + block.overview,
+            "## Source relationship navigation (not evidence)\n" + (block.navigation or "(none collected)"),
+            "## Changes\nAllowed unit_id values (copy exactly): " + ids + "\n\n" + block.diff_text,
+            "## RIGHT-side anchors\n" + "\n".join(anchors),
+            "## Context\n" + (block.context_text or "(no context delivered)"),
+            "## Structured difference focus (attention cues, not defect verdicts)\n"
+            + (block.focus or "Compare before/after behavior."),
+            "## Unchecked\n" + ("\n".join(block.unchecked) or "(no collected direction omitted)"),
+            "## Existing hypotheses\n" + (existing_text or "(none)"),
+        ]
+        if block.oversize:
+            sections.append(
+                "## Input size\nIndivisible shared hunk exceeds the soft diff target; "
+                "supplied intact under the original hard cap."
+            )
+        if guidance:
+            sections.append(guidance)
+        sections.append(
+            f"## Required assessments ({len(block.units)})\n"
+            f"New candidate allowance this block: {allowance}. Assess each ID in exactly one category: hypotheses, "
+            "source-backed no_issue check, or explicit deferred_units. Independent risks may have multiple "
+            "hypotheses for one unit. A deferred answer is not clean.\n" + ids
+        )
+        return "\n\n".join(sections)
+
+    async def _run_discovery(
+        self,
+        state: StateStore,
+        pack: ContextPack,
+        changeset: SemanticChangeSet,
+        ledger: HypothesisLedger,
+        *,
+        resume: bool,
+        overview_changeset: SemanticChangeSet | None,
+    ) -> HypothesisGenerationResult:
+        result = HypothesisGenerationResult()
+        completed = set()
+        policy_deferred = set()
+        if resume:
+            for record in ledger.discovery_blocks.values():
+                if record.get("source") == self._source:
+                    completed.update(
+                        unit_id for unit_id, row in record.get("units", {}).items() if row.get("status") == "assessed"
+                    )
+                    policy_deferred.update(
+                        unit_id
+                        for unit_id, row in record.get("units", {}).items()
+                        if row.get("status") == "capacity-deferred"
+                    )
+        pending = SemanticChangeSet(
+            repo=changeset.repo,
+            pr_number=changeset.pr_number,
+            head_sha=changeset.head_sha,
+            units=[unit for unit in changeset.units if unit.id not in completed | policy_deferred],
+        )
+        blocks = plan_discovery(
+            pending,
+            pack,
+            state.file_diffs or {},
+            limits=self._discovery_limits,
+            overview_changeset=overview_changeset or changeset,
+        )
+        right_lines = _right_lines_by_path(state)
+        for index, block in enumerate(blocks):
+            key = f"{self._source}:{block.id}"
+            record = {
+                "source": self._source,
+                "unit_ids": [unit.id for unit in block.units],
+                "diff_chars": len(block.diff_text),
+                "context_chars": len(block.context_text),
+                "oversize": block.oversize,
+                "units": {},
+                "status": "pending",
+            }
+            ledger.discovery_blocks[key] = record
+            used = sum(item.source == "generator" or item.source.startswith("lens:") for item in ledger.items.values())
+            allowance = min(self._discovery_max_hypotheses_per_block, max(0, self._max_hypotheses - used))
+            user = self._render_discovery_message(
+                block, ledger, allowance, self._verification_guidance(block.units, state.file_diffs or {}, pack)
+            )
+            record["input_chars"] = len(user)
+            failure = block.failure
+            if index >= self._discovery_max_blocks:
+                failure = "capacity-deferred: discovery block limit"
+            elif len(user) > self._max_input_chars:
+                failure = "input-too-large"
+            if failure:
+                record["status"] = "capacity-deferred" if failure.startswith("capacity-deferred") else "unresolved"
+                for unit in block.units:
+                    self._discovery_unresolved(ledger, result, unit.id, failure)
+                    record["units"][unit.id] = {"status": record["status"], "reason": failure}
+                result.failed_blocks += 1
+                if self._on_update is not None:
+                    await self._on_update(ledger)
+                continue
+            result.blocks += 1
+            try:
+                response = await self._llm.ainvoke(
+                    [SystemMessage(content=self._discovery_system_prompt(allowance)), HumanMessage(content=user)],
+                    max_tokens=8192,
+                )
+                original = getattr(response, "content", "") or ""
+                parsed = self._parse_response(original)
+                if parsed is None and isinstance(original, str) and original.strip():
+                    parsed = await self._invoke_repair(original)
+                if parsed is None:
+                    failure = (
+                        "empty model response"
+                        if isinstance(original, str) and not original.strip()
+                        else "parse failure"
+                    )
+            except Exception as exc:
+                parsed = None
+                failure = (
+                    "budget-exhausted"
+                    if getattr(exc, "outcome", "") == "budget-exhausted"
+                    else f"provider error: {type(exc).__name__}"
+                )
+                logger.warning("%s discovery failed: %s", self._source, type(exc).__name__)
+            if parsed is None:
+                record["status"] = "unresolved"
+                for unit in block.units:
+                    self._discovery_unresolved(ledger, result, unit.id, failure)
+                    record["units"][unit.id] = {"status": "unresolved", "reason": failure}
+                result.failed_blocks += 1
+            else:
+                await self._consume_discovery(parsed, block, ledger, result, right_lines, allowance, record)
+            if self._on_update is not None:
+                await self._on_update(ledger)
+        return result
+
+    def _discovery_unresolved(
+        self, ledger: HypothesisLedger, result: HypothesisGenerationResult, unit_id: str, reason: str
+    ) -> None:
+        previous = ledger.unresolved_units.get(unit_id, "")
+        if not previous or previous.startswith(f"{self._source} "):
+            ledger.unresolved_units[unit_id] = f"{self._source} {reason}"
+        ledger.no_issue_units.pop(unit_id, None)
+        if unit_id not in result.unresolved_units:
+            result.unresolved_units.append(unit_id)
+        if reason.startswith("capacity-deferred") and unit_id not in result.capacity_deferred_units:
+            result.capacity_deferred_units.append(unit_id)
+
+    @staticmethod
+    def _valid_behavior(item: dict[str, Any], unit: SemanticUnit, block: DiscoveryBlock) -> bool:
+        behavior = item.get("behavior")
+        if not isinstance(behavior, dict) or any(
+            not isinstance(behavior.get(field), str) or not behavior[field].strip() or len(behavior[field]) > 600
+            for field in ("before", "after", "observable")
+        ):
+            return False
+        facts = behavior.get("source_facts")
+        if (
+            not isinstance(facts, list)
+            or not 1 <= len(facts) <= 4
+            or not all(block.source_matches(fact) for fact in facts)
+        ):
+            return False
+        sides = {fact["side"] for fact in facts if fact["path"] == unit.path}
+        target = block.unit_facts.get(unit.id, [])
+        if not target:
+            return False
+        for side in ("before", "after"):
+            relevant = [fact for fact in target if fact.side == side]
+            if relevant and (
+                side not in sides
+                or not any(
+                    fact["side"] == side
+                    and block.unit_source_matches(unit.id, fact, changed=any(source.changed for source in relevant))
+                    for fact in facts
+                )
+            ):
+                return False
+        return True
+
+    async def _consume_discovery(
+        self,
+        parsed: dict[str, Any],
+        block: DiscoveryBlock,
+        ledger: HypothesisLedger,
+        result: HypothesisGenerationResult,
+        right_lines: dict[str, dict[int, str]],
+        allowance: int,
+        record: dict[str, Any],
+    ) -> None:
+        units = {unit.id: unit for unit in block.units}
+        answers: dict[str, list[tuple[str, dict[str, Any]]]] = {key: [] for key in units}
+        failed: dict[str, str] = {}
+        invalid_other = False
+        for kind, array in (
+            ("hypothesis", parsed.get("hypotheses", [])),
+            ("no_issue", parsed.get("no_issue_units", [])),
+            ("deferred", parsed.get("deferred_units", [])),
+        ):
+            if not isinstance(array, list):
+                invalid_other = True
+                continue
+            for raw in array:
+                unit_id = raw.get("unit_id") if isinstance(raw, dict) else None
+                if not isinstance(unit_id, str) or unit_id not in units:
+                    result.dropped_invalid += 1
+                    invalid_other = True
+                    continue
+                answers[unit_id].append((kind, raw))
+        candidates = []
+        for unit_id, entries in answers.items():
+            unit = units[unit_id]
+            if not entries:
+                failed[unit_id] = "missing unit assessment"
+                continue
+            # Several independent candidates for one unit are permitted. A
+            # candidate plus clean/deferred or repeated clean is contradictory.
+            if len(entries) > 1 and any(kind != "hypothesis" for kind, _ in entries):
+                failed[unit_id] = "contradictory unit assessments"
+                result.dropped_invalid += sum(kind == "hypothesis" for kind, _ in entries)
+                continue
+            for kind, raw in entries:
+                if kind == "deferred":
+                    if not isinstance(raw.get("reason"), str) or not raw["reason"].strip() or len(raw["reason"]) > 600:
+                        failed[unit_id] = "invalid deferred assessment"
+                    else:
+                        failed[unit_id] = "capacity-deferred: " + raw["reason"].strip()
+                    continue
+                if not self._valid_behavior(raw, unit, block):
+                    failed[unit_id] = "invalid source-backed behavior assessment"
+                    result.dropped_invalid += int(kind == "hypothesis")
+                    continue
+                if kind == "no_issue":
+                    if (
+                        not isinstance(raw.get("checked"), str)
+                        or not raw["checked"].strip()
+                        or len(raw["checked"]) > 600
+                    ):
+                        failed[unit_id] = "missing concrete checked boundary"
+                    continue
+                payload, sites = self._validate_hypothesis(raw, right_lines)
+                required = ("claim", "trigger", "impact", "open_question", "refutation", "discrepancy")
+                if (
+                    payload is None
+                    or any(
+                        not isinstance(raw.get(field), str) or not raw[field].strip() or len(raw[field]) > 600
+                        for field in required
+                    )
+                    or not isinstance(raw.get("severity"), str)
+                    or raw["severity"] not in _SEVERITIES
+                    or not block.source_matches(raw.get("trigger_basis"))
+                ):
+                    failed[unit_id] = "invalid candidate schema or source basis"
+                    result.dropped_invalid += 1
+                    continue
+                if (
+                    not sites
+                    or not any(
+                        block.unit_source_matches(
+                            unit_id, {"side": "after", "path": path, "line": line, "excerpt": excerpt}
+                        )
+                        for path, line, excerpt in sites
+                    )
+                    or not isinstance(raw.get("sites"), list)
+                    or any(
+                        not isinstance(site, dict)
+                        or not isinstance(site.get("path"), str)
+                        or not isinstance(site.get("line"), int)
+                        or isinstance(site["line"], bool)
+                        or not isinstance(site.get("excerpt"), str)
+                        for site in raw["sites"]
+                    )
+                    or not all(
+                        block.source_matches({"side": "after", "path": path, "line": line, "excerpt": excerpt})
+                        for path, line, excerpt in sites
+                    )
+                ):
+                    failed[unit_id] = "invalid candidate source location"
+                    result.dropped_unanchored += 1
+                    continue
+                candidates.append(raw)
+        candidates.sort(key=lambda raw: (-_SEVERITY_PRIORITY[raw["severity"]], raw["unit_id"], raw["claim"]))
+        kept = candidates[:allowance]
+        for raw in candidates[allowance:]:
+            result.dropped_overflow += 1
+            failed[raw["unit_id"]] = "capacity-deferred: PR candidate limit"
+        if kept:
+            await self._consume({"hypotheses": kept, "no_issue_units": []}, ledger, result, right_lines, units)
+        for unit_id, entries in answers.items():
+            if invalid_other and unit_id not in failed:
+                failed[unit_id] = "invalid block output entries"
+            if unit_id in failed:
+                reason = failed[unit_id]
+                status = "capacity-deferred" if reason.startswith("capacity-deferred") else "unresolved"
+                self._discovery_unresolved(ledger, result, unit_id, reason)
+                record["units"][unit_id] = {"status": status, "reason": reason}
+                continue
+            prior = ledger.unresolved_units.get(unit_id, "")
+            if prior.startswith(f"{self._source} "):
+                ledger.unresolved_units.pop(unit_id, None)
+            kind, raw = entries[0]
+            record["units"][unit_id] = {"status": "assessed", "assessment": kind, "behavior": raw["behavior"]}
+            for previous in ledger.discovery_blocks.values():
+                old_row = previous.get("units", {}).get(unit_id)
+                if (
+                    previous is not record
+                    and previous.get("source") == self._source
+                    and isinstance(old_row, dict)
+                    and old_row.get("status") in {"unresolved", "capacity-deferred"}
+                ):
+                    old_row["status"] = "recovered"
+                    old_row["resolved_by"] = block.id
+                    if all(row.get("status") in {"assessed", "recovered"} for row in previous["units"].values()):
+                        previous["status"] = "recovered"
+            if kind == "hypothesis":
+                record["units"][unit_id]["candidates"] = [raw for _, raw in entries]
+            elif unit_id not in ledger.unresolved_units and not any(
+                item.unit_id == unit_id for item in ledger.items.values()
+            ):
+                ledger.no_issue_units[unit_id] = raw["checked"].strip()
+        record["status"] = "partial" if failed or invalid_other else "completed"
+        if failed or invalid_other:
+            result.failed_blocks += 1
 
     def _chunk_units(
         self,
@@ -518,6 +911,10 @@ class HypothesisGenerator:
                 if not sites:
                     result.dropped_unanchored += 1
                     continue
+                if ledger.protocol_version >= 3:
+                    payload["discovery_basis"] = copy.deepcopy(
+                        {field: item[field] for field in ("behavior", "discrepancy", "trigger_basis")}
+                    )
                 valid.append((payload, sites))
 
         valid.sort(key=lambda entry: (-_SEVERITY_PRIORITY.get(entry[0]["severity"], 0), entry[0]["unit_id"]))
@@ -528,7 +925,19 @@ class HypothesisGenerator:
             unit = units[payload["unit_id"]]
             # The model can describe an anchor, but cannot define its identity.
             # Prefer a primary site in the declared unit, then use stable order.
-            primary = min(sites, key=lambda site: (site[0] != unit.path, site[0], site[1]))
+            if ledger.protocol_version >= 3:
+                primary = min(
+                    sites,
+                    key=lambda site: (
+                        site[0] != unit.path
+                        or bool(unit.start_line)
+                        and not unit.start_line <= site[1] <= unit.end_line,
+                        site[0],
+                        site[1],
+                    ),
+                )
+            else:
+                primary = min(sites, key=lambda site: (site[0] != unit.path, site[0], site[1]))
             anchor = (
                 await self._anchor_resolver(unit.id, primary[0], primary[1])
                 if self._anchor_resolver is not None
@@ -548,6 +957,7 @@ class HypothesisGenerator:
                 sites=[Site(path=path, line=line, excerpt=excerpt) for path, line, excerpt in sites],
                 severity=payload["severity"],
                 source=self._source,
+                **({"discovery_basis": payload["discovery_basis"]} if ledger.protocol_version >= 3 else {}),
             )
             ledger.upsert(hypothesis)
             ledger.no_issue_units.pop(hypothesis.unit_id, None)

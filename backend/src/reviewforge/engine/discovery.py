@@ -1,0 +1,409 @@
+"""Deterministic, bounded discovery inputs for protocol v3.
+
+Semantic units remain coverage identities. A discovery block is only a delivery
+group: shared hunks and collected source relationships put related units next
+to one another, without claiming type resolution, execution order or a defect.
+The soft budgets never truncate a changed hunk. A large indivisible change can
+use the original input hard cap and is explicitly labelled oversize.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass, field
+
+from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
+
+_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_CONDITION = re.compile(r"\b(if|elif|unless|while|case|switch)\b|&&|\|\||\?|(?<!=)!(?!=)")
+_OPERATIONS = (
+    ("condition", _CONDITION, "Compare both true and false branches, guard polarity and the value written/returned."),
+    (
+        "state",
+        re.compile(r"\b(set|reset|clear|delete|remove|close|release|dispose|commit|rollback)\w*\s*\("),
+        "Trace the same object's state before/after the changed operation and its next observable read.",
+    ),
+    (
+        "call",
+        re.compile(r"[\w.]\s*\([^)]*\)"),
+        "Compare argument values, call counts and ordering against the collected caller/callee contract.",
+    ),
+    (
+        "operator",
+        re.compile(r"(?:==|!=|<=|>=|\+=|-=|\*|/|\breturn\b)"),
+        "Compare the returned/computed result for the same supported input, including the changed boundary.",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class DiscoveryLimits:
+    target_input_chars: int = 32_000
+    hard_input_chars: int = 120_000
+    diff_max_chars: int = 20_000
+    context_max_chars: int = 8_000
+    global_context_max_chars: int = 40_000
+    max_units: int = 12
+    overview_max_chars: int = 2_000
+    navigation_max_chars: int = 2_000
+
+
+@dataclass(frozen=True)
+class SourceLine:
+    side: str
+    path: str
+    line: int
+    text: str
+    right_line: int = 0
+    changed: bool = False
+
+
+@dataclass
+class _Hunk:
+    key: str
+    path: str
+    start: int
+    end: int
+    text: str
+    facts: list[SourceLine]
+    changed_text: str
+    complete: bool
+
+
+@dataclass
+class DiscoveryBlock:
+    id: str
+    units: list[SemanticUnit]
+    diff_text: str
+    context_text: str
+    overview: str
+    navigation: str
+    focus: str
+    facts: list[SourceLine] = field(default_factory=list)
+    unchecked: list[str] = field(default_factory=list)
+    oversize: bool = False
+    failure: str = ""
+    unit_facts: dict[str, list[SourceLine]] = field(default_factory=dict)
+
+    def source_matches(self, raw: object) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        if (
+            not isinstance(raw.get("side"), str)
+            or raw["side"] not in {"before", "after", "context"}
+            or not isinstance(raw.get("line"), int)
+        ):
+            return False
+        if isinstance(raw["line"], bool):
+            return False
+        excerpt = raw.get("excerpt")
+        return (
+            isinstance(excerpt, str)
+            and bool(excerpt.strip())
+            and len(excerpt) <= 240
+            and any(
+                item.side == raw["side"]
+                and item.path == raw.get("path")
+                and item.line == raw["line"]
+                and excerpt in item.text
+                for item in self.facts
+            )
+        )
+
+    def unit_source_matches(self, unit_id: str, raw: object, *, changed: bool = False) -> bool:
+        if not self.source_matches(raw):
+            return False
+        assert isinstance(raw, dict)
+        return any(
+            fact.side == raw["side"]
+            and fact.path == raw["path"]
+            and fact.line == raw["line"]
+            and raw["excerpt"] in fact.text
+            and (not changed or fact.changed)
+            for fact in self.unit_facts.get(unit_id, [])
+        )
+
+
+def _hunks(path: str, diff: str) -> list[_Hunk]:
+    chunks: list[list[str]] = []
+    active: list[str] | None = None
+    for raw in (diff or "").splitlines():
+        if _HEADER.match(raw):
+            chunks.append([raw])
+            active = chunks[-1]
+        elif raw.startswith(("@@", "diff --git ")):
+            active = None
+        elif active is not None and raw.startswith((" ", "+", "-", "\\ No newline")):
+            active.append(raw)
+        elif active is not None:
+            active = None
+    result = []
+    for index, chunk in enumerate(chunks):
+        match = _HEADER.match(chunk[0])
+        assert match is not None
+        old, new = int(match[1]), int(match[3])
+        old_left, new_left = int(match[2] or 1), int(match[4] or 1)
+        rendered = [chunk[0]]
+        facts = []
+        changed = []
+        for raw in chunk[1:]:
+            prefix, text = raw[:1], raw[1:]
+            if prefix == "-" and old_left > 0:
+                facts.append(SourceLine("before", path, old, text, new, True))
+                rendered.append(f"-{old:>5} | {text}")
+                changed.append(text)
+                old, old_left = old + 1, old_left - 1
+            elif prefix == "+" and new_left > 0:
+                facts.append(SourceLine("after", path, new, text, new, True))
+                rendered.append(f"+{new:>5} | {text}")
+                changed.append(text)
+                new, new_left = new + 1, new_left - 1
+            elif prefix == " " and old_left > 0 and new_left > 0:
+                facts.extend([SourceLine("before", path, old, text, new), SourceLine("after", path, new, text, new)])
+                rendered.append(f" {new:>5} | {text}")
+                old, new = old + 1, new + 1
+                old_left, new_left = old_left - 1, new_left - 1
+            else:
+                rendered.append(raw)
+        first = int(match[3])
+        result.append(
+            _Hunk(
+                f"{path}:{index}",
+                path,
+                first,
+                first + max(1, int(match[4] or 1)) - 1,
+                "\n".join(rendered),
+                facts,
+                "\n".join(changed),
+                old_left == 0 and new_left == 0,
+            )
+        )
+    return result
+
+
+def _bounded_lines(lines: list[str], limit: int, label: str) -> str:
+    kept: list[str] = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > max(0, limit) - 70:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    omitted = len(lines) - len(kept)
+    if omitted and limit >= 70:
+        kept.append(f"({omitted} {label} omitted from this bounded navigation; not assessed here.)")
+    return "\n".join(kept)[: max(0, limit)]
+
+
+def _overview(changeset: SemanticChangeSet, pack: ContextPack, limit: int) -> str:
+    intent = (pack.pr_intent or "(no supplied intent)")[: min(1_000, max(0, limit // 2))]
+    header = f"PR head={changeset.head_sha}; {len(changeset.units)} semantic units.\nIntent: {intent}\n"
+    inventory = [
+        f"- {u.id} {u.path}:{u.start_line}-{u.end_line} {u.symbol or '(resource)'}"
+        for u in sorted(changeset.units, key=lambda u: (-u.risk_score, u.id))
+    ]
+    return (header + _bounded_lines(inventory, max(0, limit - len(header)), "PR units"))[:limit]
+
+
+def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple[str, list[SourceLine], list[str]]:
+    sections, facts, unchecked = [], [], []
+    seen: dict[tuple, str] = {}
+    per_unit = max(0, budget // max(1, len(units)))
+    for unit in units:
+        ctx = pack.units.get(unit.id)
+        if ctx is None:
+            continue
+        remaining = per_unit
+        for slice_ in ctx.slices:
+            key = (slice_.path, slice_.start_line, slice_.end_line, slice_.sha, slice_.text)
+            header = f"### {unit.id} {slice_.kind} {slice_.path}:{slice_.start_line}-{slice_.end_line}\n"
+            header += f"Navigation reason (not evidence): {slice_.reason}\n"
+            if key in seen:
+                piece = header + f"Same delivered source as {seen[key]}."
+                if len(piece) + 2 <= remaining:
+                    sections.append(piece)
+                    remaining -= len(piece) + 2
+                else:
+                    unchecked.append(f"{unit.id}: context {slice_.kind} omitted by context budget")
+                continue
+            lines = slice_.text.splitlines()
+            rendered, selected = [], []
+            size = len(header) + 2
+            for offset, text in enumerate(lines):
+                line = slice_.start_line + offset
+                if line > slice_.end_line:
+                    break
+                numbered = f"{line:>5} | {text}"
+                if size + len(numbered) + 1 > remaining:
+                    break
+                rendered.append(numbered)
+                selected.append(SourceLine("context", slice_.path, line, text))
+                size += len(numbered) + 1
+            if rendered:
+                piece = header + "\n".join(rendered)
+                sections.append(piece)
+                remaining -= len(piece) + 2
+                facts.extend(selected)
+                # A shared reference can only reuse the actually delivered prefix.
+                if len(rendered) == len(lines):
+                    seen[key] = f"{unit.id} {slice_.kind} {slice_.path}:{slice_.start_line}-{slice_.end_line}"
+            if len(rendered) < len(lines):
+                unchecked.append(f"{unit.id}: context {slice_.kind} only {len(rendered)}/{len(lines)} lines delivered")
+        unchecked.extend(f"{unit.id}: unavailable context {kind}" for kind in ctx.truncated_kinds)
+    return "\n\n".join(sections), facts, unchecked
+
+
+def _block(
+    units: list[SemanticUnit],
+    pack: ContextPack,
+    overview: str,
+    selected: list[_Hunk],
+    limits: DiscoveryLimits,
+    context_budget: int,
+) -> DiscoveryBlock:
+    diffs = "\n\n".join(f"### Shared before/after diff: {h.path}\n{h.text}" for h in selected)
+    context, context_facts, unchecked = _context(units, pack, context_budget)
+    nav = []
+    for unit in units:
+        ctx = pack.units.get(unit.id)
+        if ctx is not None:
+            nav.extend(
+                f"- {unit.id} -> {s.kind} {s.path}:{s.start_line}-{s.end_line} {s.symbol}: {s.reason}"
+                for s in ctx.slices
+            )
+        nav.extend(f"- {unit.id} -> candidate test {path}" for path in unit.candidate_tests)
+    changed = "\n".join(h.changed_text for h in selected)
+    focus = "\n".join(f"- {kind}: {guide}" for kind, pattern, guide in _OPERATIONS if pattern.search(changed))
+    signature = "\n".join(u.id for u in units) + "\n" + "\n".join(h.key + ":" + h.text for h in selected)
+    identity = "db_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+    missing = [
+        f"{u.id}: no source diff hunk was supplied" for u in units if not any(h.path == u.path for h in selected)
+    ]
+    block = DiscoveryBlock(
+        identity,
+        units,
+        diffs,
+        context,
+        overview,
+        _bounded_lines(nav, limits.navigation_max_chars, "source relationships"),
+        focus,
+        [fact for h in selected for fact in h.facts] + context_facts,
+        unchecked + missing,
+        oversize=len(diffs) > limits.diff_max_chars,
+        failure="missing-diff" if missing else "incomplete-diff" if any(not h.complete for h in selected) else "",
+    )
+    # Source identity and coverage identity are separate. Quotes from a nearby
+    # function in the same file cannot complete this unit's behavior check.
+    # Before deletions use their post-image boundary, since old coordinates
+    # need not match the head symbol coordinates after preceding insertions.
+    for unit in units:
+        block.unit_facts[unit.id] = [
+            fact
+            for h in selected
+            for fact in h.facts
+            if fact.path == unit.path and (not unit.start_line or unit.start_line <= fact.right_line <= unit.end_line)
+        ]
+    return block
+
+
+def plan_discovery(
+    changeset: SemanticChangeSet,
+    pack: ContextPack,
+    diffs: dict[str, str],
+    *,
+    limits: DiscoveryLimits,
+    overview_changeset: SemanticChangeSet | None = None,
+) -> list[DiscoveryBlock]:
+    """Cover each unit exactly once, preferring shared hunks then source relations.
+
+    A hunk unmatched by symbol coordinates is assigned to the nearest unit in
+    its file. This preserves changes outside parsed declarations, too. Relation
+    edges are navigation only and never used as proof of supported input.
+    """
+    remaining = sorted(changeset.units, key=lambda u: (-u.risk_score, u.id))
+    by_path: dict[str, list[SemanticUnit]] = {}
+    for unit in remaining:
+        by_path.setdefault(unit.path, []).append(unit)
+    all_hunks = {h.key: h for path in by_path for h in _hunks(path, diffs.get(path, ""))}
+    hunk_chars = {key: len(f"### Shared before/after diff: {h.path}\n") + len(h.text) for key, h in all_hunks.items()}
+    keys: dict[str, set[str]] = {u.id: set() for u in remaining}
+    for h in all_hunks.values():
+        matches = [
+            u
+            for u in by_path[h.path]
+            if not u.start_line or h.start <= u.end_line + 3 and h.end >= max(1, u.start_line - 3)
+        ]
+        if not matches:
+            matches = [min(by_path[h.path], key=lambda u: (abs(u.start_line - h.start), u.id))]
+        for unit in matches:
+            keys[unit.id].add(h.key)
+    related: dict[str, set[str]] = {u.id: set() for u in remaining}
+    for unit in remaining:
+        ctx = pack.units.get(unit.id)
+        paths = {s.path for s in ctx.slices} if ctx is not None else set()
+        paths.update(unit.candidate_tests)
+        for other in remaining:
+            if other.path in paths and other.id != unit.id:
+                related[unit.id].add(other.id)
+                related[other.id].add(unit.id)
+    overview = _overview(overview_changeset or changeset, pack, limits.overview_max_chars)
+    context_left = max(0, limits.global_context_max_chars)
+    blocks = []
+
+    def make(units: list[SemanticUnit]) -> DiscoveryBlock:
+        selected_keys = set().union(*(keys[u.id] for u in units))
+        selected = [
+            all_hunks[k] for k in sorted(selected_keys, key=lambda k: (all_hunks[k].path, all_hunks[k].start, k))
+        ]
+        return _block(units, pack, overview, selected, limits, min(limits.context_max_chars, context_left))
+
+    while remaining:
+        group = [remaining.pop(0)]
+        block = make(group)
+        while remaining and len(group) < max(1, limits.max_units):
+            group_keys = set().union(*(keys[u.id] for u in group))
+            group_relations = set().union(*(related[u.id] for u in group))
+            choices = sorted(
+                remaining,
+                key=lambda u: (-len(keys[u.id] & group_keys), u.id not in group_relations, -u.risk_score, u.id),
+            )
+            chosen = None
+            for unit in choices:
+                candidate_keys = group_keys | keys[unit.id]
+                diff_chars = sum(hunk_chars[key] for key in candidate_keys) + max(0, len(candidate_keys) - 1) * 2
+                # Reject impossible unions before rendering source, context,
+                # unit fact maps and their stable hash. The key union preserves
+                # exactly the shared-hunk test used by the full renderer.
+                shares_oversize = block.oversize and candidate_keys == group_keys
+                if diff_chars > limits.diff_max_chars and not shares_oversize:
+                    continue
+                candidate = make([*group, unit])
+                estimate = len(candidate.diff_text) + len(candidate.context_text) + len(candidate.overview)
+                estimate += (
+                    len(candidate.navigation)
+                    + len(candidate.focus)
+                    + 1_000
+                    + sum(len(u.id) + 60 for u in candidate.units)
+                )
+                # An oversize hunk can still be shared without expanding it.
+                shared_oversize = block.oversize and candidate.diff_text == block.diff_text
+                if (
+                    len(candidate.diff_text) <= limits.diff_max_chars
+                    and estimate <= limits.target_input_chars
+                    or shared_oversize
+                    and estimate <= limits.hard_input_chars
+                ):
+                    chosen, block = unit, candidate
+                    break
+            if chosen is None:
+                break
+            group.append(chosen)
+            remaining.remove(chosen)
+        context_left -= len(block.context_text)
+        blocks.append(block)
+    return blocks
+
+
+__all__ = ["DiscoveryBlock", "DiscoveryLimits", "SourceLine", "plan_discovery"]

@@ -9,7 +9,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections import deque
 from dataclasses import asdict, dataclass
+from itertools import groupby, zip_longest
 
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.hypothesis import Hypothesis
@@ -53,6 +55,42 @@ def build_investigation_tasks(
             InvestigationTask(task_id, copy.deepcopy(representative), tuple(sorted(item.identity for item in members)))
         )
     return tasks
+
+
+def fair_investigation_tasks(tasks: list[InvestigationTask]) -> list[InvestigationTask]:
+    """Interleave anchors as well as mechanisms without combining proof duties.
+
+    A dozen wording variants at one function must not take every admission slot
+    before another equally severe function gets its first investigation.
+    """
+    severity_rank = {"info": 0, "warning": 1, "error": 2}
+    ranked = sorted(
+        tasks,
+        key=lambda task: (
+            -severity_rank[task.hypothesis.severity],
+            -len(task.hypothesis.sites),
+            task.hypothesis.identity,
+        ),
+    )
+    result = []
+    for _, severity_tasks in groupby(ranked, key=lambda task: severity_rank[task.hypothesis.severity]):
+        mechanisms: dict[str, dict[tuple[str, ...], deque[InvestigationTask]]] = {}
+        for task in severity_tasks:
+            item = task.hypothesis
+            anchor = item.identity.rsplit("::", 1)[-1]
+            key = (*sorted({site.path for site in item.sites}), anchor)
+            if not anchor or anchor == "<module>":
+                key += (item.unit_id,)
+            mechanisms.setdefault(item.mechanism.value, {}).setdefault(key, deque()).append(task)
+        queues = []
+        for anchors in mechanisms.values():
+            ordered = []
+            while any(anchors.values()):
+                ordered.extend(queue.popleft() for queue in anchors.values() if queue)
+            queues.append(ordered)
+        for batch in zip_longest(*queues):
+            result.extend(task for task in batch if task is not None)
+    return result
 
 
 def context_units(item: Hypothesis, changeset: SemanticChangeSet | None, pack: ContextPack) -> list[str]:

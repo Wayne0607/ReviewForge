@@ -175,6 +175,7 @@ class ModelRouter:
         # field later does not update an already-created provider client.
         self._max_retries = max_retries
         self._cache: dict[str, BaseChatModel] = {}
+        self._retry_override_cache: dict[tuple[str, int], BaseChatModel] = {}
         # Seed an empty role_overrides dict so legacy configs still index safely.
         if not getattr(config, "role_overrides", None):
             config.role_overrides = {name: RoleOverride() for name in ROLE_NAMES}
@@ -229,11 +230,15 @@ class ModelRouter:
             None,
         )
 
-    def get_llm(self, agent_name: str) -> BaseChatModel:
-        """Get or create an LLM instance for the given agent."""
+    def get_llm(self, agent_name: str, *, max_retries: int | None = None) -> BaseChatModel:
+        """Get an LLM, isolating explicit SDK retry settings from legacy clients."""
+        if max_retries is not None and (type(max_retries) is not int or max_retries < 0):
+            raise ValueError("SDK max_retries must be a nonnegative integer")
         key, effective, profile_name, temperature, max_tokens = self._resolve(agent_name)
-        if key in self._cache:
-            return self._cache[key]
+        cache = self._cache if max_retries is None else self._retry_override_cache
+        cache_key = key if max_retries is None else (key, max_retries)
+        if cache_key in cache:
+            return cache[cache_key]
 
         llm = _build_llm(
             base_url=effective["base_url"],
@@ -241,9 +246,9 @@ class ModelRouter:
             model=effective["model"],
             temperature=temperature,
             max_tokens=max_tokens,
-            max_retries=self._max_retries,
+            max_retries=self._max_retries if max_retries is None else max_retries,
         )
-        self._cache[key] = llm
+        cache[cache_key] = llm
         if key.startswith("role:"):
             logger.info(
                 "LLM[%s → %s]: base_url=%s, model=%s, temp=%s",
@@ -277,3 +282,4 @@ class ModelRouter:
     def invalidate_cache(self) -> None:
         """Drop cached LLM instances (used by admin hot-reload)."""
         self._cache.clear()
+        self._retry_override_cache.clear()

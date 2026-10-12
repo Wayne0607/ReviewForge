@@ -144,12 +144,16 @@ class PipelineV4Config:
     """
 
     mode: str = "legacy"
+    protocol_version: int = 3
     output_language: str = "auto"
     workspace_max_bytes: int = 200_000_000
     context_pack_max_slices: int = 12
     context_pack_max_chars: int = 40_000
     generator_max_input_chars: int = 120_000
     generator_max_hypotheses: int = 12
+    discovery_target_input_chars: int = 32_000
+    discovery_max_blocks: int = 8
+    discovery_max_tokens: int = 80_000
     max_lenses: int = 3
     investigator_concurrency: int = 4
     investigator_max_hypotheses_per_pr: int = 12
@@ -158,6 +162,8 @@ class PipelineV4Config:
     json_output_mode: str = "auto"
     investigator_closure_thinking: str = "auto"
     max_tokens_per_pr: int = 250_000
+    provider_max_attempts: int = 3
+    provider_retry_404: bool = False
 
 
 def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
@@ -168,6 +174,12 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         cfg.mode = _normalize_pipeline_mode(data["mode"], cfg.mode)
     if "output_language" in data:
         cfg.output_language = _normalize_output_language(data["output_language"], cfg.output_language)
+    if type(data.get("protocol_version")) is int and data["protocol_version"] in {1, 2, 3}:
+        cfg.protocol_version = data["protocol_version"]
+    if type(data.get("provider_max_attempts")) is int and data["provider_max_attempts"] in {1, 2, 3}:
+        cfg.provider_max_attempts = data["provider_max_attempts"]
+    if isinstance(data.get("provider_retry_404"), bool):
+        cfg.provider_retry_404 = data["provider_retry_404"]
     for name, allowed in (
         ("json_output_mode", {"auto", "off", "json_object"}),
         ("investigator_closure_thinking", {"auto", "default", "disabled"}),
@@ -180,6 +192,9 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         "context_pack_max_chars",
         "generator_max_input_chars",
         "generator_max_hypotheses",
+        "discovery_target_input_chars",
+        "discovery_max_blocks",
+        "discovery_max_tokens",
         "max_lenses",
         "investigator_concurrency",
         "investigator_max_hypotheses_per_pr",

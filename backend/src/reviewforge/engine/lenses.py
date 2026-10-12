@@ -156,6 +156,8 @@ def build_lens_generator(
     anchor_resolver: AnchorResolver | None = None,
     max_input_chars: int = 120_000,
     context_max_chars: int = 40_000,
+    discovery_target_input_chars: int = 32_000,
+    discovery_max_blocks: int = 2,
 ) -> HypothesisGenerator:
     return HypothesisGenerator(
         llm,
@@ -168,6 +170,8 @@ def build_lens_generator(
         skill_body=lens_skill_body(name),
         on_update=on_update,
         anchor_resolver=anchor_resolver,
+        discovery_target_input_chars=discovery_target_input_chars,
+        discovery_max_blocks=discovery_max_blocks,
     )
 
 
@@ -186,6 +190,9 @@ async def run_lens(
     anchor_resolver: AnchorResolver | None = None,
     max_input_chars: int = 120_000,
     context_max_chars: int = 40_000,
+    discovery_target_input_chars: int = 32_000,
+    discovery_max_blocks: int = 2,
+    resume: bool = False,
 ) -> HypothesisGenerationResult:
     """Execute one lens over the units that triggered it and upsert into the ledger."""
 
@@ -205,8 +212,10 @@ async def run_lens(
         anchor_resolver=anchor_resolver,
         max_input_chars=max_input_chars,
         context_max_chars=context_max_chars,
+        discovery_target_input_chars=discovery_target_input_chars,
+        discovery_max_blocks=discovery_max_blocks,
     )
-    return await generator.run(state, pack, filtered, ledger)
+    return await generator.run(state, pack, filtered, ledger, resume=resume, overview_changeset=changeset)
 
 
 __all__ = ["LensSelection", "build_lens_generator", "lens_skill_body", "run_lens", "select_lenses"]

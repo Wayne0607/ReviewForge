@@ -45,7 +45,7 @@ class UsageLLM(BaseChatModel):
         return "usage-fixture"
 
 
-def state_and_fake(tmp_path, *, db=None):
+def state_and_fake(tmp_path, *, db=None, protocol_version=3):
     state = StateStore(
         repo="owner/repo",
         pr_number=1,
@@ -77,6 +77,16 @@ def state_and_fake(tmp_path, *, db=None):
                             "refutation": "caller checks None",
                             "severity": "warning",
                             "sites": [{"path": "app.py", "line": 2, "excerpt": "return x.name"}],
+                            "behavior": {
+                                "before": "The function did not exist.",
+                                "after": "The function reads the receiver name.",
+                                "observable": "A missing receiver raises on the property read.",
+                                "source_facts": [
+                                    {"side": "after", "path": "app.py", "line": 2, "excerpt": "return x.name"}
+                                ],
+                            },
+                            "discrepancy": "The new receiver read has no local guard.",
+                            "trigger_basis": {"side": "after", "path": "app.py", "line": 2, "excerpt": "return x.name"},
                         }
                     ],
                     "no_issue_units": [],
@@ -96,7 +106,7 @@ def state_and_fake(tmp_path, *, db=None):
         _gateway=SimpleNamespace(workspace_for=AsyncMock(return_value=workspace)),
         _events=events,
         _db=db,
-        _pipeline_v4_config=PipelineV4Config(mode="shadow"),
+        _pipeline_v4_config=PipelineV4Config(mode="shadow", protocol_version=protocol_version),
         _model_router=SimpleNamespace(
             get_llm=lambda name: {"hypothesis_generator": generator, "investigator": investigator}.get(name, UsageLLM())
         ),
@@ -113,12 +123,13 @@ async def test_workspace_unavailable_cannot_complete_a_review(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_counts_actual_role_usage(tmp_path) -> None:
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_pipeline_counts_actual_role_usage(tmp_path, protocol_version) -> None:
     db = Database(tmp_path / "db.sqlite")
     await db.connect()
     try:
         await db.create_run("run", "owner/repo", 1, "abc")
-        state, fake = state_and_fake(tmp_path, db=db)
+        state, fake = state_and_fake(tmp_path, db=db, protocol_version=protocol_version)
         seen = []
         fake._events.subscribe(seen.append)
         await run_hypothesis_pipeline(fake, state)
@@ -131,18 +142,48 @@ async def test_pipeline_counts_actual_role_usage(tmp_path) -> None:
         assert generated.data["tokens"] == 100
         investigation = next(event for event in seen if event.event_type == "investigation.completed")
         assert investigation.data["tokens"] == 100
-        assert investigation.data["steps"] == 1
+        # Protocol 3 charges the initial source acquisition as a tool step.
+        assert investigation.data["steps"] == (2 if protocol_version >= 3 else 1)
     finally:
         await db.close()
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_survives_interrupt_after_generation(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_context_telemetry_does_not_mark_v3_discovery_inputs_missing(tmp_path, monkeypatch, protocol_version):
+    from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
+    from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+
+    state, fake = state_and_fake(tmp_path, protocol_version=protocol_version)
+    unit = compile_semantic_changeset(state).units[0]
+    context = UnitContext(
+        unit.id,
+        slices=[ContextSlice("caller", "caller.py", 1, 100, "caller", "caller(f)\n" * 100, "call site", "abc")],
+    )
+    pack = ContextPack(units={unit.id: context}, workspace_digest="d")
+    fake._pipeline_v4_config.context_pack_max_chars = 200
+    monkeypatch.setattr(ContextPack, "build", lambda *args, **kwargs: pack)
+    original = HypothesisGenerator.run
+    observed = []
+
+    async def inspect(self, state, delivered_pack, *args, **kwargs):
+        observed.append(list(delivered_pack.units[unit.id].truncated_kinds))
+        return await original(self, state, delivered_pack, *args, **kwargs)
+
+    monkeypatch.setattr(HypothesisGenerator, "run", inspect)
+    await run_hypothesis_pipeline(fake, state)
+    assert observed
+    assert ("caller" in observed[0]) == (protocol_version < 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_checkpoint_survives_interrupt_after_generation(tmp_path, monkeypatch, protocol_version) -> None:
     db = Database(tmp_path / "db.sqlite")
     await db.connect()
     try:
         await db.create_run("run", "owner/repo", 1, "abc")
-        state, fake = state_and_fake(tmp_path, db=db)
+        state, fake = state_and_fake(tmp_path, db=db, protocol_version=protocol_version)
         monkeypatch.setattr(
             "reviewforge.engine.pipeline_v4.Investigator.run", AsyncMock(side_effect=RuntimeError("interrupted"))
         )

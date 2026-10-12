@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import os
@@ -64,6 +65,31 @@ def wait_for_request_slot(path: Path, interval: float) -> None:
             handle.truncate()
             handle.write(str(time.monotonic()))
             handle.flush()
+
+
+async def wait_for_request_slot_async(path: Path, interval: float) -> None:
+    """Reserve the same cross-process slot without uncancellable worker sleeps."""
+    if interval <= 0:
+        return
+    while True:
+        delay = 0.05
+        try:
+            with exclusive_file_lock(path.with_suffix(".lock"), blocking=False):
+                with path.open("a+", encoding="utf-8") as handle:
+                    handle.seek(0)
+                    previous = float(handle.read().strip() or 0)
+                    now = time.monotonic()
+                    delay = interval - (now - previous) if 0 < previous <= now else 0
+                    if delay <= 0:
+                        handle.seek(0)
+                        handle.truncate()
+                        handle.write(str(now))
+                        handle.flush()
+                        return
+        except BlockingIOError:
+            pass
+        # Release the file lock before waiting; cancellation never owns a slot.
+        await asyncio.sleep(delay)
 
 
 def is_complete_result(row: dict) -> bool:

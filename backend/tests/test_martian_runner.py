@@ -102,6 +102,144 @@ async def test_benchmark_actual_sdk_sends_one_http_attempt_on_429(runner, monkey
 
 
 @pytest.mark.asyncio
+async def test_explicit_legacy_retry_traces_each_sdk_attempt_and_exhausts_locally(runner, monkeypatch, tmp_path):
+    from openai import RateLimitError
+
+    from reviewforge.engine import model_router
+
+    requests = []
+
+    def reject(request):
+        requests.append(request.content)
+        return httpx.Response(429, json={"error": {"message": "temporary"}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(reject))
+    original = model_router.ChatOpenAI
+    monkeypatch.setattr(model_router, "ChatOpenAI", lambda **kwargs: original(**kwargs, http_async_client=http))
+    monkeypatch.setenv("GITHUB_TOKEN", "placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "placeholder")
+    monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
+    orchestrator, db, raw = await runner._build_runtime(tmp_path, "test-model", llm_min_interval=0, llm_max_attempts=3)
+    try:
+        with pytest.raises(RateLimitError):
+            await orchestrator._model_router.get_llm("hypothesis_generator").ainvoke("fixed")
+        assert len(requests) == 3 and requests[0] == requests[1] == requests[2]
+        errors = [json.loads(path.read_text()) for path in (tmp_path / "llm-traces").glob("*-error.json")]
+        assert len(errors) == 3
+        assert {error["provider_attempt"]["attempt"] for error in errors} == {1, 2, 3}
+        assert all(error["usage_status"] == "unknown" for error in errors)
+        assert len(list((tmp_path / "provider-attempts").glob("*-finished.json"))) == 3
+    finally:
+        await db.close()
+        await raw.close()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pr_failure_does_not_abort_independent_work_and_metadata_freezes_retry(runner, monkeypatch, tmp_path):
+    import argparse
+
+    workload = tmp_path / "workload.json"
+    output = tmp_path / "new" / "results.json"
+    workload.write_text(
+        json.dumps(
+            [
+                {"golden_url": "one", "repo": "owner/repo", "pr_number": 1},
+                {"golden_url": "two", "repo": "owner/repo", "pr_number": 2},
+            ]
+        )
+    )
+    config = SimpleNamespace(
+        generator_max_input_chars=50000,
+        protocol_version=3,
+        json_output_mode="auto",
+        investigator_closure_thinking="default",
+        max_tokens_per_pr=250000,
+    )
+    gateway = SimpleNamespace(cleanup_workspaces=lambda: None)
+    router = SimpleNamespace(_config=SimpleNamespace(base_url="https://relay.example/v1", model="same"))
+    orchestrator = SimpleNamespace(_model_router=router, _pipeline_v4_config=config, _gateway=gateway)
+    calls = []
+
+    class Resource:
+        async def close(self):
+            pass
+
+    async def runtime(*args):
+        assert args[-2:] == (3, True)
+        return orchestrator, Resource(), Resource()
+
+    async def run_one(item, *args, **kwargs):
+        calls.append(item["golden_url"])
+        if item["golden_url"] == "one":
+            raise RuntimeError("do not persist private exception body")
+        return {
+            **item,
+            "status": "completed",
+            "summary": {"status": "completed"},
+            "review_comments": [],
+            "tokens": 0,
+            "duration_seconds": 0,
+        }
+
+    monkeypatch.setattr(runner, "_build_runtime", runtime)
+    monkeypatch.setattr(runner, "_run_one", run_one)
+    args = argparse.Namespace(
+        reviewer_concurrency=4,
+        publication_gate_concurrency=1,
+        output=str(output),
+        workload=str(workload),
+        capture_invalid_outputs=False,
+        shard_count=1,
+        shard_index=0,
+        limit=0,
+        pipeline="hypothesis",
+        model_override="same",
+        output_language="en",
+        reasoning_effort="",
+        llm_min_interval=0,
+        thinking="default",
+        investigator_thinking="default",
+        generator_max_input_chars=0,
+        require_complete_workspace=True,
+        llm_max_attempts=3,
+        llm_retry_404=True,
+    )
+    await runner.main_async(args)
+    results = json.loads(output.read_text())
+    assert calls == ["one", "two"]
+    assert [row["status"] for row in results] == ["failed", "completed"]
+    assert results[0]["error"] == "RuntimeError" and "private" not in output.read_text()
+    metadata = json.loads((output.parent / "metadata.json").read_text())
+    assert metadata["v4_protocol"]["version"] == 3
+    assert metadata["provider_retry"]["max_attempts"] == 3 and metadata["provider_retry"]["retry_404"]
+    assert metadata["sdk_max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_v3_runtime_passes_retry_policy_to_product_without_double_wrapping(runner, monkeypatch, tmp_path):
+    from reviewforge.engine.provider_retry import RetryChatLLM
+
+    monkeypatch.setenv("GITHUB_TOKEN", "placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "placeholder")
+    monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
+    orchestrator, db, raw = await runner._build_runtime(
+        tmp_path, "test-model", pipeline="hypothesis", llm_min_interval=0, llm_max_attempts=3, llm_retry_404=True
+    )
+    try:
+        config = orchestrator._pipeline_v4_config
+        if getattr(config, "protocol_version", 2) < 3:
+            pytest.skip("Protocol v3 configuration is being integrated independently")
+        assert config.provider_max_attempts == 3 and config.provider_retry_404
+        llm = orchestrator._model_router.get_llm("investigator", max_retries=0)
+        assert isinstance(llm, runner.BenchmarkLLM) and not isinstance(llm, RetryChatLLM)
+        assert llm._inner.root_async_client.max_retries == 0
+    finally:
+        await db.close()
+        await raw.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "global_mode,investigator_mode", [("disabled", "enabled"), ("enabled", "disabled"), ("disabled", "default")]
 )

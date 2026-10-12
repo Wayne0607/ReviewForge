@@ -56,6 +56,7 @@ class Observation:
     # Actual saved read_file source; line_range remains the requested window.
     # Missing in old checkpoints and in multi-location search observations.
     excerpt_line_range: tuple[int, int] | None = None
+    shared_result_id: str = ""
 
     def __post_init__(self) -> None:
         if self.status not in {"success", "not_found", "error"}:
@@ -181,6 +182,9 @@ class Hypothesis:
     investigation_outcome: str = ""
     investigation_task_id: str = ""
     coverage_identity: str = ""
+    investigation_progress: list[dict[str, Any]] = field(default_factory=list)
+    investigation_unreported_tokens: int = 0
+    discovery_basis: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.severity not in _SEVERITY_RANK:
@@ -199,6 +203,15 @@ class Hypothesis:
         for name in ("counterevidence", "investigation_outcome", "investigation_task_id", "coverage_identity"):
             if data[name] is None or data[name] == "":
                 data.pop(name)
+        if not data["investigation_progress"]:
+            data.pop("investigation_progress")
+        if not data["discovery_basis"]:
+            data.pop("discovery_basis")
+        if not data["investigation_unreported_tokens"]:
+            data.pop("investigation_unreported_tokens")
+        for observation in data["observations"]:
+            if not observation["shared_result_id"]:
+                observation.pop("shared_result_id")
         return data
 
     @classmethod
@@ -238,6 +251,9 @@ class Hypothesis:
             investigation_outcome=str(data.get("investigation_outcome", "")),
             investigation_task_id=str(data.get("investigation_task_id", "")),
             coverage_identity=str(data.get("coverage_identity", "")),
+            investigation_progress=copy.deepcopy(data.get("investigation_progress", [])),
+            investigation_unreported_tokens=int(data.get("investigation_unreported_tokens", 0)),
+            discovery_basis=copy.deepcopy(data.get("discovery_basis", {})),
         )
 
 
@@ -254,10 +270,12 @@ class HypothesisLedger:
     unresolved_units: dict[str, str] = field(default_factory=dict)
     protocol_version: int = 1
     investigation_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    discovery_blocks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    request_budget: dict[str, Any] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.protocol_version not in {1, 2}:
+        if self.protocol_version not in {1, 2, 3}:
             raise ValueError("unsupported investigation protocol")
 
     def upsert(self, hypothesis: Hypothesis) -> tuple[Hypothesis, bool]:
@@ -321,6 +339,8 @@ class HypothesisLedger:
         counterevidence: CounterEvidence | None = None,
         investigation_outcome: str = "",
         investigation_task_id: str = "",
+        investigation_progress: list[dict[str, Any]] | None = None,
+        investigation_unreported_tokens: int = 0,
     ) -> Hypothesis:
         """Apply an investigation verdict to one hypothesis.
 
@@ -343,11 +363,14 @@ class HypothesisLedger:
             current.attempts += 1
             current.investigation_steps = investigation_steps
             current.investigation_tokens = investigation_tokens
+            current.investigation_unreported_tokens = investigation_unreported_tokens
             current.retryable = retryable
             current.assessment = copy.deepcopy(assessment)
             current.counterevidence = copy.deepcopy(counterevidence)
             current.investigation_outcome = investigation_outcome
             current.investigation_task_id = investigation_task_id
+            if investigation_progress is not None:
+                current.investigation_progress = copy.deepcopy(investigation_progress)
             if observations:
                 known = {observation.id for observation in current.observations}
                 for observation in observations:
@@ -387,7 +410,13 @@ class HypothesisLedger:
             for identity in members:
                 self.apply_verdict(
                     identity,
-                    **{**verdict, "investigation_tokens": tokens if identity == charged_to else 0},
+                    **{
+                        **verdict,
+                        "investigation_tokens": tokens if identity == charged_to else 0,
+                        "investigation_unreported_tokens": verdict.get("investigation_unreported_tokens", 0)
+                        if identity == charged_to
+                        else 0,
+                    },
                     investigation_task_id=task_id,
                 )
             self.investigation_tasks[task_id] = {
@@ -397,6 +426,11 @@ class HypothesisLedger:
                 "verdict": str(verdict["status"]),
                 "tokens": tokens,
                 "total_tokens": int(previous.get("total_tokens", 0)) + tokens,
+                **(
+                    {"unreported_tokens": verdict.get("investigation_unreported_tokens", 0)}
+                    if self.protocol_version >= 3
+                    else {}
+                ),
                 "attempts": int(previous.get("attempts", 0)) + 1,
             }
 
@@ -415,6 +449,14 @@ class HypothesisLedger:
                 "unresolved_units": dict(sorted(self.unresolved_units.items())),
                 "protocol_version": self.protocol_version,
                 "investigation_tasks": copy.deepcopy(self.investigation_tasks),
+                **(
+                    {
+                        "discovery_blocks": copy.deepcopy(self.discovery_blocks),
+                        "request_budget": copy.deepcopy(self.request_budget),
+                    }
+                    if self.protocol_version >= 3
+                    else {}
+                ),
             }
 
     @classmethod
@@ -428,4 +470,6 @@ class HypothesisLedger:
             unresolved_units=dict(data.get("unresolved_units", {})),
             protocol_version=int(data.get("protocol_version", 1)),
             investigation_tasks=copy.deepcopy(data.get("investigation_tasks", {})),
+            discovery_blocks=copy.deepcopy(data.get("discovery_blocks", {})),
+            request_budget=copy.deepcopy(data.get("request_budget", {})),
         )

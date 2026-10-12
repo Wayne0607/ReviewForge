@@ -84,13 +84,37 @@ override on both paired sides. Metadata records its effective value. Changing it
 requires a new output directory; it does not change production defaults or scores.
 
 `--llm-min-interval` defaults to 30 seconds between request starts across all
-benchmark processes on the host. The benchmark disables SDK automatic retries;
-the zero-retry option is supplied before constructing provider clients, and its
-effective HTTP behavior is covered by a real-SDK/mock-transport regression.
-rate failures remain visible instead of consuming an unrecorded retry burst.
-Tracing wraps the provider below the token wrapper so private `_agenerate`
-delegation cannot bypass it. Judge requests must also respect the provider's
-quota; do not run the judge while review workers are using the same quota.
+benchmark processes on the host, including recovery attempts. SDK automatic
+retries stay disabled before provider clients are constructed. By default,
+`--llm-max-attempts 1` preserves the original single-attempt evaluation policy.
+For a new bounded-recovery run, pass `--llm-max-attempts 3`: one unchanged logical
+request gets at most three attempts with 1/2-second backoff for timeout,
+connection, 429 or 5xx errors. Authentication, parameter and ordinary 404 errors
+are terminal. `--llm-retry-404` is an explicit opt-in for a relay with known
+transient routing 404s; it retains the same three-attempt ceiling. Both flags and
+the retry policy are frozen in metadata. Changing them requires a new output
+directory and identical settings on paired comparison sides.
+
+Protocol v3 owns retry ordering outside per-attempt tracking and budget
+admission, so a failed request can consume conservative unreported usage and
+prevent its next attempt. The runner never adds a second v3 retry wrapper.
+Earlier protocols and legacy use the runner's explicit retry policy. Trace
+inputs/outputs/errors link physical attempts to a logical request; failures label
+usage as unknown. Non-v3 retry audits are also saved in `provider-attempts/`.
+Pacing and backoff are cancellable. Tracing wraps the provider below the token
+wrapper so private `_agenerate` delegation cannot bypass it. Judge requests must
+also respect the provider's quota; do not run the judge while review workers are
+using the same quota.
+
+Use the existing bounded `launch_windows.py --task runner -- ...` or
+`launch_isolated.py --task runner -- ...` entry point with the same explicit
+memory/CPU/runtime/reserve limits and a new execution record. Append
+`--llm-max-attempts 3` to the runner arguments and add `--llm-retry-404` only for
+the known relay. The launcher terminates on resource/runtime limits or process
+exit; an individual request error trace does not terminate the process tree.
+After retry exhaustion the runner persists that PR's partial/failed result and
+continues independent PRs. Do not attach the private first-error kill watcher
+to these recovery runs. Strict judging still refuses any incomplete fixed queue.
 
 `llm-traces/` contains public benchmark source and model responses. Keep credential
 files outside the output directory. Each process uses its own SQLite DB. Restart

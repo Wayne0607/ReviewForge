@@ -36,10 +36,12 @@ from reviewforge.engine.hypothesis import (
     Observation,
     Site,
 )
+from reviewforge.engine.investigation_evidence import EvidenceScope, SharedEvidenceCache, diff_evidence_window
 from reviewforge.engine.investigation_tasks import (
     InvestigationTask,
     build_investigation_tasks,
     context_units,
+    fair_investigation_tasks,
     render_investigation_context,
 )
 from reviewforge.engine.prompts_v4 import load_prompt
@@ -65,6 +67,8 @@ _MAX_STEPS = 8
 _TOOL_RESULT_CHARS = 6_000
 _OBS_EXCERPT_CHARS = 1_200
 _EVIDENCE_SEGMENT_CHARS = 400
+_MIN_USEFUL_OUTPUT = 512
+_CONTEXT_CHARS = 12_000
 _NOT_FOUND_MARKERS = frozenset({"no results", "not found", "no matches", "no definition found", "no callers found"})
 
 _OUT_OF_DIFF_TOKENS = ("caller", "callee", "parent", "base class", "interface", "schema")
@@ -119,6 +123,8 @@ class InvestigationResult:
     assessment: ContractAssessment | None = None
     counterevidence: CounterEvidence | None = None
     outcome: str = ""
+    progress: list[dict[str, Any]] = field(default_factory=list)
+    unreported_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.outcome:
@@ -251,6 +257,7 @@ class Investigator:
         changeset: SemanticChangeSet | None = None,
         protocol_version: int = 1,
         closing_llm: BaseChatModel | None = None,
+        evidence_cache: SharedEvidenceCache | None = None,
     ) -> None:
         self._llm = llm
         self._executor = executor
@@ -266,6 +273,10 @@ class Investigator:
         self._tokens = 0
         self._input_overhead = 0
         self._read_focus: dict[str, int] = {}
+        self._evidence_cache = evidence_cache
+        self._progress: list[dict[str, Any]] = []
+        self._unreported_tokens = 0
+        self._task_request_budget: Any = None
 
     def _build_tools(self) -> list[StructuredTool]:
         async def read_file(path: str, start: int | None = None, end: int | None = None) -> str:
@@ -321,12 +332,36 @@ class Investigator:
         if name == "read_file":
             args = self._focus_read_args(args)
         query = _query_string(name, args)
+        if self._protocol_version >= 3:
+            existing = next((obs for obs in self._observations if obs.query == query), None)
+            if existing is not None:
+                return self._observation_reply(existing) + "\nAlready recorded; choose a different missing fact."
         if self._tool_counts.get(query, 0) >= 2:
             return "Repeated tool call limit reached; use existing observations or investigate a different fact."
         self._tool_counts[query] = self._tool_counts.get(query, 0) + 1
         failed = False
-        try:
+        shared_result_id = ""
+        reused = False
+        diff_navigation = {}
+
+        async def execute(name: str, args: dict[str, Any]) -> str:
             text = str(await self._executor(name, args) or "")
+            if self._protocol_version >= 3 and name == "read_diff" and isinstance(args.get("start"), int):
+                text, _ = diff_evidence_window(text, args["start"])
+            return text
+
+        try:
+            if self._protocol_version >= 3 and self._evidence_cache is not None:
+                scope = self._evidence_cache.scope
+                if self._state is None or self._state.head_sha != scope.head_sha:
+                    raise ValueError("investigation source does not match the shared evidence head")
+                shared = await self._evidence_cache.execute(name, args, execute, scope=scope)
+                text, shared_result_id, reused = shared.text, shared.shared_result_id, shared.reused
+            else:
+                text = await execute(name, args)
+            if self._protocol_version >= 3 and name == "read_diff" and self._state is not None:
+                patch = (self._state.file_diffs or {}).get(args.get("path"), "") or ""
+                _, diff_navigation = diff_evidence_window(patch, int(args.get("start") or 1))
         except Exception as exc:
             # Error bodies may contain credentials or arbitrary source. Keep
             # them out of evidence and logs; retain only the trusted failure
@@ -364,9 +399,28 @@ class Investigator:
             excerpt=excerpt,
             status=status,
             excerpt_line_range=excerpt_range,
+            **({"shared_result_id": shared_result_id} if self._protocol_version >= 3 else {}),
         )
         self._obs_counter += 1
         self._observations.append(observation)
+        if self._protocol_version >= 3:
+            self._progress.append(
+                {
+                    "phase": "evidence",
+                    "query": query,
+                    "observation_id": observation.id,
+                    "status": status,
+                    "shared_result_id": shared_result_id,
+                    "reused": reused,
+                }
+            )
+            if diff_navigation:
+                self._progress.append({"phase": "diff-navigation", "observation_id": observation.id, **diff_navigation})
+        return self._observation_reply(observation, text=text)
+
+    def _observation_reply(self, observation: Observation, *, text: str | None = None) -> str:
+        text = observation.excerpt if text is None else text
+        name, status = observation.tool, observation.status
         label = f"[{observation.id}]"
         if name == "read_file" and observation.line_range:
             label += f" {observation.path} (requested lines {observation.line_range[0]}-{observation.line_range[1]})"
@@ -375,6 +429,20 @@ class Investigator:
             return f"{label} status={status}\n{text}" if text else f"{label} status={status} (no content)"
         view = "\n\n".join(f"[{reference}]\n{citation.quote}" for reference, citation in segments.items())
         reply = f"{label} Saved evidence (copy the exact reference IDs into assessment):\n{view}"
+        navigation = next(
+            (
+                item
+                for item in reversed(self._progress)
+                if item.get("phase") == "diff-navigation" and item.get("observation_id") == observation.id
+            ),
+            None,
+        )
+        if navigation:
+            reply += (
+                "\nNavigation only: partial hunk "
+                + navigation["hunk_header"]
+                + "; omitted source is not evidence. Complete before/after pairing is not established by this excerpt."
+            )
         if observation.excerpt_line_range:
             start, saved_end = observation.excerpt_line_range
             reply += f"\nSaved source lines {start}-{saved_end}; the last line may be incomplete."
@@ -402,7 +470,10 @@ class Investigator:
         first = max(1, int(args.get("start") or 1))
         lines = text.splitlines(keepends=True)
         excerpt = text[:_OBS_EXCERPT_CHARS]
-        focus = self._saved_read_focus(str(args.get("path") or ""))
+        path = str(args.get("path") or "")
+        focus = self._saved_read_focus(path)
+        if self._protocol_version >= 3:
+            focus = focus or self._read_focus.get(path)
         offset = focus - first if focus is not None else -1
         if 0 <= offset < len(lines) and len("".join(lines[: offset + 1])) > _OBS_EXCERPT_CHARS:
             begin = max(0, offset - 3)
@@ -455,7 +526,13 @@ class Investigator:
         return None
 
     def _system_prompt(self) -> str:
-        name = "investigator_v2" if self._protocol_version >= 2 else "investigator"
+        name = (
+            "investigator_v3"
+            if self._protocol_version >= 3
+            else "investigator_v2"
+            if self._protocol_version >= 2
+            else "investigator"
+        )
         return load_prompt(name, output_language=_language_directive(self._output_language))
 
     def _render_user(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> str:
@@ -473,18 +550,33 @@ class Investigator:
             if patch:
                 sections.append(f"### {path}\n{patch}")
         diff_section = "\n\n".join(sections) or "(no matching hunk; use read_diff to inspect the file's changes)"
+        context_chars = _CONTEXT_CHARS
+        basis_navigation = ""
+        if self._protocol_version >= 3:
+            if hypothesis.discovery_basis:
+                basis_navigation = json.dumps(hypothesis.discovery_basis, ensure_ascii=False)[:2_000]
+            context_chars = max(0, context_chars - len(self._render_observations()) - len(basis_navigation))
+            diff_section = "Before/after hunk requested as recorded evidence; inspect its saved status and excerpts."
         context = (
-            render_investigation_context(hypothesis, self._changeset, pack, max_chars=12_000)
+            render_investigation_context(hypothesis, self._changeset, pack, max_chars=context_chars)
             if self._protocol_version >= 2
             else pack.render_for_unit(hypothesis.unit_id, max_chars=12_000)
         )
-        hypothesis_body = json.dumps(hypothesis.to_dict(), ensure_ascii=False, indent=2)
+        candidate = hypothesis.to_dict()
+        if self._protocol_version >= 3:
+            # Evidence is delivered once through code-written saved references.
+            candidate.pop("observations", None)
+            candidate.pop("investigation_progress", None)
+            candidate.pop("discovery_basis", None)
+        hypothesis_body = json.dumps(candidate, ensure_ascii=False, indent=2)
         sections = [
             "## Hypothesis\n" + hypothesis_body,
             "## Diff hunk(s)\n" + diff_section,
             "## Context\n" + (context or "（无）/(none)"),
             defect_scope_guidance(),
         ]
+        if basis_navigation:
+            sections.append("## Discovery proof plan (navigation only; not saved evidence)\n" + basis_navigation)
         if pack.pr_intent:
             sections.append("## PR intent (author context, not defect evidence)\n" + pack.pr_intent[:2_000])
         boundary = self._resource_boundary(hypothesis)
@@ -507,6 +599,170 @@ class Investigator:
         if any(has_state_navigation(pack, unit_id) for unit_id in units):
             sections.append("## Verification guidance\n" + state_guidance())
         return "\n\n".join(sections)
+
+    async def _bootstrap(self, hypothesis: Hypothesis, pack: ContextPack) -> bool:
+        """Replace the first tool round with the known diff and actual anchor.
+
+        These are real executor reads, not Context promotion. Two anchor reads
+        and at most one validated trigger-location read replace the first round.
+        """
+        declared = (
+            next((unit for unit in self._changeset.units if unit.id == hypothesis.unit_id), None)
+            if self._changeset is not None
+            else None
+        )
+        primary = min(
+            hypothesis.sites,
+            key=lambda site: (declared is None or site.path != declared.path, site.path, site.line),
+        )
+        start, end = max(1, primary.line - 3), primary.line + 8
+        if self._changeset is not None:
+            enclosing = [
+                unit
+                for unit in self._changeset.units
+                if unit.path == primary.path and unit.start_line <= primary.line <= unit.end_line
+            ]
+            if enclosing:
+                unit = min(enclosing, key=lambda unit: (unit.end_line - unit.start_line, unit.id))
+                if unit.end_line - unit.start_line <= 30:
+                    start, end = max(1, unit.start_line - 1), unit.end_line + 1
+        self._read_focus[primary.path] = primary.line
+        await self._run_tool("read_diff", {"path": primary.path, "start": primary.line, "end": primary.line})
+        await self._run_tool("read_file", {"path": primary.path, "start": start, "end": end})
+        tool_calls = 2
+        location = self._discovery_trigger_location(hypothesis, pack)
+        if location is not None:
+            path, line = location
+            already_saved = any(
+                obs.tool == "read_file"
+                and obs.status == "success"
+                and obs.path == path
+                and obs.excerpt_line_range is not None
+                and obs.excerpt_line_range[0] <= line <= obs.excerpt_line_range[1]
+                for obs in self._observations
+            )
+            if not already_saved:
+                self._progress.append({"phase": "trigger-navigation", "path": path, "line": line})
+                await self._run_tool("read_file", {"path": path, "start": max(1, line - 3), "end": line + 8})
+                tool_calls += 1
+        self._progress.append({"phase": "bootstrap", "steps": 1, "tool_calls": tool_calls})
+        return True
+
+    def _discovery_trigger_location(self, hypothesis: Hypothesis, pack: ContextPack) -> tuple[str, int] | None:
+        basis = hypothesis.discovery_basis.get("trigger_basis")
+        if not isinstance(basis, dict):
+            return None
+        path, line, quote = basis.get("path"), basis.get("line"), basis.get("excerpt")
+        if (
+            not isinstance(path, str)
+            or type(line) is not int
+            or line <= 0
+            or not isinstance(quote, str)
+            or not quote.strip()
+        ):
+            return None
+        if basis.get("side") == "after" and self._state is not None:
+            if any(
+                number == line and quote in content
+                for number, content in iter_right_lines((self._state.file_diffs or {}).get(path, "") or "")
+            ):
+                return path, line
+        if basis.get("side") == "context" and self._state is not None:
+            for context in pack.units.values():
+                for slice_ in context.slices:
+                    if (
+                        slice_.path != path
+                        or slice_.sha != self._state.head_sha
+                        or not slice_.start_line <= line <= slice_.end_line
+                    ):
+                        continue
+                    lines = slice_.text.splitlines()
+                    offset = line - slice_.start_line
+                    if offset < len(lines) and quote in lines[offset]:
+                        return path, line
+        return None
+
+    def _model_progress(self, content: str, known_tools: dict[str, StructuredTool], step: int) -> dict[str, Any] | None:
+        parsed = extract_json_value(content, required_key="progress", allow_list=False)
+        if not isinstance(parsed, dict):
+            return None
+        value = parsed["progress"]
+        if not isinstance(value, dict) or value.get("missing_premise") not in {
+            "trigger",
+            "mechanism",
+            "impact",
+            "regression",
+            "contract",
+        }:
+            raise ValueError("progress requires one missing proof premise")
+        question = value.get("question")
+        if not isinstance(question, str) or not question.strip() or len(question) > 600:
+            raise ValueError("progress requires a bounded evidence question")
+        navigation = value.get("next_evidence")
+        if not isinstance(navigation, dict) or navigation.get("tool") not in known_tools:
+            raise ValueError("progress requires a read-only next evidence tool")
+        args = navigation.get("args")
+        if not isinstance(args, dict):
+            raise ValueError("progress requires tool arguments")
+        known_tools[navigation["tool"]].args_schema.model_validate(args)
+        record = {
+            "phase": "proof-duty",
+            "step": step,
+            "missing_premise": value["missing_premise"],
+            "question": question.strip(),
+            "next_evidence": {"tool": navigation["tool"], "args": args},
+        }
+        self._progress.append(record)
+        return record
+
+    async def _follow_caller(self, observation: Observation) -> str:
+        """Read one concrete production call hit, never an inferred contract."""
+        if observation.tool != "find_callers" or observation.status != "success":
+            return ""
+        try:
+            symbol = json.loads(observation.query.partition(" ")[2])["symbol"]
+        except (ValueError, KeyError, TypeError):
+            return ""
+        calls = []
+        for line in observation.excerpt.splitlines():
+            match = re.match(r"^- (.+?):(\d+):\s*(.*)$", line)
+            if not match or not re.search(rf"\b{re.escape(symbol)}\s*\(", match[3]):
+                continue
+            path, number, source = match[1], int(match[2]), match[3]
+            if source.lstrip().startswith(("//", "#", "/*", "*")):
+                continue
+            if re.match(r"\s*" + re.escape(symbol) + r"\s*\(", source):
+                # A naked multi-line signature is common in Go interfaces.
+                # Only a complete single-line bare call is safe to auto-follow;
+                # leave ambiguous hits available for explicit model navigation.
+                if ")" not in source or re.search(r"\)\s*(?::|[A-Za-z_{])", source):
+                    continue
+            if re.search(r"(?:^|/)(?:tests?|__tests__|testdata)(?:/|$)|(?:_test|\.test|\.spec)\.", path):
+                continue
+            if re.match(
+                r"\s*(?:(?:async|static|public|private|protected|override|export)\s+)*(?:def|func|function)\b", source
+            ):
+                continue
+            if source.rstrip().endswith(";") and re.match(r"\s*[\w<>,\[\].?]+\s+" + re.escape(symbol), source):
+                continue
+            already_read = any(
+                obs.tool == "read_file"
+                and obs.status == "success"
+                and obs.path == path
+                and obs.excerpt_line_range is not None
+                and obs.excerpt_line_range[0] <= number <= obs.excerpt_line_range[1]
+                for obs in self._observations
+            )
+            if not already_read and number > 0:
+                calls.append((path, number))
+        if not calls:
+            return ""
+        path, number = calls[0]
+        self._progress.append(
+            {"phase": "caller-followup", "from_observation": observation.id, "path": path, "line": number}
+        )
+        result = await self._run_tool("read_file", {"path": path, "start": max(1, number - 8), "end": number + 12})
+        return "Known production caller read as recorded evidence:\n" + result
 
     def _resource_boundary(self, hypothesis: Hypothesis) -> str:
         # Resource contents can violate a local contract without a runtime
@@ -542,33 +798,72 @@ class Investigator:
         *,
         changed_paths: set[str] | None = None,
     ) -> InvestigationResult:
+        """Keep each v3 request attempt inside the original task allowance."""
+        if self._protocol_version < 3:
+            return await self._investigate(hypothesis, state, pack, changed_paths=changed_paths)
+        from reviewforge.engine.request_budget import investigation_request_scope
+
+        steps = self._max_steps if self._max_steps is not None else budget_steps(hypothesis)
+        self._unreported_tokens = 0
+        with investigation_request_scope(steps * 4_000) as task_budget:
+            self._task_request_budget = task_budget
+            try:
+                result = await self._investigate(hypothesis, state, pack, changed_paths=changed_paths)
+            finally:
+                self._unreported_tokens = int(task_budget.snapshot()["unreported_reserved_tokens"])
+                self._task_request_budget = None
+            result.unreported_tokens = self._unreported_tokens
+            if self._unreported_tokens:
+                result.progress.append(
+                    {"phase": "budget", "event": "unreported-attempt-usage", "tokens": self._unreported_tokens}
+                )
+            return result
+
+    def _accounted_tokens(self) -> int:
+        unknown = self._unreported_tokens
+        if self._task_request_budget is not None:
+            unknown = int(self._task_request_budget.snapshot()["unreported_reserved_tokens"])
+        return self._tokens + unknown
+
+    async def _investigate(
+        self,
+        hypothesis: Hypothesis,
+        state: StateStore,
+        pack: ContextPack,
+        *,
+        changed_paths: set[str] | None = None,
+    ) -> InvestigationResult:
         """Answer one hypothesis's open_question within its budget_steps."""
 
         self._state = state
         self._prepare_read_focus(hypothesis, pack)
-        self._observations = list(hypothesis.observations)
+        self._observations = [
+            obs for obs in hypothesis.observations if self._protocol_version < 3 or obs.sha == state.head_sha
+        ]
+        self._progress = list(hypothesis.investigation_progress) if self._protocol_version >= 3 else []
         self._tokens = 0
         self._input_overhead = 0
         self._tool_counts = {}
         self._obs_counter = max(
-            (
-                int(obs.id[4:]) + 1
-                for obs in hypothesis.observations
-                if obs.id.startswith("obs_") and obs.id[4:].isdigit()
-            ),
+            (int(obs.id[4:]) + 1 for obs in self._observations if obs.id.startswith("obs_") and obs.id[4:].isdigit()),
             default=0,
         )
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
         steps = self._max_steps if self._max_steps is not None else budget_steps(hypothesis)
         token_limit = steps * 4_000
+        first_step = 0
+        if self._protocol_version >= 3:
+            first_step = int(await self._bootstrap(hypothesis, pack))
 
         chat = [
             SystemMessage(content=self._system_prompt()),
             HumanMessage(content=self._render_user(hypothesis, state, pack)),
         ]
         initial = list(chat)
+        if self._protocol_version >= 3:
+            chat.append(HumanMessage(content="## Recorded observations\n" + self._render_observations()))
         tools = self._build_tools()
-        known_names = {tool.name for tool in tools}
+        known_tools = {tool.name: tool for tool in tools}
         bound = self._llm.bind_tools(tools)
         schema_tokens = self._estimate_text_tokens(
             json.dumps(
@@ -577,7 +872,7 @@ class Investigator:
             )
         )
 
-        for step in range(steps):
+        for step in range(first_step, steps):
             closing = self._closing_chat(initial, token_limit)
             # A tool round is useful only if we can still ask for a verdict.
             # Reserve the closing input and output within the SAME budget,
@@ -585,14 +880,26 @@ class Investigator:
             # a quarter of the total budget so small budgets can collect facts.
             input_tokens = self._estimate_input_tokens(chat) + schema_tokens + self._input_overhead
             closing_tokens = self._estimate_input_tokens(closing) + self._input_overhead
-            remaining = token_limit - self._tokens
+            remaining = token_limit - self._accounted_tokens()
             closing_output = min(4_000, token_limit // 4)
             output_tokens = min(4_000, remaining - input_tokens - closing_tokens - closing_output)
-            if output_tokens <= 0:
+            if output_tokens < (_MIN_USEFUL_OUTPUT if self._protocol_version >= 3 else 1):
+                if self._protocol_version >= 3:
+                    self._progress.append(
+                        {"phase": "budget", "event": "close-before-small-output", "output_tokens": output_tokens}
+                    )
                 return await self._close(closing, hypothesis, changed, token_limit=token_limit, steps=step)
             try:
                 response = await bound.ainvoke(chat, max_tokens=output_tokens)
             except Exception as exc:
+                if getattr(exc, "outcome", "") == "budget-exhausted":
+                    return self._result(
+                        verdict="unknown",
+                        reason="run-budget-exhausted",
+                        severity=hypothesis.severity,
+                        steps=step,
+                        outcome="budget-exhausted",
+                    )
                 logger.warning("investigator provider error for %s: %s", hypothesis.identity, exc)
                 return self._result(
                     verdict="unknown",
@@ -603,7 +910,7 @@ class Investigator:
                 )
             self._record_tokens(response, chat, schema_tokens=schema_tokens)
             chat.append(response)
-            if self._tokens > token_limit:
+            if self._accounted_tokens() > token_limit:
                 return self._result(
                     verdict="unknown",
                     reason="token-exhausted",
@@ -612,6 +919,39 @@ class Investigator:
                     outcome="budget-exhausted",
                 )
             tool_calls = getattr(response, "tool_calls", None) or []
+            if self._protocol_version >= 3:
+                content = getattr(response, "content", "") or ""
+                proof = self._parse_verdict(content)
+                if proof is not None and (
+                    proof.get("assessment") is not None or proof.get("counterevidence") is not None
+                ):
+                    return self._finalize(proof, hypothesis, changed, steps=step + 1)
+                try:
+                    progress = self._model_progress(content, known_tools, step + 1)
+                except (ValueError, TypeError):
+                    return self._invalid_output("invalid-progress", hypothesis, step + 1)
+                if not tool_calls and progress is not None:
+                    navigation = progress["next_evidence"]
+                    args = (
+                        self._focus_read_args(navigation["args"])
+                        if navigation["tool"] == "read_file"
+                        else navigation["args"]
+                    )
+                    if any(obs.query == _query_string(navigation["tool"], args) for obs in self._observations):
+                        self._progress.append({"phase": "budget", "event": "close-after-repeated-evidence"})
+                        return await self._close(
+                            self._closing_chat(initial, token_limit),
+                            hypothesis,
+                            changed,
+                            token_limit=token_limit,
+                            steps=step + 1,
+                        )
+                    reply = await self._run_tool(navigation["tool"], navigation["args"])
+                    chat.append(HumanMessage(content=reply))
+                    follow = await self._follow_caller(self._observations[-1])
+                    if follow:
+                        chat.append(HumanMessage(content=follow))
+                    continue
             if not tool_calls:
                 parsed = self._parse_verdict(getattr(response, "content", "") or "")
                 if parsed is not None:
@@ -623,7 +963,7 @@ class Investigator:
                     token_limit=token_limit,
                     steps=step + 1,
                 )
-            if self._tokens >= token_limit:
+            if self._accounted_tokens() >= token_limit:
                 return self._result(
                     verdict="unknown",
                     reason="token-exhausted",
@@ -631,20 +971,40 @@ class Investigator:
                     steps=step + 1,
                     outcome="budget-exhausted",
                 )
+            followups = []
+            before_observations = len(self._observations)
             for tool_call in tool_calls:
                 name = str(tool_call.get("name", ""))
                 args = tool_call.get("args", {}) or {}
-                if name not in known_names:
+                if name not in known_tools:
                     result = f"Unknown tool: {name}"
                 else:
                     result = await self._run_tool(name, args)
                 chat.append(ToolMessage(content=result, tool_call_id=tool_call.get("id", "")))
+                if self._protocol_version >= 3 and name == "find_callers" and self._observations:
+                    followups.append(self._observations[-1])
+            if followups:
+                # At most one deterministic caller read per original tool round.
+                for observation in followups:
+                    follow = await self._follow_caller(observation)
+                    if follow:
+                        chat.append(HumanMessage(content=follow))
+                        break
+            if self._protocol_version >= 3 and len(self._observations) == before_observations:
+                self._progress.append({"phase": "budget", "event": "close-after-repeated-evidence"})
+                return await self._close(
+                    self._closing_chat(initial, token_limit),
+                    hypothesis,
+                    changed,
+                    token_limit=token_limit,
+                    steps=step + 1,
+                )
 
         return await self._close(
             self._closing_chat(initial, token_limit), hypothesis, changed, token_limit=token_limit, steps=steps
         )
 
-    def _closing_chat(self, initial: list[Any], token_limit: int) -> list[Any]:
+    def _render_observations(self) -> str:
         # Replay the hypothesis/context and code-written excerpts, rather than
         # every 6000-character tool result and the model's speculative history.
         # Nothing outside a saved Observation becomes citable during closure.
@@ -657,6 +1017,22 @@ class Investigator:
                 "line_range": obs.line_range,
                 "excerpt_line_range": obs.excerpt_line_range,
                 "status": obs.status,
+                **({"shared_result_id": obs.shared_result_id} if obs.shared_result_id else {}),
+                **(
+                    {"navigation_only": item}
+                    if (
+                        item := next(
+                            (
+                                entry
+                                for entry in self._progress
+                                if entry.get("phase") == "diff-navigation" and entry.get("observation_id") == obs.id
+                            ),
+                            None,
+                        )
+                    )
+                    is not None
+                    else {}
+                ),
                 **(
                     {"evidence": {reference: citation.quote for reference, citation in _evidence_segments(obs).items()}}
                     if obs.status == "success"
@@ -665,12 +1041,15 @@ class Investigator:
             }
             for obs in self._observations
         ]
+        return json.dumps(observations, ensure_ascii=False)
+
+    def _closing_chat(self, initial: list[Any], token_limit: int) -> list[Any]:
         return [
             *initial,
             HumanMessage(
                 content="## Recorded observations\n"
-                + json.dumps(observations, ensure_ascii=False)
-                + f"\nRemaining investigation budget: {max(0, token_limit - self._tokens)} tokens. "
+                + self._render_observations()
+                + f"\nRemaining investigation budget: {max(0, token_limit - self._accounted_tokens())} tokens. "
                 "Finish now. Answer the one open_question using these saved observations. "
                 "Assessment JSON only; no tools. Missing proof: comparison=unresolved or assessment=null."
             ),
@@ -686,7 +1065,8 @@ class Investigator:
         steps: int,
     ) -> InvestigationResult:
         input_tokens = self._estimate_input_tokens(chat) + self._input_overhead
-        if self._tokens + input_tokens >= token_limit:
+        available_output = token_limit - self._accounted_tokens() - input_tokens
+        if available_output < (_MIN_USEFUL_OUTPUT if self._protocol_version >= 3 else 1):
             return self._result(
                 verdict="unknown",
                 reason="token-exhausted",
@@ -696,15 +1076,23 @@ class Investigator:
             )
         try:
             closer = self._closing_llm if self._closing_llm is not None else self._llm
-            final = await closer.ainvoke(chat, max_tokens=min(4_000, token_limit - self._tokens - input_tokens))
+            final = await closer.ainvoke(chat, max_tokens=min(4_000, available_output))
             self._record_tokens(final, chat)
             parsed = self._parse_verdict(getattr(final, "content", "") or "")
         except Exception as exc:
+            if getattr(exc, "outcome", "") == "budget-exhausted":
+                return self._result(
+                    verdict="unknown",
+                    reason="run-budget-exhausted",
+                    severity=hypothesis.severity,
+                    steps=steps,
+                    outcome="budget-exhausted",
+                )
             logger.warning("investigator final call failed for %s: %s", hypothesis.identity, exc)
             return self._result(
                 verdict="unknown", reason="provider error", severity=hypothesis.severity, steps=steps, retryable=True
             )
-        if self._tokens > token_limit:
+        if self._accounted_tokens() > token_limit:
             return self._result(
                 verdict="unknown",
                 reason="token-exhausted",
@@ -758,7 +1146,7 @@ class Investigator:
                 total = int(measured_input) + int(output)
         if total is not None:
             self._tokens += max(0, int(total))
-        else:
+        elif self._protocol_version < 3:
             self._tokens += self._estimate_input_tokens(chat) + schema_tokens + self._estimate_input_tokens([response])
 
     @staticmethod
@@ -1043,6 +1431,8 @@ class Investigator:
             assessment=assessment,
             counterevidence=counterevidence,
             outcome=outcome,
+            progress=list(self._progress),
+            unreported_tokens=self._unreported_tokens,
         )
 
     async def run(
@@ -1088,6 +1478,14 @@ class Investigator:
             if ledger.protocol_version >= 2
             else [InvestigationTask(item.identity, item, (item.identity,)) for item in targets]
         )
+        evidence_cache = None
+        if ledger.protocol_version >= 3:
+            if ledger.head_sha != state.head_sha or (
+                pack.workspace_digest and ledger.workspace_digest != pack.workspace_digest
+            ):
+                raise ValueError("investigation ledger/context does not match the fixed head workspace")
+            tasks = fair_investigation_tasks(tasks)
+            evidence_cache = SharedEvidenceCache(EvidenceScope(ledger.run_id, ledger.head_sha, ledger.workspace_digest))
         semaphore = asyncio.Semaphore(max(1, concurrency))
         available_tokens = None if token_budget is None else max(0, token_budget)
 
@@ -1119,6 +1517,7 @@ class Investigator:
                     changeset=self._changeset,
                     protocol_version=ledger.protocol_version,
                     closing_llm=self._closing_llm,
+                    evidence_cache=evidence_cache,
                 )
                 try:
                     result = await worker.investigate(hypothesis, state, pack, changed_paths=changed)
@@ -1132,7 +1531,7 @@ class Investigator:
                         outcome="output-error",
                     )
                 if available_tokens is not None:
-                    available_tokens += reserve - result.tokens
+                    available_tokens += reserve - result.tokens - result.unreported_tokens
                 return result
 
         async def complete(index: int, task: InvestigationTask) -> InvestigationResult:
@@ -1151,6 +1550,12 @@ class Investigator:
                 assessment=result.assessment,
                 counterevidence=result.counterevidence,
                 investigation_outcome=result.outcome,
+                **({"investigation_progress": result.progress} if ledger.protocol_version >= 3 else {}),
+                **(
+                    {"investigation_unreported_tokens": result.unreported_tokens}
+                    if ledger.protocol_version >= 3
+                    else {}
+                ),
             )
             if ledger.protocol_version >= 2:
                 ledger.apply_task_verdict(task.id, task.members, hypothesis.identity, **verdict)
@@ -1168,6 +1573,8 @@ class Investigator:
                 if not job.done():
                     job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
+            if evidence_cache is not None:
+                await evidence_cache.close()
 
 
 __all__ = ["InvestigationResult", "Investigator", "build_workspace_executor", "budget_steps"]

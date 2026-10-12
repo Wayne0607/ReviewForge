@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import time
+from copy import deepcopy
 from dataclasses import asdict
 from typing import Any
 
@@ -32,8 +33,11 @@ from reviewforge.engine.investigator import Investigator, build_workspace_execut
 from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.lenses import run_lens, select_lenses
 from reviewforge.engine.llm_protocol_v4 import request_options
+from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import scan_changed_files
+from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
 from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
+from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
 from reviewforge.engine.run_health import RunHealth
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
@@ -143,10 +147,27 @@ async def _run_llm_stages(
     events = orchestrator._events
     ctx = RunContext()
     ctx.set(ledger.run_id, getattr(orchestrator, "_db", None))
+    request_budget = (
+        RequestBudget(
+            config.max_tokens_per_pr,
+            discovery_limit=config.discovery_max_tokens,
+            saved=ledger.request_budget,
+        )
+        if ledger.protocol_version >= 3
+        else None
+    )
+
+    async def budget_changed(snapshot: dict[str, Any]) -> None:
+        ledger.request_budget = snapshot
+        events.emit("pipeline_v4.request_budget", snapshot)
+        await _persist_ledger(orchestrator, ledger)
 
     def routed(name: str, *, closing: bool = False):
         async def record(usage: dict[str, Any]) -> None:
             usage_by_agent[name] = usage_by_agent.get(name, 0) + int(usage["total_tokens"])
+
+        async def attempt_changed(attempt: dict[str, Any]) -> None:
+            events.emit("pipeline_v4.provider_attempt", {"agent": name, "closing": closing, **attempt})
 
         options = {}
         if ledger.protocol_version >= 2:
@@ -159,7 +180,21 @@ async def _run_llm_stages(
                 closure_thinking=config.investigator_closure_thinking,
             )
             events.emit("pipeline_v4.request_options", {"agent": name, "closing": closing, "options": options})
-        return TrackedChatLLM(router.get_llm(name), ctx, name, usage_sink=record, request_options=options)
+        raw = (
+            router.get_llm(name, max_retries=0)
+            if request_budget and isinstance(router, ModelRouter)
+            else router.get_llm(name)
+        )
+        if request_budget is None:
+            return TrackedChatLLM(raw, ctx, name, usage_sink=record, request_options=options)
+        phase = "editor" if name == "editor" else "investigation" if name == "investigator" else "discovery"
+        admitted = BudgetedChatLLM(raw, request_budget, phase=phase, on_change=budget_changed)
+        tracked = TrackedChatLLM(admitted, ctx, name, usage_sink=record, request_options=options, receipt_first=True)
+        return RetryChatLLM(
+            tracked,
+            policy=RetryPolicy(max_attempts=config.provider_max_attempts, retry_404=config.provider_retry_404),
+            attempt_sink=attempt_changed,
+        )
 
     async def checkpoint(current: HypothesisLedger) -> None:
         await _persist_ledger(orchestrator, current)
@@ -176,8 +211,22 @@ async def _run_llm_stages(
             output_language=language,
             on_update=checkpoint,
             anchor_resolver=anchor_resolver,
+            **(
+                {
+                    "discovery_target_input_chars": config.discovery_target_input_chars,
+                    "discovery_max_blocks": config.discovery_max_blocks,
+                }
+                if ledger.protocol_version >= 3
+                else {}
+            ),
         )
-        gen_result = await generator.run(state, pack, changeset, ledger)
+        gen_result = await generator.run(
+            state,
+            pack,
+            changeset,
+            ledger,
+            **({"resume": bool(ledger.discovery_blocks)} if ledger.protocol_version >= 3 else {}),
+        )
         events.emit(
             "hypothesis.generated",
             {
@@ -217,6 +266,15 @@ async def _run_llm_stages(
                 anchor_resolver=anchor_resolver,
                 max_input_chars=config.generator_max_input_chars,
                 context_max_chars=config.context_pack_max_chars,
+                **(
+                    {
+                        "discovery_target_input_chars": config.discovery_target_input_chars,
+                        "discovery_max_blocks": min(2, config.discovery_max_blocks),
+                        "resume": bool(ledger.discovery_blocks),
+                    }
+                    if ledger.protocol_version >= 3
+                    else {}
+                ),
             )
 
     executor = build_workspace_executor(workspace, state)
@@ -239,9 +297,13 @@ async def _run_llm_stages(
             max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
             concurrency=config.investigator_concurrency,
             on_update=checkpoint,
-            token_budget=max(0, config.max_tokens_per_pr - sum(usage_by_agent.values()) - 16_000)
-            if ledger.protocol_version >= 2
-            else None,
+            token_budget=(
+                request_budget.available("investigation")
+                if request_budget is not None
+                else max(0, config.max_tokens_per_pr - sum(usage_by_agent.values()) - 16_000)
+                if ledger.protocol_version >= 2
+                else None
+            ),
         )
 
     if resume:
@@ -407,9 +469,13 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         state,
         max_slices=config.context_pack_max_slices,
     )
-    rendered = pack.render_all(max_chars=config.context_pack_max_chars)
+    protocol_version = state.ledger.protocol_version if state.ledger is not None else config.protocol_version
+    # Rendering marks omitted slices. Protocol 3 renders independently budgeted
+    # blocks later, so this aggregate telemetry must not mark their inputs absent.
+    telemetry_pack = deepcopy(pack) if protocol_version >= 3 else pack
+    rendered = telemetry_pack.render_all(max_chars=config.context_pack_max_chars)
     slices = sum(len(context.slices) for context in pack.units.values())
-    truncated_units = sum(bool(context.truncated_kinds) for context in pack.units.values())
+    truncated_units = sum(bool(context.truncated_kinds) for context in telemetry_pack.units.values())
     orchestrator._events.emit(
         "context_pack.built",
         {
@@ -424,10 +490,12 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             run_id=workspace_event.run_id,
             head_sha=str(state.head_sha or ""),
             workspace_digest=pack.workspace_digest,
-            protocol_version=2,
+            protocol_version=config.protocol_version,
         )
     elif state.ledger.head_sha != str(state.head_sha or ""):
         raise ValueError("restored hypothesis ledger does not match PR head")
+    elif state.ledger.protocol_version >= 3 and state.ledger.workspace_digest != pack.workspace_digest:
+        raise ValueError("restored hypothesis ledger does not match pinned workspace")
     ledger = state.ledger
     await _persist_ledger(orchestrator, ledger)
     database = getattr(orchestrator, "_db", None)
@@ -556,6 +624,7 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             "published": delivered,
             "tokens_by_agent": usage_by_agent,
             "protocol_version": ledger.protocol_version,
+            **({"request_budget": ledger.request_budget} if ledger.protocol_version >= 3 else {}),
             "investigation_tasks": len(ledger.investigation_tasks),
             "investigation_failures": investigation_failures,
             "policy_deferred": sum(item.investigation_outcome == "policy-deferred" for item in hypotheses),
@@ -569,7 +638,16 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         investigation_failures=investigation_failures,
         investigation_unknown_total=sum(item.status == HypothesisStatus.UNKNOWN for item in hypotheses),
         investigation_deferred=sum(item.investigation_outcome == "policy-deferred" for item in hypotheses),
-        budget_failures=int(ledger.protocol_version >= 2 and sum(usage_by_agent.values()) > config.max_tokens_per_pr),
+        budget_failures=int(
+            (
+                ledger.request_budget.get("reported_tokens", 0)
+                + ledger.request_budget.get("unreported_reserved_tokens", 0)
+                > config.max_tokens_per_pr
+                or ledger.request_budget.get("denied_requests", 0) > 0
+            )
+            if ledger.protocol_version >= 3
+            else ledger.protocol_version >= 2 and sum(usage_by_agent.values()) > config.max_tokens_per_pr
+        ),
         delivery_failures=rejected,
         delivery_errors=(outcome.error,) if outcome.error else (),
         delivery_retryable=outcome.retryable,

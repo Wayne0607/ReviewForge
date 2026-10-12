@@ -73,3 +73,20 @@ async def test_append_only_resume_uses_latest_revision(tmp_path) -> None:
         assert (await cursor.fetchone())["count"] == 2
     finally:
         await db.close()
+
+
+def test_v3_checkpoint_keeps_discovery_and_budget_without_upgrading_old_records():
+    from reviewforge.engine.hypothesis import HypothesisLedger
+
+    ledger = HypothesisLedger("run", "sha", "workspace", protocol_version=3)
+    ledger.discovery_blocks = {"block": {"unit_ids": ["u1"], "status": "assessed"}}
+    ledger.request_budget = {"reported_tokens": 123, "pending": {"request_2": {"reserved_tokens": 500}}}
+    restored = HypothesisLedger.from_dict(ledger.to_dict())
+    assert restored.protocol_version == 3
+    assert restored.discovery_blocks == ledger.discovery_blocks
+    assert restored.request_budget == ledger.request_budget
+    restored.discovery_blocks["block"]["unit_ids"].append("u2")
+    assert ledger.discovery_blocks["block"]["unit_ids"] == ["u1"]
+    old = HypothesisLedger.from_dict({"run_id": "old", "head_sha": "sha", "workspace_digest": "d"})
+    assert old.protocol_version == 1
+    assert "discovery_blocks" not in old.to_dict()

@@ -104,3 +104,15 @@ def test_minimax_m27_also_uses_anthropic_compatibility():
     ModelRouter(config).get_llm("correctness_reviewer")
 
     assert DummyLLM.instances[-1].kwargs["base_url"] == "https://api.minimaxi.com/anthropic"
+
+
+def test_explicit_retry_override_keeps_legacy_clients_and_cache_unchanged():
+    router = ModelRouter(_make_config())
+    legacy = router.get_llm("correctness_reviewer")
+    no_sdk_retry = router.get_llm("correctness_reviewer", max_retries=0)
+    assert no_sdk_retry is not legacy
+    assert legacy.kwargs["max_retries"] == 2 and no_sdk_retry.kwargs["max_retries"] == 0
+    assert router.get_llm("security_reviewer", max_retries=0) is no_sdk_retry
+    assert router.get_llm("security_reviewer") is legacy
+    router.invalidate_cache()
+    assert router.get_llm("correctness_reviewer", max_retries=0) is not no_sdk_retry

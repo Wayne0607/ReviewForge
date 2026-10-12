@@ -55,6 +55,7 @@ class TrackedChatLLM(BaseChatModel):
     _agent_name: str
     _usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None
     _request_options: dict[str, Any]
+    _receipt_first: bool
 
     class Config:
         arbitrary_types_allowed = True
@@ -66,6 +67,7 @@ class TrackedChatLLM(BaseChatModel):
         agent_name: str,
         usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         request_options: dict[str, Any] | None = None,
+        receipt_first: bool = False,
     ) -> None:
         super().__init__()
         self._inner = inner
@@ -73,6 +75,7 @@ class TrackedChatLLM(BaseChatModel):
         self._agent_name = agent_name
         self._usage_sink = usage_sink
         self._request_options = dict(request_options or {})
+        self._receipt_first = receipt_first
 
     async def _agenerate(
         self,
@@ -103,6 +106,17 @@ class TrackedChatLLM(BaseChatModel):
                 completion_tokens = um.get("output_tokens", completion_tokens)
                 total_tokens = um.get("total_tokens", prompt_tokens + completion_tokens)
 
+        receipt = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "model": model,
+        }
+        # New protocols deliver the known response receipt before DB I/O can
+        # be cancelled. Legacy callers retain their original accounting order.
+        if self._receipt_first and self._usage_sink is not None:
+            await self._usage_sink(receipt)
+
         # Record to DB
         if total_tokens > 0 and self._ctx.db and self._ctx.run_id:
             try:
@@ -121,15 +135,8 @@ class TrackedChatLLM(BaseChatModel):
             except Exception as e:
                 logger.warning(f"Failed to record token usage: {e}")
 
-        if self._usage_sink is not None:
-            await self._usage_sink(
-                {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "model": model,
-                }
-            )
+        if not self._receipt_first and self._usage_sink is not None:
+            await self._usage_sink(receipt)
         return result
 
     def _generate(

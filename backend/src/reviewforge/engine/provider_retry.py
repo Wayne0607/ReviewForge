@@ -11,10 +11,13 @@ import asyncio
 import contextvars
 import logging
 import math
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import anthropic
@@ -25,6 +28,14 @@ from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
 _attempt_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("provider_attempt", default=None)
+_ERROR_CODES = frozenset({"rate_limit_exceeded", "insufficient_quota"})
+_ERROR_TYPES = frozenset({"tokens", "requests", "rate_limit_error", "insufficient_quota", "invalid_request_error"})
+_MAX_DIAGNOSTIC_DELAY = 7 * 24 * 60 * 60
+_HTTP_DATE = re.compile(
+    r"(?:[A-Za-z]{3}, [0-9]{2} [A-Za-z]{3} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+    r"|[A-Za-z]+, [0-9]{2}-[A-Za-z]{3}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+    r"|[A-Za-z]{3} [A-Za-z]{3} {1,2}[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4})"
+)
 
 
 @dataclass(frozen=True)
@@ -33,13 +44,14 @@ class RetryPolicy:
     base_delay_seconds: float = 1.0
     max_delay_seconds: float = 4.0
     retry_404: bool = False
+    retry_after_max_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 3:
             raise ValueError("Provider requests require one to three attempts")
         if type(self.retry_404) is not bool:
             raise ValueError("404 recovery requires an explicit boolean policy")
-        for delay in (self.base_delay_seconds, self.max_delay_seconds):
+        for delay in (self.base_delay_seconds, self.max_delay_seconds, self.retry_after_max_seconds):
             if type(delay) not in {int, float} or not math.isfinite(delay) or delay < 0:
                 raise ValueError("Provider retry delays must be finite and nonnegative")
 
@@ -49,6 +61,7 @@ class RetryPolicy:
             "base_delay_seconds": self.base_delay_seconds,
             "max_delay_seconds": self.max_delay_seconds,
             "retry_404": self.retry_404,
+            "retry_after_max_seconds": self.retry_after_max_seconds,
         }
 
 
@@ -56,6 +69,74 @@ def current_retry_attempt() -> dict[str, Any] | None:
     """Trace linkage for the currently executing physical provider attempt."""
     current = _attempt_var.get()
     return dict(current) if current is not None else None
+
+
+def _allowlisted(value: object, allowed: frozenset[str]) -> str | None:
+    if value is None:
+        return None
+    return value if type(value) is str and value in allowed else "unrecognized"
+
+
+def _retry_after(raw: object, now: datetime) -> tuple[float | None, str]:
+    if raw is None:
+        return None, "absent"
+    if type(raw) is not str or len(raw) > 128:
+        return None, "invalid"
+    value = raw.strip()
+    try:
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+            seconds = float(value)
+            kind = "delay_seconds"
+        else:
+            if not _HTTP_DATE.fullmatch(value):
+                return None, "invalid"
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            seconds = max(0.0, (parsed - now).total_seconds())
+            kind = "http_date"
+    except (ValueError, TypeError, OverflowError):
+        return None, "invalid"
+    if not math.isfinite(seconds):
+        return None, "invalid"
+    if seconds > _MAX_DIAGNOSTIC_DELAY:
+        return None, "out_of_bounds"
+    return seconds, kind
+
+
+def safe_provider_diagnostics(exc: BaseException, *, now: datetime | None = None) -> dict[str, Any]:
+    """Copy only approved tokens and a bounded parsed delay, never error text.
+
+    Provider-reported categories are diagnostics, not evidence of billing or a
+    temporal RPM/TPM window. Unknown values and original headers/bodies are not
+    serialized. HTTPX bodies are not decoded; SDK structured dicts suffice.
+    """
+    if not isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError, httpx.HTTPStatusError)):
+        return {}
+    body = getattr(exc, "body", None)
+    if type(body) is dict:
+        body = body.get("error", body)
+    if type(body) is not dict:
+        body = {}
+    code = _allowlisted(body.get("code"), _ERROR_CODES)
+    error_type = _allowlisted(body.get("type"), _ERROR_TYPES)
+    kind = "unspecified"
+    if code == "insufficient_quota" or error_type == "insufficient_quota":
+        kind = "provider_reported_quota"
+    elif error_type in {"tokens", "requests"}:
+        kind = "provider_reported_" + error_type
+    receipt_time = now or datetime.now(UTC)
+    if receipt_time.tzinfo is None:
+        receipt_time = receipt_time.replace(tzinfo=UTC)
+    delay, delay_format = _retry_after(exc.response.headers.get("retry-after"), receipt_time)
+    return {
+        "diagnostic_version": 1,
+        "error_code": code,
+        "error_type": error_type,
+        "limit_kind": kind,
+        "retry_after_seconds": delay,
+        "retry_after_format": delay_format,
+    }
 
 
 def _failure(exc: Exception, policy: RetryPolicy) -> tuple[bool, bool, int | None]:
@@ -155,8 +236,20 @@ class RetryChatLLM(BaseChatModel):
                 raise
             except Exception as exc:
                 provider, retryable, status = _failure(exc, self._policy)
+                diagnostics = safe_provider_diagnostics(exc)
                 retry = retryable and attempt < self._policy.max_attempts
                 delay = min(self._policy.max_delay_seconds, self._policy.base_delay_seconds * 2 ** (attempt - 1))
+                suppression = None
+                server_delay = diagnostics.get("retry_after_seconds")
+                if retry and (
+                    diagnostics.get("retry_after_format") == "out_of_bounds"
+                    or server_delay is not None
+                    and server_delay > self._policy.retry_after_max_seconds
+                ):
+                    retry = False
+                    suppression = "retry-after-exceeds-policy-cap"
+                elif retry and server_delay is not None:
+                    delay = max(delay, server_delay)
                 await self._record(
                     {
                         **identity,
@@ -164,6 +257,8 @@ class RetryChatLLM(BaseChatModel):
                         "outcome": "provider-error" if provider else "error",
                         "error_type": type(exc).__name__,
                         "status_code": status,
+                        "provider_diagnostics": diagnostics,
+                        "retry_suppressed_reason": suppression,
                         "retryable": retryable,
                         "will_retry": retry,
                         "delay_seconds": delay if retry else 0,

@@ -12,6 +12,8 @@ import os
 from dataclasses import replace
 from typing import Any
 
+import httpx
+
 from reviewforge.core.change_manifest import (
     FileChange,
     file_changes_from_pr_files,
@@ -27,6 +29,39 @@ from reviewforge.tools.github_api import MAX_REVIEW_COMMENTS_PER_REQUEST, GitHub
 from reviewforge.tools.workspace import DEFAULT_MAX_BYTES, PRHeadWorkspace, WorkspaceUnavailable
 
 logger = logging.getLogger(__name__)
+
+_METADATA_ERROR_TYPES = frozenset(
+    {
+        "HTTPStatusError",
+        "ConnectError",
+        "ReadError",
+        "RemoteProtocolError",
+        "DecodingError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "TimeoutException",
+        "OSError",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "AttributeError",
+        "RuntimeError",
+    }
+)
+
+
+def _metadata_failure(stage: str, error: Exception) -> str:
+    """Fixed diagnostic labels only; provider bodies and exception text stay out."""
+    kind = type(error).__name__
+    if isinstance(error, TimeoutError):
+        kind = "timeout"
+    elif kind not in _METADATA_ERROR_TYPES:
+        kind = "other-exception"
+    elif isinstance(error, httpx.TimeoutException):
+        kind = "timeout-" + kind
+    return stage + ":" + kind
 
 
 def _workspace_max_bytes() -> int:
@@ -270,7 +305,7 @@ class ToolGateway:
             return failed("invalid-pr-identity")
         api_names = ("get_pr_info", "get_pr_files", "get_comparison_base", "get_git_entries")
         if any(not callable(getattr(self._github, name, None)) for name in api_names):
-            return failed("metadata-unavailable")
+            return failed("capability:unavailable")
 
         def matches(info: dict[str, Any]) -> bool:
             actual_repo = (info.get("head", {}).get("repo") or {}).get("full_name")
@@ -280,10 +315,12 @@ class ToolGateway:
                 and (not actual_repo or actual_repo == head_repo)
             )
 
+        stage = "pr-identity"
         try:
             async with asyncio.timeout(60):
                 if not matches(await self._github.get_pr_info(repo, state.pr_number)):
                     return failed("stale-pr-head")
+                stage = "pr-files"
                 files = await self._github.get_pr_files(repo, state.pr_number)
                 fresh = file_changes_from_pr_files(
                     repo=repo, head_repo=head_repo, base_sha=base_sha, head_sha=head_sha, files=files
@@ -299,6 +336,7 @@ class ToolGateway:
                         records[path] = replace(change, proof_error="patch-unavailable")
                 if not candidates:
                     return records
+                stage = "comparison-base"
                 comparison_base = await self._github.get_comparison_base(repo, base_sha, head_repo, head_sha)
                 if not valid_sha(comparison_base):
                     return failed("comparison-base-unavailable")
@@ -312,12 +350,16 @@ class ToolGateway:
                         selected.append(change)
                 if not selected:
                     return records
+                stage = "before-tree"
                 before = await self._github.get_git_entries(
                     repo, comparison_base, [change.previous_path for change in selected]
                 )
+                stage = "head-tree"
                 after = await self._github.get_git_entries(head_repo, head_sha, [change.path for change in selected])
+                stage = "pr-recheck"
                 if not matches(await self._github.get_pr_info(repo, state.pr_number)):
                     return failed("stale-pr-head")
+                stage = "proof-bind"
                 for change in selected:
                     old, new = before.get(change.previous_path), after.get(change.path)
                     if not isinstance(old, dict) or not isinstance(new, dict):
@@ -346,10 +388,10 @@ class ToolGateway:
                         hydrated = replace(hydrated, patch_state="verified-no-text-change")
                     records[change.path] = hydrated
                 return records
-        except Exception:
+        except Exception as error:
             # Metadata failures are coverage gaps, never proof of unchanged
             # content. HTTP/error bodies must not enter facts or model inputs.
-            return failed("metadata-unavailable")
+            return failed(_metadata_failure(stage, error))
 
     async def _read_file(self, params: dict[str, Any], state: StateStore) -> str | None:
         if self._pipeline_requires_workspace():

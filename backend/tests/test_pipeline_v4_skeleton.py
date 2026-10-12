@@ -66,7 +66,8 @@ async def test_shadow_failure_is_non_blocking_and_cleanup_runs(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_skeleton_emits_complete_workspace_and_context_events(tmp_path) -> None:
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_skeleton_emits_complete_workspace_and_context_events(tmp_path, protocol_version) -> None:
     workspace = SimpleNamespace(
         info=WorkspaceInfo(
             repo="owner/repo",
@@ -89,18 +90,26 @@ async def test_skeleton_emits_complete_workspace_and_context_events(tmp_path) ->
     fake = SimpleNamespace(
         _gateway=SimpleNamespace(workspace_for=AsyncMock(return_value=workspace)),
         _events=events,
-        _pipeline_v4_config=PipelineV4Config(),
+        _pipeline_v4_config=PipelineV4Config(protocol_version=protocol_version),
     )
     state = StateStore(repo="owner/repo", pr_number=1, head_sha="abc")
     await run_hypothesis_pipeline(fake, state)
-    workspace_event, context_event = seen[:2]
+    assert [event.event_type for event in seen] == [
+        "workspace.built",
+        *(["file_changes.verified"] if protocol_version >= 3 else []),
+        "context_pack.built",
+        "pipeline_v4.completed",
+    ]
+    workspace_event, context_event = seen[0], seen[-2]
     assert workspace_event.event_type == "workspace.built"
     assert set(workspace_event.data) == {"source", "file_count", "byte_size", "truncated", "digest", "ms"}
     assert context_event.event_type == "context_pack.built"
     assert set(context_event.data) == {"units", "slices", "truncated_units", "chars"}
-    assert seen[2].event_type == "pipeline_v4.completed"
     assert state.ledger is not None
     assert state.ledger.run_id == "run"
+    if protocol_version >= 3:
+        assert state.ledger.structural_checks == seen[1].data
+        assert state.ledger.structural_checks["hydrator_available"] is False
 
 
 @pytest.mark.asyncio

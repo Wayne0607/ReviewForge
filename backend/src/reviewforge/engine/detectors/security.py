@@ -186,7 +186,9 @@ _SECURITY_RULES: dict[str, list[_Rule]] = {
             0.98,
         ),
         _Rule(
-            r"\bFunction\s*\(",
+            # JavaScript identifiers are case-sensitive even though the shared
+            # scanner also supports case-insensitive configuration/SQL rules.
+            r"(?-i:\bFunction)\s*\(",
             "code-injection",
             "warning",
             "Dynamic Function constructor used.",

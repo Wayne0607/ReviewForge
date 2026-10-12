@@ -56,6 +56,7 @@ from reviewforge.engine.provider_retry import (
     RetryChatLLM,
     RetryPolicy,
     current_retry_attempt,
+    safe_provider_diagnostics,
 )
 from reviewforge.engine.publication_policy import (
     PublicationPolicy,
@@ -117,6 +118,7 @@ class BenchmarkLLM(BaseChatModel):
                     "provider_attempt": attempt,
                     "error_type": type(exc).__name__,
                     "status_code": getattr(exc, "status_code", None),
+                    "provider_diagnostics": safe_provider_diagnostics(exc),
                     "usage_status": "unknown",
                 },
             )

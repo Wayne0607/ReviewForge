@@ -1,9 +1,8 @@
-"""Editor — deterministic selection + LLM comment writing (§4.7).
+"""Deterministic publication of independently verified v3 facts.
 
-The editor is a single publication_gate call per PR.  Deterministic
-preprocessing (cluster, rank, split) happens before any LLM call, so the
-inline-vs-summary split and its ordering are reproducible.  On LLM failure the
-confirmed hypotheses are still published through a deterministic template.
+V3 selection requires a current ProofGate receipt; comments preserve the
+accepted original facts and citations without another model call. V1/v2 keep
+their original LLM comment writing and deterministic failure template (§4.7).
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Site
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.proof_gate import accepted, completed
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,9 @@ def cluster_confirmed(ledger: HypothesisLedger) -> list[ConfirmedCluster]:
         if ledger.protocol_version >= 2 and item.coverage_identity
     }
     for hypothesis in sorted(ledger.items.values(), key=lambda item: item.identity):
-        if hypothesis.status != HypothesisStatus.CONFIRMED:
+        if hypothesis.status != HypothesisStatus.CONFIRMED or (
+            ledger.protocol_version >= 3 and not accepted(hypothesis, ledger)
+        ):
             continue
         key = (hypothesis.mechanism.value, _anchor(hypothesis))
         if key in distinct_risk_scopes:
@@ -200,6 +202,46 @@ def fallback_comment(cluster: ConfirmedCluster, *, output_language: str = "en") 
     )
 
 
+def proof_comment(cluster: ConfirmedCluster, *, output_language: str = "en") -> PublicationComment:
+    """Publish immutable reviewed facts; no second model may invent a new defect."""
+    english = output_language != "zh-CN"
+    parts = []
+    for item in cluster.hypotheses:
+        assessment = item.assessment
+        if assessment is None:
+            raise ValueError("publication requires an independently verified assessment")
+        parts.extend(
+            [
+                item.claim,
+                f"{'When' if english else '触发条件'}: {item.trigger}",
+                f"{'Impact' if english else '影响'}: {item.impact}",
+                f"{'Required' if english else '要求'}: {assessment.expected}",
+                f"{'Observed' if english else '实际'}: {assessment.actual}",
+            ]
+        )
+        by_id = {observation.id: observation for observation in item.observations}
+        seen = set()
+        for citation in [*assessment.expected_evidence, *assessment.actual_evidence]:
+            key = (citation.observation_id, citation.quote)
+            if key in seen:
+                continue
+            seen.add(key)
+            observation = by_id[citation.observation_id]
+            span = observation.excerpt_line_range or observation.line_range
+            location = observation.path or observation.tool
+            if span:
+                location += f":{span[0]}"
+            parts.append(f"{location}:\n" + "\n".join("> " + line for line in citation.quote.splitlines()))
+    parts.append("\n".join(f"- {site.path}:{site.line}" for site in cluster.sites))
+    return PublicationComment(
+        hypothesis_ids=list(cluster.hypothesis_ids),
+        path=cluster.sites[0].path,
+        line=cluster.sites[0].line,
+        title=cluster.hypotheses[0].claim[:60],
+        body="\n\n".join(parts),
+    )
+
+
 def fallback_summary(cluster: ConfirmedCluster) -> tuple[str, str]:
     if _structural(cluster):
         return cluster.hypothesis_ids[0], _structural_summary(cluster)
@@ -295,10 +337,20 @@ def resumed_publication(
     )
     inline_keys = {cluster.key for cluster in inline}
     return Publication(
-        comments=[fallback_comment(cluster, output_language=output_language) for cluster in inline],
+        comments=[
+            (proof_comment if ledger.protocol_version >= 3 else fallback_comment)(
+                cluster, output_language=output_language
+            )
+            for cluster in inline
+        ],
         summary_items=[fallback_summary(cluster) for cluster in ordered if cluster.key not in inline_keys],
         merged=[cluster.hypothesis_ids for cluster in inline if len(cluster.hypothesis_ids) > 1],
-        fallback=bool(ordered),
+        unknown_ids=(
+            [item.id for item in ledger.items.values() if item.status == HypothesisStatus.UNKNOWN]
+            if ledger.protocol_version >= 3
+            else []
+        ),
+        fallback=bool(ordered) and ledger.protocol_version < 3,
     )
 
 
@@ -321,7 +373,11 @@ def _parse_publication(content: str) -> dict[str, Any] | None:
 def _site_index(ledger: HypothesisLedger) -> dict[str, set[tuple[str, int]]]:
     index: dict[str, set[tuple[str, int]]] = {}
     for item in ledger.items.values():
-        if item.status == HypothesisStatus.CONFIRMED and item.change_anchor is None:
+        if (
+            item.status == HypothesisStatus.CONFIRMED
+            and item.change_anchor is None
+            and (ledger.protocol_version < 3 or accepted(item, ledger))
+        ):
             index[item.id] = {(site.path, site.line) for site in item.sites}
     return index
 
@@ -424,9 +480,20 @@ class Editor:
         """Cluster, select, and ask the editor LLM for comments.
 
         Falls back to the deterministic template when the LLM cannot produce a
-        valid JSON object, so confirmed hypotheses are always publishable.
+        valid JSON object. V3 uses current independent proof receipts and never
+        invokes a prose model or publishes an unverified fallback.
         """
 
+        if ledger.protocol_version >= 3:
+            return resumed_publication(
+                ledger,
+                covered_ids=set(),
+                published_clusters=set(),
+                inline_used=0,
+                max_inline=self._max_inline,
+                max_inline_overflow=self._max_inline_overflow,
+                output_language=self._output_language,
+            )
         ordered = order_clusters(cluster_confirmed(ledger))
         inline, summary = split_for_publication(ordered, self._max_inline, self._max_inline_overflow)
         unknown_ids = [
@@ -553,7 +620,12 @@ def render_review_body(publication: Publication, ledger: HypothesisLedger, *, ou
     """Render the PR review body ``<details>`` from summary items + UNKNOWN claims."""
 
     english = output_language != "zh-CN"
-    if not publication.summary_items and not publication.unknown_ids:
+    unverified = [
+        item
+        for item in ledger.items.values()
+        if ledger.protocol_version >= 3 and item.status == HypothesisStatus.CONFIRMED and not accepted(item, ledger)
+    ]
+    if not publication.summary_items and not publication.unknown_ids and not unverified:
         return ""
     claims_by_id = {item.id: item.claim for item in ledger.items.values()}
     lines: list[str] = ["<details>\n<summary>Review summary</summary>\n"]
@@ -568,6 +640,18 @@ def render_review_body(publication: Publication, ledger: HypothesisLedger, *, ou
         lines.append(f"\n**{'Unconfirmed' if english else '未能确认'}**（{wording}）\n")
         for identity in publication.unknown_ids:
             lines.append(f"- {claims_by_id.get(identity, identity)}\n")
+
+    if unverified:
+        label = "Not accepted by independent proof review" if english else "未通过独立证据核验"
+        lines.append(f"\n**{label}**\n")
+        rejected = sum(
+            completed(item, ledger) and ledger.publication_reviews.get(item.id, {}).get("decision") == "refuted"
+            for item in unverified
+        )
+        if english:
+            lines.append(f"{rejected} claims contradicted; {len(unverified) - rejected} claims remain unverified.\n")
+        else:
+            lines.append(f"{rejected} 条疑点被证据反驳；{len(unverified) - rejected} 条疑点尚未完成核验。\n")
 
     lines.append("\n</details>\n")
     return "".join(lines)

@@ -179,7 +179,7 @@ async def test_specialist_rules_share_initial_discovery_only_in_new_protocol(pro
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protocol_version", [2, 3])
 async def test_llm_stages_wire_generator_and_investigator(tmp_path, protocol_version) -> None:
-    diff = _diff("def f(x):", "    return x.name")
+    diff = _diff("def f(x=None):", "    return x.name")
     state = StateStore(
         repo="owner/repo",
         pr_number=1,
@@ -244,6 +244,18 @@ async def test_llm_stages_wire_generator_and_investigator(tmp_path, protocol_ver
                             },
                             "discrepancy": "The new receiver read has no local guard.",
                             "trigger_basis": {"side": "after", "path": "app.py", "line": 2, "excerpt": "return x.name"},
+                            "violation": {
+                                "required_behavior": "The function should support its explicitly declared default.",
+                                "requirement_basis": [
+                                    {"side": "after", "path": "app.py", "line": 1, "excerpt": "def f(x=None):"}
+                                ],
+                                "actual_incompatible_behavior": "Default None is dereferenced before a guard.",
+                                "negative_consequence": "The default call may raise AttributeError.",
+                                "supported_input": "The caller omits x, using the declared None default.",
+                                "input_basis": [
+                                    {"side": "after", "path": "app.py", "line": 1, "excerpt": "def f(x=None):"}
+                                ],
+                            },
                         }
                     ],
                     "no_issue_units": [],

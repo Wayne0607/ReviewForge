@@ -93,7 +93,7 @@ async def test_structural_preparation_before_context_diff_loading_keeps_verified
     "kwargs,error,patch_state",
     [
         ({"changed_blob": True}, "blob-mismatch", "absent-unverified"),
-        ({"fail": True}, "metadata-unavailable", "absent-unverified"),
+        ({"fail": True}, "before-tree:OSError", "absent-unverified"),
         ({"stale": True}, "stale-pr-head", "absent-unverified"),
         ({"mode": "100755"}, "unsupported-mode", "unsupported"),
     ],
@@ -115,6 +115,75 @@ async def test_failed_proof_is_explicit_and_not_retried(kwargs, error, patch_sta
     await gateway.ensure_file_changes(value)
     assert len(github.calls) == previous
     assert "private" not in change.proof_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["pr-identity", "pr-files", "comparison-base", "before-tree", "head-tree", "pr-recheck"]
+)
+async def test_metadata_exception_preserves_fixed_stage_and_kind_without_private_body(stage):
+    class FailingGitHub(GitHub):
+        info_reads = 0
+
+        async def get_pr_info(self, *args):
+            self.info_reads += 1
+            if stage == "pr-identity" and self.info_reads == 1 or stage == "pr-recheck" and self.info_reads == 2:
+                raise ValueError("private response body must not be copied")
+            return await super().get_pr_info(*args)
+
+        async def get_pr_files(self, *args):
+            if stage == "pr-files":
+                raise ValueError("private response body must not be copied")
+            return await super().get_pr_files(*args)
+
+        async def get_comparison_base(self, *args):
+            if stage == "comparison-base":
+                raise ValueError("private response body must not be copied")
+            return await super().get_comparison_base(*args)
+
+        async def get_git_entries(self, repo, ref, paths):
+            if stage == "before-tree" and ref == MERGE or stage == "head-tree" and ref == HEAD:
+                raise ValueError("private response body must not be copied")
+            return await super().get_git_entries(repo, ref, paths)
+
+    value = state()
+    populate_file_changes(value, [{"filename": "new.txt", "previous_filename": "old.txt", "status": "renamed"}])
+    await ToolGateway(build_registry(), FailingGitHub()).ensure_file_changes(value)
+    assert value.file_changes["new.txt"].proof_error == stage + ":ValueError"
+    assert not is_verified_rename(value.file_changes["new.txt"], HEAD)
+
+
+@pytest.mark.asyncio
+async def test_total_metadata_timeout_preserves_current_stage(monkeypatch):
+    class BlockingGitHub(GitHub):
+        async def get_git_entries(self, *args):
+            await asyncio.Event().wait()
+
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr("reviewforge.tools.gateway.asyncio.timeout", lambda _seconds: original_timeout(0.001))
+    value = state()
+    await ToolGateway(build_registry(), BlockingGitHub()).ensure_file_changes(value)
+    assert value.file_changes["new.txt"].proof_error == "before-tree:timeout"
+    assert not is_verified_rename(value.file_changes["new.txt"], HEAD)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,kind",
+    [
+        (httpx.ReadTimeout("private token/body"), "timeout-ReadTimeout"),
+        (Exception("private token/body"), "other-exception"),
+    ],
+)
+async def test_metadata_timeout_and_unknown_exception_labels_are_allowlisted(error, kind):
+    class FailingGitHub(GitHub):
+        async def get_comparison_base(self, *args):
+            raise error
+
+    value = state()
+    await ToolGateway(build_registry(), FailingGitHub()).ensure_file_changes(value)
+    assert value.file_changes["new.txt"].proof_error == "comparison-base:" + kind
+    assert "private" not in value.file_changes["new.txt"].proof_error
 
 
 @pytest.mark.asyncio

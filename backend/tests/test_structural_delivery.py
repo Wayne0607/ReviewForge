@@ -21,8 +21,9 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
 from reviewforge.engine.editor import Editor, cluster_confirmed, render_review_body, resumed_publication
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
-from reviewforge.engine.investigator import Investigator, build_workspace_executor
+from reviewforge.engine.investigator import Investigator, _evidence_segments, build_workspace_executor
 from reviewforge.engine.pipeline_v4 import _publication_coverage, run_hypothesis_pipeline
+from reviewforge.engine.proof_gate import OBLIGATIONS, ProofGate, accepted
 from reviewforge.tools.gateway import ToolGateway
 from reviewforge.tools.workspace import PRHeadWorkspace, WorkspaceInfo
 
@@ -344,6 +345,35 @@ async def test_read_change_does_not_silently_truncate_authoritative_metadata():
         await executor("read_change", {"path": item.path})
 
 
+async def review_saved_proofs(current):
+    """Script the independent review for this executable filename/id fixture."""
+    reviews = []
+    for item in current.items.values():
+        references = [
+            f"{item.id}/{reference}"
+            for observation in item.observations
+            for reference in _evidence_segments(observation)
+        ]
+        reviews.append(
+            {
+                "hypothesis_id": item.id,
+                "decision": "accepted",
+                "reason": "The saved filename/id loader contract conflicts with the renamed payload.",
+                "obligations": {
+                    name: {
+                        "statement": "The explicit loader validates the requested stem against payload id.",
+                        "evidence": references,
+                    }
+                    for name in OBLIGATIONS
+                },
+                "counterevidence": None,
+                "missing_obligations": [],
+            }
+        )
+    await ProofGate(ScriptedLLM(turns=[{"reviews": reviews}])).run(current)
+    assert all(accepted(item, current) for item in current.items.values())
+
+
 @pytest.mark.asyncio
 async def test_real_structural_reads_confirm_then_publish_summary_and_resume_without_duplicates():
     state, pack, executor = inputs()
@@ -358,6 +388,7 @@ async def test_real_structural_reads_confirm_then_publish_summary_and_resume_wit
     assert stored.observations[0].line_range is None
     assert [obs.path for obs in stored.observations[1:]] == ["loader.py", change().path]
     assert all(obs.sha == HEAD for obs in stored.observations)
+    await review_saved_proofs(current)
 
     editor_llm = ScriptedLLM()
     publication = await Editor(editor_llm).run(current, pack)
@@ -394,17 +425,19 @@ async def test_stale_structural_anchor_stops_before_tool_or_model_calls():
 
 @pytest.mark.asyncio
 async def test_structural_summary_cannot_be_forced_inline_or_use_up_inline_quota():
-    structural = replace(candidate(), status=HypothesisStatus.CONFIRMED)
+    state, pack, executor = inputs()
+    current = ledger(candidate())
+    await Investigator(ScriptedLLM(turns=[confirmation()]), executor, protocol_version=3).run(current, state, pack)
+    structural = next(iter(current.items.values()))
     regular = replace(
         structural,
         id="h_regular",
-        identity="other::null-path::run",
+        identity="other::contract-mismatch::payload",
         change_anchor=None,
-        sites=[Site("a.py", 5, "return user.name")],
-        claim="Missing user guard",
+        sites=[Site(change().path, 1, PAYLOAD.strip())],
     )
-    current = ledger(structural)
     current.upsert(regular)
+    await review_saved_proofs(current)
     llm = ScriptedLLM(
         turns=[
             {
@@ -427,20 +460,29 @@ async def test_structural_summary_cannot_be_forced_inline_or_use_up_inline_quota
     assert publication.summary_items[0][0] == structural.id
     assert "omit proof" not in publication.summary_items[0][1]
     assert "Before" in publication.summary_items[0][1]
+    assert not llm.calls
     assert len(cluster_confirmed(current)) == 2
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stale_metadata", [False, True])
-async def test_restored_summary_delivery_requires_fresh_matching_change_proof(tmp_path, stale_metadata):
+@pytest.mark.parametrize(
+    ("stale_metadata", "proof_case"), [(False, "valid"), (True, "valid"), (False, "missing"), (False, "changed-source")]
+)
+async def test_restored_summary_delivery_requires_fresh_matching_change_proof(tmp_path, stale_metadata, proof_case):
     state, pack, executor = inputs()
     current = ledger(candidate())
     await Investigator(ScriptedLLM(turns=[confirmation()]), executor, protocol_version=3).run(current, state, pack)
+    await review_saved_proofs(current)
     publication = await Editor(ScriptedLLM()).run(current, pack)
     body = render_review_body(publication, current)
     payload = {"comments": [], "body": body}
     payload["coverage"] = _publication_coverage(current, publication, payload)
     state.ledger = HypothesisLedger.from_dict(current.to_dict())
+    if proof_case == "missing":
+        payload["coverage"].pop("publication_proof_version")
+    elif proof_case == "changed-source":
+        restored = next(iter(state.ledger.items.values()))
+        restored.observations[0] = replace(restored.observations[0], result_digest="changed-source-digest")
     if stale_metadata:
         state.file_changes = {}
     source = tmp_path / "data"
@@ -477,6 +519,11 @@ async def test_restored_summary_delivery_requires_fresh_matching_change_proof(tm
             with pytest.raises(ValueError, match="verified PR change"):
                 await run_hypothesis_pipeline(fake, state)
             assert not calls
+        elif proof_case != "valid":
+            health = await run_hypothesis_pipeline(fake, state)
+            assert not calls and not health.completed
+            assert "frozen review lacks matching independent proof" in health.delivery.errors[0]
+            assert (await database.get_v4_publication("run"))["status"] == "pending"
         else:
             await run_hypothesis_pipeline(fake, state)
             await run_hypothesis_pipeline(fake, state)

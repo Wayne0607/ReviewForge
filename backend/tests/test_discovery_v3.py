@@ -60,6 +60,14 @@ def candidate(u: SemanticUnit) -> dict:
         "behavior": behavior(u.path),
         "discrepancy": "The return expression changed while the caller still uses the persisted value.",
         "trigger_basis": fact(u.path, "before", "return old_value"),
+        "violation": {
+            "required_behavior": "The persisted-value interface returns the stored old value.",
+            "requirement_basis": [fact(u.path, "before", "return old_value")],
+            "actual_incompatible_behavior": "The changed return yields the replacement value.",
+            "negative_consequence": "The caller receives a value incompatible with its persisted record.",
+            "supported_input": "The existing operation receives the caller's stored-value request.",
+            "input_basis": [fact(u.path, "before", "return old_value")],
+        },
     }
 
 
@@ -190,7 +198,9 @@ async def test_valid_candidate_with_uncertainty_words_is_accepted_without_blackl
     assert result.accepted == 1 and not ledger.unresolved_units
     assert llm.limits == [8192]
     stored = next(iter(ledger.items.values()))
-    assert stored.discovery_basis == {key: valid[key] for key in ("behavior", "discrepancy", "trigger_basis")}
+    assert stored.discovery_basis == {
+        key: valid[key] for key in ("behavior", "discrepancy", "trigger_basis", "violation")
+    }
     assert not stored.observations
 
 

@@ -5,6 +5,7 @@ Config priority: environment variables > reviewforge.yaml > defaults.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -164,6 +165,7 @@ class PipelineV4Config:
     max_tokens_per_pr: int = 250_000
     provider_max_attempts: int = 3
     provider_retry_404: bool = False
+    provider_retry_after_max_seconds: float = 60.0
 
 
 def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
@@ -180,6 +182,14 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         cfg.provider_max_attempts = data["provider_max_attempts"]
     if isinstance(data.get("provider_retry_404"), bool):
         cfg.provider_retry_404 = data["provider_retry_404"]
+    if "provider_retry_after_max_seconds" in data and not isinstance(data["provider_retry_after_max_seconds"], bool):
+        try:
+            retry_after_cap = float(data["provider_retry_after_max_seconds"])
+        except (ValueError, TypeError, OverflowError):
+            pass
+        else:
+            if math.isfinite(retry_after_cap) and retry_after_cap >= 0:
+                cfg.provider_retry_after_max_seconds = retry_after_cap
     for name, allowed in (
         ("json_output_mode", {"auto", "off", "json_object"}),
         ("investigator_closure_thinking", {"auto", "default", "disabled"}),

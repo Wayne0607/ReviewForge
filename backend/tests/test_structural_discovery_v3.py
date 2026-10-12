@@ -128,6 +128,14 @@ def candidate(unit, change):
         "discrepancy": "The verified path changed while the consumer's literal path did not.",
         "trigger_basis": source,
         "behavior": behavior(change),
+        "violation": {
+            "required_behavior": "The consumer's configured resource lookup must return the configuration.",
+            "requirement_basis": [source],
+            "actual_incompatible_behavior": "The renamed resource is unavailable at the consumer's literal old path.",
+            "negative_consequence": "The supported configuration load can fail.",
+            "supported_input": "The delivered production consumer calls its configured resource loader.",
+            "input_basis": [source],
+        },
     }
 
 

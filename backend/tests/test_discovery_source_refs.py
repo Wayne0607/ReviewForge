@@ -29,6 +29,8 @@ def referenced_candidate(u, block):
     item["behavior"]["source_facts"] = [reference(block, "before", u.path), reference(block, "after", u.path)]
     item["trigger_basis"] = reference(block, "before", u.path)
     item["sites"] = [reference(block, "after", u.path)]
+    item["violation"]["requirement_basis"] = [reference(block, "before", u.path)]
+    item["violation"]["input_basis"] = [reference(block, "before", u.path)]
     return item
 
 
@@ -43,6 +45,8 @@ async def test_six_long_exact_source_quotes_are_accepted_without_undeclared_leng
         {"side": "after", "path": u.path, "line": 1, "excerpt": after},
     ]
     item["trigger_basis"] = item["behavior"]["source_facts"][0]
+    item["violation"]["requirement_basis"] = [item["behavior"]["source_facts"][0]]
+    item["violation"]["input_basis"] = [item["behavior"]["source_facts"][0]]
     item["sites"] = [{"path": u.path, "line": 1, "excerpt": after}]
     ledger = HypothesisLedger("run", "abc", "digest", protocol_version=3)
     result = await HypothesisGenerator(ScriptedLLM(responses=[json.dumps({"hypotheses": [item]})])).run(

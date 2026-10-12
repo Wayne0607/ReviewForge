@@ -15,7 +15,8 @@ is before source, `+ line [sr_ID] | code` is after source, and unchanged
 LEFT; an after fact or site uses RIGHT. Do not copy RIGHT into a before fact.
 Context lines are separately numbered and require side=context even when the
 same text also appears in diff; alternatively cite its exact diff side/line.
-Use `{"source_ref":"sr_ID"}` for source_facts, trigger_basis and sites. Copy a
+Use `{"source_ref":"sr_ID"}` for source_facts, trigger_basis, sites and violation
+requirement_basis/input_basis. Copy a
 delivered ID exactly; the program resolves its side, path, line and exact source
 excerpt. IDs belong only to this block. Long lines show `sr_ID:start-end` column
 ranges for short fragments of the same source body; copy only the ID, without
@@ -26,14 +27,24 @@ preserve any `|` in the code itself. Only after/RIGHT
 locations can become `sites`. Facts must cite delivered source, not navigation,
 an omitted slice, a hypothetical call, or an invented input.
 
-First state the behavior before and after, and its observable result. Propose
-a candidate only when a concrete discrepancy is visible in the supplied source
-and a supported trigger has a source basis. Then ask one factual question whose
-answer determines the claimed regression, and state what would refute it. A
-remaining fact may need investigation; the entire claim cannot be an invented
-scenario. "This change is correct, but some unobserved caller might fail" has
-no concrete discrepancy or supported trigger. Wording is not a verdict: a
-source-backed regression can still be uncertain until investigation.
+First state the behavior before and after, and its observable result. A real
+observable change may be compatible with the contract or repair an earlier
+defect. That comparison alone does not establish a regression. A candidate
+also requires a separate violation: the required behavior and its real source
+basis, the after behavior incompatible with that requirement, the negative
+consequence, and a supported input/lifecycle with its real source basis. A
+before image alone does not establish that its behavior was required. References
+must support their assigned role; an unrelated caller, resource key or code
+line is not a supported input merely because it was delivered in this block.
+Do not manufacture a requirement to preserve a previous defect, formatting or
+wording. If you cannot establish the consumer requirement or a harmful after
+result, explicitly defer that boundary rather than allocate a defect candidate.
+For a compatible behavior change, no_issue.checked must explain which supplied
+contract remains satisfied and what was compared. Then ask one factual question
+whose answer determines the proposed regression, and state what would refute it.
+These obligations are still unconfirmed discovery navigation; investigation
+must independently prove the requirement, supported input, after violation and
+harm in the same direction. Source resolution does not prove semantic support.
 
 Keep independent triggers/impacts distinct. Combine sites only for the same
 root cause, trigger and consequence. An existing OPEN candidate is not proven;
@@ -82,6 +93,14 @@ Schema (the example IDs and source are not available IDs):
     "sites": [{"source_ref": "sr_AFTER_ID"}],
     "discrepancy": "Observed mismatch between the change and an input/caller/contract",
     "trigger_basis": {"source_ref": "sr_CALLER_ID"},
+    "violation": {
+      "required_behavior": "The delivered caller contract requires returning its persisted value",
+      "requirement_basis": [{"source_ref": "sr_CALLER_CONTRACT_ID"}],
+      "actual_incompatible_behavior": "The changed operation returns a replacement instead",
+      "negative_consequence": "The caller receives a value incompatible with its stored record",
+      "supported_input": "The delivered caller requests an existing persisted record",
+      "input_basis": [{"source_ref": "sr_SUPPORTED_CALL_ID"}]
+    },
     "behavior": {
       "before": "Result for the same concrete input before the change",
       "after": "Result for that input after the change",
@@ -127,6 +146,16 @@ Prefer the short IDs to repeating source text. Limit each prose field to at most
 characters; these are hard schema limits, not length targets. The behavior,
 discrepancy and trigger basis will be delivered as bounded navigation to the
 investigator; they are not Observations or confirmed evidence.
+Every hypothesis requires all six violation fields shown above; use no extra
+fields. Each violation prose field is a nonempty string of at most 600
+characters; each basis contains 1–4 real delivered source references. A single
+real source location may support both requirement and input when its actual
+content does so; different IDs are not required. Typed change facts, rules,
+navigation and negative search results cannot replace either source basis.
+The behavior delta and violation remain separate: a changed output is not by
+itself an incompatible or harmful output. Preserve this direction in claim,
+impact, open_question and refutation rather than asking whether a beneficial
+change could have any difference at all.
 
 Some units have `## Structural changes`: a typed, program-verified rename with
 equal comparison-base/head blobs and no text hunk. Its old/new path still changes

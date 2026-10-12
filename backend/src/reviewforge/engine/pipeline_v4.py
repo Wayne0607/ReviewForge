@@ -35,6 +35,8 @@ from reviewforge.engine.lenses import build_discovery_responsibilities, run_lens
 from reviewforge.engine.llm_protocol_v4 import request_options
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import scan_changed_files
+from reviewforge.engine.proof_gate import PROOF_VERSION, ProofGate, accepted, completed, proof_fingerprint
+from reviewforge.engine.proof_gate import retryable as proof_retryable
 from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
 from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
 from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
@@ -91,7 +93,7 @@ def _seed_detector_hypotheses(
     ledger: HypothesisLedger,
     findings: list[Any],
 ) -> int:
-    """Turn deterministic detector findings into CONFIRMED, strong hypotheses."""
+    """Treat v3 pattern matches as proposals requiring investigation and proof."""
 
     diffs = state.file_diffs or {}
     seeded = 0
@@ -102,7 +104,11 @@ def _seed_detector_hypotheses(
         unit = _unit_for(changeset.units, finding.file, max(1, finding.line))
         unit_id = unit.id if unit is not None else f"{finding.file}:line{max(1, finding.line)}"
         anchor = (unit.symbol if unit else "") or f"line{max(1, finding.line)}"
-        excerpt = _line_content(diffs.get(finding.file, ""), max(1, finding.line)) or str(finding.message)
+        excerpt = _line_content(diffs.get(finding.file, ""), max(1, finding.line))
+        if ledger.protocol_version >= 3 and (unit is None or not excerpt):
+            ledger.unresolved_units[unit_id] = "detector match has no attributable changed source"
+            continue
+        excerpt = excerpt or str(finding.message)
         identity = f"{unit_id}::{mechanism.value}::{anchor}"
         hypothesis = Hypothesis(
             id="h_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8],
@@ -110,15 +116,27 @@ def _seed_detector_hypotheses(
             unit_id=unit_id,
             mechanism=mechanism,
             claim=str(finding.message),
-            trigger="",
+            trigger="Execution reaches this changed operation; supported input remains to be verified."
+            if ledger.protocol_version >= 3
+            else "",
             impact=str(finding.suggestion or finding.message),
-            open_question="",
-            refutation="",
+            open_question=(
+                "Do the actual operation, supported input and consumer contract "
+                "establish a defect introduced by this change?"
+            )
+            if ledger.protocol_version >= 3
+            else "",
+            refutation=(
+                "Positive source shows a different operation, a protecting condition, "
+                "or no introduced violation of the required contract."
+            )
+            if ledger.protocol_version >= 3
+            else "",
             sites=[Site(path=str(finding.file), line=max(1, finding.line), excerpt=excerpt)],
             severity=_normalize_severity(finding.severity),
             source=f"detector:{finding.category}",
-            status=HypothesisStatus.CONFIRMED,
-            evidence_strength="strong",
+            status=HypothesisStatus.OPEN if ledger.protocol_version >= 3 else HypothesisStatus.CONFIRMED,
+            evidence_strength="none" if ledger.protocol_version >= 3 else "strong",
         )
         ledger.upsert(hypothesis)
         seeded += 1
@@ -195,7 +213,11 @@ async def _run_llm_stages(
         tracked = TrackedChatLLM(admitted, ctx, name, usage_sink=record, request_options=options, receipt_first=True)
         return RetryChatLLM(
             tracked,
-            policy=RetryPolicy(max_attempts=config.provider_max_attempts, retry_404=config.provider_retry_404),
+            policy=RetryPolicy(
+                max_attempts=config.provider_max_attempts,
+                retry_404=config.provider_retry_404,
+                retry_after_max_seconds=config.provider_retry_after_max_seconds,
+            ),
             attempt_sink=attempt_changed,
         )
 
@@ -303,6 +325,18 @@ async def _run_llm_stages(
             ),
         )
 
+    if ledger.protocol_version >= 3:
+        await ProofGate(routed("editor"), output_language=language, on_update=checkpoint).run(ledger)
+        events.emit(
+            "publication_proof.completed",
+            {
+                "accepted": sum(accepted(item, ledger) for item in ledger.items.values()),
+                "reviews": {
+                    key: {field: review.get(field) for field in ("decision", "outcome", "reason", "attempts")}
+                    for key, review in ledger.publication_reviews.items()
+                },
+            },
+        )
     if resume:
         publication = resumed_publication(
             ledger,
@@ -330,7 +364,7 @@ async def _run_llm_stages(
     events.emit("editor.completed", editor_stats)
 
     for item in ledger.items.values():
-        if item.source.startswith("detector"):
+        if ledger.protocol_version < 3 and item.source.startswith("detector"):
             continue
         if item.status == HypothesisStatus.UNKNOWN and (
             item.verdict_reason == "budget-exhausted" or item.investigation_outcome == "policy-deferred"
@@ -433,6 +467,16 @@ def _publication_coverage(
         "confirmed_ids": sorted(covered),
         "cluster_keys": [list(cluster.key) for cluster in clusters if covered.intersection(cluster.hypothesis_ids)],
         "fact_hashes": {item.id: confirmed_fact_digest(item) for item in ledger.items.values() if item.id in covered},
+        **(
+            {
+                "publication_proof_version": PROOF_VERSION,
+                "proof_fingerprints": {
+                    identity: ledger.publication_reviews[identity]["fingerprint"] for identity in covered
+                },
+            }
+            if ledger.protocol_version >= 3
+            else {}
+        ),
     }
 
 
@@ -454,10 +498,21 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
 
     config = orchestrator._pipeline_v4_config
     protocol_version = state.ledger.protocol_version if state.ledger is not None else config.protocol_version
+    structural_checks = {}
     if protocol_version >= 3:
+        metadata_started = time.perf_counter()
         hydrate_changes = getattr(orchestrator._gateway, "ensure_file_changes", None)
         if callable(hydrate_changes):
             await hydrate_changes(state)
+        structural_checks = {
+            "head_sha": state.head_sha,
+            "elapsed_ms": int((time.perf_counter() - metadata_started) * 1000),
+            "hydrator_available": callable(hydrate_changes),
+            "changes": {
+                path: change.to_dict() for path, change in state.file_changes.items() if change.status == "renamed"
+            },
+        }
+        orchestrator._events.emit("file_changes.verified", structural_checks)
 
     # Rebuild through the pinned gateway, including after legacy shadow: v4
     # declarations must be code-backed, independent of legacy regex heuristics.
@@ -500,6 +555,8 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     elif state.ledger.protocol_version >= 3 and state.ledger.workspace_digest != pack.workspace_digest:
         raise ValueError("restored hypothesis ledger does not match pinned workspace")
     ledger = state.ledger
+    if ledger.protocol_version >= 3:
+        ledger.structural_checks = structural_checks
     for item in ledger.items.values():
         if item.change_anchor is not None and state.file_changes.get(item.change_anchor.path) != item.change_anchor:
             raise ValueError("restored structural hypothesis does not match the verified PR change")
@@ -512,6 +569,18 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     # Finish/reconcile every frozen batch before spending model tokens or
     # preparing new writes. Ambiguous acceptance permits reads only.
     for record in records:
+        if ledger.protocol_version >= 3 and record["status"] != "delivered":
+            coverage = record["payload"].get("coverage", {})
+            by_id = {item.id: item for item in ledger.items.values()}
+            if coverage.get("publication_proof_version") != PROOF_VERSION or any(
+                identity not in by_id
+                or not accepted(by_id[identity], ledger)
+                or coverage.get("proof_fingerprints", {}).get(identity)
+                != ledger.publication_reviews[identity].get("fingerprint")
+                for identity in coverage.get("confirmed_ids", [])
+            ):
+                outcome = DeliveryOutcome(error="frozen review lacks matching independent proof verification")
+                break
         rejected += int(record["payload"].get("rejected", 0))
         outcome = await deliver_saved_publication(
             database, orchestrator._gateway, state, ledger.run_id, batch_id=record["batch_id"]
@@ -528,10 +597,31 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     published_clusters = {
         tuple(key) for record in records for key in record["payload"].get("coverage", {}).get("cluster_keys", [])
     }
+
+    def publication_pending(item: Hypothesis) -> bool:
+        if ledger.protocol_version < 3:
+            return item.id not in covered_ids
+        if accepted(item, ledger):
+            return item.id not in covered_ids
+        if completed(item, ledger):
+            return False
+        if proof_retryable(item, ledger):
+            return True
+        review = ledger.publication_reviews.get(item.id, {})
+        # Absent/stale receipts are new work. Current budget refusals and capped
+        # execution errors cannot acquire another attempt merely by resuming.
+        return (
+            review.get("proof_version") != PROOF_VERSION
+            or review.get("fingerprint") != proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest)
+            or review.get("run_id") != ledger.run_id
+            or review.get("head_sha") != ledger.head_sha
+            or review.get("workspace_digest") != ledger.workspace_digest
+        )
+
     needs_resume = bool(ledger.unresolved_units) or any(
         item.status == HypothesisStatus.OPEN
         or (item.status == HypothesisStatus.UNKNOWN and item.retryable)
-        or (item.status == HypothesisStatus.CONFIRMED and item.id not in covered_ids)
+        or (item.status == HypothesisStatus.CONFIRMED and publication_pending(item))
         for item in ledger.items.values()
     )
     if saved and needs_resume and any("coverage" not in record["payload"] for record in records):
@@ -549,12 +639,14 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     publication = Publication(comments=[], summary_items=[], merged=[], unknown_ids=[], fallback=False)
     language = resolve_output_language(state, config)
     usage_by_agent: dict[str, int] = {}
+    stages_ran = False
     if (
         not outcome.error
         and (not saved or needs_resume)
         and getattr(orchestrator, "_model_router", None) is not None
         and changeset.units
     ):
+        stages_ran = True
         publication = await _run_llm_stages(
             orchestrator,
             state,
@@ -580,7 +672,19 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         await database.save_shadow_publication(
             ledger.run_id, {"publication": asdict(publication), "payload": payload, "rejected": rejected}
         )
-    if config.mode == "hypothesis" and not outcome.error:
+    new_publication = not (
+        saved
+        and ledger.protocol_version >= 3
+        and (
+            not stages_ran
+            or (
+                not publication.comments
+                and not publication.summary_items
+                and payload["body"] in {record["payload"].get("body", "") for record in records}
+            )
+        )
+    )
+    if config.mode == "hypothesis" and not outcome.error and new_publication:
         if database and (payload["comments"] or payload["body"]):
             coverage = _publication_coverage(ledger, publication, payload)
             batch_id = (
@@ -618,6 +722,11 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         or (item.status == HypothesisStatus.UNKNOWN and not item.investigation_outcome)
         for item in hypotheses
     )
+    proof_failures = (
+        sum(item.status == HypothesisStatus.CONFIRMED and not completed(item, ledger) for item in hypotheses)
+        if ledger.protocol_version >= 3
+        else 0
+    )
     orchestrator._events.emit(
         "pipeline_v4.completed",
         {
@@ -634,9 +743,19 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             "investigation_tasks": len(ledger.investigation_tasks),
             "investigation_failures": investigation_failures,
             "policy_deferred": sum(item.investigation_outcome == "policy-deferred" for item in hypotheses),
+            **(
+                {
+                    "publication_verified": sum(accepted(item, ledger) for item in hypotheses),
+                    "publication_proof_failures": proof_failures,
+                }
+                if ledger.protocol_version >= 3
+                else {}
+            ),
         },
     )
     return RunHealth.build(
+        publication_failures=proof_failures,
+        publication_retryable=any(proof_retryable(item, ledger) for item in hypotheses),
         hypothesis_failures=len(ledger.unresolved_units),
         investigation_unknown_errors=unknown_error,
         investigation_retryable=any(item.retryable for item in hypotheses),

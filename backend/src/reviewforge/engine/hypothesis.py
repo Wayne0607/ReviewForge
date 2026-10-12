@@ -285,6 +285,8 @@ class HypothesisLedger:
     investigation_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
     discovery_blocks: dict[str, dict[str, Any]] = field(default_factory=dict)
     request_budget: dict[str, Any] = field(default_factory=dict)
+    publication_reviews: dict[str, dict[str, Any]] = field(default_factory=dict)
+    structural_checks: dict[str, Any] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -477,6 +479,8 @@ class HypothesisLedger:
                     {
                         "discovery_blocks": copy.deepcopy(self.discovery_blocks),
                         "request_budget": copy.deepcopy(self.request_budget),
+                        "publication_reviews": copy.deepcopy(self.publication_reviews),
+                        "structural_checks": copy.deepcopy(self.structural_checks),
                     }
                     if self.protocol_version >= 3
                     else {}
@@ -496,4 +500,6 @@ class HypothesisLedger:
             investigation_tasks=copy.deepcopy(data.get("investigation_tasks", {})),
             discovery_blocks=copy.deepcopy(data.get("discovery_blocks", {})),
             request_budget=copy.deepcopy(data.get("request_budget", {})),
+            publication_reviews=copy.deepcopy(data.get("publication_reviews", {})),
+            structural_checks=copy.deepcopy(data.get("structural_checks", {})),
         )

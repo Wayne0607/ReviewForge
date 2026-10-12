@@ -4,7 +4,11 @@ Protocols v1/v2 keep their original PR pass and risk-ordered input chunking.
 Protocol v3 delivers bounded groups of related changes, exact per-unit source
 scope and domain responsibilities, sharing each complete before/after hunk.
 Explicit before/RIGHT coordinates and declaration presence keep new code and
-old implementations distinct. The generator only *proposes*; it never investigates and never
+old implementations distinct. Candidate violation obligations separately bind
+the proposed requirement, supported input, incompatible after behavior and harm;
+an observed before/after delta alone does not enter the hypothesis queue.
+These checks validate source and schema, never semantic proof. The generator
+only *proposes*; it never investigates and never
 retries with a "look harder" signal — explicit clean assessments are valid
 NO_ISSUE results. Units omitted from an otherwise valid response, or in a
 block that fails to parse, are marked ``unresolved``.
@@ -56,7 +60,7 @@ _EXCERPT_MIN_CHARS = 12
 
 def _discovery_output_floor(unit_count: int, allowance: int) -> int:
     """Policy estimate for useful structured coverage, not a truncation guarantee."""
-    return min(8192, 256 + 256 * unit_count + 448 * min(allowance, unit_count))
+    return min(8192, 256 + 256 * unit_count + 640 * min(allowance, unit_count))
 
 
 def _discovery_available(ledger: HypothesisLedger) -> int:
@@ -774,6 +778,34 @@ class HypothesisGenerator:
                 return False
         return True
 
+    @staticmethod
+    def _valid_violation(item: dict[str, Any], block: DiscoveryBlock) -> bool:
+        """Check discovery's source-bound obligations, never certify a defect.
+
+        Before/after deltas alone are not an expected contract or harmful
+        outcome. Whether the supplied source actually supports each statement
+        remains an independent investigation/proof-gate question.
+        """
+        violation = item.get("violation")
+        prose = ("required_behavior", "actual_incompatible_behavior", "negative_consequence", "supported_input")
+        bases = ("requirement_basis", "input_basis")
+        return (
+            isinstance(violation, dict)
+            and set(violation) == set(prose + bases)
+            and all(
+                isinstance(violation.get(field), str)
+                and bool(violation[field].strip())
+                and len(violation[field]) <= 600
+                for field in prose
+            )
+            and all(
+                isinstance(violation.get(field), list)
+                and 1 <= len(violation[field]) <= 4
+                and all(block.source_matches(fact) for fact in violation[field])
+                for field in bases
+            )
+        )
+
     async def _consume_discovery(
         self,
         parsed: dict[str, Any],
@@ -834,6 +866,10 @@ class HypothesisGenerator:
                         or len(raw["checked"]) > 600
                     ):
                         failed[unit_id] = "missing concrete checked boundary"
+                    continue
+                if not self._valid_violation(raw, block):
+                    failed[unit_id] = "invalid source-backed violation obligations"
+                    result.dropped_invalid += 1
                     continue
                 payload, sites = self._validate_hypothesis(raw, right_lines)
                 required = ("claim", "trigger", "impact", "open_question", "refutation", "discrepancy")
@@ -948,6 +984,11 @@ class HypothesisGenerator:
             behavior["source_facts"] = [block.resolve_source_fact(fact) for fact in behavior["source_facts"]]
         if "trigger_basis" in item:
             item["trigger_basis"] = block.resolve_source_fact(item["trigger_basis"])
+        violation = item.get("violation")
+        if isinstance(violation, dict):
+            for field in ("requirement_basis", "input_basis"):
+                if isinstance(violation.get(field), list):
+                    violation[field] = [block.resolve_source_fact(fact) for fact in violation[field]]
         if isinstance(item.get("sites"), list):
             sites = []
             for site in item["sites"]:
@@ -1161,7 +1202,7 @@ class HypothesisGenerator:
                     continue
                 if ledger.protocol_version >= 3:
                     payload["discovery_basis"] = copy.deepcopy(
-                        {field: item[field] for field in ("behavior", "discrepancy", "trigger_basis")}
+                        {field: item[field] for field in ("behavior", "discrepancy", "trigger_basis", "violation")}
                     )
                 payload["change_anchor"] = change
                 valid.append((payload, sites))

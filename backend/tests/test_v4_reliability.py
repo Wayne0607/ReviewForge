@@ -18,6 +18,7 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.engine.pipeline_v4 import _persist_ledger, run_hypothesis_pipeline
+from reviewforge.engine.proof_gate import PROOF_VERSION
 from reviewforge.engine.semantic_diff import compile_semantic_changeset
 from reviewforge.tools.workspace import WorkspaceUnavailable
 
@@ -50,7 +51,10 @@ def state_and_fake(tmp_path, *, db=None, protocol_version=3):
         repo="owner/repo",
         pr_number=1,
         head_sha="abc",
-        file_diffs={"app.py": "@@ -0,0 +1,2 @@\n+def f(x):\n+    return x.name\n"},
+        file_diffs={
+            "app.py": "@@ -0,0 +1,2 @@\n+def f(x):\n"
+            '+    return x.name  # Contract: accepts None and returns "" for a missing receiver.\n'
+        },
         impact_manifest={
             "files": [
                 {
@@ -87,6 +91,27 @@ def state_and_fake(tmp_path, *, db=None, protocol_version=3):
                             },
                             "discrepancy": "The new receiver read has no local guard.",
                             "trigger_basis": {"side": "after", "path": "app.py", "line": 2, "excerpt": "return x.name"},
+                            "violation": {
+                                "required_behavior": "None is supported and requires an empty display name.",
+                                "requirement_basis": [
+                                    {
+                                        "side": "after",
+                                        "path": "app.py",
+                                        "line": 2,
+                                        "excerpt": 'Contract: accepts None and returns "" for a missing receiver.',
+                                    }
+                                ],
+                                "actual_incompatible_behavior": (
+                                    "The new operation dereferences None instead of returning the empty name."
+                                ),
+                                "negative_consequence": (
+                                    "An AttributeError prevents the caller receiving the required display name."
+                                ),
+                                "supported_input": "A missing receiver is the documented supported None input.",
+                                "input_basis": [
+                                    {"side": "after", "path": "app.py", "line": 2, "excerpt": "accepts None"}
+                                ],
+                            },
                         }
                     ],
                     "no_issue_units": [],
@@ -393,7 +418,19 @@ async def test_ambiguous_frozen_delivery_blocks_new_models_and_supplements(tmp_p
         fake._pipeline_v4_config.mode = "hypothesis"
         fake._model_router.get_llm = lambda name: pytest.fail("models ran before delivery reconciliation")
         await db.prepare_v4_publication(
-            "run", "abc", {"comments": [], "body": "unconfirmed", "coverage": {"confirmed_ids": []}}
+            "run",
+            "abc",
+            {
+                "comments": [],
+                "body": "unconfirmed",
+                # No confirmed claim or comment is published by this batch;
+                # its current empty proof stamp isolates receipt reconciliation.
+                "coverage": {
+                    "confirmed_ids": [],
+                    "publication_proof_version": PROOF_VERSION,
+                    "proof_fingerprints": {},
+                },
+            },
         )
         await db.claim_v4_publication("run")
         fake._gateway.invoke = AsyncMock(return_value={})

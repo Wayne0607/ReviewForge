@@ -1180,6 +1180,8 @@ class Investigator:
                 )
             }
             candidate["mechanism"] = hypothesis.mechanism.value
+            if hypothesis.discovery_basis.get("violation"):
+                candidate["proposed_violation"] = hypothesis.discovery_basis["violation"]
             candidate["sites"] = [
                 {"path": site.path, "line": site.line, "excerpt": site.excerpt} for site in hypothesis.sites
             ]
@@ -1455,7 +1457,14 @@ class Investigator:
                             self._quote_outside_diff(by_id[citation.observation_id], citation.quote, changed)
                             for citation in proof
                         )
-                        strength = "strong" if (outside_diff or hypothesis.source.startswith("detector")) else "weak"
+                        strength = (
+                            "strong"
+                            if (
+                                outside_diff
+                                or (self._protocol_version < 3 and hypothesis.source.startswith("detector"))
+                            )
+                            else "weak"
+                        )
 
         return self._result(
             verdict=verdict,

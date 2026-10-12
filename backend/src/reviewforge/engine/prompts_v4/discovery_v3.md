@@ -10,8 +10,12 @@ including which values are written or omitted. Intent alone does not establish
 equivalence or correctness.
 
 Shared hunks are supplied once for all the units that use them. `- line | code`
-is before source, `+ line | code` is after source, and unchanged ` line | code`
-uses RIGHT coordinates. Context lines are separately numbered. Copy excerpts
+is before source, `+ line | code` is after source, and unchanged
+`before=LEFT RIGHT=NEW | code` has two explicit coordinates. A before fact uses
+LEFT; an after fact or site uses RIGHT. Do not copy RIGHT into a before fact.
+Context lines are separately numbered and require side=context even when the
+same text also appears in diff; alternatively cite its exact diff side/line.
+Copy excerpts
 from the code after `|`; preserve any `|` in the code itself. Only after/RIGHT
 locations can become `sites`. Facts must cite delivered source, not navigation,
 an omitted slice, a hypothetical call, or an invented input.
@@ -36,9 +40,21 @@ Return one JSON object. Each allowed unit must have a hypothesis, a concrete
 `no_issue_units` check, or an explicit `deferred_units` reason. Independent
 hypotheses may share a unit; do not mix clean/deferred with a hypothesis for
 that unit. No blanket "looks correct" or "logic equivalent" clean assessments:
-show which before/after behavior and contract you actually compared. For new
-code, describe the absent prior behavior and cite after source; otherwise cite
-both before and after source. Source facts are review input, never saved
+show which before/after behavior and contract you actually compared.
+`absent-before-in-delivered-source` means only that the delivered fragments have
+no before source; a zero-context insertion can have this state. It does not mean
+the base file did not exist or that prior behavior was absent across the PR.
+`absent-new-declaration` records a positively added head declaration with no old
+counterpart in the visible source association. It does not prove that no same
+declaration or prior caller behavior exists elsewhere. Describe only this local
+absence and cite after source; a reused old closing brace is not an old
+implementation of a new method. Otherwise cite both target before and after
+source when supplied. `unresolved-declaration-correspondence` does not establish
+newness, including when no target before source was delivered. Do not invent
+prior behavior from an unavailable before image; defer a check whose conclusion
+needs that missing source. The exact per-unit target ranges govern behavior facts and the primary
+site; the wider shared hunk is supporting source, not a substitute target.
+Source facts are review input, never saved
 investigation Observations or proof that the candidate is confirmed.
 
 Schema (the example IDs and source are not available IDs):
@@ -101,6 +117,10 @@ excerpt, including trigger_basis. Limit each prose field to at most 600
 characters; these are hard schema limits, not length targets. The behavior,
 discrepancy and trigger basis will be delivered as bounded navigation to the
 investigator; they are not Observations or confirmed evidence.
+The unit's listed responsibilities and their domain rules are delivered with
+this first discovery input. Check those rules together with general correctness
+against the same source; there is no later full-PR specialist rescan. Rules are
+not evidence, and echoing a responsibility name does not prove coverage.
 
 This block allows at most **{{max_hypotheses}} new candidates**. This is an
 upper bound, not a quota; the whole PR shares a fixed candidate cap. If a real

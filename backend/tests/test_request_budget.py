@@ -14,6 +14,7 @@ from reviewforge.engine.request_budget import (
     RequestBudgetExceededError,
     estimate_request,
     investigation_request_scope,
+    plan_request,
 )
 
 
@@ -160,3 +161,79 @@ async def test_retries_cannot_reset_the_individual_investigation_allowance():
         assert 6_000 < investigation.snapshot()["unreported_reserved_tokens"] < 7_000
     assert budget.snapshot()["pending"] == {}
     assert budget.snapshot()["unreported_reserved_tokens"] == investigation.snapshot()["unreported_reserved_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_planning_includes_bound_tools_and_tracked_options_without_reserving():
+    from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
+    from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
+
+    model = _Model()
+    budget = RequestBudget(30_000, editor_reserve=0)
+    options = {"extra_body": {"thinking": {"type": "disabled"}}}
+    wrapped = RetryChatLLM(
+        TrackedChatLLM(
+            BudgetedChatLLM(model, budget, phase="investigation"),
+            RunContext(),
+            "investigator",
+            request_options=options,
+        ),
+        RetryPolicy(max_attempts=3, base_delay_seconds=0),
+    ).bind_tools([{"type": "function", "function": {"name": "read", "description": "source " * 300}}])
+    messages = [HumanMessage(content="inspect")]
+    before = budget.snapshot()
+    plan = plan_request(wrapped, messages, fallback_available=20_000)
+    assert budget.snapshot() == before
+    await wrapped.ainvoke(messages, max_tokens=plan.max_output_tokens)
+    assert plan.input_tokens == estimate_request(messages, model.calls[0])
+    assert model.calls[0]["extra_body"] == options["extra_body"]
+    assert plan.input_tokens > estimate_request(messages, {"max_tokens": 4_000})
+
+
+@pytest.mark.asyncio
+async def test_closure_reduces_output_to_remaining_task_capacity_using_admission_estimator():
+    model = _Model()
+    budget = RequestBudget(250_000)
+    wrapped = BudgetedChatLLM(model, budget, phase="investigation")
+    messages = [HumanMessage(content="source " * 2_850)]
+    with investigation_request_scope(16_000) as task:
+        receipt = task.reserve("investigation", 6_034)
+        task.settle(receipt, 6_034)
+        plan = plan_request(wrapped, messages, fallback_available=9_966)
+        assert plan.available_tokens == 9_966
+        assert 512 <= plan.max_output_tokens < 4_000
+        assert plan.input_tokens + plan.max_output_tokens == 9_966
+        await wrapped.ainvoke(messages, max_tokens=plan.max_output_tokens)
+        assert task.snapshot()["denied_requests"] == 0
+        assert task.snapshot()["reported_tokens"] == 6_046
+
+
+def test_plan_honors_pending_pr_capacity_and_reserves_next_request():
+    budget = RequestBudget(20_000, editor_reserve=2_000)
+    budget.reserve("investigation", 12_000)
+    wrapped = BudgetedChatLLM(_Model(), budget, phase="investigation")
+    messages = [HumanMessage(content="inspect")]
+    with investigation_request_scope(16_000):
+        plan = plan_request(wrapped, messages, fallback_available=16_000, reserve_tokens=3_000)
+    assert plan.available_tokens == 6_000
+    assert plan.max_output_tokens == 3_000 - plan.input_tokens
+    assert budget.snapshot()["request_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retries_keep_preplanned_request_identical_when_remaining_capacity_shrinks():
+    from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
+
+    model = _Model(fail=True)
+    budget = RequestBudget(30_000, editor_reserve=0)
+    wrapped = RetryChatLLM(
+        BudgetedChatLLM(model, budget, phase="investigation"),
+        RetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    messages = [HumanMessage(content="inspect")]
+    plan = plan_request(wrapped, messages, fallback_available=30_000)
+    with pytest.raises(TimeoutError):
+        await wrapped.ainvoke(messages, max_tokens=plan.max_output_tokens)
+    assert len(model.calls) == 3
+    assert model.calls[0] == model.calls[1] == model.calls[2]
+    assert model.calls[0]["max_tokens"] == plan.max_output_tokens

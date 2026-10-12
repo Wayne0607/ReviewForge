@@ -1,10 +1,10 @@
 """Hypothesis generator for the hypothesis pipeline.
 
-One bounded pass over the whole PR: the deterministic context pack plus the
-before/after hunks are shared once per file in each block, with separate
-RIGHT-side anchors per semantic unit (risk-ordered, chunked when the input
-exceeds the configured budget), and the model proposes testable
-hypotheses.  The generator only *proposes*; it never investigates and never
+Protocols v1/v2 keep their original PR pass and risk-ordered input chunking.
+Protocol v3 delivers bounded groups of related changes, exact per-unit source
+scope and domain responsibilities, sharing each complete before/after hunk.
+Explicit before/RIGHT coordinates and declaration presence keep new code and
+old implementations distinct. The generator only *proposes*; it never investigates and never
 retries with a "look harder" signal — explicit clean assessments are valid
 NO_ISSUE results. Units omitted from an otherwise valid response, or in a
 block that fails to parse, are marked ``unresolved``.
@@ -193,6 +193,16 @@ def _new_hypothesis_id(identity: str) -> str:
     return "h_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
 
 
+def _coordinate_ranges(lines: list[int]) -> str:
+    ranges = []
+    for line in sorted(set(lines)):
+        if ranges and line == ranges[-1][1] + 1:
+            ranges[-1][1] = line
+        else:
+            ranges.append([line, line])
+    return ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in ranges)
+
+
 def _parse_mechanism(value: Any) -> Mechanism | None:
     if isinstance(value, Mechanism):
         return value
@@ -263,6 +273,8 @@ class HypothesisGenerator:
         discovery_max_units: int = 12,
         discovery_max_blocks: int = 8,
         discovery_max_hypotheses_per_block: int = 6,
+        unit_responsibilities: dict[str, list[str]] | None = None,
+        responsibility_rules: dict[str, str] | None = None,
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
@@ -287,6 +299,8 @@ class HypothesisGenerator:
         )
         self._discovery_max_blocks = max(1, int(discovery_max_blocks))
         self._discovery_max_hypotheses_per_block = max(1, int(discovery_max_hypotheses_per_block))
+        self._unit_responsibilities = copy.deepcopy(unit_responsibilities or {})
+        self._responsibility_rules = dict(responsibility_rules or {})
 
     def _system_prompt(self) -> str:
         lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
@@ -387,7 +401,7 @@ class HypothesisGenerator:
                 await self._on_update(ledger)
         return result
 
-    def _discovery_system_prompt(self, allowance: int) -> str:
+    def _discovery_system_prompt(self, allowance: int, responsibilities: list[str] | None = None) -> str:
         prompt = load_prompt(
             "discovery_v3",
             output_language=_language_directive(self._output_language),
@@ -396,6 +410,12 @@ class HypothesisGenerator:
         )
         if self._skill_body:
             prompt += f"\n\n## Specialist rules\n{self._skill_body}"
+        seen = set()
+        for name in responsibilities or []:
+            body = self._responsibility_rules.get(name, "")
+            if body and body not in seen:
+                seen.add(body)
+                prompt += f"\n\n## Responsibility rules: {name} (rules, not evidence)\n{body}"
         return prompt + "\n\n" + defect_scope_guidance() + "\n\n" + investigation_capabilities()
 
     def _render_discovery_message(
@@ -404,25 +424,16 @@ class HypothesisGenerator:
         ids = ", ".join(unit.id for unit in block.units)
         anchors = []
         for unit in block.units:
-            lines = sorted(
-                {
-                    fact.line
-                    for fact in block.facts
-                    if fact.side == "after"
-                    and fact.path == unit.path
-                    and (not unit.start_line or max(1, unit.start_line - 3) <= fact.line <= unit.end_line + 3)
-                }
-            )
-            ranges = []
-            for line in lines:
-                if ranges and line == ranges[-1][1] + 1:
-                    ranges[-1][1] = line
-                else:
-                    ranges.append([line, line])
-            coordinates = ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in ranges)
+            target = block.unit_facts.get(unit.id, [])
+            coordinates = _coordinate_ranges([fact.line for fact in target if fact.side == "after"])
+            before = _coordinate_ranges([fact.line for fact in target if fact.side == "before"])
             anchors.append(
                 f"- {unit.id} {unit.path} symbol={unit.symbol or '-'} RIGHT lines: "
                 + (coordinates or "(none in this unit's range)")
+                + f"; before state={block.unit_before_states.get(unit.id)}; before lines: "
+                + (before or "(no target before quote required)")
+                + "; responsibilities: "
+                + (", ".join(self._unit_responsibilities.get(unit.id, [])) or "general correctness")
             )
         # Cross-block rows retain identity/trigger/impact navigation but cannot
         # consume the changed-source budget or count as a fresh assessment.
@@ -498,7 +509,7 @@ class HypothesisGenerator:
             overview_changeset=overview_changeset or changeset,
         )
         right_lines = _right_lines_by_path(state)
-        for index, block in enumerate(blocks):
+        for block in blocks:
             key = f"{self._source}:{block.id}"
             record = {
                 "source": self._source,
@@ -508,18 +519,43 @@ class HypothesisGenerator:
                 "oversize": block.oversize,
                 "units": {},
                 "status": "pending",
+                "source_ranges": {
+                    unit.id: {
+                        "before_state": block.unit_before_states.get(unit.id),
+                        "before": _coordinate_ranges(
+                            [fact.line for fact in block.unit_facts.get(unit.id, []) if fact.side == "before"]
+                        ),
+                        "after": _coordinate_ranges(
+                            [fact.line for fact in block.unit_facts.get(unit.id, []) if fact.side == "after"]
+                        ),
+                    }
+                    for unit in block.units
+                },
             }
             ledger.discovery_blocks[key] = record
             used = sum(item.source == "generator" or item.source.startswith("lens:") for item in ledger.items.values())
             allowance = min(self._discovery_max_hypotheses_per_block, max(0, self._max_hypotheses - used))
+            responsibilities = list(
+                dict.fromkeys(name for unit in block.units for name in self._unit_responsibilities.get(unit.id, []))
+            )
+            record["requested_responsibilities"] = {
+                unit.id: self._unit_responsibilities.get(unit.id, []) for unit in block.units
+            }
             user = self._render_discovery_message(
-                block, ledger, allowance, self._verification_guidance(block.units, state.file_diffs or {}, pack)
+                block,
+                ledger,
+                allowance,
+                self._verification_guidance(
+                    block.units, state.file_diffs or {}, pack, delivered_rules=set(responsibilities)
+                ),
             )
             record["input_chars"] = len(user)
             failure = block.failure
-            if index >= self._discovery_max_blocks:
+            if any(not self._responsibility_rules.get(name, "").strip() for name in responsibilities):
+                failure = "missing responsibility rules"
+            if not failure and result.blocks >= self._discovery_max_blocks:
                 failure = "capacity-deferred: discovery block limit"
-            elif len(user) > self._max_input_chars:
+            elif not failure and len(user) > self._max_input_chars:
                 failure = "input-too-large"
             if failure:
                 record["status"] = "capacity-deferred" if failure.startswith("capacity-deferred") else "unresolved"
@@ -531,11 +567,16 @@ class HypothesisGenerator:
                     await self._on_update(ledger)
                 continue
             result.blocks += 1
+            record["attempted_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
             try:
                 response = await self._llm.ainvoke(
-                    [SystemMessage(content=self._discovery_system_prompt(allowance)), HumanMessage(content=user)],
+                    [
+                        SystemMessage(content=self._discovery_system_prompt(allowance, responsibilities)),
+                        HumanMessage(content=user),
+                    ],
                     max_tokens=8192,
                 )
+                record["delivered_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
                 original = getattr(response, "content", "") or ""
                 parsed = self._parse_response(original)
                 if parsed is None and isinstance(original, str) and original.strip():
@@ -784,15 +825,24 @@ class HypothesisGenerator:
         return blocks
 
     def _verification_guidance(
-        self, units: list[SemanticUnit], diffs: dict[str, str], pack: ContextPack | None = None
+        self,
+        units: list[SemanticUnit],
+        diffs: dict[str, str],
+        pack: ContextPack | None = None,
+        *,
+        delivered_rules: set[str] | None = None,
     ) -> str:
         # Lenses carry their domain guides in the system prompt. State-flow
         # proof rules follow collected navigation in all discovery roles.
         guides = []
         if self._prompt_template == "generator":
-            if any(is_localization_path(unit.path) for unit in units):
+            if any(is_localization_path(unit.path) for unit in units) and "localization" not in (
+                delivered_rules or set()
+            ):
                 guides.append(localization_guidance())
-            if any(has_python_concurrency(unit.path, diffs.get(unit.path, "")) for unit in units):
+            if any(
+                has_python_concurrency(unit.path, diffs.get(unit.path, "")) for unit in units
+            ) and "concurrency" not in (delivered_rules or set()):
                 guides.append(python_concurrency_guidance())
         if pack is not None and any(has_state_navigation(pack, unit.id) for unit in units):
             guides.append(state_guidance())

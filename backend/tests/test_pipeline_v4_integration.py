@@ -82,12 +82,14 @@ def test_seed_detector_hypotheses_maps_security_and_a11y() -> None:
 
 class _ScriptedLLM(BaseChatModel):
     responses: list = Field(default_factory=list)
+    calls: list = Field(default_factory=list)
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def bind_tools(self, tools, **kwargs):
         return self.bind()
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.calls.append(messages)
         content = self.responses.pop(0) if self.responses else "{}"
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
@@ -98,6 +100,80 @@ class _ScriptedLLM(BaseChatModel):
     @property
     def _identifying_params(self):
         return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", [2, 3])
+async def test_specialist_rules_share_initial_discovery_only_in_new_protocol(protocol_version):
+    from reviewforge.engine.pipeline_v4 import _run_llm_stages
+    from reviewforge.engine.verification_guidance import localization_guidance
+
+    path = "themes/base/login/messages/messages_en.properties"
+    unit = _unit(path, "resource")
+    unit.end_line = 1
+    unit.added_lines = [1]
+    unit.kind = UnitKind.RESOURCE
+    state = StateStore(
+        repo="o/r",
+        pr_number=1,
+        head_sha="abc",
+        file_diffs={path: "@@ -0,0 +1 @@\n+welcomeMessage=Welcome back\n"},
+    )
+    changeset = SemanticChangeSet(repo="o/r", pr_number=1, head_sha="abc", units=[unit])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=protocol_version)
+    response = json.dumps(
+        {
+            "hypotheses": [],
+            "no_issue_units": [
+                {
+                    "unit_id": unit.id,
+                    "checked": "The new welcome label has no argument placeholder and matches its English locale.",
+                    "behavior": {
+                        "before": "There was no welcome label.",
+                        "after": "The label renders Welcome back.",
+                        "observable": "The English resource renders the declared welcome text without interpolation.",
+                        "source_facts": [
+                            {"side": "after", "path": path, "line": 1, "excerpt": "welcomeMessage=Welcome back"}
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+    models = {}
+
+    def get_llm(name):
+        models[name] = _ScriptedLLM(responses=[response])
+        return models[name]
+
+    events = EventBus()
+    seen = []
+    events.subscribe(seen.append)
+    fake = SimpleNamespace(_model_router=SimpleNamespace(get_llm=get_llm), _events=events, _db=None)
+    await _run_llm_stages(
+        fake,
+        state,
+        changeset,
+        ContextPack(),
+        ledger,
+        SimpleNamespace(),
+        PipelineV4Config(protocol_version=protocol_version),
+        "en",
+        {},
+    )
+    assert unit.id in ledger.no_issue_units
+    assert not ledger.unresolved_units
+    event = next(event for event in seen if event.event_type == "lens.selected")
+    assert event.data["lenses"] == ["localization"]
+    assert ("lens_localization" in models) is (protocol_version == 2)
+    if protocol_version == 3:
+        prompt = "\n".join(str(message.content) for message in models["hypothesis_generator"].calls[0])
+        assert "responsibilities: localization" in prompt
+        assert prompt.count(localization_guidance()) == 1
+        assert event.data["mode"] == "integrated-discovery"
+        records = list(ledger.discovery_blocks.values())
+        assert len(records) == 1
+        assert records[0]["delivered_responsibilities"] == {unit.id: ["localization"]}
 
 
 @pytest.mark.asyncio

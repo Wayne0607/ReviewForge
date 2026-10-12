@@ -31,7 +31,7 @@ from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Hypothes
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator, build_anchor_resolver
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
 from reviewforge.engine.language import resolve_output_language
-from reviewforge.engine.lenses import run_lens, select_lenses
+from reviewforge.engine.lenses import build_discovery_responsibilities, run_lens, select_lenses
 from reviewforge.engine.llm_protocol_v4 import request_options
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import scan_changed_files
@@ -141,7 +141,10 @@ async def _run_llm_stages(
     published_clusters: set[tuple[str, str]] | None = None,
     inline_used: int = 0,
 ) -> Publication:
-    """Generator → lenses → investigator → editor for one run."""
+    """Discover with specialist responsibilities, investigate, then edit.
+
+    Saved v1/v2 protocols retain their separate generator and lens passes.
+    """
 
     router = orchestrator._model_router
     events = orchestrator._events
@@ -203,6 +206,24 @@ async def _run_llm_stages(
     # generation/lens failures remain; finished verdicts stay in the ledger.
     if not resume or ledger.unresolved_units:
         anchor_resolver = build_anchor_resolver(workspace, changeset)
+        selections = select_lenses(state, changeset, max_lenses=config.max_lenses)
+        events.emit(
+            "lens.selected",
+            {
+                "lenses": [selection.name for selection in selections],
+                "reasons": [selection.reason for selection in selections],
+                "mode": "integrated-discovery" if ledger.protocol_version >= 3 else "standalone",
+            },
+        )
+        discovery_options = {}
+        if ledger.protocol_version >= 3:
+            responsibilities, rules = build_discovery_responsibilities(state, changeset, max_lenses=config.max_lenses)
+            discovery_options = {
+                "discovery_target_input_chars": config.discovery_target_input_chars,
+                "discovery_max_blocks": config.discovery_max_blocks,
+                "unit_responsibilities": responsibilities,
+                "responsibility_rules": rules,
+            }
         generator = HypothesisGenerator(
             routed("hypothesis_generator"),
             max_input_chars=config.generator_max_input_chars,
@@ -211,14 +232,7 @@ async def _run_llm_stages(
             output_language=language,
             on_update=checkpoint,
             anchor_resolver=anchor_resolver,
-            **(
-                {
-                    "discovery_target_input_chars": config.discovery_target_input_chars,
-                    "discovery_max_blocks": config.discovery_max_blocks,
-                }
-                if ledger.protocol_version >= 3
-                else {}
-            ),
+            **discovery_options,
         )
         gen_result = await generator.run(
             state,
@@ -242,15 +256,7 @@ async def _run_llm_stages(
             },
         )
 
-        selections = select_lenses(state, changeset, max_lenses=config.max_lenses)
-        events.emit(
-            "lens.selected",
-            {
-                "lenses": [selection.name for selection in selections],
-                "reasons": [selection.reason for selection in selections],
-            },
-        )
-        for selection in selections:
+        for selection in selections if ledger.protocol_version < 3 else []:
             llm = routed(f"lens_{selection.name}")
             await run_lens(
                 llm,
@@ -266,15 +272,6 @@ async def _run_llm_stages(
                 anchor_resolver=anchor_resolver,
                 max_input_chars=config.generator_max_input_chars,
                 context_max_chars=config.context_pack_max_chars,
-                **(
-                    {
-                        "discovery_target_input_chars": config.discovery_target_input_chars,
-                        "discovery_max_blocks": min(2, config.discovery_max_blocks),
-                        "resume": bool(ledger.discovery_blocks),
-                    }
-                    if ledger.protocol_version >= 3
-                    else {}
-                ),
             )
 
     executor = build_workspace_executor(workspace, state)

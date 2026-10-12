@@ -1,14 +1,16 @@
 """Specialist lenses for the hypothesis pipeline.
 
-A lens is a risk-triggered, single-shot reviewer. It reuses the generator's
+A standalone v1/v2 lens is a risk-triggered, single-shot reviewer. It reuses the generator's
 parsing, validation and ledger upsert but scopes its input to the units that
 triggered it, uses the ``lens`` prompt template, and tags every hypothesis with
 ``source="lens:<name>"``.  Lenses are strictly additive — they write OPEN
 hypotheses into the shared ledger and never investigate.
 
-Triggering is purely deterministic: path and added-line rules plus the unit
-risk signals.  The LLM does the actual reasoning; the trigger only decides
-whether a cheap second pass is worth an extra call.
+Protocol v3 reuses the same deterministic path, added-line and risk-signal
+selection to assign domain responsibilities to the initial discovery blocks.
+Rules are delivered once per relevant block; the pipeline does not run a
+second full-PR specialist discovery pass. Selection and rules are navigation,
+not evidence or proof that a unit has been checked.
 """
 
 from __future__ import annotations
@@ -146,6 +148,41 @@ def lens_skill_body(name: str) -> str:
     return body
 
 
+def build_discovery_responsibilities(
+    state: StateStore,
+    changeset: SemanticChangeSet,
+    *,
+    max_lenses: int = 3,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Assign the existing deterministic lens rules to the initial v3 blocks.
+
+    This builds delivery responsibilities, not extra calls or findings. Rules
+    are delivered once per relevant block; source-backed checks still determine
+    coverage. The old standalone lens API and v1/v2 behavior remain available.
+    """
+    responsibilities: dict[str, list[str]] = {}
+    rules = {}
+    fallback = {
+        "security": (
+            "Trace the changed sink's supported input and existing validation; "
+            "require a concrete trust-boundary violation."
+        ),
+        "accessibility": (
+            "Check changed interactive controls for supported keyboard/focus behavior, accessible names "
+            "and actual state exposure. Identify a concrete user-visible regression."
+        ),
+        "dependency": (
+            "Compare the changed manifest and lockfile, declared runtime/platform constraints and actual "
+            "consumers. Require an observable incompatibility introduced by the change, not a guessed advisory."
+        ),
+    }
+    for selection in select_lenses(state, changeset, max_lenses=max_lenses):
+        rules[selection.name] = lens_skill_body(selection.name).strip() or fallback.get(selection.name, "")
+        for unit_id in selection.units:
+            responsibilities.setdefault(unit_id, []).append(selection.name)
+    return responsibilities, rules
+
+
 def build_lens_generator(
     llm: BaseChatModel,
     name: str,
@@ -218,4 +255,11 @@ async def run_lens(
     return await generator.run(state, pack, filtered, ledger, resume=resume, overview_changeset=changeset)
 
 
-__all__ = ["LensSelection", "build_lens_generator", "lens_skill_body", "run_lens", "select_lenses"]
+__all__ = [
+    "LensSelection",
+    "build_discovery_responsibilities",
+    "build_lens_generator",
+    "lens_skill_body",
+    "run_lens",
+    "select_lenses",
+]

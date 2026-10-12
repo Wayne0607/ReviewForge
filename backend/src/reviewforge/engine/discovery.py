@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 
 from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 
 _HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -86,6 +87,7 @@ class DiscoveryBlock:
     oversize: bool = False
     failure: str = ""
     unit_facts: dict[str, list[SourceLine]] = field(default_factory=dict)
+    unit_before_states: dict[str, str] = field(default_factory=dict)
 
     def source_matches(self, raw: object) -> bool:
         if not isinstance(raw, dict):
@@ -162,7 +164,7 @@ def _hunks(path: str, diff: str) -> list[_Hunk]:
                 new, new_left = new + 1, new_left - 1
             elif prefix == " " and old_left > 0 and new_left > 0:
                 facts.extend([SourceLine("before", path, old, text, new), SourceLine("after", path, new, text, new)])
-                rendered.append(f" {new:>5} | {text}")
+                rendered.append(f" before={old:>5} RIGHT={new:>5} | {text}")
                 old, new = old + 1, new + 1
                 old_left, new_left = old_left - 1, new_left - 1
             else:
@@ -181,6 +183,57 @@ def _hunks(path: str, diff: str) -> list[_Hunk]:
             )
         )
     return result
+
+
+def _visible_declarations(facts: list[SourceLine], side: str, path: str) -> list[tuple[str, int, int]]:
+    """Parse only contiguous delivered source; preserve its absolute coordinates.
+
+    Unseen lines never become padding for a fabricated full-file source. A
+    missing declaration is useful only with a positively added head declaration
+    and no attributable removed operation; absence alone does not prove newness.
+    """
+    records = {fact.line: fact.text for fact in facts if fact.side == side and fact.path == path}
+    runs: list[list[tuple[int, str]]] = []
+    for line, text in sorted(records.items()):
+        if not runs or line != runs[-1][-1][0] + 1:
+            runs.append([])
+        runs[-1].append((line, text))
+    return [
+        (declaration.name, declaration.start_line + run[0][0] - 1, declaration.line + run[0][0] - 1)
+        for run in runs
+        for declaration in extract_code_definitions("\n".join(text for _, text in run), path)
+    ]
+
+
+def _before_states(units: list[SemanticUnit], hunks: dict[str, _Hunk]) -> dict[str, str]:
+    by_path: dict[str, list[SourceLine]] = {}
+    for hunk in hunks.values():
+        by_path.setdefault(hunk.path, []).extend(hunk.facts)
+    declarations = {
+        path: (_visible_declarations(facts, "before", path), _visible_declarations(facts, "after", path))
+        for path, facts in by_path.items()
+    }
+    states = {}
+    for unit in units:
+        facts = by_path.get(unit.path, [])
+        target = [fact for fact in facts if not unit.start_line or unit.start_line <= fact.right_line <= unit.end_line]
+        old, new = declarations.get(unit.path, ([], []))
+        name = unit.symbol.rsplit(".", 1)[-1]
+        head = [line for symbol, start, line in new if symbol == name and unit.start_line in {start, line}]
+        added_declaration = bool(head) and any(
+            fact.side == "after" and fact.changed and fact.line in head for fact in target
+        )
+        old_name = any(symbol == name for symbol, _, _ in old)
+        removed_operation = any(fact.side == "before" and fact.changed for fact in target)
+        if facts and not any(fact.side == "before" for fact in facts):
+            states[unit.id] = "absent-before-in-delivered-source"
+        elif added_declaration and not old_name and not removed_operation:
+            states[unit.id] = "absent-new-declaration"
+        elif old_name:
+            states[unit.id] = "present-declaration"
+        else:
+            states[unit.id] = "unresolved-declaration-correspondence"
+    return states
 
 
 def _bounded_lines(lines: list[str], limit: int, label: str) -> str:
@@ -262,6 +315,7 @@ def _block(
     selected: list[_Hunk],
     limits: DiscoveryLimits,
     context_budget: int,
+    before_states: dict[str, str] | None = None,
 ) -> DiscoveryBlock:
     diffs = "\n\n".join(f"### Shared before/after diff: {h.path}\n{h.text}" for h in selected)
     context, context_facts, unchecked = _context(units, pack, context_budget)
@@ -299,11 +353,15 @@ def _block(
     # Before deletions use their post-image boundary, since old coordinates
     # need not match the head symbol coordinates after preceding insertions.
     for unit in units:
+        state = (before_states or {}).get(unit.id, "unresolved-declaration-correspondence")
+        block.unit_before_states[unit.id] = state
         block.unit_facts[unit.id] = [
             fact
             for h in selected
             for fact in h.facts
-            if fact.path == unit.path and (not unit.start_line or unit.start_line <= fact.right_line <= unit.end_line)
+            if fact.path == unit.path
+            and (not unit.start_line or unit.start_line <= fact.right_line <= unit.end_line)
+            and (fact.side != "before" or not state.startswith("absent-"))
         ]
     return block
 
@@ -327,6 +385,7 @@ def plan_discovery(
     for unit in remaining:
         by_path.setdefault(unit.path, []).append(unit)
     all_hunks = {h.key: h for path in by_path for h in _hunks(path, diffs.get(path, ""))}
+    before_states = _before_states(remaining, all_hunks)
     hunk_chars = {key: len(f"### Shared before/after diff: {h.path}\n") + len(h.text) for key, h in all_hunks.items()}
     keys: dict[str, set[str]] = {u.id: set() for u in remaining}
     for h in all_hunks.values():
@@ -357,12 +416,14 @@ def plan_discovery(
         selected = [
             all_hunks[k] for k in sorted(selected_keys, key=lambda k: (all_hunks[k].path, all_hunks[k].start, k))
         ]
-        return _block(units, pack, overview, selected, limits, min(limits.context_max_chars, context_left))
+        return _block(
+            units, pack, overview, selected, limits, min(limits.context_max_chars, context_left), before_states
+        )
 
     while remaining:
         group = [remaining.pop(0)]
         block = make(group)
-        while remaining and len(group) < max(1, limits.max_units):
+        while remaining and not block.failure and len(group) < max(1, limits.max_units):
             group_keys = set().union(*(keys[u.id] for u in group))
             group_relations = set().union(*(related[u.id] for u in group))
             choices = sorted(
@@ -371,6 +432,8 @@ def plan_discovery(
             )
             chosen = None
             for unit in choices:
+                if not keys[unit.id] or any(not all_hunks[key].complete for key in keys[unit.id]):
+                    continue
                 candidate_keys = group_keys | keys[unit.id]
                 diff_chars = sum(hunk_chars[key] for key in candidate_keys) + max(0, len(candidate_keys) - 1) * 2
                 # Reject impossible unions before rendering source, context,

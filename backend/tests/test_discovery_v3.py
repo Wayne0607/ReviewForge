@@ -457,3 +457,187 @@ async def test_discovery_navigation_metadata_limits_are_enforced(change):
         ScriptedLLM(responses=[json.dumps({"hypotheses": [bad], "no_issue_units": []})])
     ).run(StateStore(file_diffs={u.path: patch}), ContextPack(), changeset(u), ledger)
     assert result.failed_blocks == 1 and not ledger.items and u.id in ledger.unresolved_units
+
+
+def test_new_java_method_does_not_inherit_the_previous_methods_drifting_closing_brace():
+    # Shape of the first real v3 callback: unchanged old closing brace becomes
+    # the last newly added method's closing brace in the post-image.
+    u = unit("ParserTest.java", "verifyNewCase")
+    u.start_line, u.end_line = 48, 52
+    patch = "\n".join(
+        [
+            "@@ -29,8 +29,26 @@ class ParserTest {",
+            " ",
+            "     @Test",
+            "     void verifyExistingCase() {",
+            "-        verifyOld();",
+            "-        assertOldResult();",
+            "+        verifyCurrent();",
+            "+        assertCurrentResult();",
+            "+    }",
+            "+",
+            "+    @Test",
+            "+    void verifyExtraCase() {",
+            "+        verifyExtra();",
+            "+        assertExtraResult();",
+            "+    }",
+            "+",
+            "+    @Test",
+            "+    void verifyAnotherCase() {",
+            "+        verifyAnother();",
+            "+        assertAnotherResult();",
+            "+    }",
+            "+",
+            "+    @Test",
+            "+    void verifyNewCase() {",
+            "+        verifyNew();",
+            "+        assertNewResult();",
+            "     }",
+            " ",
+            "     private void helper() {",
+        ]
+    )
+    block = plan_discovery(changeset(u), ContextPack(), {u.path: patch}, limits=DiscoveryLimits())[0]
+    assert block.unit_before_states[u.id] == "absent-new-declaration"
+    assert any(f.side == "before" and f.line == 34 and f.right_line == 52 for f in block.facts)
+    assert not any(f.side == "before" for f in block.unit_facts[u.id])
+    check = {
+        "unit_id": u.id,
+        "checked": "Checked the new assertion.",
+        "behavior": {
+            "before": "This test did not exist.",
+            "after": "The new test checks the new result.",
+            "observable": "A wrong new result fails the test.",
+            "source_facts": [{"side": "after", "path": u.path, "line": 51, "excerpt": "assertNewResult();"}],
+        },
+    }
+    assert HypothesisGenerator._valid_behavior(check, u, block)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        "@@ -1,3 +1,3 @@\n-public void run() {\n+public void run(int value) {\n     process();\n }",
+        "@@ -1,3 +1,3 @@\n-public void oldName() {\n+public void run() {\n     process();\n }",
+    ],
+)
+def test_signature_replacement_and_rename_do_not_claim_absent_before(patch):
+    u = unit("Service.java", "run")
+    block = plan_discovery(changeset(u), ContextPack(), {u.path: patch}, limits=DiscoveryLimits())[0]
+    assert not block.unit_before_states[u.id].startswith("absent-")
+    assert any(f.side == "before" and f.changed for f in block.unit_facts[u.id])
+
+
+def test_unknown_declaration_correspondence_is_not_guessed_new():
+    u = unit("Service.java", "run")
+    patch = "@@ -2,2 +2,3 @@\n     process();\n+    processExtra();\n }"
+    block = plan_discovery(changeset(u), ContextPack(), {u.path: patch}, limits=DiscoveryLimits())[0]
+    assert block.unit_before_states[u.id] == "unresolved-declaration-correspondence"
+    assert any(f.side == "before" for f in block.unit_facts[u.id])
+
+
+def test_zero_context_insertion_state_describes_delivered_source_only():
+    from reviewforge.engine.prompts_v4 import load_prompt
+
+    u = unit("Service.java", "run")
+    u.start_line, u.end_line = 50, 50
+    block = plan_discovery(
+        changeset(u),
+        ContextPack(),
+        {u.path: "@@ -49,0 +50,1 @@\n+    processExtra();"},
+        limits=DiscoveryLimits(),
+    )[0]
+    assert block.unit_before_states[u.id] == "absent-before-in-delivered-source"
+    prompt = load_prompt("discovery_v3", lens="general correctness", output_language="English", max_hypotheses=6)
+    assert "a zero-context insertion can have this state" in prompt
+    assert "It does not mean\nthe base file did not exist" in prompt
+    assert "including when no target before source was delivered" in prompt
+
+
+def test_unchanged_source_prints_both_explicit_coordinates_and_scope_is_exact():
+    u = unit("Service.java", "run")
+    u.start_line, u.end_line = 49, 51
+    patch = "@@ -41,3 +48,4 @@\n public void run() {\n     process();\n+    processExtra();\n }"
+    block = plan_discovery(changeset(u), ContextPack(), {u.path: patch}, limits=DiscoveryLimits())[0]
+    assert "before=   42 RIGHT=   49 |     process();" in block.diff_text
+    assert block.source_matches({"side": "before", "path": u.path, "line": 42, "excerpt": "process();"})
+    assert not block.source_matches({"side": "before", "path": u.path, "line": 49, "excerpt": "process();"})
+    user = HypothesisGenerator(ScriptedLLM())._render_discovery_message(
+        block, HypothesisLedger("run", "abc", "digest", protocol_version=3), 6
+    )
+    assert "RIGHT lines: 49-51" in user and "before lines: 42-43" in user
+    assert "RIGHT lines: 48" not in user
+
+
+@pytest.mark.asyncio
+async def test_missing_hunk_is_isolated_from_units_with_complete_source():
+    missing, first, second = unit("renamed.properties", ""), unit("a.py"), unit("b.py")
+    llm = ScriptedLLM(responses=[json.dumps({"hypotheses": [], "no_issue_units": [clean(first), clean(second)]})])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=3)
+    result = await HypothesisGenerator(llm).run(
+        StateStore(file_diffs={first.path: diff(), second.path: diff(), missing.path: ""}),
+        ContextPack(),
+        changeset(missing, first, second),
+        ledger,
+    )
+    assert set(ledger.no_issue_units) == {first.id, second.id}
+    assert ledger.unresolved_units == {missing.id: "generator missing-diff"}
+    assert result.blocks == 1 and result.failed_blocks == 1
+    assert any(row["unit_ids"] == [missing.id] for row in ledger.discovery_blocks.values())
+
+
+@pytest.mark.asyncio
+async def test_missing_inputs_do_not_consume_the_valid_discovery_call_slots():
+    missing = [unit(f"renamed{i}.properties", "", risk=10) for i in range(10)]
+    first, second = unit("a.py"), unit("b.py")
+    llm = ScriptedLLM(responses=[json.dumps({"hypotheses": [], "no_issue_units": [clean(first), clean(second)]})])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=3)
+    await HypothesisGenerator(llm, discovery_max_blocks=1).run(
+        StateStore(file_diffs={first.path: diff(), second.path: diff()}),
+        ContextPack(),
+        changeset(*missing, first, second),
+        ledger,
+    )
+    assert len(llm.calls) == 1 and set(ledger.no_issue_units) == {first.id, second.id}
+    assert all(ledger.unresolved_units[u.id] == "generator missing-diff" for u in missing)
+
+
+@pytest.mark.asyncio
+async def test_responsibilities_are_fused_into_first_call_and_rules_delivered_once():
+    from reviewforge.engine.lenses import build_discovery_responsibilities
+    from reviewforge.engine.verification_guidance import localization_guidance
+
+    u = unit("messages_en.properties", "")
+    state = StateStore(file_diffs={u.path: diff()})
+    responsibilities, rules = build_discovery_responsibilities(state, changeset(u))
+    assert responsibilities == {u.id: ["localization"]}
+    llm = ScriptedLLM(responses=[json.dumps({"hypotheses": [], "no_issue_units": [clean(u)]})])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=3)
+    await HypothesisGenerator(llm, unit_responsibilities=responsibilities, responsibility_rules=rules).run(
+        state, ContextPack(), changeset(u), ledger
+    )
+    assert len(llm.calls) == 1
+    full_input = "\n".join(message.content for message in llm.calls[0])
+    assert full_input.count(localization_guidance()) == 1
+    assert "responsibilities: localization" in full_input
+    row = next(iter(ledger.discovery_blocks.values()))
+    assert row["delivered_responsibilities"] == {u.id: ["localization"]}
+    assert ledger.no_issue_units[u.id]
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_or_missing_responsibility_rules_are_not_silently_delivered():
+    u = unit("a.py")
+    llm = ScriptedLLM(responses=[json.dumps({"hypotheses": [], "no_issue_units": [clean(u)]})])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=3)
+    await HypothesisGenerator(llm, responsibility_rules={"unused": "UNRELATED RULE"}).run(
+        StateStore(file_diffs={u.path: diff()}), ContextPack(), changeset(u), ledger
+    )
+    assert "UNRELATED RULE" not in llm.calls[0][0].content
+    missing_llm = ScriptedLLM()
+    missing_ledger = HypothesisLedger("run", "abc", "digest", protocol_version=3)
+    await HypothesisGenerator(missing_llm, unit_responsibilities={u.id: ["missing"]}).run(
+        StateStore(file_diffs={u.path: diff()}), ContextPack(), changeset(u), missing_ledger
+    )
+    assert not missing_llm.calls and missing_ledger.unresolved_units[u.id] == "generator missing responsibility rules"
+    assert "delivered_responsibilities" not in next(iter(missing_ledger.discovery_blocks.values()))

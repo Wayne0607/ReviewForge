@@ -45,6 +45,7 @@ from reviewforge.engine.investigation_tasks import (
     render_investigation_context,
 )
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.request_budget import plan_request
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
 from reviewforge.engine.verification_guidance import (
     defect_scope_guidance,
@@ -878,11 +879,39 @@ class Investigator:
             # Reserve the closing input and output within the SAME budget,
             # before spending on more tools. The output reserve is capped at
             # a quarter of the total budget so small budgets can collect facts.
-            input_tokens = self._estimate_input_tokens(chat) + schema_tokens + self._input_overhead
-            closing_tokens = self._estimate_input_tokens(closing) + self._input_overhead
             remaining = token_limit - self._accounted_tokens()
             closing_output = min(4_000, token_limit // 4)
-            output_tokens = min(4_000, remaining - input_tokens - closing_tokens - closing_output)
+            if self._protocol_version >= 3:
+                closer = self._closing_llm if self._closing_llm is not None else self._llm
+                closing_plan = plan_request(
+                    closer,
+                    closing,
+                    max_output_tokens=closing_output,
+                    fallback_available=remaining,
+                )
+                reserve = closing_plan.input_tokens + closing_plan.max_output_tokens
+                exploration_plan = plan_request(
+                    bound,
+                    chat,
+                    fallback_available=remaining,
+                    reserve_tokens=reserve,
+                )
+                output_tokens = exploration_plan.max_output_tokens
+                self._progress.append(
+                    {
+                        "phase": "budget",
+                        "event": "request-plan",
+                        "stage": "exploration",
+                        "input_tokens": exploration_plan.input_tokens,
+                        "available_tokens": exploration_plan.available_tokens,
+                        "max_output_tokens": output_tokens,
+                        "closing_reserve_tokens": reserve,
+                    }
+                )
+            else:
+                input_tokens = self._estimate_input_tokens(chat) + schema_tokens + self._input_overhead
+                closing_tokens = self._estimate_input_tokens(closing) + self._input_overhead
+                output_tokens = min(4_000, remaining - input_tokens - closing_tokens - closing_output)
             if output_tokens < (_MIN_USEFUL_OUTPUT if self._protocol_version >= 3 else 1):
                 if self._protocol_version >= 3:
                     self._progress.append(
@@ -1064,8 +1093,27 @@ class Investigator:
         token_limit: int,
         steps: int,
     ) -> InvestigationResult:
-        input_tokens = self._estimate_input_tokens(chat) + self._input_overhead
-        available_output = token_limit - self._accounted_tokens() - input_tokens
+        closer = self._closing_llm if self._closing_llm is not None else self._llm
+        if self._protocol_version >= 3:
+            closing_plan = plan_request(
+                closer,
+                chat,
+                fallback_available=token_limit - self._accounted_tokens(),
+            )
+            available_output = closing_plan.max_output_tokens
+            self._progress.append(
+                {
+                    "phase": "budget",
+                    "event": "request-plan",
+                    "stage": "closing",
+                    "input_tokens": closing_plan.input_tokens,
+                    "available_tokens": closing_plan.available_tokens,
+                    "max_output_tokens": available_output,
+                }
+            )
+        else:
+            input_tokens = self._estimate_input_tokens(chat) + self._input_overhead
+            available_output = token_limit - self._accounted_tokens() - input_tokens
         if available_output < (_MIN_USEFUL_OUTPUT if self._protocol_version >= 3 else 1):
             return self._result(
                 verdict="unknown",
@@ -1075,7 +1123,6 @@ class Investigator:
                 outcome="budget-exhausted",
             )
         try:
-            closer = self._closing_llm if self._closing_llm is not None else self._llm
             final = await closer.ainvoke(chat, max_tokens=min(4_000, available_output))
             self._record_tokens(final, chat)
             parsed = self._parse_verdict(getattr(final, "content", "") or "")

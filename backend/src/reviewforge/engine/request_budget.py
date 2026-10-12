@@ -14,11 +14,13 @@ import json
 import math
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatResult
+from langchain_core.runnables.base import RunnableBindingBase
 
 
 class RequestBudgetExceededError(ValueError):
@@ -160,6 +162,48 @@ def estimate_request(messages: list[BaseMessage], kwargs: dict[str, Any]) -> int
     return math.ceil(len(source.encode("utf-8")) / 3) + 256
 
 
+@dataclass(frozen=True)
+class RequestBudgetView:
+    input_tokens: int
+    available_tokens: int
+
+
+@dataclass(frozen=True)
+class RequestPlan:
+    input_tokens: int
+    available_tokens: int
+    max_output_tokens: int
+
+
+def plan_request(
+    llm: Any,
+    messages: list[BaseMessage],
+    *,
+    max_output_tokens: int = 4_000,
+    fallback_available: int,
+    reserve_tokens: int = 0,
+) -> RequestPlan:
+    """Forecast once before retries, using the same input as physical admission.
+
+    This is a read-only snapshot, not a reservation. Concurrent requests may
+    consume capacity before dispatch; the physical budget remains authoritative.
+    A logical retry never replans or changes the already chosen output limit.
+    """
+    if max_output_tokens <= 0 or reserve_tokens < 0:
+        raise ValueError("planning requires a positive output cap and nonnegative reserve")
+    options = {"max_tokens": max_output_tokens}
+    while isinstance(llm, RunnableBindingBase):
+        options = llm.kwargs | options
+        llm = llm.bound
+    planner = getattr(llm, "request_budget_view", None)
+    view = planner(messages, options) if callable(planner) else None
+    if view is None:
+        view = RequestBudgetView(estimate_request(messages, options), max(0, fallback_available))
+    available = min(view.available_tokens, max(0, fallback_available))
+    output = max(0, min(max_output_tokens, available - view.input_tokens - reserve_tokens))
+    return RequestPlan(view.input_tokens, available, output)
+
+
 class BudgetedChatLLM(BaseChatModel):
     _inner: BaseChatModel
     _budget: RequestBudget
@@ -173,6 +217,13 @@ class BudgetedChatLLM(BaseChatModel):
     async def _changed(self):
         if self._on_change is not None:
             await self._on_change(self._budget.snapshot())
+
+    def request_budget_view(self, messages, options) -> RequestBudgetView:
+        available = self._budget.available(self._phase)
+        task_budget = _task_budget.get()
+        if task_budget is not None:
+            available = min(available, task_budget.available(self._phase))
+        return RequestBudgetView(estimate_request(messages, options), available)
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         options = dict(kwargs)

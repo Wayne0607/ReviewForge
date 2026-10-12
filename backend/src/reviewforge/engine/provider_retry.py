@@ -122,6 +122,10 @@ class RetryChatLLM(BaseChatModel):
         self._policy = policy or RetryPolicy()
         self._attempt_sink = attempt_sink
 
+    def request_budget_view(self, messages, options):
+        planner = getattr(self._inner, "request_budget_view", None)
+        return planner(messages, options) if callable(planner) else None
+
     async def _record(self, event: dict[str, Any]) -> None:
         # No exception text, request kwargs, endpoint keys or content.
         logger.info("Provider attempt: %s", event)

@@ -77,6 +77,10 @@ class TrackedChatLLM(BaseChatModel):
         self._request_options = dict(request_options or {})
         self._receipt_first = receipt_first
 
+    def request_budget_view(self, messages, options):
+        planner = getattr(self._inner, "request_budget_view", None)
+        return planner(messages, self._request_options | options) if callable(planner) else None
+
     async def _agenerate(
         self,
         messages: list[BaseMessage],

@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
@@ -276,17 +276,97 @@ async def test_same_evidence_query_closes_without_repeated_io_or_more_exploratio
 
 @pytest.mark.asyncio
 async def test_small_output_budget_skips_exploration_but_keeps_grounded_closure(monkeypatch):
+    from reviewforge.engine.request_budget import RequestPlan
+
     # Reproduce the 114-token case without sending a futile exploration call.
     llm = RecordingLLM(turns=[refute()])
     value = Investigator(llm, source_executor([]), protocol_version=3, max_steps=2)
-    monkeypatch.setattr(value, "_estimate_input_tokens", lambda chat: 1000)
-    monkeypatch.setattr(value, "_estimate_text_tokens", lambda text: 3886)
+
+    def planner(llm, messages, *, max_output_tokens=4000, fallback_available, reserve_tokens=0):
+        incoming = 4886 if reserve_tokens else 1000
+        return RequestPlan(
+            incoming, fallback_available, max(0, min(max_output_tokens, fallback_available - incoming - reserve_tokens))
+        )
+
+    monkeypatch.setattr("reviewforge.engine.investigator.plan_request", planner)
     result = await value.investigate(candidate(), state(), ContextPack())
     assert result.verdict == "refuted"
     assert [call["tools"] for call in llm.calls] == [False]
     assert any(
         event.get("event") == "close-before-small-output" and event["output_tokens"] == 114 for event in result.progress
     )
+
+
+@pytest.mark.asyncio
+async def test_real_receipt_6034_leaves_a_useful_closing_request_inside_the_16000_task_budget():
+    from reviewforge.engine.request_budget import (
+        BudgetedChatLLM,
+        RequestBudget,
+        estimate_request,
+        investigation_request_scope,
+    )
+
+    # The first real Keycloak investigation spent 6034 and retained five source
+    # observations. Its closing input required 7017 under physical admission,
+    # leaving 2949 useful output tokens rather than the rejected fixed 4000.
+    # Keep the receipt/size boundary without copying benchmark message content.
+    budget = RequestBudget(250_000)
+    paid = budget.reserve("investigation", 6034)
+    budget.settle(paid, 6034)
+    inner = RecordingLLM(turns=[refute()], usages=[(7000, 200)])
+    routed = BudgetedChatLLM(inner, budget, phase="investigation")
+    value = Investigator(routed, source_executor([]), protocol_version=3)
+    value._state = state()
+    value._tokens = 6034
+    value._observations = [
+        Observation(
+            f"obs_{index}",
+            "read_file",
+            f"source {index}",
+            "a.ts",
+            None,
+            "head",
+            "digest",
+            "return calendar?.id" if index == 1 else "saved source fact " + "x" * 1000,
+            "success",
+        )
+        for index in range(5)
+    ]
+    initial = [SystemMessage(content=value._system_prompt()), HumanMessage(content="Recorded claim navigation.\n")]
+    closing = value._closing_chat(initial, 16000)
+    padding = 3 * (7017 - estimate_request(closing, {"max_tokens": 4000}))
+    assert padding > 0
+    initial[1].content += "x" * padding
+    closing = value._closing_chat(initial, 16000)
+    assert estimate_request(closing, {"max_tokens": 4000}) == 7017
+    assert value._estimate_input_tokens(closing) + 4000 <= 9966
+    with investigation_request_scope(16000) as task_budget:
+        first = task_budget.reserve("investigation", 6034)
+        task_budget.settle(first, 6034)
+        result = await value._close(closing, candidate(), {"a.ts"}, token_limit=16000, steps=2)
+        assert task_budget.denials == 0
+        assert task_budget.reported == 13234
+    assert result.verdict == "refuted" and result.outcome == "resolved"
+    assert inner.calls[0]["limit"] == 2949
+    assert result.tokens == 13234
+    assert budget.denials == 0
+    assert any(event.get("stage") == "closing" and event.get("max_output_tokens") == 2949 for event in result.progress)
+
+
+@pytest.mark.asyncio
+async def test_closing_plan_below_useful_output_stops_before_dispatch(monkeypatch):
+    from reviewforge.engine.request_budget import RequestPlan
+
+    inner = RecordingLLM(turns=[refute()])
+    value = Investigator(inner, source_executor([]), protocol_version=3)
+    monkeypatch.setattr(
+        "reviewforge.engine.investigator.plan_request", lambda *args, **kwargs: RequestPlan(3489, 4000, 511)
+    )
+    result = await value._close(
+        [HumanMessage(content="saved evidence")], candidate(), {"a.ts"}, token_limit=4000, steps=1
+    )
+    assert result.verdict == "unknown" and result.outcome == "budget-exhausted"
+    assert inner.calls == []
 
 
 def test_same_anchor_variants_do_not_take_every_task_slot_and_different_severity_stays_first():

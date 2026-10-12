@@ -94,6 +94,55 @@ class SourceLine:
     unit_id: str = ""
 
 
+def compact_source_coordinates(text: str) -> str:
+    """Remove coordinate padding only; preserve source bodies and reference IDs.
+
+    Run after reference registration so delivery signatures, source selection
+    and reference resolution remain independent of presentation whitespace.
+    """
+    lines = []
+    for line in text.split("\n"):
+        line = re.sub(
+            r"^ before=\s*(\d+)( \[[^\]]*\])? RIGHT=\s*(\d+)( \[[^\]]*\])? \| ",
+            r" before=\1\2 RIGHT=\3\4 | ",
+            line,
+        )
+        line = re.sub(r"^([-+])\s+(\d+)( \[[^\]]*\])? \| ", r"\1\2\3 | ", line)
+        line = re.sub(r"^ +(\d+)( \[[^\]]*\])? \| ", r"\1\2 | ", line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def compact_overview(text: str) -> str:
+    """Group only contiguous same-file inventory rows, without dropping a row.
+
+    The original bounded overview is the input: no extra inventory selection or
+    reordering happens here. Unrecognized/truncated rows remain verbatim.
+    """
+    lines, rendered = text.split("\n"), []
+    index = 0
+    while index < len(lines):
+        match = re.fullmatch(r"- (\S+) (.+):(\d+-\d+) (.*)", lines[index])
+        if match is None:
+            rendered.append(lines[index])
+            index += 1
+            continue
+        group = [match]
+        following = index + 1
+        while following < len(lines):
+            next_match = re.fullmatch(r"- (\S+) (.+):(\d+-\d+) (.*)", lines[following])
+            if next_match is None or next_match[2] != match[2]:
+                break
+            group.append(next_match)
+            following += 1
+        original = "\n".join(lines[index:following])
+        compact = "File " + match[2] + " (inventory: unit_id | RIGHT range | symbol):\n"
+        compact += "\n".join(f"{row[1]} | {row[3]} | {row[4]}" for row in group)
+        rendered.append(compact if len(compact) < len(original) else original)
+        index = following
+    return "\n".join(rendered)
+
+
 @dataclass
 class _Hunk:
     key: str

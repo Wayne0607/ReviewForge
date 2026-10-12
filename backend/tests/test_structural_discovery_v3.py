@@ -172,7 +172,9 @@ async def test_stale_consumer_produces_program_bound_structural_candidate_with_e
     saved = next(iter(ledger.items.values()))
     assert saved.change_anchor == state.file_changes[unit.path] and saved.sites == []
     assert saved.observations == [] and "file-change:" in saved.identity
-    assert "sites must be []" in llm.calls[0][1].content
+    assert "Use sites=[]" in llm.calls[0][0].content
+    row = json.loads(next(line for line in llm.calls[0][1].content.splitlines() if line.startswith("[")))
+    assert row[3] == "structural-rename" and row[4:6] == ["", ""] and row[7] == change.id
     assert "Structural changes (typed facts" in llm.calls[0][1].content
     restored = HypothesisLedger.from_dict(ledger.to_dict())
     assert next(iter(restored.items.values())).change_anchor == change

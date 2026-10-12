@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -37,7 +38,14 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, render_numbered_diff, select_diff_hunks
-from reviewforge.engine.discovery import DiscoveryBlock, DiscoveryLimits, plan_discovery, split_discovery
+from reviewforge.engine.discovery import (
+    DiscoveryBlock,
+    DiscoveryLimits,
+    compact_overview,
+    compact_source_coordinates,
+    plan_discovery,
+    split_discovery,
+)
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import RequestBudgetExceededError, RequestPlan, plan_request
@@ -458,30 +466,34 @@ class HypothesisGenerator:
             if body and body not in seen:
                 seen.add(body)
                 prompt += f"\n\n## Responsibility rules: {name} (rules, not evidence)\n{body}"
-        return prompt + "\n\n" + defect_scope_guidance() + "\n\n" + investigation_capabilities()
+        # v3 includes scope/capabilities in its single output contract. Keep the
+        # legacy prompts' overlays separate; repeating them here costs every block.
+        return prompt
 
     def _render_discovery_message(
         self, block: DiscoveryBlock, ledger: HypothesisLedger, allowance: int, guidance: str = ""
     ) -> str:
-        ids = ", ".join(unit.id for unit in block.units)
         anchors = []
         for unit in block.units:
-            if unit.id in block.structural_changes:
-                anchors.append(
-                    f"- {unit.id} {unit.path} change_id={block.structural_changes[unit.id].id}; "
-                    "structural rename: sites must be []; cite typed change_facts plus real head/reference source."
-                )
-                continue
             target = block.unit_facts.get(unit.id, [])
             coordinates = _coordinate_ranges([fact.line for fact in target if fact.side == "after"])
             before = _coordinate_ranges([fact.line for fact in target if fact.side == "before"])
+            change = block.structural_changes.get(unit.id)
             anchors.append(
-                f"- {unit.id} {unit.path} symbol={unit.symbol or '-'} RIGHT lines: "
-                + (coordinates or "(none in this unit's range)")
-                + f"; before state={block.unit_before_states.get(unit.id)}; before lines: "
-                + (before or "(no target before quote required)")
-                + "; responsibilities: "
-                + (", ".join(self._unit_responsibilities.get(unit.id, [])) or "general correctness")
+                json.dumps(
+                    [
+                        unit.id,
+                        unit.path,
+                        unit.symbol or "",
+                        block.unit_before_states.get(unit.id),
+                        before,
+                        coordinates,
+                        self._unit_responsibilities.get(unit.id, []),
+                        change.id if change else "",
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             )
         # Cross-block rows retain identity/trigger/impact navigation but cannot
         # consume the changed-source budget or count as a fresh assessment.
@@ -494,11 +506,14 @@ class HypothesisGenerator:
                 existing_text[:1_900] + "\n(existing-hypothesis navigation truncated; not proof of coverage)"
             )
         sections = [
-            "## PR overview\n" + block.overview,
+            "## PR overview\n" + compact_overview(block.overview),
             "## Source relationship navigation (not evidence)\n" + (block.navigation or "(none collected)"),
-            "## Changes\nAllowed unit_id values (copy exactly): " + ids + "\n\n" + block.diff_text,
-            "## RIGHT-side anchors\n" + "\n".join(anchors),
-            "## Context\n" + (block.context_text or "(no context delivered)"),
+            "## Units\nAllowed IDs/target scopes; each JSON row is "
+            "[unit_id,path,symbol,before_state,LEFT_ranges,RIGHT_ranges,responsibilities,change_id]. "
+            "Empty ranges mean no target source delivered on that side; "
+            "[] responsibilities means general correctness.\n" + "\n".join(anchors),
+            "## Changes\n" + compact_source_coordinates(block.diff_text),
+            "## Context\n" + (compact_source_coordinates(block.context_text) or "(no context delivered)"),
             "## Structured difference focus (attention cues, not defect verdicts)\n"
             + (block.focus or "Compare before/after behavior."),
             "## Unchecked\n" + ("\n".join(block.unchecked) or "(no collected direction omitted)"),
@@ -517,10 +532,7 @@ class HypothesisGenerator:
             sections.append(guidance)
         sections.append(
             f"## Required assessments ({len(block.units)})\n"
-            f"New candidate allowance this block: {allowance}. Assess each ID with hypotheses, "
-            "a source-backed no_issue check, or explicit deferred_units. Independent risks may have multiple "
-            "hypotheses for one unit and explicitly defer an additional unchecked boundary. "
-            "A no_issue check cannot coexist with another answer for its unit. A deferred answer is not clean.\n" + ids
+            f"New candidate allowance this block: {allowance}. Assess every Units row using the output contract."
         )
         return "\n\n".join(sections)
 

@@ -1,19 +1,49 @@
 """Dashboard API — endpoints for the frontend dashboard.
 
 Provides review history, metrics, trends, and system info
-for the React dashboard to consume. All counts are computed
-from actual findings in the database, not from summary_json.
+for the React dashboard to consume. Legacy counts come from persisted findings.
+Protocol v3 hypothesis runs use their persisted stage summary because their
+ledger and independent publication proof do not create legacy finding rows.
+Publication verification permits posting; it does not count delivered comments.
 """
 
 from __future__ import annotations
+
+import json
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 router = APIRouter(prefix="/api/v1/dashboard")
 
 
+def _hypothesis_v3_summary(run: dict) -> dict | None:
+    raw = run.get("summary_json", run.get("summary"))
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if (
+        not isinstance(raw, dict)
+        or raw.get("mode") != "hypothesis"
+        or type(raw.get("protocol_version")) is not int
+        or raw["protocol_version"] < 3
+    ):
+        return None
+    summary = dict(raw)
+    # Keep the existing dashboard response shape without inventing legacy rows
+    # or translating publication refutations into investigation status changes.
+    for name in ("false_positives", "tasks_completed", "tasks_failed"):
+        summary.setdefault(name, 0)
+    return summary
+
+
 async def _enrich_run(db, run: dict) -> dict:
-    """Add accurate counts from actual findings instead of summary_json."""
+    """Read v3 stage counts, otherwise count actual legacy findings."""
+    summary = _hypothesis_v3_summary(run)
+    if summary is not None:
+        run["summary"] = summary
+        return run
     run_id = run["run_id"]
     findings = await db.get_findings(run_id=run_id)
 
@@ -57,7 +87,7 @@ async def list_reviews(
 
     for r in runs:
         c = counts.get(r["run_id"], {})
-        r["summary"] = {
+        r["summary"] = _hypothesis_v3_summary(r) or {
             "total_findings": c.get("total", 0),
             "confirmed": c.get("confirmed", 0),
             "false_positives": c.get("false_positives", 0),

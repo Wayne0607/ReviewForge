@@ -168,7 +168,9 @@ async def test_specialist_rules_share_initial_discovery_only_in_new_protocol(pro
     assert ("lens_localization" in models) is (protocol_version == 2)
     if protocol_version == 3:
         prompt = "\n".join(str(message.content) for message in models["hypothesis_generator"].calls[0])
-        assert "responsibilities: localization" in prompt
+        unit_rows = [json.loads(line) for line in prompt.splitlines() if line.startswith(f'["{unit.id}",')]
+        assert len(unit_rows) == 1
+        assert unit_rows[0][6] == ["localization"]
         assert prompt.count(localization_guidance()) == 1
         assert event.data["mode"] == "integrated-discovery"
         records = list(ledger.discovery_blocks.values())

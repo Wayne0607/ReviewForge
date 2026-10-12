@@ -225,7 +225,7 @@ async def test_resume_only_revisits_failed_units():
     await generator.run(state, ContextPack(), changeset(first, second), ledger)
     llm.responses.append(json.dumps({"hypotheses": [], "no_issue_units": [clean(second)]}))
     await generator.run(state, ContextPack(), changeset(first, second), ledger, resume=True)
-    required = llm.calls[-1][1].content.split("## Required assessments", 1)[1]
+    required = llm.calls[-1][1].content.split("## Units\n", 1)[1].split("\n\n", 1)[0]
     assert second.id in required and first.id not in required
     assert set(ledger.no_issue_units) == {first.id, second.id} and not ledger.unresolved_units
 
@@ -560,7 +560,7 @@ def test_zero_context_insertion_state_describes_delivered_source_only():
     assert block.unit_before_states[u.id] == "absent-before-in-delivered-source"
     prompt = load_prompt("discovery_v3", lens="general correctness", output_language="English", max_hypotheses=6)
     assert "a zero-context insertion can have this state" in prompt
-    assert "It does not mean\nthe base file did not exist" in prompt
+    assert "It does not mean\n  the base file did not exist" in prompt
     assert "including when no target before source was delivered" in prompt
 
 
@@ -575,8 +575,9 @@ def test_unchanged_source_prints_both_explicit_coordinates_and_scope_is_exact():
     user = HypothesisGenerator(ScriptedLLM())._render_discovery_message(
         block, HypothesisLedger("run", "abc", "digest", protocol_version=3), 6
     )
-    assert "RIGHT lines: 49-51" in user and "before lines: 42-43" in user
-    assert "RIGHT lines: 48" not in user
+    row = json.loads(next(line for line in user.splitlines() if line.startswith("[")))
+    assert row[:3] == [u.id, u.path, u.symbol]
+    assert row[4:6] == ["42-43", "49-51"]
 
 
 @pytest.mark.asyncio
@@ -629,7 +630,8 @@ async def test_responsibilities_are_fused_into_first_call_and_rules_delivered_on
     assert len(llm.calls) == 1
     full_input = "\n".join(message.content for message in llm.calls[0])
     assert full_input.count(localization_guidance()) == 1
-    assert "responsibilities: localization" in full_input
+    row = json.loads(next(line for line in llm.calls[0][1].content.splitlines() if line.startswith("[")))
+    assert row[6] == ["localization"]
     row = next(iter(ledger.discovery_blocks.values()))
     assert row["delivered_responsibilities"] == {u.id: ["localization"]}
     assert ledger.no_issue_units[u.id]

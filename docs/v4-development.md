@@ -1,6 +1,22 @@
 # ReviewForge v4 开发记录
 
-更新时间：2026-10-12。开发分支：`dev`。生产分支：`main@00c667556c88241d72d96f24430c7c16b4add24e`。
+更新时间：2026-10-13。开发分支：`dev`。生产分支：`main@00c667556c88241d72d96f24430c7c16b4add24e`。
+
+## 最新验收状态（2026-10-13）
+
+独立核验与确定性发布已提交 `c681d2fd8abcff518536e3b6a055d6d5a802f657`；本机 2168 项通过、1 跳过，Linux [CI 通过](https://github.com/Wayne0607/ReviewForge/actions/runs/38272944094)。新冻结的小额旧实录回放在 `saved-proof-replay-c681d2f-20261012-234902/`：健康检查成功、实报 15 tokens，第一批核验在约 30 秒物理间隔下连续 3 次 HTTP 429 后停止。消息、4096 输出限额和 JSON/disabled 选项相同；未继续后续案例，不能声称完成五项语义验证或新的十 PR 质量验收。
+
+三个失败请求的最终未知费用预占合计 40737，pending=0；未知预占不是中转账单。该批总保守记账 40752，未达到 50k 上限；重设计累计 722740 reported + 354627 unknown = 1077367 保守记账。Job 峰值 124592128 bytes，无资源保护触发。脱敏错误 code/type 未识别、Retry-After 缺失，不能断言是 RPM、TPM、余额或服务端负载；已请求用户转述中转控制台限额或错误说明，继续做无需模型的输入压缩。
+
+离线审计 b019 首 PR 的五份物理发现输入，UTF-8 总计 196469 bytes：源码正文 48534（24.7%）、source_ref 标签 15096（7.7%）、system 69099（35.2%）、其余导航/坐标/说明 63740（32.4%）。同块实际源码重复 5356 bytes（总输入 2.7%），跨这五份输入的完整 hunk 重复为 0。四次成功的实际输入 43353、输出 8717 tokens；另一次 429 保留 24502 未知预占。压缩重点是重复规则与导航，不能用删除源码、放宽覆盖或改 golden 来获得低消耗。
+
+呈现压缩后的同五份输入为 174603 bytes，减少 11.13%；统一物理准入估算从 68147 降至 60964，减少 7183。878 次源码事实出现、792 个 source_ref、目标 LEFT/RIGHT 范围和领域规则正文逐项一致；没有重分块、源码 alias 或额外模型调用，且保留了 b019 尚未包含的完整 violation 契约。当前通用 system 从 c681 的 13764 bytes 降至 8778（36.2%）；完整实际输入的缩减应使用前述 11.13%，不能混为同一个指标。对照报告为 `.reviewforge/eval-private/discovery-input-compression-20261013.json`，由同目录 `compare_discovery_presentation.py` 重建。估算不是实际账单，也不证明全 PR 能在 80k 内覆盖或质量已提高。
+
+修正了两个阶段统计断点：orchestrator 不再把调查 CONFIRMED 当作核验通过；控制台单次运行列表与详情不再从空的 legacy findings 表将 v3 结果覆盖成零。新增持久化、SQLite 恢复和实际 HTTP 回归；旧协议与 legacy/shadow 保持原计数。核验通过数不等于送达评论数，全局指标/趋势仍沿用旧 findings 聚合，不在本次修复范围。
+
+严格裁判的原有主口径仅评分已发布 inline comments；结构问题或超额确认项若只在 review body 中发布，不计入主指标 TP/FP，对应 golden 仍可能记 FN。UNKNOWN 也在 body 内，不能把整个 body 接入裁判当作确认项。该边界由 `scripts/benchmarks/README.md` 明确声明，当前与旧冻结裁判一致；本轮未修改裁判、golden 或历史成绩。
+
+压缩与统计接通后的 Windows 全量回归：2182 passed、1 skipped、6 项既有弃用警告（57.81 秒）；backend 与 benchmark 脚本 Ruff/format 237 文件通过，CLI spec-check 通过，严格裁判 2 项离线回归通过。该验证不涉及新模型请求，不能代替真实开发集或 holdout 验收。
 
 ## 2026-10-12：发现与调查协作重设计
 

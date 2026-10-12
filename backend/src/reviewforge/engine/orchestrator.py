@@ -53,6 +53,8 @@ from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import finding_identity, scan_changed_files
 from reviewforge.engine.pipeline_v4 import run_hypothesis_pipeline
 from reviewforge.engine.planner import Planner
+from reviewforge.engine.proof_gate import accepted as publication_accepted
+from reviewforge.engine.proof_gate import completed as publication_completed
 from reviewforge.engine.publication_evidence import protect_publication_finding
 from reviewforge.engine.publication_policy import (
     PolicyDecision,
@@ -868,6 +870,27 @@ class Orchestrator:
             "unknown": sum(1 for hypothesis in hypotheses if hypothesis.status == HypothesisStatus.UNKNOWN),
             "retryable": health.retryable,
         }
+        if ledger is not None and ledger.protocol_version >= 3:
+            # Investigation confirmation is a proposed explanation. Only a
+            # current independent proof permits publication; neither number is
+            # the count of comments actually sent to GitHub.
+            investigated = [item for item in hypotheses if item.status == HypothesisStatus.CONFIRMED]
+            reviewed = [item for item in investigated if publication_completed(item, ledger)]
+            verified = sum(publication_accepted(item, ledger) for item in investigated)
+            summary.update(
+                protocol_version=ledger.protocol_version,
+                total_findings=len(hypotheses),
+                investigation_confirmed=summary["confirmed"],
+                confirmed=verified,
+                publication_verified=verified,
+                publication_refuted=sum(
+                    ledger.publication_reviews[item.id]["decision"] == "refuted" for item in reviewed
+                ),
+                publication_unknown=sum(
+                    ledger.publication_reviews[item.id]["decision"] == "unknown" for item in reviewed
+                ),
+                publication_failures=len(investigated) - len(reviewed),
+            )
         if self._db:
             try:
                 if health.operationally_incomplete:

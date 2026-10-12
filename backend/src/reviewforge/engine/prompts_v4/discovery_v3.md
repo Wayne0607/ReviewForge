@@ -1,201 +1,129 @@
 # Discovery protocol v3 — {{lens}}
 
-Review only defects introduced by this PR. This is one bounded group of related
-changes, not the entire PR. The PR overview and relationship navigation retain
-the wider design; navigation, existing candidates and attention cues are not
-proof of execution order, a supported input or a defect. Review the supplied
-before AND after source for the same input before deciding whether behavior
-changes. For a changed conditional, explicitly compare true and false branches,
-including which values are written or omitted. Intent alone does not establish
-equivalence or correctness.
+Assess this bounded group of PR changes, including each unit's responsibilities;
+there is no later specialist rescan. PR intent, relationship navigation, focus,
+rules and existing candidates are navigation/policy, not evidence or coverage.
+Compare before AND after for the same supported input. For changed conditions,
+compare true/false branches, guard polarity and values written or omitted.
+Intent does not prove equivalence. A real
+observable change may be compatible with the contract or repair an earlier defect.
 
-Shared hunks are supplied once for all the units that use them. `- line [sr_ID] | code`
-is before source, `+ line [sr_ID] | code` is after source, and unchanged
-`before=LEFT [sr_ID] RIGHT=NEW [sr_OTHER] | code` has two explicit coordinates. A before fact uses
-LEFT; an after fact or site uses RIGHT. Do not copy RIGHT into a before fact.
-Context lines are separately numbered and require side=context even when the
-same text also appears in diff; alternatively cite its exact diff side/line.
-Use `{"source_ref":"sr_ID"}` for source_facts, trigger_basis, sites and violation
-requirement_basis/input_basis. Copy a
-delivered ID exactly; the program resolves its side, path, line and exact source
-excerpt. IDs belong only to this block. Long lines show `sr_ID:start-end` column
-ranges for short fragments of the same source body; copy only the ID, without
-the column suffix. The source text is not repeated in an index. Legacy explicit
-side/path/line/excerpt facts also remain valid when the excerpt is an exact
-substring of the delivered line. Copy such excerpts from the code after `|`;
-preserve any `|` in the code itself. Only after/RIGHT
-locations can become `sites`. Facts must cite delivered source, not navigation,
-an omitted slice, a hypothetical call, or an invented input.
+Defect scope: only PR-introduced violations of a supported contract with a
+concrete incorrect result for that same witness. A before image, factual answer,
+candidate claim or absent operation alone establishes no requirement. Use actual
+caller/test/config contracts or supplied standards bound to this implementation;
+do not invent preservation of an old defect, formatting or wording as a contract.
+Style, naming, extra tests/docs, intended negative fixtures and pre-existing bugs
+are out of scope. A changed test may fail incorrectly or mask an observed failure;
+missing assertions alone are a coverage request, and an exit-code API establishes
+no obligation for every test to assert it. Missing context proves neither bug nor safety.
 
-First state the behavior before and after, and its observable result. A real
-observable change may be compatible with the contract or repair an earlier
-defect. That comparison alone does not establish a regression. A candidate
-also requires a separate violation: the required behavior and its real source
-basis, the after behavior incompatible with that requirement, the negative
-consequence, and a supported input/lifecycle with its real source basis. A
-before image alone does not establish that its behavior was required. References
-must support their assigned role; an unrelated caller, resource key or code
-line is not a supported input merely because it was delivered in this block.
-Do not manufacture a requirement to preserve a previous defect, formatting or
-wording. If you cannot establish the consumer requirement or a harmful after
-result, explicitly defer that boundary rather than allocate a defect candidate.
-For a compatible behavior change, no_issue.checked must explain which supplied
-contract remains satisfied and what was compared. Then ask one factual question
-whose answer determines the proposed regression, and state what would refute it.
-These obligations are still unconfirmed discovery navigation; investigation
-must independently prove the requirement, supported input, after violation and
-harm in the same direction. Source resolution does not prove semantic support.
+First describe behavior, then independently propose the violation: required
+behavior, incompatible after behavior, negative consequence and supported input,
+with real source supporting the requirement and input in their assigned roles.
+A delivered unrelated caller/key is not an input contract. If the requirement or
+harm is unavailable, defer that boundary. For compatible changes, checked must
+explain which supplied contract remains satisfied and the concrete comparison.
+Keep claim/impact/question/refutation in this same direction. A changed output
+alone is not harmful; ask one repository-verifiable question deciding the proposed
+regression and give its refutation. Investigation independently proves these
+obligations; source resolution does not prove semantic support. Discovery facts
+are not saved Observations or confirmation.
 
-Keep independent triggers/impacts distinct. Combine sites only for the same
-root cause, trigger and consequence. An existing OPEN candidate is not proven;
-when it covers the same risk, explain the concrete check and cite that identity
-in `checked`, rather than creating a duplicate. Styles, naming, requests for
-more tests/documentation, intended negative fixtures and pre-existing defects
-are outside this review. Missing context cannot prove a defect or clean result.
+Source coordinates and scope:
+- Shared hunks are intact and supplied once. `- LEFT [sr_ID] | code` is before;
+  `+ RIGHT [sr_ID] | code` is after; unchanged
+  `before=LEFT [sr_ID] RIGHT=NEW [sr_OTHER] | code` has both coordinates.
+  Never use RIGHT for before. Context has side=context at its own path/line,
+  even when the same text appears in the diff; cite the exact diff side instead
+  if choosing a diff reference. Preserve code's own `|` characters.
+- Default reference R = {"source_ref":"sr_ID"}. Copy a delivered ID exactly,
+  without a long-line `:start-end` column suffix. IDs resolve only inside this
+  block to exact side/path/line/excerpt; no overrides or other-block IDs.
+  Long-line IDs bind short fragments (<=240 chars) of the single source body.
+  Legacy {side,path,line,excerpt} exact substrings remain valid without a separate
+  length cap. Only after/RIGHT references can be sites; site excerpts need >=12 chars.
+  No navigation, omitted slices, hypothetical calls or invented inputs as source.
+- Units rows define exact target ranges. Behavior must cite the target's changed
+  operation on both supplied sides (including removed/added rows when present),
+  not a neighboring function or just the wider shared hunk. A textual candidate
+  needs at least one own-target RIGHT site; shared parent/child ranges can refer
+  to the same operation. Other-file facts/sites can support but cannot replace it.
+- absent-before-in-delivered-source is local fragment absence;
+  a zero-context insertion can have this state. It does not mean
+  the base file did not exist or prior behavior was absent across the PR.
+  absent-new-declaration means a positively added head declaration with no old
+  counterpart in the visible association, not absence elsewhere. Cite after and
+  describe only local absence; an old closing brace is not a new method's old body.
+  unresolved-declaration-correspondence does not establish newness,
+  including when no target before source was delivered. Never invent unavailable
+  prior behavior; defer conclusions needing it.
 
-Return one JSON object. Each allowed unit must have a hypothesis, a concrete
-`no_issue_units` check, or an explicit `deferred_units` reason. Independent
-hypotheses may share a unit. A hypothesis may coexist with deferred_units when
-another hunk, supported input or contract remains unchecked; state that boundary
-explicitly. The candidate is retained and this unit remains incompletely covered.
-Do not mix a no_issue_units clean assessment with any other answer for that unit.
-No blanket "looks correct" or "logic equivalent" clean assessments:
-show which before/after behavior and contract you actually compared.
-`absent-before-in-delivered-source` means only that the delivered fragments have
-no before source; a zero-context insertion can have this state. It does not mean
-the base file did not exist or that prior behavior was absent across the PR.
-`absent-new-declaration` records a positively added head declaration with no old
-counterpart in the visible source association. It does not prove that no same
-declaration or prior caller behavior exists elsewhere. Describe only this local
-absence and cite after source; a reused old closing brace is not an old
-implementation of a new method. Otherwise cite both target before and after
-source when supplied. `unresolved-declaration-correspondence` does not establish
-newness, including when no target before source was delivered. Do not invent
-prior behavior from an unavailable before image; defer a check whose conclusion
-needs that missing source. The exact per-unit target ranges govern behavior facts and the primary
-site; the wider shared hunk is supporting source, not a substitute target.
-Source facts are review input, never saved
-investigation Observations or proof that the candidate is confirmed.
+Output one JSON object with arrays hypotheses, no_issue_units, deferred_units.
+Assess every Units ID: independent hypotheses may share a unit; hypotheses plus
+deferred_units retain candidates but leave the explicit remaining boundary
+uncovered. no_issue_units cannot coexist with any other answer for that unit.
+No omissions or blanket "looks correct"/"logic equivalent" clean answers.
+Keep independent triggers/impacts distinct; combine sites only for the same root
+cause/trigger/consequence. Existing OPEN risks are unproved; for the same risk,
+give a concrete checked comparison citing its identity rather than a duplicate.
 
-Schema (the example IDs and source are not available IDs):
+Types (example identifiers are placeholders, never available references):
+P = nonempty prose <=600 chars; use one concise factual sentence, not a length target.
+B = {"before":P,"after":P,"observable":P,"source_facts":[R]} with 1–4 facts.
+V = {"required_behavior":P,"requirement_basis":[R],
+     "actual_incompatible_behavior":P,"negative_consequence":P,
+     "supported_input":P,"input_basis":[R]}.
+V requires exactly these six fields; each basis has 1–4 real source references.
+The same real source may support requirement and input when its content does so;
+different IDs are not required. Change metadata, rules, navigation and negative
+search cannot replace either basis. Behavior delta and violation stay separate.
 
 ```json
 {
   "hypotheses": [{
-    "unit_id": "COPY_ALLOWED_ID",
-    "mechanism": "contract-mismatch",
-    "claim": "Concrete regression introduced by the change",
-    "trigger": "Observed supported input or lifecycle condition",
-    "impact": "Observable incorrect output or state",
-    "open_question": "One source-verifiable fact deciding the regression?",
-    "refutation": "Specific source fact that would refute the regression",
-    "severity": "warning",
-    "sites": [{"source_ref": "sr_AFTER_ID"}],
-    "discrepancy": "Observed mismatch between the change and an input/caller/contract",
-    "trigger_basis": {"source_ref": "sr_CALLER_ID"},
-    "violation": {
-      "required_behavior": "The delivered caller contract requires returning its persisted value",
-      "requirement_basis": [{"source_ref": "sr_CALLER_CONTRACT_ID"}],
-      "actual_incompatible_behavior": "The changed operation returns a replacement instead",
-      "negative_consequence": "The caller receives a value incompatible with its stored record",
-      "supported_input": "The delivered caller requests an existing persisted record",
-      "input_basis": [{"source_ref": "sr_SUPPORTED_CALL_ID"}]
-    },
-    "behavior": {
-      "before": "Result for the same concrete input before the change",
-      "after": "Result for that input after the change",
-      "observable": "The changed return value, state, error or other observable result",
-      "source_facts": [
-        {"source_ref": "sr_BEFORE_ID"},
-        {"source_ref": "sr_AFTER_ID"}
-      ]
-    }
+    "unit_id":"COPY_UNITS_ID", "mechanism":"contract-mismatch",
+    "claim":"P", "trigger":"P", "impact":"P", "open_question":"P",
+    "refutation":"P", "severity":"warning", "sites":[{"source_ref":"sr_AFTER_ID"}],
+    "discrepancy":"P", "trigger_basis":{"source_ref":"sr_INPUT_ID"},
+    "behavior":{"before":"P","after":"P","observable":"P","source_facts":[{"source_ref":"sr_BEFORE_ID"},{"source_ref":"sr_AFTER_ID"}]},
+    "violation":{"required_behavior":"P","requirement_basis":[{"source_ref":"sr_CONTRACT_ID"}],"actual_incompatible_behavior":"P","negative_consequence":"P","supported_input":"P","input_basis":[{"source_ref":"sr_INPUT_ID"}]}
   }],
-  "no_issue_units": [{
-    "unit_id": "COPY_OTHER_ALLOWED_ID",
-    "checked": "Specific comparison/check and its source-backed compatibility result",
-    "behavior": {
-      "before": "Prior behavior for the compared input",
-      "after": "New behavior for the same input",
-      "observable": "Actual checked result and why it respects the supplied contract",
-      "source_facts": [
-        {"source_ref": "sr_OTHER_BEFORE_ID"},
-        {"source_ref": "sr_OTHER_AFTER_ID"}
-      ]
-    }
-  }],
-  "deferred_units": [{"unit_id": "COPY_THIRD_ALLOWED_ID", "reason": "Concrete missing context or candidate capacity that prevents this assessment"}]
+  "no_issue_units":[],
+  "deferred_units":[{"unit_id":"COPY_UNITS_ID","reason":"P: concrete unchecked boundary"}]
 }
 ```
+no_issue_units entries are {unit_id,checked:P,behavior:B}; B/V are objects,
+not strings. Replace prose placeholders and use distinct example unit IDs.
+mechanism: wrong-argument|wrong-operator|null-path|contract-mismatch|missing-await|
+lock-scope|state-leak|error-path|regression-removed|security-sink|i18n|a11y|perf|test-gap|doc.
+severity: error|warning|info. Legacy side: before|after|context.
+Copy unit IDs/symbols exactly. Behavior/discrepancy/trigger/violation are bounded
+investigation navigation, not evidence that the proposed semantic roles are true.
 
-`mechanism` must be one of wrong-argument, wrong-operator, null-path,
-contract-mismatch, missing-await, lock-scope, state-leak, error-path,
-regression-removed, security-sink, i18n, a11y, perf, test-gap, doc.
-`severity` must be error, warning or info. `side` must be before, after or
-context. Every fact must quote delivered code at its exact path and line;
-every site excerpt must be a verbatim after/RIGHT substring of at least 12
-characters. Do not invent an anchor symbol or a unit ID.
-Behavior facts must include the changed operation inside the declared unit's
-range, not merely a neighboring function in the same file. A candidate must
-have at least one RIGHT site in that target unit; shared parent/child ranges
-may refer to the same operation. Additional cross-file facts/sites may explain
-the contract but cannot replace the target's own source.
-Use at most four source_facts per behavior. Program source_ref excerpts are at
-most 240 characters; explicit legacy exact quotes have no separate length limit.
-Prefer the short IDs to repeating source text. Limit each prose field to at most 600
-characters; these are hard schema limits, not length targets. The behavior,
-discrepancy and trigger basis will be delivered as bounded navigation to the
-investigator; they are not Observations or confirmed evidence.
-Every hypothesis requires all six violation fields shown above; use no extra
-fields. Each violation prose field is a nonempty string of at most 600
-characters; each basis contains 1–4 real delivered source references. A single
-real source location may support both requirement and input when its actual
-content does so; different IDs are not required. Typed change facts, rules,
-navigation and negative search results cannot replace either source basis.
-The behavior delta and violation remain separate: a changed output is not by
-itself an incompatible or harmful output. Preserve this direction in claim,
-impact, open_question and refutation rather than asking whether a beneficial
-change could have any difference at all.
+Structural units: typed verified rename facts have equal comparison-base/head
+blobs, normal mode/type and no text hunk. Equal content does not prove compatible
+resource lookup/import/consumer contracts. Use sites=[]; fabricate no RIGHT line
+or model change_anchor (the program binds it). Keep B/V and other usual fields;
+add B.change_facts with 2–4 exact references, including both old and new paths:
+{"kind":"file-change","change_id":"COPY_CHANGE_ID","field":"previous_path","value":"COPY_OLD_PATH"}
+and the same shape with field="path", value="COPY_NEW_PATH"; no other fields.
+Metadata is not SourceLine/Observation. B.source_facts and trigger_basis must
+cite real delivered head/reference source, not only rename metadata. A structural
+no_issue must cite actual reference/consumer code and explain its old/new lookup
+contract check. No references found, a negative search or rename alone is not
+safety proof. Defer missing consumer/source material. Unverified missing patches,
+mode changes and binary inputs do not use this structural path.
 
-Some units have `## Structural changes`: a typed, program-verified rename with
-equal comparison-base/head blobs and no text hunk. Its old/new path still changes
-resource lookup, imports and consumer contracts. Equal contents do not prove a
-safe rename. These facts are separate from source lines and are not Observations.
-For such a unit, set `sites: []`; there is no RIGHT line to fabricate. Do not
-return a model-constructed change_anchor: the program binds the trusted record.
-Keep the usual hypothesis fields and behavioral comparison. Add exact typed
-path references to `behavior.change_facts`, for example:
+Domain rules below apply to their listed units with general correctness; they
+are not evidence. Echoing a responsibility does not complete coverage.
+The investigator can read the pinned repository via read_file/read_diff/grep/
+find_definition/find_callers, without internet/advisory lookup or execution.
+Questions must be answerable from repository evidence and supplied contracts;
+external CVE claims need a concrete supplied advisory, not merely a new dependency.
 
-```json
-"change_facts": [
-  {"kind": "file-change", "change_id": "COPY_DELIVERED_CHANGE_ID", "field": "previous_path", "value": "old/path.json"},
-  {"kind": "file-change", "change_id": "COPY_DELIVERED_CHANGE_ID", "field": "path", "value": "new/path.json"}
-]
-```
-
-Copy both paths and change_id exactly from the unit's typed record; do not put
-metadata in source_facts or invent a line number for it. Use 2–4 change facts,
-with only the fields previous_path/path. Also cite delivered real head or
-reference code in source_facts. A structural candidate's trigger_basis must be
-that real head/reference code, not just the rename record. A structural no_issue
-check must cite actual reference/consumer code and explain what was checked
-about the old/new lookup or contract. A negative search, no collected references
-or the rename alone cannot prove it safe; explicitly defer when the needed
-consumer/source material is missing. Unverified missing patches, mode changes
-and unsupported binary inputs do not use this structural path.
-
-The unit's listed responsibilities and their domain rules are delivered with
-this first discovery input. Check those rules together with general correctness
-against the same source; there is no later full-PR specialist rescan. Rules are
-not evidence, and echoing a responsibility name does not prove coverage.
-
-This block allows at most **{{max_hypotheses}} new candidates**. This is an
-upper bound, not a quota; the whole PR shares a fixed candidate cap. If a real
-risk cannot fit, use deferred_units and explain the concrete capacity boundary;
-do not call it clean. Keep every prose field to one concise factual sentence,
-use only the source excerpts needed for validation, and close the entire JSON
-object inside the existing 8192-token output limit. If evidence is insufficient,
-explicitly defer the unit; do not hide it by omission. Do not re-review, search
-the internet or execute code.
-
-Output language: {{output_language}}. Keep code identifiers unchanged.
+At most **{{max_hypotheses}} new candidates** in this block; upper bound, not quota,
+with a shared PR cap. If a real risk cannot fit, defer its concrete boundary,
+never call it clean. Close the entire JSON within the existing 8192-token limit.
+Do not re-review, search the internet or execute code.
+Output language: {{output_language}}; keep code identifiers unchanged.

@@ -36,8 +36,8 @@ class CoverageModel(BaseChatModel):
         if self.raw:
             body = self.raw
         else:
-            allowed = messages[-1].content.split("Allowed unit_id values (copy exactly): ", 1)[1].split("\n", 1)[0]
-            selected = [self.units[key] for key in allowed.split(", ")]
+            table = messages[-1].content.split("## Units\n", 1)[1].split("\n\n", 1)[0]
+            selected = [self.units[json.loads(row)[0]] for row in table.splitlines() if row.startswith("[")]
             emit_candidate = (
                 self.candidate_mode and "New candidate allowance this block: 0." not in messages[-1].content
             )
@@ -306,13 +306,19 @@ async def test_child_allowance_and_floor_use_latest_global_candidate_count():
     model = CoverageModel(units={u.id: u for u in units}, candidate_mode=True)
     probe = HypothesisGenerator(model, max_hypotheses=1, **kwargs)
     _, messages = final_messages(probe, units, state, ledger)
-    budget = RequestBudget(250_000, discovery_limit=estimate_request(messages, {"max_tokens": 8192}) - 100)
+    # Refuse the complete parent but admit useful child output. Derive this
+    # boundary from the policy floor, not incidental prompt padding bytes.
+    budget = RequestBudget(
+        250_000,
+        discovery_limit=estimate_request(messages, {"max_tokens": 8192}) + _discovery_output_floor(4, 1) - 100,
+    )
     result = await HypothesisGenerator(
         BudgetedChatLLM(model, budget, phase="discovery"), max_hypotheses=1, **kwargs
     ).run(state, ContextPack(), changeset(*units), ledger)
     assert result.accepted == 1 and len(ledger.items) == 1 and 2 <= len(model.calls) <= 4
     assert "New candidate allowance this block: 1." in model.calls[0][0][-1].content
     assert "New candidate allowance this block: 0." in model.calls[1][0][-1].content
+    assert any(len(row["unit_ids"]) == 4 and row["status"] == "partitioned" for row in ledger.discovery_blocks.values())
     delivered = [row for row in ledger.discovery_blocks.values() if row.get("request_attempted")]
     assert delivered[0]["request_plan"]["useful_output_floor"] == _discovery_output_floor(
         len(delivered[0]["unit_ids"]), 1

@@ -35,3 +35,13 @@ UNKNOWN: missing proof stays missing.
 {"answer":"what the observations establish","severity":"error","assessment":null,"counterevidence":null,"reason":"the specific unsupported input, contract, ordering or consequence still missing","additional_sites":[]}
 
 additional_sites require RIGHT {path,line,excerpt}. Output: {{output_language}}.
+
+## Structural changes
+
+When a hypothesis has a change_anchor instead of source sites, read_change is
+the authoritative recorded metadata for the pinned rename. Equal blobs prove
+unchanged file contents, not safe lookup/import/runtime behavior. Verify the
+claimed consumer contract in actual source. Do not invent a diff hunk or a
+RIGHT line for a rename-only file. Confirmed structural issues are published in
+the review summary with evidence and immutable source links.
+

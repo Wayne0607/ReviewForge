@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-READ_ONLY_TOOLS = frozenset({"read_file", "read_diff", "grep", "find_definition", "find_callers"})
+READ_ONLY_TOOLS = frozenset({"read_file", "read_diff", "read_change", "grep", "find_definition", "find_callers"})
 MAX_CACHE_ENTRIES = 512
 MAX_CACHE_BYTES = 4 * 1024 * 1024
 MAX_RESULT_CHARS = 6_000

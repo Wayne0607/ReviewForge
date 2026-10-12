@@ -9,8 +9,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import replace
 from typing import Any
 
+from reviewforge.core.change_manifest import (
+    FileChange,
+    file_changes_from_pr_files,
+    is_verified_rename,
+    populate_file_changes,
+    valid_path,
+    valid_repo,
+    valid_sha,
+)
 from reviewforge.core.specs import SpecRegistry
 from reviewforge.core.state import StateStore
 from reviewforge.tools.github_api import MAX_REVIEW_COMMENTS_PER_REQUEST, GitHubClient
@@ -69,6 +79,7 @@ class ToolGateway:
         # request. Entries live only while the bulk request is in flight; the
         # resulting patches are owned by the per-run StateStore.
         self._diff_loads: dict[int, asyncio.Task[dict[str, str]]] = {}
+        self._change_loads: dict[int, asyncio.Task[dict[str, FileChange]]] = {}
         # Hypothesis/shadow tool reads share one pinned workspace per run.  The
         # map is intentionally keyed by StateStore identity because StateStore
         # is mutable and therefore not hashable.
@@ -168,11 +179,177 @@ class ToolGateway:
             # per-file contract. Production GitHubClient always supports bulk.
             return {}
         files = await get_pr_files(state.repo, state.pr_number)
+        populate_file_changes(state, files)
         return {
             str(item["filename"]): str(item.get("patch", "") or "")
             for item in files
             if isinstance(item, dict) and item.get("filename")
         }
+
+    async def ensure_file_changes(self, state: StateStore) -> None:
+        """Explicit v3-only preparation; legacy diff loading never invokes it.
+
+        Missing evidence stays missing. Concurrent callers share one attempt;
+        a stable failure is retained in this state and is not silently retried.
+        """
+        # ContextEngine subsequently calls ensure_file_diffs. Load the raw
+        # metadata first so that later lazy diff initialization cannot replace
+        # a verified record with the unhydrated PR-file record.
+        if state.file_diffs is None:
+            await self.ensure_file_diffs(state)
+        identity = (state.repo, state.head_repo or state.repo, state.base_sha, state.head_sha)
+        records = state.file_changes
+        if all(
+            path in records
+            and (records[path].repo, records[path].head_repo, records[path].base_sha, records[path].head_sha)
+            == identity
+            and (
+                records[path].patch_state in {"present", "unsupported"}
+                or records[path].proof_error
+                or is_verified_rename(records[path], state.head_sha)
+            )
+            for path in state.files_changed
+        ):
+            return
+        key = id(state)
+        load = self._change_loads.get(key)
+        if load is None:
+            load = asyncio.create_task(self._load_file_changes(state))
+            self._change_loads[key] = load
+        try:
+            loaded = await asyncio.shield(load)
+            if (state.repo, state.head_repo or state.repo, state.base_sha, state.head_sha) != identity:
+                raise ValueError("PR identity changed during structural verification")
+            state.file_changes = loaded
+        finally:
+            if load.done() and self._change_loads.get(key) is load:
+                self._change_loads.pop(key, None)
+
+    async def _load_file_changes(self, state: StateStore) -> dict[str, FileChange]:
+        repo, head_repo, base_sha, head_sha = state.repo, state.head_repo or state.repo, state.base_sha, state.head_sha
+        paths = tuple(state.files_changed)
+        # Rebinding every record prevents checkpoint proof from another head
+        # being reused. Fresh PR-file metadata is read only for this v3 path.
+        records = file_changes_from_pr_files(
+            repo=repo,
+            head_repo=head_repo,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            files=[{"filename": path, "patch": (state.file_diffs or {}).get(path, "")} for path in paths],
+        )
+        for path, change in state.file_changes.items():
+            if path in records and (change.repo, change.head_repo, change.base_sha, change.head_sha) == (
+                repo,
+                head_repo,
+                base_sha,
+                head_sha,
+            ):
+                # Preserve captured rename metadata even if the first proof
+                # lookup fails; proof fields must be supplied by this attempt.
+                records[path] = replace(
+                    change,
+                    comparison_base_sha="",
+                    base_blob_sha="",
+                    head_blob_sha="",
+                    base_mode="",
+                    head_mode="",
+                    base_type="",
+                    head_type="",
+                    patch_state=records[path].patch_state,
+                    source="github-pr-files",
+                    proof_error="",
+                )
+
+        def failed(error: str) -> dict[str, FileChange]:
+            return {
+                path: replace(change, proof_error=error) if change.patch_state != "present" else change
+                for path, change in records.items()
+            }
+
+        if not valid_repo(repo) or not valid_repo(head_repo) or not valid_sha(base_sha) or not valid_sha(head_sha):
+            return failed("invalid-pr-identity")
+        api_names = ("get_pr_info", "get_pr_files", "get_comparison_base", "get_git_entries")
+        if any(not callable(getattr(self._github, name, None)) for name in api_names):
+            return failed("metadata-unavailable")
+
+        def matches(info: dict[str, Any]) -> bool:
+            actual_repo = (info.get("head", {}).get("repo") or {}).get("full_name")
+            return (
+                info.get("head", {}).get("sha") == head_sha
+                and info.get("base", {}).get("sha") == base_sha
+                and (not actual_repo or actual_repo == head_repo)
+            )
+
+        try:
+            async with asyncio.timeout(60):
+                if not matches(await self._github.get_pr_info(repo, state.pr_number)):
+                    return failed("stale-pr-head")
+                files = await self._github.get_pr_files(repo, state.pr_number)
+                fresh = file_changes_from_pr_files(
+                    repo=repo, head_repo=head_repo, base_sha=base_sha, head_sha=head_sha, files=files
+                )
+                records.update({path: fresh[path] for path in paths if path in fresh})
+                candidates = [
+                    change
+                    for change in records.values()
+                    if change.patch_state == "absent-unverified" and change.status == "renamed"
+                ]
+                for path, change in list(records.items()):
+                    if change.patch_state == "absent-unverified" and change.status != "renamed":
+                        records[path] = replace(change, proof_error="patch-unavailable")
+                if not candidates:
+                    return records
+                comparison_base = await self._github.get_comparison_base(repo, base_sha, head_repo, head_sha)
+                if not valid_sha(comparison_base):
+                    return failed("comparison-base-unavailable")
+                selected = []
+                for index, change in enumerate(candidates):
+                    if index >= 16:
+                        records[change.path] = replace(change, proof_error="metadata-limit")
+                    elif not valid_path(change.previous_path) or change.previous_path == change.path:
+                        records[change.path] = replace(change, proof_error="invalid-rename-path")
+                    else:
+                        selected.append(change)
+                if not selected:
+                    return records
+                before = await self._github.get_git_entries(
+                    repo, comparison_base, [change.previous_path for change in selected]
+                )
+                after = await self._github.get_git_entries(head_repo, head_sha, [change.path for change in selected])
+                if not matches(await self._github.get_pr_info(repo, state.pr_number)):
+                    return failed("stale-pr-head")
+                for change in selected:
+                    old, new = before.get(change.previous_path), after.get(change.path)
+                    if not isinstance(old, dict) or not isinstance(new, dict):
+                        records[change.path] = replace(change, proof_error="git-entry-unavailable")
+                        continue
+                    hydrated = replace(
+                        change,
+                        comparison_base_sha=comparison_base,
+                        base_blob_sha=old.get("sha", ""),
+                        head_blob_sha=new.get("sha", ""),
+                        base_mode=old.get("mode", ""),
+                        head_mode=new.get("mode", ""),
+                        base_type=old.get("type", ""),
+                        head_type=new.get("type", ""),
+                        source="github-pr-files+git-tree",
+                    )
+                    if not valid_sha(hydrated.base_blob_sha) or not valid_sha(hydrated.head_blob_sha):
+                        hydrated = replace(hydrated, proof_error="git-entry-unavailable")
+                    elif hydrated.base_type != "blob" or hydrated.head_type != "blob":
+                        hydrated = replace(hydrated, patch_state="unsupported", proof_error="unsupported-type")
+                    elif hydrated.base_mode != hydrated.head_mode or hydrated.base_mode not in {"100644", "100755"}:
+                        hydrated = replace(hydrated, patch_state="unsupported", proof_error="unsupported-mode")
+                    elif hydrated.base_blob_sha != hydrated.head_blob_sha:
+                        hydrated = replace(hydrated, proof_error="blob-mismatch")
+                    else:
+                        hydrated = replace(hydrated, patch_state="verified-no-text-change")
+                    records[change.path] = hydrated
+                return records
+        except Exception:
+            # Metadata failures are coverage gaps, never proof of unchanged
+            # content. HTTP/error bodies must not enter facts or model inputs.
+            return failed("metadata-unavailable")
 
     async def _read_file(self, params: dict[str, Any], state: StateStore) -> str | None:
         if self._pipeline_requires_workspace():
@@ -284,6 +461,13 @@ class ToolGateway:
         """
 
         state_key = id(state)
+        change_load = self._change_loads.pop(state_key, None)
+        if change_load is not None:
+            change_load.cancel()
+            try:
+                await change_load
+            except asyncio.CancelledError:
+                pass
         known_state = self._workspace_states.get(state_key)
         if known_state is not None and known_state is not state:
             return
@@ -315,6 +499,9 @@ class ToolGateway:
             workspace.cleanup()
         self._workspaces.clear()
         self._workspace_states.clear()
+        for load in self._change_loads.values():
+            load.cancel()
+        self._change_loads.clear()
 
     async def _get_change_context(self, params: dict[str, Any], state: StateStore) -> str:
         """Return the precomputed Impact Manifest, optionally narrowed."""

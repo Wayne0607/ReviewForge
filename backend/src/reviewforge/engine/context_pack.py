@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
+from reviewforge.core.change_manifest import FileChange, is_verified_rename
 from reviewforge.engine.declarations_v4 import extract_code_definitions as extract_definitions
 from reviewforge.engine.java_navigation import JavaSource
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
@@ -113,6 +114,7 @@ class ContextPack:
         max_slices: int = _DEFAULT_MAX_SLICES,
         max_slice_lines: int = _DEFAULT_MAX_SLICE_LINES,
         max_callers: int = _DEFAULT_MAX_CALLERS,
+        protocol_version: int = 1,
     ) -> ContextPack:
         """Build a deterministic pack from semantic units and a PR workspace.
 
@@ -150,6 +152,16 @@ class ContextPack:
             max_slices=max(0, int(max_slices)),
             max_slice_lines=max(1, int(max_slice_lines)),
             max_callers=max(0, int(max_callers)),
+            file_changes={
+                path: change
+                for path, change in (_value(state, "file_changes", {}) or {}).items()
+                if protocol_version >= 3
+                and isinstance(change, FileChange)
+                and change.repo == changeset.repo
+                and change.path == path
+                and change.head_repo == (_value(state, "head_repo", "") or changeset.repo)
+                and is_verified_rename(change, changeset.head_sha)
+            },
         )
 
         units = _value(changeset, "units", []) or []
@@ -283,6 +295,7 @@ class _PackBuilder:
         max_slices: int,
         max_slice_lines: int,
         max_callers: int,
+        file_changes: dict[str, FileChange] | None = None,
     ) -> None:
         self.changeset = changeset
         self.workspace = workspace
@@ -290,6 +303,7 @@ class _PackBuilder:
         self.max_slices = max_slices
         self.max_slice_lines = max_slice_lines
         self.max_callers = max_callers
+        self.file_changes = file_changes or {}
         self._source_cache: dict[str, str | None] = {}
         self.sha = (
             _workspace_value(workspace, "head_sha")
@@ -313,6 +327,7 @@ class _PackBuilder:
         self._unchecked = []
         self._callee_state = []
         self._state_paths.begin_unit()
+        candidates.extend(self._collect_structural(unit))
         candidates.extend(self._collect_callers(unit))
         candidates.extend(self._collect_callees(unit))
         base, interfaces = self._collect_inheritance(unit)
@@ -335,6 +350,64 @@ class _PackBuilder:
             context.truncated_kinds = _ordered_unique(slice_.kind for slice_ in candidates[kept:])
         context.truncated_kinds = _ordered_unique([*self._unchecked, *context.truncated_kinds])
         return context
+
+    def _collect_structural(self, unit: SemanticUnit) -> list[ContextSlice]:
+        change = self.file_changes.get(unit.path)
+        if change is None:
+            return []
+        source = self._read(change.path)
+        if source is None or "\x00" in source:
+            self._unchecked.extend(["head", "reference"])
+            return []
+        result = []
+        head = self._slice_from_source(
+            kind="head",
+            path=change.path,
+            start_line=1,
+            end_line=self.max_slice_lines,
+            symbol="",
+            reason="pinned head text for verified structural rename",
+            source=source,
+        )
+        if head is not None:
+            result.append(head)
+        tokens = sorted(
+            {
+                change.previous_path,
+                change.path,
+                PurePosixPath(change.previous_path).name,
+                PurePosixPath(change.path).name,
+            }
+        )
+        pattern = "|".join(re.escape(token) for token in tokens if token)
+        hits = _workspace_call(self.workspace, "grep", pattern, globs=None, max_hits=8, context=0, diverse=True)
+        references = []
+        for hit in sorted((_normalise_hit(item) for item in hits), key=lambda item: (item["path"], item["line"])):
+            path, line = hit["path"], hit["line"]
+            if not path or path == change.path or line <= 0:
+                continue
+            actual = self._read(path)
+            lines = actual.splitlines() if actual is not None and "\x00" not in actual else []
+            if line > len(lines) or not any(token and token in lines[line - 1] for token in tokens):
+                continue
+            reference = self._slice_from_source(
+                kind="reference",
+                path=path,
+                start_line=max(1, line - 12),
+                end_line=line + 12,
+                symbol="",
+                reason=f"literal old/new path reference for {change.id}; navigation, not usage proof",
+                source=actual,
+            )
+            if reference is not None:
+                references.append(reference)
+            if len(references) >= 4:
+                break
+        if not references:
+            self._unchecked.append("reference")
+        # Consumers decide path compatibility. Preserve their actual code
+        # before a potentially long resource or license head prefix.
+        return references + result
 
     def _java_source(self, path: str) -> JavaSource | None:
         if path not in self._java_sources:

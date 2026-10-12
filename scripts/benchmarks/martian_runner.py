@@ -39,6 +39,7 @@ if str(BACKEND_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT / "src"))
 
 import reviewforge.engine.orchestrator as orchestrator_module
+from reviewforge.core.change_manifest import populate_file_changes
 from reviewforge.core.config import ReviewForgeConfig
 from reviewforge.core.database import Database
 from reviewforge.core.events import EventBus
@@ -483,6 +484,7 @@ async def _run_one(
         ),
         file_diffs={str(file["filename"]): str(file.get("patch") or "") for file in files},
     )
+    populate_file_changes(state, files)
     if workspace_preflight_dir is not None:
         workspace_preflight_dir.mkdir(parents=True, exist_ok=True)
         try:

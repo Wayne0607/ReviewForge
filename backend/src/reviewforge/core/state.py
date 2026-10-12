@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from reviewforge.core.change_manifest import FileChange
+
 if TYPE_CHECKING:
     from reviewforge.engine.hypothesis import HypothesisLedger
 
@@ -200,6 +202,9 @@ class StateStore:
     # Per-run patch cache. ``None`` means the PR file list has not been loaded;
     # an empty dict is a valid loaded result (for example binary-only patches).
     file_diffs: dict[str, str] | None = field(default=None, repr=False)
+    # Structural metadata does not fabricate diff lines. Hydrated only by the
+    # explicit v3 gateway path; legacy/v1/v2 retain their existing request flow.
+    file_changes: dict[str, FileChange] = field(default_factory=dict, repr=False, kw_only=True)
     # Bounded repository context generated before planning. It is derived from
     # the immutable PR head and is safe to share by deep-copy/read-only views.
     impact_manifest: dict[str, Any] = field(default_factory=dict, repr=False)

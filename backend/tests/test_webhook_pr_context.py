@@ -95,6 +95,20 @@ def test_null_pr_body_is_normalized_to_empty_string():
     assert state.pr_body == ""
 
 
+def test_rename_metadata_survives_ingress_without_claiming_blob_proof(monkeypatch):
+    async def renamed(self, _repo, _pr_number):
+        return [
+            {"filename": "new.txt", "previous_filename": "old.txt", "status": "renamed", "additions": 0, "deletions": 0}
+        ]
+
+    monkeypatch.setattr(_GitHub, "get_pr_files", renamed)
+    state = _deliver(_payload())
+    change = state.file_changes["new.txt"]
+    assert state.file_diffs == {"new.txt": ""}
+    assert change.previous_path == "old.txt" and change.status == "renamed"
+    assert change.patch_state == "absent-unverified" and not change.base_blob_sha
+
+
 @pytest.mark.parametrize("missing_head_repo", [None, pytest.param("omitted", id="omitted")])
 def test_missing_fork_head_repo_stays_observably_empty(missing_head_repo: str | None):
     payload = _payload()

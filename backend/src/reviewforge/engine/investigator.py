@@ -22,6 +22,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
+from reviewforge.core.change_manifest import is_verified_rename, render_change_fact
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
@@ -202,6 +203,14 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
     """Bind the SPEC §4.6 tool names to a pinned :class:`PRHeadWorkspace`."""
 
     async def _execute(name: str, args: dict[str, Any]) -> str:
+        if name == "read_change":
+            change = state.file_changes.get(args["path"])
+            if change is None or not is_verified_rename(change, state.head_sha):
+                raise ValueError("structural change has not been verified against this PR head")
+            facts = render_change_fact(change)
+            if len(facts) > _OBS_EXCERPT_CHARS:
+                raise ValueError("verified change metadata exceeds the saved Observation limit")
+            return facts
         if name == "read_file":
             # Read pinned source, then select the window locally. Workspace's
             # display-oriented range reader inserts "N: " on every line, which
@@ -305,7 +314,7 @@ class Investigator:
                 payload["end"] = end
             return await self._run_tool("read_diff", payload)
 
-        return [
+        tools = [
             StructuredTool.from_function(
                 coroutine=read_file,
                 name="read_file",
@@ -328,6 +337,24 @@ class Investigator:
                 description="读取 PR before/after diff；可用 start/end RIGHT 行窗口定位 hunk，保留删除行与上下文",
             ),
         ]
+        if (
+            self._protocol_version >= 3
+            and self._state is not None
+            and any(is_verified_rename(change, self._state.head_sha) for change in self._state.file_changes.values())
+        ):
+
+            async def read_change(path: str) -> str:
+                return await self._run_tool("read_change", {"path": path})
+
+            tools.append(
+                StructuredTool.from_function(
+                    coroutine=read_change,
+                    name="read_change",
+                    description="Read verified PR rename metadata bound to the comparison base and head. "
+                    "This proves paths and blob identity, not consumer compatibility or runtime behavior.",
+                )
+            )
+        return tools
 
     async def _run_tool(self, name: str, args: dict[str, Any]) -> str:
         if name == "read_file":
@@ -558,6 +585,11 @@ class Investigator:
                 basis_navigation = json.dumps(hypothesis.discovery_basis, ensure_ascii=False)[:2_000]
             context_chars = max(0, context_chars - len(self._render_observations()) - len(basis_navigation))
             diff_section = "Before/after hunk requested as recorded evidence; inspect its saved status and excerpts."
+            if hypothesis.change_anchor is not None:
+                diff_section = (
+                    "This is a verified rename without a text hunk. Read the recorded read_change evidence "
+                    "and actual consumer source; identical file contents do not establish rename safety."
+                )
         context = (
             render_investigation_context(hypothesis, self._changeset, pack, max_chars=context_chars)
             if self._protocol_version >= 2
@@ -569,6 +601,8 @@ class Investigator:
             candidate.pop("observations", None)
             candidate.pop("investigation_progress", None)
             candidate.pop("discovery_basis", None)
+            if hypothesis.change_anchor is not None:
+                candidate["change_anchor"] = {"id": hypothesis.change_anchor.id, "path": hypothesis.change_anchor.path}
         hypothesis_body = json.dumps(candidate, ensure_ascii=False, indent=2)
         sections = [
             "## Hypothesis\n" + hypothesis_body,
@@ -607,6 +641,18 @@ class Investigator:
         These are real executor reads, not Context promotion. Two anchor reads
         and at most one validated trigger-location read replace the first round.
         """
+        if hypothesis.change_anchor is not None:
+            change = hypothesis.change_anchor
+            await self._run_tool("read_change", {"path": change.path})
+            location = self._discovery_trigger_location(hypothesis, pack)
+            path, line = location if location is not None else (change.path, 1)
+            await self._run_tool("read_file", {"path": path, "start": max(1, line - 3), "end": line + 12})
+            calls = 2
+            if path != change.path:
+                await self._run_tool("read_file", {"path": change.path, "start": 1, "end": 16})
+                calls += 1
+            self._progress.append({"phase": "bootstrap", "steps": 1, "tool_calls": calls, "surface": "structural"})
+            return True
         declared = (
             next((unit for unit in self._changeset.units if unit.id == hypothesis.unit_id), None)
             if self._changeset is not None
@@ -849,6 +895,18 @@ class Investigator:
             (int(obs.id[4:]) + 1 for obs in self._observations if obs.id.startswith("obs_") and obs.id[4:].isdigit()),
             default=0,
         )
+        if hypothesis.change_anchor is not None and (
+            self._protocol_version < 3
+            or state.file_changes.get(hypothesis.change_anchor.path) != hypothesis.change_anchor
+            or not is_verified_rename(hypothesis.change_anchor, state.head_sha)
+        ):
+            return self._result(
+                verdict="unknown",
+                reason="structural change provenance mismatch",
+                severity=hypothesis.severity,
+                steps=0,
+                outcome="tool-error",
+            )
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
         steps = self._max_steps if self._max_steps is not None else budget_steps(hypothesis)
         token_limit = steps * 4_000

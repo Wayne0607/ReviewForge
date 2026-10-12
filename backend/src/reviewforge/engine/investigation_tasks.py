@@ -41,6 +41,8 @@ def build_investigation_tasks(
                 (asdict(site) for site in item.sites), key=lambda site: (site["path"], site["line"], site["excerpt"])
             ),
         }
+        if item.change_anchor is not None:
+            facts["change_anchor"] = item.change_anchor.to_dict()
         if not anchor or anchor == "<module>":
             facts["unit_id"] = item.unit_id
         task_id = (
@@ -79,6 +81,8 @@ def fair_investigation_tasks(tasks: list[InvestigationTask]) -> list[Investigati
             item = task.hypothesis
             anchor = item.identity.rsplit("::", 1)[-1]
             key = (*sorted({site.path for site in item.sites}), anchor)
+            if item.change_anchor is not None:
+                key += (item.change_anchor.id,)
             if not anchor or anchor == "<module>":
                 key += (item.unit_id,)
             mechanisms.setdefault(item.mechanism.value, {}).setdefault(key, deque()).append(task)
@@ -96,7 +100,7 @@ def fair_investigation_tasks(tasks: list[InvestigationTask]) -> list[Investigati
 def context_units(item: Hypothesis, changeset: SemanticChangeSet | None, pack: ContextPack) -> list[str]:
     """Resolve the primary compiler site before using its declaration's context."""
     declared = item.unit_id
-    if changeset is None:
+    if changeset is None or item.change_anchor is not None:
         return [declared]
     unit = next((unit for unit in changeset.units if unit.id == declared), None)
     if unit is not None and unit.kind is UnitKind.RESOURCE:

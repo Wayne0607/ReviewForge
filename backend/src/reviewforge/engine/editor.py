@@ -14,6 +14,7 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any
+from urllib.parse import quote
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -60,6 +61,8 @@ class Publication:
 
 
 def _anchor(hypothesis: Hypothesis) -> str:
+    if hypothesis.change_anchor is not None:
+        return json.dumps(["change", hypothesis.change_anchor.id], ensure_ascii=False, separators=(",", ":"))
     symbol = hypothesis.identity.rsplit("::", 1)[-1]
     # A missing symbol describes no shared cause. Resource/file units with an
     # empty or module anchor must remain independent; a bare function name is
@@ -143,8 +146,11 @@ def split_for_publication(
 ) -> tuple[list[ConfirmedCluster], list[ConfirmedCluster]]:
     """Split into inline (published as comments) and summary clusters."""
 
-    inline: list[ConfirmedCluster] = list(ordered[: max(0, max_inline)])
-    for cluster in ordered[max(0, max_inline) : max(max(0, max_inline), max_inline_overflow)]:
+    # Structural findings have no changed source line. A summary preserves the
+    # confirmed issue without fabricating an inline coordinate or hiding it.
+    eligible = [cluster for cluster in ordered if cluster.sites and not _structural(cluster)]
+    inline: list[ConfirmedCluster] = list(eligible[: max(0, max_inline)])
+    for cluster in eligible[max(0, max_inline) : max(max(0, max_inline), max_inline_overflow)]:
         if cluster.severity == "error" and cluster.strength == "strong":
             inline.append(cluster)
     inline_keys = {cluster.key for cluster in inline}
@@ -195,8 +201,58 @@ def fallback_comment(cluster: ConfirmedCluster, *, output_language: str = "en") 
 
 
 def fallback_summary(cluster: ConfirmedCluster) -> tuple[str, str]:
+    if _structural(cluster):
+        return cluster.hypothesis_ids[0], _structural_summary(cluster)
     where = ", ".join(f"{site.path}:{site.line}" for site in cluster.sites)
     return cluster.hypothesis_ids[0], f"{cluster.hypotheses[0].claim} ({where})"
+
+
+def _structural(cluster: ConfirmedCluster) -> bool:
+    return any(item.change_anchor is not None for item in cluster.hypotheses)
+
+
+def _structural_summary(cluster: ConfirmedCluster) -> str:
+    """Keep grounded structural proof even if the editor omits/rewrites it."""
+    parts = []
+    for item in cluster.hypotheses:
+        change = item.change_anchor
+        if change is None:
+            continue
+        before = (
+            f"https://github.com/{change.repo}/blob/{change.comparison_base_sha}/"
+            f"{quote(change.previous_path, safe='/')}"
+        )
+        after = f"https://github.com/{change.head_repo}/blob/{change.head_sha}/{quote(change.path, safe='/')}"
+        parts.append(
+            f"{item.claim}\n\n{item.trigger}\n\n{item.impact}\n\n"
+            f"[Before]({before}) → [After]({after}); `{change.previous_path}` → `{change.path}`."
+        )
+        if item.assessment is None:
+            continue
+        by_id = {observation.id: observation for observation in item.observations}
+        parts.append(f"Expected: {item.assessment.expected}\n\nActual: {item.assessment.actual}")
+        seen = set()
+        for citation in [*item.assessment.expected_evidence, *item.assessment.actual_evidence]:
+            observation = by_id.get(citation.observation_id)
+            key = (citation.observation_id, citation.quote)
+            if (
+                key in seen
+                or observation is None
+                or observation.status != "success"
+                or citation.quote not in observation.excerpt
+            ):
+                continue
+            seen.add(key)
+            label = observation.path or observation.tool
+            if observation.path and observation.tool != "read_change":
+                url = (
+                    f"https://github.com/{change.head_repo}/blob/{observation.sha}/{quote(observation.path, safe='/')}"
+                )
+                if observation.excerpt_line_range:
+                    url += f"#L{observation.excerpt_line_range[0]}"
+                label = f"[{label}]({url})"
+            parts.append(label + ":\n" + "\n".join("> " + line for line in citation.quote.splitlines()))
+    return "\n\n".join(parts)
 
 
 def confirmed_fact_digest(hypothesis: Hypothesis) -> str:
@@ -209,6 +265,8 @@ def confirmed_fact_digest(hypothesis: Hypothesis) -> str:
         "strength": hypothesis.evidence_strength,
         "sites": sorted((site.path, site.line, site.excerpt) for site in hypothesis.sites),
     }
+    if hypothesis.change_anchor is not None:
+        facts["change_anchor"] = hypothesis.change_anchor.to_dict()
     if hypothesis.assessment is not None:
         facts["assessment"] = hypothesis.assessment.to_dict()
     return hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -263,7 +321,7 @@ def _parse_publication(content: str) -> dict[str, Any] | None:
 def _site_index(ledger: HypothesisLedger) -> dict[str, set[tuple[str, int]]]:
     index: dict[str, set[tuple[str, int]]] = {}
     for item in ledger.items.values():
-        if item.status == HypothesisStatus.CONFIRMED:
+        if item.status == HypothesisStatus.CONFIRMED and item.change_anchor is None:
             index[item.id] = {(site.path, site.line) for site in item.sites}
     return index
 
@@ -341,6 +399,10 @@ class Editor:
                         f"  observations:\n{_evidence_text(hypothesis)}",
                     ]
                 )
+                if hypothesis.change_anchor is not None:
+                    details.append(
+                        "  structural change (summary only): " + json.dumps(hypothesis.change_anchor.to_dict())
+                    )
             confirmed_lines.append("\n".join(details))
         unknown_ids = [
             item.id
@@ -478,6 +540,9 @@ class Editor:
                 model_summary.setdefault(identity, one_line)
         summary: list[tuple[str, str]] = []
         for cluster in clusters:
+            if _structural(cluster):
+                summary.append(fallback_summary(cluster))
+                continue
             identity = cluster.hypothesis_ids[0]
             text = next((model_summary[i] for i in cluster.hypothesis_ids if i in model_summary), None)
             summary.append((identity, text or fallback_summary(cluster)[1]))

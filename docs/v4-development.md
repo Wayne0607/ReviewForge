@@ -27,6 +27,20 @@ Windows 本地全量 `1898 passed, 1 skipped, 6 warnings`；ruff、格式检查�
 
 修正后 Windows 本地全量 `1915 passed, 1 skipped, 6 warnings`；ruff、格式、离线 spec-check 和两项严格裁判回归通过。随后增加一项零上下文插入的范围语义回归，发现模块 42 项通过；该状态只表示交付片段中没有 before，不证明整个旧文件不存在。后续冻结新提交，复用原固定十个 PR/head、完整源码缓存与原 golden，继续使用 `deepseek-v4-flash-0731` 验证。这些本地回归不代表真实质量提升；尚无完整重设计版质量分，也未通过 holdout40 或原 MiniMax 最终门槛。
 
+### 无文本 hunk 的重命名证据链（2026-10-12）
+
+固定 `f0a7bca` 的十 PR 诊断正在独立快照运行；后续代码不混入该结果。首个 Keycloak 37429 返回 partial、121444 reported tokens、3 条评论，尚未判定真实命中。其缺 hunk 单元再次确认是资源文件重命名。设计回查发现，要求每个文件必须有修改行的假设不适用于这种变更；仅补造 diff 会破坏证据边界，因此接通文件变更事实 → consumer 上下文 → 独立调查 → 摘要发布。
+
+- 上游保留原 PR 文件元信息，v3 有界核验固定 merge-base/head 的实际 Git entry。内容、文件类型、模式都相同的重命名才准入；API 故障、截断且无法完成遍历、head 漂移或 blob 不匹配都明确保留未知。预加载 diff、首次加载 diff 与恢复链路使用同一入口，后续 Context 构建不会把已验证元信息覆盖回原始值。
+- 发现阶段单独交付 typed change facts 与真实 head/consumer 文本。空 patch 不自动 clean，无 literal 命中不代表无消费者；仍核验源码引用。候选绑定可信 `FileChange`、保留原 unit 身份，sites 为空。
+- 调查实际读取变更事实和 consumer，成功引用仍逐条核验。确认后用摘要表达，包含固定 merge-base/head 链接和两前提证据；同已有 outbox/coverage 合作，恢复不重发，元数据与原锚点不匹配时阻止发送。
+
+零模型的真实 GitHub 只读验证通过：Keycloak 37429 固定 head 的 comparison base 为 `f3c8e8f3487112f2c99aa78400430cce2d30be39`，旧/新文件 blob 均为 `5622d4d5a09f8b52f8be99f9c981b3321ca676f9`，mode 均为 100644、type 均为 blob。这证明上游核验可用，不证明这个重命名有缺陷。
+
+本地全量检查中 `1965 passed, 1 skipped`；三个 Windows Job 实测因并行真实评测持有独占锁，在启动前被拒绝，待评测退出后补跑，不修改互斥规则。新增结构链路用例均通过；ruff、226 文件格式检查、离线 spec-check 和两项严格裁判回归通过。
+
+首 PR 的另一份独立源码审计定位到发现输出协议问题：6 条长引用逐字正确但被未告知的 240 字符上限拒绝；另 4 条是坐标/目标范围/源码括号不一致。5 条所谓冲突均为 hypothesis 与 deferred 同时出现，并非 no_issue 与 hypothesis 矛盾。后续将单独修复引用交付与覆盖语义，原实录与 golden 保留，不通过放宽源码真实性或改答案换取通过。
+
 ## 目标与边界
 
 沿用已批准的 [假设流水线规格](hypothesis-pipeline-spec.md)，改善上下文交付、共享假设调查与最终表达。重用 v3 的仓库访问、模型路由、数据库与发布基础设施。

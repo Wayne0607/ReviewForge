@@ -26,6 +26,7 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from reviewforge.core.change_manifest import FileChange, is_verified_rename
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
@@ -424,6 +425,12 @@ class HypothesisGenerator:
         ids = ", ".join(unit.id for unit in block.units)
         anchors = []
         for unit in block.units:
+            if unit.id in block.structural_changes:
+                anchors.append(
+                    f"- {unit.id} {unit.path} change_id={block.structural_changes[unit.id].id}; "
+                    "structural rename: sites must be []; cite typed change_facts plus real head/reference source."
+                )
+                continue
             target = block.unit_facts.get(unit.id, [])
             coordinates = _coordinate_ranges([fact.line for fact in target if fact.side == "after"])
             before = _coordinate_ranges([fact.line for fact in target if fact.side == "before"])
@@ -456,6 +463,10 @@ class HypothesisGenerator:
             "## Unchecked\n" + ("\n".join(block.unchecked) or "(no collected direction omitted)"),
             "## Existing hypotheses\n" + (existing_text or "(none)"),
         ]
+        if block.change_text:
+            sections.insert(
+                3, "## Structural changes (typed facts; not source lines or Observations)\n" + block.change_text
+            )
         if block.oversize:
             sections.append(
                 "## Input size\nIndivisible shared hunk exceeds the soft diff target; "
@@ -507,6 +518,16 @@ class HypothesisGenerator:
             state.file_diffs or {},
             limits=self._discovery_limits,
             overview_changeset=overview_changeset or changeset,
+            file_changes={
+                path: change
+                for path, change in (getattr(state, "file_changes", {}) or {}).items()
+                if isinstance(change, FileChange)
+                and change.path == path
+                and change.repo == state.repo
+                and change.head_repo == (state.head_repo or state.repo)
+                and change.head_sha == state.head_sha
+                and is_verified_rename(change, ledger.head_sha)
+            },
         )
         right_lines = _right_lines_by_path(state)
         for block in blocks:
@@ -515,6 +536,16 @@ class HypothesisGenerator:
                 "source": self._source,
                 "unit_ids": [unit.id for unit in block.units],
                 "diff_chars": len(block.diff_text),
+                **(
+                    {
+                        "change_chars": len(block.change_text),
+                        "structural_changes": {
+                            unit_id: change.to_dict() for unit_id, change in block.structural_changes.items()
+                        },
+                    }
+                    if block.structural_changes
+                    else {}
+                ),
                 "context_chars": len(block.context_text),
                 "oversize": block.oversize,
                 "units": {},
@@ -620,7 +651,9 @@ class HypothesisGenerator:
             result.capacity_deferred_units.append(unit_id)
 
     @staticmethod
-    def _valid_behavior(item: dict[str, Any], unit: SemanticUnit, block: DiscoveryBlock) -> bool:
+    def _valid_behavior(
+        item: dict[str, Any], unit: SemanticUnit, block: DiscoveryBlock, *, require_consumer: bool = False
+    ) -> bool:
         behavior = item.get("behavior")
         if not isinstance(behavior, dict) or any(
             not isinstance(behavior.get(field), str) or not behavior[field].strip() or len(behavior[field]) > 600
@@ -633,6 +666,12 @@ class HypothesisGenerator:
             or not 1 <= len(facts) <= 4
             or not all(block.source_matches(fact) for fact in facts)
         ):
+            return False
+        if unit.id in block.structural_changes:
+            return block.valid_change_facts(unit.id, behavior.get("change_facts")) and any(
+                block.structural_source_matches(unit.id, fact, consumer=require_consumer) for fact in facts
+            )
+        if behavior.get("change_facts"):
             return False
         sides = {fact["side"] for fact in facts if fact["path"] == unit.path}
         target = block.unit_facts.get(unit.id, [])
@@ -699,7 +738,7 @@ class HypothesisGenerator:
                     else:
                         failed[unit_id] = "capacity-deferred: " + raw["reason"].strip()
                     continue
-                if not self._valid_behavior(raw, unit, block):
+                if not self._valid_behavior(raw, unit, block, require_consumer=kind == "no_issue"):
                     failed[unit_id] = "invalid source-backed behavior assessment"
                     result.dropped_invalid += int(kind == "hypothesis")
                     continue
@@ -722,32 +761,38 @@ class HypothesisGenerator:
                     or not isinstance(raw.get("severity"), str)
                     or raw["severity"] not in _SEVERITIES
                     or not block.source_matches(raw.get("trigger_basis"))
+                    or unit_id in block.structural_changes
+                    and not block.structural_source_matches(unit_id, raw.get("trigger_basis"))
                 ):
                     failed[unit_id] = "invalid candidate schema or source basis"
                     result.dropped_invalid += 1
                     continue
-                if (
-                    not sites
-                    or not any(
-                        block.unit_source_matches(
-                            unit_id, {"side": "after", "path": path, "line": line, "excerpt": excerpt}
+                if unit_id in block.structural_changes:
+                    valid_location = raw.get("sites") == []
+                else:
+                    valid_location = not (
+                        not sites
+                        or not any(
+                            block.unit_source_matches(
+                                unit_id, {"side": "after", "path": path, "line": line, "excerpt": excerpt}
+                            )
+                            for path, line, excerpt in sites
                         )
-                        for path, line, excerpt in sites
+                        or not isinstance(raw.get("sites"), list)
+                        or any(
+                            not isinstance(site, dict)
+                            or not isinstance(site.get("path"), str)
+                            or not isinstance(site.get("line"), int)
+                            or isinstance(site["line"], bool)
+                            or not isinstance(site.get("excerpt"), str)
+                            for site in raw["sites"]
+                        )
+                        or not all(
+                            block.source_matches({"side": "after", "path": path, "line": line, "excerpt": excerpt})
+                            for path, line, excerpt in sites
+                        )
                     )
-                    or not isinstance(raw.get("sites"), list)
-                    or any(
-                        not isinstance(site, dict)
-                        or not isinstance(site.get("path"), str)
-                        or not isinstance(site.get("line"), int)
-                        or isinstance(site["line"], bool)
-                        or not isinstance(site.get("excerpt"), str)
-                        for site in raw["sites"]
-                    )
-                    or not all(
-                        block.source_matches({"side": "after", "path": path, "line": line, "excerpt": excerpt})
-                        for path, line, excerpt in sites
-                    )
-                ):
+                if not valid_location:
                     failed[unit_id] = "invalid candidate source location"
                     result.dropped_unanchored += 1
                     continue
@@ -758,7 +803,14 @@ class HypothesisGenerator:
             result.dropped_overflow += 1
             failed[raw["unit_id"]] = "capacity-deferred: PR candidate limit"
         if kept:
-            await self._consume({"hypotheses": kept, "no_issue_units": []}, ledger, result, right_lines, units)
+            await self._consume(
+                {"hypotheses": kept, "no_issue_units": []},
+                ledger,
+                result,
+                right_lines,
+                units,
+                structural_changes=block.structural_changes,
+            )
         for unit_id, entries in answers.items():
             if invalid_other and unit_id not in failed:
                 failed[unit_id] = "invalid block output entries"
@@ -948,6 +1000,8 @@ class HypothesisGenerator:
         result: HypothesisGenerationResult,
         right_lines: dict[str, dict[int, str]],
         units: dict[str, SemanticUnit],
+        *,
+        structural_changes: dict[str, FileChange] | None = None,
     ) -> int:
         valid: list[tuple[dict[str, Any], list[tuple[str, int, str]]]] = []
 
@@ -958,13 +1012,22 @@ class HypothesisGenerator:
                 if payload is None or payload["unit_id"] not in units:
                     result.dropped_invalid += 1
                     continue
-                if not sites:
+                change = (structural_changes or {}).get(payload["unit_id"])
+                if change is not None and (
+                    ledger.protocol_version < 3
+                    or not is_verified_rename(change, ledger.head_sha)
+                    or item.get("sites") != []
+                ):
+                    result.dropped_invalid += 1
+                    continue
+                if not sites and change is None:
                     result.dropped_unanchored += 1
                     continue
                 if ledger.protocol_version >= 3:
                     payload["discovery_basis"] = copy.deepcopy(
                         {field: item[field] for field in ("behavior", "discrepancy", "trigger_basis")}
                     )
+                payload["change_anchor"] = change
                 valid.append((payload, sites))
 
         valid.sort(key=lambda entry: (-_SEVERITY_PRIORITY.get(entry[0]["severity"], 0), entry[0]["unit_id"]))
@@ -975,7 +1038,10 @@ class HypothesisGenerator:
             unit = units[payload["unit_id"]]
             # The model can describe an anchor, but cannot define its identity.
             # Prefer a primary site in the declared unit, then use stable order.
-            if ledger.protocol_version >= 3:
+            change = payload.get("change_anchor")
+            if change is not None:
+                anchor = f"file-change:{change.id}"
+            elif ledger.protocol_version >= 3:
                 primary = min(
                     sites,
                     key=lambda site: (
@@ -988,11 +1054,12 @@ class HypothesisGenerator:
                 )
             else:
                 primary = min(sites, key=lambda site: (site[0] != unit.path, site[0], site[1]))
-            anchor = (
-                await self._anchor_resolver(unit.id, primary[0], primary[1])
-                if self._anchor_resolver is not None
-                else unit.symbol
-            )
+            if change is None:
+                anchor = (
+                    await self._anchor_resolver(unit.id, primary[0], primary[1])
+                    if self._anchor_resolver is not None
+                    else unit.symbol
+                )
             identity = _identity(payload["unit_id"], payload["mechanism"], anchor)
             hypothesis = Hypothesis(
                 id=_new_hypothesis_id(identity),
@@ -1008,6 +1075,7 @@ class HypothesisGenerator:
                 severity=payload["severity"],
                 source=self._source,
                 **({"discovery_basis": payload["discovery_basis"]} if ledger.protocol_version >= 3 else {}),
+                **({"change_anchor": change} if change is not None else {}),
             )
             ledger.upsert(hypothesis)
             ledger.no_issue_units.pop(hypothesis.unit_id, None)

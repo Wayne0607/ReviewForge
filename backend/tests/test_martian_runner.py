@@ -500,6 +500,8 @@ async def test_benchmark_workspace_preflight_precedes_models_and_reuses_one_snap
 
         async def run(self, state):
             self.model_calls += 1
+            assert state.file_changes["src/f.py"].head_sha == state.head_sha
+            assert state.file_changes["src/f.py"].patch_state == "present"
             # Production v4 calls this same public API with the same StateStore.
             workspace = await self._gateway.workspace_for(state)
             assert workspace.read("src/f.py") == data.decode()

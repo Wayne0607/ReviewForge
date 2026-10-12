@@ -452,6 +452,13 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     workspace_payload["ms"] = int((time.perf_counter() - started) * 1000)
     workspace_event = orchestrator._events.emit("workspace.built", workspace_payload)
 
+    config = orchestrator._pipeline_v4_config
+    protocol_version = state.ledger.protocol_version if state.ledger is not None else config.protocol_version
+    if protocol_version >= 3:
+        hydrate_changes = getattr(orchestrator._gateway, "ensure_file_changes", None)
+        if callable(hydrate_changes):
+            await hydrate_changes(state)
+
     # Rebuild through the pinned gateway, including after legacy shadow: v4
     # declarations must be code-backed, independent of legacy regex heuristics.
     if state.files_changed:
@@ -459,14 +466,13 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             state
         )
     changeset = compile_changeset_v4(state)
-    config = orchestrator._pipeline_v4_config
     pack = ContextPack.build(
         changeset,
         workspace,
         state,
         max_slices=config.context_pack_max_slices,
+        **({"protocol_version": protocol_version} if protocol_version >= 3 else {}),
     )
-    protocol_version = state.ledger.protocol_version if state.ledger is not None else config.protocol_version
     # Rendering marks omitted slices. Protocol 3 renders independently budgeted
     # blocks later, so this aggregate telemetry must not mark their inputs absent.
     telemetry_pack = deepcopy(pack) if protocol_version >= 3 else pack
@@ -494,6 +500,9 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     elif state.ledger.protocol_version >= 3 and state.ledger.workspace_digest != pack.workspace_digest:
         raise ValueError("restored hypothesis ledger does not match pinned workspace")
     ledger = state.ledger
+    for item in ledger.items.values():
+        if item.change_anchor is not None and state.file_changes.get(item.change_anchor.path) != item.change_anchor:
+            raise ValueError("restored structural hypothesis does not match the verified PR change")
     await _persist_ledger(orchestrator, ledger)
     database = getattr(orchestrator, "_db", None)
     saved = await database.get_v4_publication(ledger.run_id) if database and config.mode == "hypothesis" else None

@@ -117,6 +117,34 @@ excerpt, including trigger_basis. Limit each prose field to at most 600
 characters; these are hard schema limits, not length targets. The behavior,
 discrepancy and trigger basis will be delivered as bounded navigation to the
 investigator; they are not Observations or confirmed evidence.
+
+Some units have `## Structural changes`: a typed, program-verified rename with
+equal comparison-base/head blobs and no text hunk. Its old/new path still changes
+resource lookup, imports and consumer contracts. Equal contents do not prove a
+safe rename. These facts are separate from source lines and are not Observations.
+For such a unit, set `sites: []`; there is no RIGHT line to fabricate. Do not
+return a model-constructed change_anchor: the program binds the trusted record.
+Keep the usual hypothesis fields and behavioral comparison. Add exact typed
+path references to `behavior.change_facts`, for example:
+
+```json
+"change_facts": [
+  {"kind": "file-change", "change_id": "COPY_DELIVERED_CHANGE_ID", "field": "previous_path", "value": "old/path.json"},
+  {"kind": "file-change", "change_id": "COPY_DELIVERED_CHANGE_ID", "field": "path", "value": "new/path.json"}
+]
+```
+
+Copy both paths and change_id exactly from the unit's typed record; do not put
+metadata in source_facts or invent a line number for it. Use 2–4 change facts,
+with only the fields previous_path/path. Also cite delivered real head or
+reference code in source_facts. A structural candidate's trigger_basis must be
+that real head/reference code, not just the rename record. A structural no_issue
+check must cite actual reference/consumer code and explain what was checked
+about the old/new lookup or contract. A negative search, no collected references
+or the rename alone cannot prove it safe; explicitly defer when the needed
+consumer/source material is missing. Unverified missing patches, mode changes
+and unsupported binary inputs do not use this structural path.
+
 The unit's listed responsibilities and their domain rules are delivered with
 this first discovery input. Check those rules together with general correctness
 against the same source; there is no later full-PR specialist rescan. Rules are

@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 import httpx
 
+from reviewforge.core.change_manifest import valid_path, valid_repo, valid_sha
+
 logger = logging.getLogger(__name__)
 
 MAX_REVIEW_COMMENTS_PER_REQUEST = 40
@@ -289,6 +291,106 @@ class GitHubClient:
         resp = await self._client.get(f"/repos/{repo}/pulls/{int(pr_number)}")
         resp.raise_for_status()
         return resp.json()
+
+    async def get_comparison_base(self, repo: str, base_sha: str, head_repo: str, head_sha: str) -> str:
+        """Resolve the merge-base from fixed SHAs, including fork-network heads."""
+        if not valid_repo(repo) or not valid_repo(head_repo) or not valid_sha(base_sha) or not valid_sha(head_sha):
+            raise ValueError("invalid comparison identity")
+        head = head_sha if head_repo == repo else f"{head_repo.split('/')[0]}:{head_sha}"
+        response = await self._client.get(
+            f"/repos/{repo}/compare/{base_sha}...{quote(head, safe=':')}", params={"per_page": 1}
+        )
+        response.raise_for_status()
+        data = response.json()
+        merge_base = data.get("merge_base_commit", {}).get("sha", "")
+        if data.get("base_commit", {}).get("sha") != base_sha or not valid_sha(merge_base):
+            raise ValueError("comparison identity mismatch")
+        return merge_base
+
+    async def get_git_entries(self, repo: str, commit_sha: str, paths: list[str]) -> dict[str, dict[str, str]]:
+        """Read exact Git entries with bounded complete-tree navigation.
+
+        A truncated recursive tree is navigation only. Targeted nonrecursive
+        subtree reads must be complete; missing entries never prove a rename.
+        No cache outlives this lookup and no blob body needs downloading.
+        """
+        paths = list(dict.fromkeys(paths))
+        if (
+            not valid_repo(repo)
+            or not valid_sha(commit_sha)
+            or len(paths) > 16
+            or any(not valid_path(path) or len(path.split("/")) > 32 for path in paths)
+        ):
+            raise ValueError("invalid or excessive Git entry lookup")
+        if not paths:
+            return {}
+        commit = await self._client.get(f"/repos/{repo}/git/commits/{commit_sha}")
+        commit.raise_for_status()
+        data = commit.json()
+        tree_sha = data.get("tree", {}).get("sha", "")
+        if data.get("sha") != commit_sha or not valid_sha(tree_sha):
+            raise ValueError("Git commit identity mismatch")
+        requests = 0
+        cache: dict[str, list[dict[str, Any]]] = {}
+
+        async def tree(sha: str, *, recursive: bool = False) -> tuple[list[dict[str, Any]], bool, int]:
+            nonlocal requests
+            if requests >= 64 or not valid_sha(sha):
+                raise ValueError("Git tree lookup limit")
+            requests += 1
+            response = await self._client.get(
+                f"/repos/{repo}/git/trees/{sha}", params={"recursive": "1"} if recursive else None
+            )
+            response.raise_for_status()
+            if len(response.content) > 8 * 1024 * 1024:
+                raise ValueError("Git tree response limit")
+            result = response.json()
+            entries = result.get("tree")
+            if result.get("sha") != sha or not isinstance(entries, list) or len(entries) > 100000:
+                raise ValueError("Git tree identity mismatch")
+            truncated = result.get("truncated")
+            if not isinstance(truncated, bool) or (truncated and not recursive):
+                raise ValueError("incomplete Git tree")
+            return entries, truncated, len(response.content)
+
+        entries, truncated, _ = await tree(tree_sha, recursive=True)
+        found: dict[str, dict[str, Any]] = {}
+        if not truncated:
+            wanted = set(paths)
+            found = {
+                entry["path"]: entry for entry in entries if isinstance(entry, dict) and entry.get("path") in wanted
+            }
+        else:
+            # Discard all truncated-tree candidates; each returned fact comes
+            # from a complete, SHA-validated exact-path traversal.
+            del entries
+            cached_bytes = 0
+            for path in paths:
+                current_sha = tree_sha
+                parts = path.split("/")
+                for index, part in enumerate(parts):
+                    if current_sha in cache:
+                        subtree = cache[current_sha]
+                    else:
+                        subtree, _, size = await tree(current_sha)
+                        if cached_bytes + size <= 4 * 1024 * 1024:
+                            cache[current_sha] = subtree
+                            cached_bytes += size
+                    candidates = [entry for entry in subtree if isinstance(entry, dict) and entry.get("path") == part]
+                    if len(candidates) != 1:
+                        break
+                    entry = candidates[0]
+                    if index == len(parts) - 1:
+                        found[path] = entry
+                    elif entry.get("type") == "tree" and valid_sha(entry.get("sha")):
+                        current_sha = entry["sha"]
+                    else:
+                        break
+        return {
+            path: {"sha": entry["sha"], "mode": entry["mode"], "type": entry["type"]}
+            for path, entry in found.items()
+            if valid_sha(entry.get("sha")) and isinstance(entry.get("mode"), str) and isinstance(entry.get("type"), str)
+        }
 
 
 def _classify_write_error(operation: str, response: httpx.Response) -> GitHubAPIError:

@@ -114,6 +114,7 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                             for f in files_data
                         )
 
+                        from reviewforge.core.change_manifest import populate_file_changes
                         from reviewforge.core.state import StateStore
 
                         state = StateStore(
@@ -129,6 +130,7 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                             diff_summary=diff_summary,
                             file_diffs={f["filename"]: f.get("patch") or "" for f in files_data},
                         )
+                        populate_file_changes(state, files_data)
 
                         logger.info(f"Starting review for PR #{pr_number} on {repo}")
                         summary = await orchestrator.run(state)

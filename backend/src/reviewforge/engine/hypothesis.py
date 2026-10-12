@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from reviewforge.core.change_manifest import FileChange, is_verified_rename
+
 
 class Mechanism(StrEnum):
     WRONG_ARGUMENT = "wrong-argument"
@@ -185,14 +187,20 @@ class Hypothesis:
     investigation_progress: list[dict[str, Any]] = field(default_factory=list)
     investigation_unreported_tokens: int = 0
     discovery_basis: dict[str, Any] = field(default_factory=dict)
+    change_anchor: FileChange | None = None
 
     def __post_init__(self) -> None:
         if self.severity not in _SEVERITY_RANK:
             raise ValueError(f"unsupported hypothesis severity: {self.severity!r}")
         if self.evidence_strength not in {"none", "weak", "strong"}:
             raise ValueError(f"unsupported evidence strength: {self.evidence_strength!r}")
-        if not self.identity or not self.sites:
-            raise ValueError("hypothesis requires identity and at least one site")
+        if self.change_anchor is not None and (
+            not isinstance(self.change_anchor, FileChange)
+            or not is_verified_rename(self.change_anchor, self.change_anchor.head_sha)
+        ):
+            raise ValueError("structural hypothesis requires a verified rename anchor")
+        if not self.identity or not (self.sites or self.change_anchor):
+            raise ValueError("hypothesis requires identity and a source site or verified change anchor")
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -207,6 +215,8 @@ class Hypothesis:
             data.pop("investigation_progress")
         if not data["discovery_basis"]:
             data.pop("discovery_basis")
+        if data["change_anchor"] is None:
+            data.pop("change_anchor")
         if not data["investigation_unreported_tokens"]:
             data.pop("investigation_unreported_tokens")
         for observation in data["observations"]:
@@ -254,6 +264,9 @@ class Hypothesis:
             investigation_progress=copy.deepcopy(data.get("investigation_progress", [])),
             investigation_unreported_tokens=int(data.get("investigation_unreported_tokens", 0)),
             discovery_basis=copy.deepcopy(data.get("discovery_basis", {})),
+            change_anchor=FileChange.from_dict(data["change_anchor"])
+            if data.get("change_anchor") is not None
+            else None,
         )
 
 
@@ -277,12 +290,23 @@ class HypothesisLedger:
     def __post_init__(self) -> None:
         if self.protocol_version not in {1, 2, 3}:
             raise ValueError("unsupported investigation protocol")
+        for item in self.items.values():
+            self._validate_change_anchor(item)
+
+    def _validate_change_anchor(self, hypothesis: Hypothesis) -> None:
+        if hypothesis.change_anchor is not None and (
+            self.protocol_version < 3 or not is_verified_rename(hypothesis.change_anchor, self.head_sha)
+        ):
+            raise ValueError("change anchor does not match the ledger protocol and head")
 
     def upsert(self, hypothesis: Hypothesis) -> tuple[Hypothesis, bool]:
-        if not hypothesis.identity or not hypothesis.sites:
-            raise ValueError("hypothesis requires identity and at least one site")
+        self._validate_change_anchor(hypothesis)
+        if not hypothesis.identity or not (hypothesis.sites or hypothesis.change_anchor):
+            raise ValueError("hypothesis requires identity and a source site or verified change anchor")
         with self._lock:
             current = self.items.get(hypothesis.identity)
+            if current is not None and current.change_anchor != hypothesis.change_anchor:
+                raise ValueError("cannot merge hypotheses bound to different structural changes")
             fact_fields = ("claim", "trigger", "impact", "open_question", "refutation")
             if (
                 self.protocol_version >= 2

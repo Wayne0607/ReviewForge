@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
+from reviewforge.core.change_manifest import FileChange, is_verified_rename, render_change_fact
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
@@ -59,6 +61,8 @@ class SourceLine:
     text: str
     right_line: int = 0
     changed: bool = False
+    kind: str = ""
+    unit_id: str = ""
 
 
 @dataclass
@@ -88,6 +92,8 @@ class DiscoveryBlock:
     failure: str = ""
     unit_facts: dict[str, list[SourceLine]] = field(default_factory=dict)
     unit_before_states: dict[str, str] = field(default_factory=dict)
+    structural_changes: dict[str, FileChange] = field(default_factory=dict)
+    change_text: str = ""
 
     def source_matches(self, raw: object) -> bool:
         if not isinstance(raw, dict):
@@ -126,6 +132,51 @@ class DiscoveryBlock:
             and (not changed or fact.changed)
             for fact in self.unit_facts.get(unit_id, [])
         )
+
+    def structural_source_matches(self, unit_id: str, raw: object, *, consumer: bool = False) -> bool:
+        change = self.structural_changes.get(unit_id)
+        if change is None or not self.source_matches(raw):
+            return False
+        assert isinstance(raw, dict)
+        tokens = {
+            change.path,
+            change.previous_path,
+            PurePosixPath(change.path).name,
+            PurePosixPath(change.previous_path).name,
+        }
+        return any(
+            fact.unit_id == unit_id
+            and fact.side == raw["side"]
+            and fact.path == raw["path"]
+            and fact.line == raw["line"]
+            and raw["excerpt"] in fact.text
+            and (
+                fact.kind == "reference"
+                and any(token and token in fact.text for token in tokens)
+                or not consumer
+                and fact.kind == "head"
+                and fact.path == change.path
+            )
+            for fact in self.facts
+        )
+
+    def valid_change_facts(self, unit_id: str, raw: object) -> bool:
+        change = self.structural_changes.get(unit_id)
+        if change is None or not isinstance(raw, list) or not 2 <= len(raw) <= 4:
+            return False
+        seen = set()
+        for fact in raw:
+            if (
+                not isinstance(fact, dict)
+                or fact.get("kind") != "file-change"
+                or fact.get("change_id") != change.id
+                or not isinstance(fact.get("field"), str)
+                or fact["field"] not in {"previous_path", "path"}
+                or fact.get("value") != getattr(change, fact["field"])
+            ):
+                return False
+            seen.add(fact["field"])
+        return seen == {"previous_path", "path"}
 
 
 def _hunks(path: str, diff: str) -> list[_Hunk]:
@@ -263,6 +314,7 @@ def _overview(changeset: SemanticChangeSet, pack: ContextPack, limit: int) -> st
 def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple[str, list[SourceLine], list[str]]:
     sections, facts, unchecked = [], [], []
     seen: dict[tuple, str] = {}
+    seen_facts: dict[tuple, list[SourceLine]] = {}
     per_unit = max(0, budget // max(1, len(units)))
     for unit in units:
         ctx = pack.units.get(unit.id)
@@ -278,6 +330,10 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
                 if len(piece) + 2 <= remaining:
                     sections.append(piece)
                     remaining -= len(piece) + 2
+                    facts.extend(
+                        SourceLine(item.side, item.path, item.line, item.text, kind=slice_.kind, unit_id=unit.id)
+                        for item in seen_facts[key]
+                    )
                 else:
                     unchecked.append(f"{unit.id}: context {slice_.kind} omitted by context budget")
                 continue
@@ -292,7 +348,7 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
                 if size + len(numbered) + 1 > remaining:
                     break
                 rendered.append(numbered)
-                selected.append(SourceLine("context", slice_.path, line, text))
+                selected.append(SourceLine("context", slice_.path, line, text, kind=slice_.kind, unit_id=unit.id))
                 size += len(numbered) + 1
             if rendered:
                 piece = header + "\n".join(rendered)
@@ -302,6 +358,7 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
                 # A shared reference can only reuse the actually delivered prefix.
                 if len(rendered) == len(lines):
                     seen[key] = f"{unit.id} {slice_.kind} {slice_.path}:{slice_.start_line}-{slice_.end_line}"
+                    seen_facts[key] = selected
             if len(rendered) < len(lines):
                 unchecked.append(f"{unit.id}: context {slice_.kind} only {len(rendered)}/{len(lines)} lines delivered")
         unchecked.extend(f"{unit.id}: unavailable context {kind}" for kind in ctx.truncated_kinds)
@@ -316,6 +373,7 @@ def _block(
     limits: DiscoveryLimits,
     context_budget: int,
     before_states: dict[str, str] | None = None,
+    structural_changes: dict[str, FileChange] | None = None,
 ) -> DiscoveryBlock:
     diffs = "\n\n".join(f"### Shared before/after diff: {h.path}\n{h.text}" for h in selected)
     context, context_facts, unchecked = _context(units, pack, context_budget)
@@ -331,9 +389,27 @@ def _block(
     changed = "\n".join(h.changed_text for h in selected)
     focus = "\n".join(f"- {kind}: {guide}" for kind, pattern, guide in _OPERATIONS if pattern.search(changed))
     signature = "\n".join(u.id for u in units) + "\n" + "\n".join(h.key + ":" + h.text for h in selected)
+    changes = {unit.id: structural_changes[unit.id] for unit in units if unit.id in (structural_changes or {})}
+    change_text = "\n\n".join(
+        f"### Structural file change for {unit_id}\n{render_change_fact(change)}" for unit_id, change in changes.items()
+    )
+    if changes:
+        focus += (
+            "\n- path-contract: Compare old/new paths with actual consumers and relative/resource lookup; "
+            "identical blobs do not prove compatible path behavior."
+        )
+    if change_text:
+        signature += "\n" + change_text
     identity = "db_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
     missing = [
-        f"{u.id}: no source diff hunk was supplied" for u in units if not any(h.path == u.path for h in selected)
+        f"{u.id}: no source diff hunk was supplied"
+        for u in units
+        if not any(h.path == u.path for h in selected) and u.id not in changes
+    ]
+    material_missing = [
+        unit_id
+        for unit_id in changes
+        if not any(fact.kind in {"head", "reference"} for fact in context_facts if fact.unit_id == unit_id)
     ]
     block = DiscoveryBlock(
         identity,
@@ -345,15 +421,27 @@ def _block(
         focus,
         [fact for h in selected for fact in h.facts] + context_facts,
         unchecked + missing,
-        oversize=len(diffs) > limits.diff_max_chars,
-        failure="missing-diff" if missing else "incomplete-diff" if any(not h.complete for h in selected) else "",
+        oversize=len(diffs) + len(change_text) > limits.diff_max_chars,
+        failure=(
+            "missing-diff"
+            if missing
+            else "incomplete-diff"
+            if any(not h.complete for h in selected)
+            else "missing-structural-material"
+            if material_missing
+            else ""
+        ),
     )
+    block.structural_changes = changes
+    block.change_text = change_text
     # Source identity and coverage identity are separate. Quotes from a nearby
     # function in the same file cannot complete this unit's behavior check.
     # Before deletions use their post-image boundary, since old coordinates
     # need not match the head symbol coordinates after preceding insertions.
     for unit in units:
         state = (before_states or {}).get(unit.id, "unresolved-declaration-correspondence")
+        if unit.id in changes:
+            state = "structural-rename"
         block.unit_before_states[unit.id] = state
         block.unit_facts[unit.id] = [
             fact
@@ -373,6 +461,7 @@ def plan_discovery(
     *,
     limits: DiscoveryLimits,
     overview_changeset: SemanticChangeSet | None = None,
+    file_changes: dict[str, FileChange] | None = None,
 ) -> list[DiscoveryBlock]:
     """Cover each unit exactly once, preferring shared hunks then source relations.
 
@@ -385,6 +474,19 @@ def plan_discovery(
     for unit in remaining:
         by_path.setdefault(unit.path, []).append(unit)
     all_hunks = {h.key: h for path in by_path for h in _hunks(path, diffs.get(path, ""))}
+    structural_changes = {
+        unit.id: change
+        for unit in remaining
+        if isinstance((change := (file_changes or {}).get(unit.path)), FileChange)
+        and change.path == unit.path
+        and change.repo == changeset.repo
+        and is_verified_rename(change, changeset.head_sha)
+        and not any(hunk.path == unit.path for hunk in all_hunks.values())
+    }
+    change_chars = {
+        unit_id: len(f"### Structural file change for {unit_id}\n") + len(render_change_fact(change))
+        for unit_id, change in structural_changes.items()
+    }
     before_states = _before_states(remaining, all_hunks)
     hunk_chars = {key: len(f"### Shared before/after diff: {h.path}\n") + len(h.text) for key, h in all_hunks.items()}
     keys: dict[str, set[str]] = {u.id: set() for u in remaining}
@@ -417,7 +519,14 @@ def plan_discovery(
             all_hunks[k] for k in sorted(selected_keys, key=lambda k: (all_hunks[k].path, all_hunks[k].start, k))
         ]
         return _block(
-            units, pack, overview, selected, limits, min(limits.context_max_chars, context_left), before_states
+            units,
+            pack,
+            overview,
+            selected,
+            limits,
+            min(limits.context_max_chars, context_left),
+            before_states,
+            structural_changes,
         )
 
     while remaining:
@@ -432,18 +541,31 @@ def plan_discovery(
             )
             chosen = None
             for unit in choices:
-                if not keys[unit.id] or any(not all_hunks[key].complete for key in keys[unit.id]):
+                if (
+                    not keys[unit.id]
+                    and unit.id not in structural_changes
+                    or any(not all_hunks[key].complete for key in keys[unit.id])
+                ):
+                    continue
+                if unit.id in structural_changes and not any(
+                    slice_.kind in {"head", "reference"}
+                    for slice_ in (pack.units[unit.id].slices if unit.id in pack.units else [])
+                ):
                     continue
                 candidate_keys = group_keys | keys[unit.id]
                 diff_chars = sum(hunk_chars[key] for key in candidate_keys) + max(0, len(candidate_keys) - 1) * 2
+                diff_chars += sum(change_chars.get(item.id, 0) for item in [*group, unit])
                 # Reject impossible unions before rendering source, context,
                 # unit fact maps and their stable hash. The key union preserves
                 # exactly the shared-hunk test used by the full renderer.
-                shares_oversize = block.oversize and candidate_keys == group_keys
+                shares_oversize = block.oversize and candidate_keys == group_keys and unit.id not in structural_changes
                 if diff_chars > limits.diff_max_chars and not shares_oversize:
                     continue
                 candidate = make([*group, unit])
+                if candidate.failure:
+                    continue
                 estimate = len(candidate.diff_text) + len(candidate.context_text) + len(candidate.overview)
+                estimate += len(candidate.change_text)
                 estimate += (
                     len(candidate.navigation)
                     + len(candidate.focus)
@@ -451,9 +573,13 @@ def plan_discovery(
                     + sum(len(u.id) + 60 for u in candidate.units)
                 )
                 # An oversize hunk can still be shared without expanding it.
-                shared_oversize = block.oversize and candidate.diff_text == block.diff_text
+                shared_oversize = (
+                    block.oversize
+                    and candidate.diff_text == block.diff_text
+                    and candidate.change_text == block.change_text
+                )
                 if (
-                    len(candidate.diff_text) <= limits.diff_max_chars
+                    len(candidate.diff_text) + len(candidate.change_text) <= limits.diff_max_chars
                     and estimate <= limits.target_input_chars
                     or shared_oversize
                     and estimate <= limits.hard_input_chars

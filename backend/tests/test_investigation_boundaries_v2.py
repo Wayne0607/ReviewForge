@@ -7,7 +7,9 @@ import pytest
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
+from reviewforge.engine.editor import cluster_confirmed
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Observation, Site
+from reviewforge.engine.investigation_tasks import build_investigation_tasks
 from reviewforge.engine.investigator import Investigator
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
 
@@ -117,6 +119,33 @@ def test_v2_coverage_identity_does_not_overwrite_a_distinct_trigger_in_the_same_
     duplicate, created = ledger.upsert(candidate(trigger="calendar is an expired remote object"))
     assert not created and duplicate.identity == second.identity
     assert len(ledger.items) == 2
+
+
+def test_publication_keeps_distinct_function_risks_and_merges_only_their_exact_task_aliases():
+    ledger = HypothesisLedger("run", "head", "digest", protocol_version=2)
+    ledger.upsert(candidate())
+    other = {
+        "claim": "Missing owner causes TypeError",
+        "trigger": "owner=None",
+        "open_question": "Can the owner be absent?",
+        "refutation": "Owner is validated",
+        "sites": [Site("service.ts", 13, "return owner.email")],
+    }
+    ledger.upsert(candidate(**other))
+    ledger.upsert(candidate("method", **other))
+    for task in build_investigation_tasks(ledger.open(), head_sha="head", workspace_digest="digest"):
+        ledger.apply_task_verdict(
+            task.id,
+            task.members,
+            task.hypothesis.identity,
+            status="confirmed",
+            investigation_outcome="resolved",
+            evidence_strength="strong",
+        )
+    clusters = cluster_confirmed(ledger)
+    assert len(clusters) == 2
+    assert sorted(len(cluster.hypothesis_ids) for cluster in clusters) == [1, 2]
+    assert sum(len(cluster.hypothesis_ids) for cluster in clusters) == len(ledger.items)
 
 
 def test_old_checkpoint_keeps_v1_completion_and_closed_decision():

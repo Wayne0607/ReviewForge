@@ -85,10 +85,27 @@ def cluster_confirmed(ledger: HypothesisLedger) -> list[ConfirmedCluster]:
     """Group CONFIRMED hypotheses by mechanism and source-scoped anchor."""
 
     groups: dict[tuple[str, str], ConfirmedCluster] = {}
+    distinct_risk_scopes = {
+        (item.mechanism.value, _anchor(item))
+        for item in ledger.items.values()
+        if ledger.protocol_version >= 2 and item.coverage_identity
+    }
     for hypothesis in sorted(ledger.items.values(), key=lambda item: item.identity):
         if hypothesis.status != HypothesisStatus.CONFIRMED:
             continue
         key = (hypothesis.mechanism.value, _anchor(hypothesis))
+        if key in distinct_risk_scopes:
+            # The old function cluster must not undo v2's separation of
+            # distinct defect premises. Exact task aliases still share a key;
+            # further merging requires the editor's evidence-supported choice.
+            key = (
+                key[0],
+                json.dumps(
+                    ["risk", key[1], hypothesis.investigation_task_id or hypothesis.identity],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
         cluster = groups.get(key)
         if cluster is None:
             cluster = ConfirmedCluster(

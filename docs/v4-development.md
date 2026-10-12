@@ -529,6 +529,19 @@ keycloak#37429 与 calcom#10967 超过每 PR 250k 门槛；6 条其它已审查�
 
 阶段请求选项在 token/trace 包装内逐次传递，不修改共享模型：DeepSeek 输出阶段请求 JSON object 与 disabled thinking，调查工具阶段保留原配置，收尾单独请求 disabled。JSON object 修复失败用 unrepairable 对象，原默认修复仍用 null；两者都不能记为无问题。固定源码传输只允许同 SHA 两次、每次 180 秒的瞬时故障恢复。调查启动前在 PR 250k 门槛内扣除已记录用量、预留编辑额度，按原单任务上限预占并发额度；实际超支仍可见并使 budget stage 失败。
 
-新增 21 项回归覆盖共享调查/单次记账、不同触发及同函数风险变体、锚点交付、正向反证/恶意引用/旧 UNKNOWN、原 checkpoint、双维状态、SDK 请求选项与记账、JSON object 失败语义及传输恢复。全量 `1779 passed, 1 skipped, 6 warnings`，ruff / 202 文件 format 与结构 spec-check 通过，严格裁判 2 项通过；spec-check 使用非联网占位凭据核实配置/注册结构，真实运行另通过现有私有配置验证。
+新增 22 项回归覆盖共享调查/单次记账、不同触发及同函数风险变体、锚点交付、正向反证/恶意引用/旧 UNKNOWN、原 checkpoint、双维状态、SDK 请求选项与记账、JSON object 失败语义及传输恢复。后续发布回归先复现同函数不同风险又被预聚类折叠；现在风险变体范围按实际调查任务分簇，保留同任务别名，跨簇合并仍需同处修复证据。最终全量 `1780 passed, 1 skipped, 6 warnings`，与 CI 相同范围的 ruff / 210 文件 format 与结构 spec-check 通过，严格裁判 2 项通过；资源/基准回归 57 项通过、1 跳过。spec-check 使用非联网占位凭据核实配置/注册结构，真实运行另通过现有私有配置验证。
 
-预声明诊断输入位于 `.reviewforge/benchmarks/v4-boundaries-probe-20261012-101603/inputs.json`，SHA256 `faf56f56018c0bc83b1cc3f9870e7c79e5511ff2e3342a6879be1267c726ffc7`。仅验证中转输出选项、原 Discourse 生成输入、Cal.com 直接反证与 Sentry 收尾；累计 recorded token 上限 100k，无语义重试/无质量分。INV 使用明确标记的固定源码子集；收尾重放前逐字核实保存片段与刚获取的固定 head 源码。它不是完整 PR/完整仓库质量验收，尚待冻结版本的实际回执。
+预声明诊断输入位于 `.reviewforge/benchmarks/v4-boundaries-probe-20261012-101603/inputs.json`，SHA256 `faf56f56018c0bc83b1cc3f9870e7c79e5511ff2e3342a6879be1267c726ffc7`。仅验证中转输出选项、原 Discourse 生成输入、Cal.com 直接反证与 Sentry 收尾；累计 recorded token 上限 100k，无语义重试/无质量分。INV 使用明确标记的固定源码子集；收尾重放前逐字核实保存片段与刚获取的固定 head 源码。它不是完整 PR/完整仓库质量验收。
+
+冻结 `1d858e8aa004360d6c9f0b34d7341d576322a9f2` 的实际诊断为 6 个成功请求 / 47918 recorded tokens，提供方错误、length 截断及无工具空正文均为 0。Job 正常返回 0，02:26:56–02:29:47 UTC、峰值 118906880 bytes（约 113.4 MiB），本机 2 GiB / CPU 10% / reserve 2 GiB / disk reserve 16 GiB 与独占锁保留。它使用源码子集，不能与旧完整十 PR 的 2049 MiB 作内存收益比较。
+
+| 诊断 | 回执 | 边界 |
+|---|---|---|
+| 中转输出请求 | JSON object + disabled thinking 请求被接受，回复为有效对象 | 不能据此保证所有调用或上游 LOW 参数透传 |
+| Discourse #10 生成 | 一次生成、有效 JSON、50/50 required units 报告、12 candidates、33207 tokens | 未跑调查/编辑，不能视为候选质量或完整 PR 通过 |
+| Cal.com #10967 原空指针候选 | 新源码工具证据支持 counterevidence，REFUTED / resolved，3 步、10236 tokens | 固定单候选与源码子集，不是该 PR 全面审查 |
+| Sentry #93824 原收尾失败候选 | 有效 JSON 正文 1147 字符，4455 tokens；UNKNOWN / insufficient-evidence | 收尾重放，未补探索，不把文字判断强制升为反驳 |
+
+`verification-audit.json` 核实 111 个冻结源文件、输入 SHA 与逐请求用量和总报告一致。零模型对原 Keycloak 四条重复候选执行新任务归并，形成两项任务；它不是实际 token 节省测量。全部旧 ledger、十 PR 报告及裁判结果不改，未使用 holdout。发布保护与诊断脚本的 CI 格式修复在该模型快照之后，仅以相应回归验证，没有重跑已完成的付费诊断。首次 dev CI 发现诊断脚本在 backend 配置下的 import/长行检查遗漏，后续检查范围已与 CI 对齐。
+
+生产只读核实仍为 main `00c667556c88241d72d96f24430c7c16b4add24e`、service active / HTTP 200；未部署 v4。固定十 PR 的新完整配对质量测评及旧 MiniMax/holdout 最终门槛仍待验收。

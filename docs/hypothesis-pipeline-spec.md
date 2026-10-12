@@ -11,6 +11,7 @@
 
 - **覆盖与调查分开。** 原 unit/候选 identity 保留。调查前只归并 head/workspace、文件/锚点、mechanism、claim、trigger、impact、open_question、refutation 和 sites 全部一致的候选；无命名锚点的不同 unit 不归并。一个实际调查对应多个候选，原位置与覆盖关系都保存，token 仅在实际执行者记录一次。不同触发条件不能因同一函数而合并。
   同一旧 coverage identity 上出现不同 claim/trigger/impact/question/refutation 时，新 v2 候选增加稳定风险变体，保存 `coverage_identity` 原绑定；首条与全部 v1 identity 不改。变体仍保留末尾函数锚点，避免覆盖不同输入下的风险或破坏编辑定位。
+  编辑预聚类遇到这些风险变体时也按实际调查任务分簇，保留同任务别名；不能又按同函数把不同风险静默折叠。后续跨簇合并仍须有同一处修复的证据。
 - **上下文按实际锚点交付。** 同文件包含主 site 的最内层语义单元优先，原声明 unit 为补充；共同受原 12000 字符调查上下文限额约束。选择关系与证据需求只是导航，不能充当 Observation；resource 的 locale/契约边界保留。
 - **阶段输出接口。** 新 v4 的生成/lens/editor 与调查收尾可请求 JSON object；DeepSeek 收尾可独立请求 disabled thinking。请求经原 ModelRouter 和 token/trace 包装，工具阶段不强制 JSON，收尾仍在同一调查预算内。未知提供方保持原默认；中转能力需真实小规模验证，不能根据请求参数声称实际生效。格式修复仍仅一次，空正文不修复，不能做发现重试。
 - **两种证明形态。** confirmed 继续要求 expected/actual 的两个成功精确引用及 conflict。refuted 可用相同的 compatible assessment，或 `counterevidence={premise,statement,evidence}`，其中 premise 为 trigger/mechanism/impact/regression，statement 明确说明哪一个必要前提被源码反证，evidence 为已保存成功 Observation 的引用。负向搜索、Context 与工具 error 不能成为反证；同时提供矛盾/多种裁决、非法结构或引用均为输出失败，不得确认或反驳。仅文字回答/assessment=null 保持 UNKNOWN，不被猜测升级。

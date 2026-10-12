@@ -17,8 +17,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
-
 from martian_runner import StateStore, _atomic_json, _build_runtime
+
 from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
 from reviewforge.engine.hypothesis import Hypothesis, Observation
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
@@ -212,7 +212,9 @@ async def run(args):
                         ],
                     )
                 },
-                pr_intent="Protocol diagnostic with a partial source subset. Caller absence is not repository-wide absence.",
+                pr_intent=(
+                    "Protocol diagnostic with a partial source subset. Caller absence is not repository-wide absence."
+                ),
             )
             investigator = Investigator(
                 model("investigator"),

@@ -45,6 +45,10 @@ class RunHealth:
     delivery: StageResult
     hypothesis: StageResult = field(default_factory=lambda: StageResult(name="hypothesis"))
     investigation: StageResult = field(default_factory=lambda: StageResult(name="investigation"))
+    budget: StageResult = field(default_factory=lambda: StageResult(name="budget"))
+    protocol_version: int = 1
+    investigation_unknown_total: int = 0
+    investigation_deferred: int = 0
 
     @classmethod
     def build(
@@ -61,6 +65,11 @@ class RunHealth:
         hypothesis_failures: int = 0,
         investigation_unknown_errors: int = 0,
         investigation_retryable: bool = False,
+        protocol_version: int = 1,
+        investigation_failures: int = 0,
+        investigation_unknown_total: int = 0,
+        investigation_deferred: int = 0,
+        budget_failures: int = 0,
     ) -> RunHealth:
         return cls(
             tasks=StageResult(
@@ -97,9 +106,13 @@ class RunHealth:
             ),
             investigation=StageResult(
                 name="investigation",
-                failures=max(0, investigation_unknown_errors),
+                failures=max(0, investigation_failures if protocol_version >= 2 else investigation_unknown_errors),
                 retryable=investigation_retryable,
             ),
+            protocol_version=protocol_version,
+            investigation_unknown_total=max(0, investigation_unknown_total),
+            investigation_deferred=max(0, investigation_deferred),
+            budget=StageResult(name="budget", failures=max(0, budget_failures)),
         )
 
     @property
@@ -108,7 +121,7 @@ class RunHealth:
 
     @property
     def completed(self) -> bool:
-        """True when no error-severity claim remains UNKNOWN (§4.8)."""
+        """Execution health; v1 also gates error-severity UNKNOWN (§4.8)."""
         return not self.operationally_incomplete
 
     @property
@@ -117,7 +130,15 @@ class RunHealth:
 
     @property
     def stages(self) -> tuple[StageResult, ...]:
-        return (self.tasks, self.planner, self.publication, self.delivery, self.hypothesis, self.investigation)
+        return (
+            self.tasks,
+            self.planner,
+            self.publication,
+            self.delivery,
+            self.hypothesis,
+            self.investigation,
+            self.budget,
+        )
 
     @property
     def errors(self) -> list[str]:
@@ -125,6 +146,18 @@ class RunHealth:
 
     def apply_to_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
         """Preserve the legacy success shape and annotate incomplete runs."""
+        if self.protocol_version >= 2:
+            summary["v4_health"] = {
+                "protocol_version": self.protocol_version,
+                "unknown_claims": self.investigation_unknown_total,
+                "policy_deferred_claims": self.investigation_deferred,
+                "execution_failures": sum(
+                    max(stage.failures, len(stage.errors), int(stage.retryable)) for stage in self.stages
+                ),
+                "stage_failures": {
+                    stage.name: max(stage.failures, len(stage.errors), int(stage.retryable)) for stage in self.stages
+                },
+            }
         if self.operationally_incomplete:
             summary.update({"status": "partial", "retryable": self.retryable})
         return summary

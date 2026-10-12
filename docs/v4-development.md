@@ -518,3 +518,17 @@ keycloak#37429 与 calcom#10967 超过每 PR 250k 门槛；6 条其它已审查�
 现在无声明模式的 `extract_code_definitions` 在遮罩前返回空，workspace 定义查询在读取前跳过这些成员的声明索引。完整 workspace 仍保留所有成员与摘要，显式读取及资源上下文可用；caller 的既有字面命中范围保留。工具失败只新增异常类型与内部代码文件名/行号的日志，异常正文、参数与完整 traceback 不进入日志，原空 error Observation 与不可引用门槛保留。该改动没有修改候选身份、评分、模型预算、模式或旧结果。
 
 新增 8 项回归全部先在旧实现失败，覆盖四类无声明模式文件、归档/文件系统下不读取资产但保留其显式读取、caller 字面命中保留，以及异常种类/位置诊断与敏感正文隔离。相关 96 项通过；完整 `1758 passed, 1 skipped, 6 warnings`，ruff / 204 文件 format / spec-check / 2 项严格裁判回归通过。此修复晚于本轮模型快照，尚无新冻结的真实质量或峰值内存复测；不能将上述 2049 MiB 或十 PR 结果归为修复后的效果。生产只读核实 service active / HTTP 200，仍为 main `00c667556c88241d72d96f24430c7c16b4add24e`，v4 未部署。
+
+### 调查、覆盖、证据与执行状态的边界修订（2026-10-12）
+
+用户授权按失败分析后的推荐方案开始优化。Issue/PR 库开工及提交前均为空；SPEC 顶部记录 v2 修订及其与旧规则的边界。两问回查：原 unit identity 用于覆盖定位、两前提证据用于限制误报，这两项用途仍成立；把同一 identity 也用于不同触发条件的风险去重、把正反裁决强制为同一种证明形态、把严重度 UNKNOWN 与执行失败混合，这些假设不成立。
+
+新运行显式 `protocol_version=2`，旧 checkpoint 缺版本为 v1。原候选/单元保留，相同源码锚点与完整候选事实共享一个原预算内的调查；原 coverage identity 冲突时只给新风险增加稳定变体与原绑定。别名保留各自状态/位置/证据，实际调查 token 只记一次，任务结果与成员一起落 checkpoint。实际 site 的最内层语义单元优先交付导航，声明单元为补充，合计仍受 12000 字符上限约束。
+
+确认继续要求两个成功精确引用；反驳可提交针对 trigger/mechanism/impact/regression 的成功源码反证。UNKNOWN 不因文字断言或附带证明被猜测升级。新的 typed outcome 将有效缺证据与输出、提供方、工具、实际预算失败分开；任务名额/共享用量不足为显式 policy-deferred，不计为已取证。摘要同时保留未决、延期与各失败计数。严格裁判算法/阈值及全部旧结果不变；新完成语义明确版本，仅可在新的完整队列上正式计分，未决和延期仍影响召回。
+
+阶段请求选项在 token/trace 包装内逐次传递，不修改共享模型：DeepSeek 输出阶段请求 JSON object 与 disabled thinking，调查工具阶段保留原配置，收尾单独请求 disabled。JSON object 修复失败用 unrepairable 对象，原默认修复仍用 null；两者都不能记为无问题。固定源码传输只允许同 SHA 两次、每次 180 秒的瞬时故障恢复。调查启动前在 PR 250k 门槛内扣除已记录用量、预留编辑额度，按原单任务上限预占并发额度；实际超支仍可见并使 budget stage 失败。
+
+新增 21 项回归覆盖共享调查/单次记账、不同触发及同函数风险变体、锚点交付、正向反证/恶意引用/旧 UNKNOWN、原 checkpoint、双维状态、SDK 请求选项与记账、JSON object 失败语义及传输恢复。全量 `1779 passed, 1 skipped, 6 warnings`，ruff / 202 文件 format 与结构 spec-check 通过，严格裁判 2 项通过；spec-check 使用非联网占位凭据核实配置/注册结构，真实运行另通过现有私有配置验证。
+
+预声明诊断输入位于 `.reviewforge/benchmarks/v4-boundaries-probe-20261012-101603/inputs.json`，SHA256 `faf56f56018c0bc83b1cc3f9870e7c79e5511ff2e3342a6879be1267c726ffc7`。仅验证中转输出选项、原 Discourse 生成输入、Cal.com 直接反证与 Sentry 收尾；累计 recorded token 上限 100k，无语义重试/无质量分。INV 使用明确标记的固定源码子集；收尾重放前逐字核实保存片段与刚获取的固定 head 源码。它不是完整 PR/完整仓库质量验收，尚待冻结版本的实际回执。

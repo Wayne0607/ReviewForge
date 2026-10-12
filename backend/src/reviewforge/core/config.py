@@ -155,6 +155,9 @@ class PipelineV4Config:
     investigator_max_hypotheses_per_pr: int = 12
     publish_max_inline: int = 5
     publish_max_inline_overflow: int = 8
+    json_output_mode: str = "auto"
+    investigator_closure_thinking: str = "auto"
+    max_tokens_per_pr: int = 250_000
 
 
 def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
@@ -165,6 +168,12 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         cfg.mode = _normalize_pipeline_mode(data["mode"], cfg.mode)
     if "output_language" in data:
         cfg.output_language = _normalize_output_language(data["output_language"], cfg.output_language)
+    for name, allowed in (
+        ("json_output_mode", {"auto", "off", "json_object"}),
+        ("investigator_closure_thinking", {"auto", "default", "disabled"}),
+    ):
+        if data.get(name) in allowed:
+            setattr(cfg, name, data[name])
     for name in (
         "workspace_max_bytes",
         "context_pack_max_slices",
@@ -174,6 +183,7 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         "max_lenses",
         "investigator_concurrency",
         "investigator_max_hypotheses_per_pr",
+        "max_tokens_per_pr",
         "publish_max_inline",
         "publish_max_inline_overflow",
     ):

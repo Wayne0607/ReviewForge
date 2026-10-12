@@ -31,6 +31,7 @@ from reviewforge.engine.hypothesis_generator import HypothesisGenerator, build_a
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
 from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.lenses import run_lens, select_lenses
+from reviewforge.engine.llm_protocol_v4 import request_options
 from reviewforge.engine.phase0 import scan_changed_files
 from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
 from reviewforge.engine.run_health import RunHealth
@@ -143,11 +144,22 @@ async def _run_llm_stages(
     ctx = RunContext()
     ctx.set(ledger.run_id, getattr(orchestrator, "_db", None))
 
-    def routed(name: str):
+    def routed(name: str, *, closing: bool = False):
         async def record(usage: dict[str, Any]) -> None:
             usage_by_agent[name] = usage_by_agent.get(name, 0) + int(usage["total_tokens"])
 
-        return TrackedChatLLM(router.get_llm(name), ctx, name, usage_sink=record)
+        options = {}
+        if ledger.protocol_version >= 2:
+            effective = router.effective(name) if callable(getattr(router, "effective", None)) else {}
+            options = request_options(
+                effective.get("model", ""),
+                name,
+                closing=closing,
+                json_mode=config.json_output_mode,
+                closure_thinking=config.investigator_closure_thinking,
+            )
+            events.emit("pipeline_v4.request_options", {"agent": name, "closing": closing, "options": options})
+        return TrackedChatLLM(router.get_llm(name), ctx, name, usage_sink=record, request_options=options)
 
     async def checkpoint(current: HypothesisLedger) -> None:
         await _persist_ledger(orchestrator, current)
@@ -212,7 +224,14 @@ async def _run_llm_stages(
         if item.status == HypothesisStatus.UNKNOWN and item.retryable:
             item.status = HypothesisStatus.OPEN
     if ledger.open():
-        investigator = Investigator(routed("investigator"), executor, output_language=language, changeset=changeset)
+        investigator = Investigator(
+            routed("investigator"),
+            executor,
+            output_language=language,
+            changeset=changeset,
+            protocol_version=ledger.protocol_version,
+            closing_llm=routed("investigator", closing=True) if ledger.protocol_version >= 2 else None,
+        )
         await investigator.run(
             ledger,
             state,
@@ -220,6 +239,9 @@ async def _run_llm_stages(
             max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
             concurrency=config.investigator_concurrency,
             on_update=checkpoint,
+            token_budget=max(0, config.max_tokens_per_pr - sum(usage_by_agent.values()) - 16_000)
+            if ledger.protocol_version >= 2
+            else None,
         )
 
     if resume:
@@ -251,8 +273,13 @@ async def _run_llm_stages(
     for item in ledger.items.values():
         if item.source.startswith("detector"):
             continue
-        if item.status == HypothesisStatus.UNKNOWN and item.verdict_reason == "budget-exhausted":
-            events.emit("investigation.skipped", {"hypothesis_id": item.id, "reason": "budget-exhausted"})
+        if item.status == HypothesisStatus.UNKNOWN and (
+            item.verdict_reason == "budget-exhausted" or item.investigation_outcome == "policy-deferred"
+        ):
+            events.emit(
+                "investigation.skipped",
+                {"hypothesis_id": item.id, "reason": item.verdict_reason, "task_id": item.investigation_task_id},
+            )
         elif item.attempts > 0:
             events.emit(
                 "investigation.completed",
@@ -397,6 +424,7 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             run_id=workspace_event.run_id,
             head_sha=str(state.head_sha or ""),
             workspace_digest=pack.workspace_digest,
+            protocol_version=2,
         )
     elif state.ledger.head_sha != str(state.head_sha or ""):
         raise ValueError("restored hypothesis ledger does not match PR head")
@@ -508,6 +536,14 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         if hypothesis.status == HypothesisStatus.UNKNOWN and hypothesis.severity == "error"
     )
     generated = [hypothesis for hypothesis in hypotheses if not hypothesis.source.startswith("detector")]
+    operational_outcomes = {"provider-error", "output-error", "budget-exhausted", "tool-error"}
+    investigation_failures = sum(
+        task.get("outcome") in operational_outcomes for task in ledger.investigation_tasks.values()
+    ) + sum(
+        item.status == HypothesisStatus.OPEN
+        or (item.status == HypothesisStatus.UNKNOWN and not item.investigation_outcome)
+        for item in hypotheses
+    )
     orchestrator._events.emit(
         "pipeline_v4.completed",
         {
@@ -519,12 +555,21 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             "generated": len(generated),
             "published": delivered,
             "tokens_by_agent": usage_by_agent,
+            "protocol_version": ledger.protocol_version,
+            "investigation_tasks": len(ledger.investigation_tasks),
+            "investigation_failures": investigation_failures,
+            "policy_deferred": sum(item.investigation_outcome == "policy-deferred" for item in hypotheses),
         },
     )
     return RunHealth.build(
         hypothesis_failures=len(ledger.unresolved_units),
         investigation_unknown_errors=unknown_error,
         investigation_retryable=any(item.retryable for item in hypotheses),
+        protocol_version=ledger.protocol_version,
+        investigation_failures=investigation_failures,
+        investigation_unknown_total=sum(item.status == HypothesisStatus.UNKNOWN for item in hypotheses),
+        investigation_deferred=sum(item.investigation_outcome == "policy-deferred" for item in hypotheses),
+        budget_failures=int(ledger.protocol_version >= 2 and sum(usage_by_agent.values()) > config.max_tokens_per_pr),
         delivery_failures=rejected,
         delivery_errors=(outcome.error,) if outcome.error else (),
         delivery_retryable=outcome.retryable,

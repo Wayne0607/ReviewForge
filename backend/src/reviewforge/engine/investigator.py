@@ -28,12 +28,19 @@ from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
 from reviewforge.engine.hypothesis import (
     ContractAssessment,
+    CounterEvidence,
     EvidenceCitation,
     Hypothesis,
     HypothesisLedger,
     Mechanism,
     Observation,
     Site,
+)
+from reviewforge.engine.investigation_tasks import (
+    InvestigationTask,
+    build_investigation_tasks,
+    context_units,
+    render_investigation_context,
 )
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
@@ -110,6 +117,12 @@ class InvestigationResult:
     observations: list[Observation] = field(default_factory=list)
     retryable: bool = False
     assessment: ContractAssessment | None = None
+    counterevidence: CounterEvidence | None = None
+    outcome: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.outcome:
+            self.outcome = "insufficient-evidence" if self.verdict == "unknown" else "resolved"
 
 
 def budget_steps(hypothesis: Hypothesis) -> int:
@@ -236,12 +249,16 @@ class Investigator:
         output_language: str = "en",
         max_steps: int | None = None,
         changeset: SemanticChangeSet | None = None,
+        protocol_version: int = 1,
+        closing_llm: BaseChatModel | None = None,
     ) -> None:
         self._llm = llm
         self._executor = executor
         self._output_language = output_language
         self._max_steps = None if max_steps is None else max(1, int(max_steps))
         self._changeset = changeset
+        self._protocol_version = protocol_version
+        self._closing_llm = closing_llm
         self._observations: list[Observation] = []
         self._obs_counter = 0
         self._tool_counts: dict[str, int] = {}
@@ -398,11 +415,15 @@ class Investigator:
 
     def _prepare_read_focus(self, hypothesis: Hypothesis, pack: ContextPack) -> None:
         self._read_focus = {}
-        context = pack.units.get(hypothesis.unit_id)
-        if context is not None:
-            for item in context.slices:
-                if item.start_line > 0:
-                    self._read_focus.setdefault(item.path, item.start_line)
+        units = (
+            context_units(hypothesis, self._changeset, pack) if self._protocol_version >= 2 else [hypothesis.unit_id]
+        )
+        for unit_id in units:
+            context = pack.units.get(unit_id)
+            if context is not None:
+                for item in context.slices:
+                    if item.start_line > 0:
+                        self._read_focus.setdefault(item.path, item.start_line)
         # Compiler-associated sites take priority over the related slices.
         if self._changeset and any(unit.id == hypothesis.unit_id for unit in self._changeset.units):
             for site in reversed(hypothesis.sites):
@@ -434,7 +455,8 @@ class Investigator:
         return None
 
     def _system_prompt(self) -> str:
-        return load_prompt("investigator", output_language=_language_directive(self._output_language))
+        name = "investigator_v2" if self._protocol_version >= 2 else "investigator"
+        return load_prompt(name, output_language=_language_directive(self._output_language))
 
     def _render_user(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> str:
         diffs = state.file_diffs or {}
@@ -451,7 +473,11 @@ class Investigator:
             if patch:
                 sections.append(f"### {path}\n{patch}")
         diff_section = "\n\n".join(sections) or "(no matching hunk; use read_diff to inspect the file's changes)"
-        context = pack.render_for_unit(hypothesis.unit_id, max_chars=12_000)
+        context = (
+            render_investigation_context(hypothesis, self._changeset, pack, max_chars=12_000)
+            if self._protocol_version >= 2
+            else pack.render_for_unit(hypothesis.unit_id, max_chars=12_000)
+        )
         hypothesis_body = json.dumps(hypothesis.to_dict(), ensure_ascii=False, indent=2)
         sections = [
             "## Hypothesis\n" + hypothesis_body,
@@ -475,7 +501,10 @@ class Investigator:
             sections.append("## Verification guidance\n" + localization_guidance())
         if any(has_python_concurrency(path, diffs.get(path, "")) for path in ranges):
             sections.append("## Verification guidance\n" + python_concurrency_guidance())
-        if has_state_navigation(pack, hypothesis.unit_id):
+        units = (
+            context_units(hypothesis, self._changeset, pack) if self._protocol_version >= 2 else [hypothesis.unit_id]
+        )
+        if any(has_state_navigation(pack, unit_id) for unit_id in units):
             sections.append("## Verification guidance\n" + state_guidance())
         return "\n\n".join(sections)
 
@@ -576,7 +605,11 @@ class Investigator:
             chat.append(response)
             if self._tokens > token_limit:
                 return self._result(
-                    verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step + 1
+                    verdict="unknown",
+                    reason="token-exhausted",
+                    severity=hypothesis.severity,
+                    steps=step + 1,
+                    outcome="budget-exhausted",
                 )
             tool_calls = getattr(response, "tool_calls", None) or []
             if not tool_calls:
@@ -592,7 +625,11 @@ class Investigator:
                 )
             if self._tokens >= token_limit:
                 return self._result(
-                    verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=step + 1
+                    verdict="unknown",
+                    reason="token-exhausted",
+                    severity=hypothesis.severity,
+                    steps=step + 1,
+                    outcome="budget-exhausted",
                 )
             for tool_call in tool_calls:
                 name = str(tool_call.get("name", ""))
@@ -650,9 +687,16 @@ class Investigator:
     ) -> InvestigationResult:
         input_tokens = self._estimate_input_tokens(chat) + self._input_overhead
         if self._tokens + input_tokens >= token_limit:
-            return self._result(verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=steps)
+            return self._result(
+                verdict="unknown",
+                reason="token-exhausted",
+                severity=hypothesis.severity,
+                steps=steps,
+                outcome="budget-exhausted",
+            )
         try:
-            final = await self._llm.ainvoke(chat, max_tokens=min(4_000, token_limit - self._tokens - input_tokens))
+            closer = self._closing_llm if self._closing_llm is not None else self._llm
+            final = await closer.ainvoke(chat, max_tokens=min(4_000, token_limit - self._tokens - input_tokens))
             self._record_tokens(final, chat)
             parsed = self._parse_verdict(getattr(final, "content", "") or "")
         except Exception as exc:
@@ -661,9 +705,15 @@ class Investigator:
                 verdict="unknown", reason="provider error", severity=hypothesis.severity, steps=steps, retryable=True
             )
         if self._tokens > token_limit:
-            return self._result(verdict="unknown", reason="token-exhausted", severity=hypothesis.severity, steps=steps)
+            return self._result(
+                verdict="unknown",
+                reason="token-exhausted",
+                severity=hypothesis.severity,
+                steps=steps,
+                outcome="budget-exhausted",
+            )
         if parsed is None:
-            return self._result(verdict="unknown", reason="step-exhausted", severity=hypothesis.severity, steps=steps)
+            return self._invalid_output("step-exhausted", hypothesis, steps)
         return self._finalize(parsed, hypothesis, changed, steps=steps)
 
     @staticmethod
@@ -715,12 +765,20 @@ class Investigator:
     def _parse_verdict(content: str) -> dict[str, Any] | None:
         parsed = extract_json_value(content or "", required_key="assessment", allow_list=False)
         if not isinstance(parsed, dict):
+            parsed = extract_json_value(content or "", required_key="counterevidence", allow_list=False)
+        if not isinstance(parsed, dict):
             parsed = extract_json_value(content or "", required_key="verdict", allow_list=False)
         return parsed if isinstance(parsed, dict) else None
 
     def _finalize(
         self, parsed: dict[str, Any], hypothesis: Hypothesis, changed: set[str], *, steps: int
     ) -> InvestigationResult:
+        if self._protocol_version >= 2 and parsed.get("assessment") is not None:
+            raw = parsed["assessment"]
+            if not isinstance(raw, dict) or raw.get("comparison") not in {"conflict", "compatible", "unresolved"}:
+                return self._invalid_output("incomplete-assessment", hypothesis, steps)
+        if self._protocol_version >= 2 and parsed.get("counterevidence") is not None:
+            return self._finalize_counterevidence(parsed, hypothesis, changed, steps=steps)
         if "verdict" in parsed:
             # Explicit legacy decisions must still agree with the assessment;
             # never repair a contradictory or UNKNOWN historical response.
@@ -749,6 +807,7 @@ class Investigator:
 
         strength = "none"
         assessment = None
+        validation_failed = False
         if verdict in {"confirmed", "refuted"}:
             by_id = {observation.id: observation for observation in self._observations}
             cited = [by_id[identity] for identity in evidence_ids if identity in by_id]
@@ -763,14 +822,17 @@ class Investigator:
             if legacy_citation and not grounded:
                 verdict = "unknown"
                 reason = "ungrounded"
+                validation_failed = True
                 evidence_ids, evidence_quote = [], ""
             else:
                 try:
                     assessment = self._assessment_from_output(parsed.get("assessment"))
                 except _UnknownEvidenceReferenceError:
                     verdict, reason = "unknown", "ungrounded-assessment"
+                    validation_failed = True
                 except ValueError:
                     verdict, reason = "unknown", "incomplete-assessment"
+                    validation_failed = True
                 if assessment is not None:
                     required = "conflict" if verdict == "confirmed" else "compatible"
                     proof = [*assessment.expected_evidence, *assessment.actual_evidence]
@@ -781,8 +843,10 @@ class Investigator:
                         for citation in proof
                     ):
                         verdict, reason = "unknown", "ungrounded-assessment"
+                        validation_failed = True
                     elif assessment.comparison != required:
                         verdict, reason = "unknown", "inconsistent-assessment"
+                        validation_failed = True
                     else:
                         evidence_ids = list(dict.fromkeys(citation.observation_id for citation in proof))
                         evidence_quote = assessment.actual_evidence[0].quote
@@ -803,6 +867,85 @@ class Investigator:
             strength=strength,
             steps=steps,
             assessment=assessment,
+            outcome="output-error" if validation_failed else "",
+        )
+
+    def _invalid_output(self, reason: str, hypothesis: Hypothesis, steps: int) -> InvestigationResult:
+        return self._result(
+            verdict="unknown", reason=reason, severity=hypothesis.severity, steps=steps, outcome="output-error"
+        )
+
+    def _finalize_counterevidence(
+        self, parsed: dict[str, Any], hypothesis: Hypothesis, changed: set[str], *, steps: int
+    ) -> InvestigationResult:
+        # An explicit historical UNKNOWN is never silently upgraded.
+        if str(parsed.get("verdict", "")).strip().lower() == "unknown":
+            return self._result(
+                verdict="unknown", reason=str(parsed.get("reason", "")), severity=hypothesis.severity, steps=steps
+            )
+        if parsed.get("assessment") is not None or parsed.get("verdict", "refuted") != "refuted":
+            return self._invalid_output("inconsistent-assessment", hypothesis, steps)
+        try:
+            raw = parsed["counterevidence"]
+            if not isinstance(raw, dict):
+                raise ValueError("counterevidence must be an object")
+            # Resolve IDs using the identical two-premise citation converter.
+            proof = self._assessment_from_output(
+                {
+                    "expected": raw.get("statement"),
+                    "actual": raw.get("statement"),
+                    "comparison": "compatible",
+                    "expected_evidence": raw.get("evidence"),
+                    "actual_evidence": raw.get("evidence"),
+                }
+            ).actual_evidence
+            counter = CounterEvidence.from_dict({**raw, "evidence": [vars(citation) for citation in proof]})
+        except _UnknownEvidenceReferenceError:
+            return self._invalid_output("ungrounded-assessment", hypothesis, steps)
+        except (ValueError, TypeError):
+            return self._invalid_output("incomplete-assessment", hypothesis, steps)
+        by_id = {observation.id: observation for observation in self._observations}
+        if any(
+            citation.observation_id not in by_id
+            or by_id[citation.observation_id].status != "success"
+            or citation.quote not in by_id[citation.observation_id].excerpt
+            for citation in proof
+        ):
+            return self._invalid_output("ungrounded-assessment", hypothesis, steps)
+        # Explicit old quote fields remain enforceable, even with a valid new proof.
+        if "evidence_ids" in parsed or "evidence_quote" in parsed:
+            quote = parsed.get("evidence_quote")
+            ids = parsed.get("evidence_ids")
+            if (
+                not isinstance(quote, str)
+                or not isinstance(ids, list)
+                or not any(
+                    identity in by_id
+                    and by_id[identity].status == "success"
+                    and quote
+                    and quote in by_id[identity].excerpt
+                    for identity in ids
+                    if isinstance(identity, str)
+                )
+            ):
+                return self._invalid_output("ungrounded", hypothesis, steps)
+        severity = parsed.get("severity", hypothesis.severity)
+        if severity not in _SEVERITY_RANK:
+            severity = hypothesis.severity
+        outside = any(
+            self._quote_outside_diff(by_id[citation.observation_id], citation.quote, changed) for citation in proof
+        )
+        return self._result(
+            verdict="refuted",
+            answer=str(parsed.get("answer", "")),
+            reason=str(parsed.get("reason", "")),
+            severity=severity,
+            evidence_ids=list(dict.fromkeys(citation.observation_id for citation in proof)),
+            evidence_quote=proof[0].quote,
+            strength="strong" if outside else "weak",
+            steps=steps,
+            counterevidence=counter,
+            additional_sites=_parse_additional_sites(parsed.get("additional_sites"), self._state),
         )
 
     def _assessment_from_output(self, raw: Any) -> ContractAssessment:
@@ -872,7 +1015,18 @@ class Investigator:
         steps: int = 0,
         retryable: bool = False,
         assessment: ContractAssessment | None = None,
+        counterevidence: CounterEvidence | None = None,
+        outcome: str = "",
     ) -> InvestigationResult:
+        if not outcome:
+            if verdict != "unknown":
+                outcome = "resolved"
+            elif retryable:
+                outcome = "provider-error"
+            elif any(observation.status == "error" for observation in self._observations):
+                outcome = "tool-error"
+            else:
+                outcome = "insufficient-evidence"
         return InvestigationResult(
             verdict=verdict,
             answer=answer,
@@ -887,6 +1041,8 @@ class Investigator:
             observations=list(self._observations),
             retryable=retryable,
             assessment=assessment,
+            counterevidence=counterevidence,
+            outcome=outcome,
         )
 
     async def run(
@@ -898,6 +1054,7 @@ class Investigator:
         changed_paths: set[str] | None = None,
         max_hypotheses_per_pr: int = 12,
         concurrency: int = 1,
+        token_budget: int | None = None,
         on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
     ) -> list[InvestigationResult]:
         """Investigate every OPEN hypothesis concurrently, then apply verdicts.
@@ -926,34 +1083,62 @@ class Investigator:
                 mechanisms.setdefault(item.mechanism, []).append(item)
             for round_items in zip_longest(*mechanisms.values()):
                 targets.extend(item for item in round_items if item is not None)
+        tasks = (
+            build_investigation_tasks(targets, head_sha=ledger.head_sha, workspace_digest=ledger.workspace_digest)
+            if ledger.protocol_version >= 2
+            else [InvestigationTask(item.identity, item, (item.identity,)) for item in targets]
+        )
         semaphore = asyncio.Semaphore(max(1, concurrency))
+        available_tokens = None if token_budget is None else max(0, token_budget)
 
         async def _investigate(index: int, hypothesis: Hypothesis) -> InvestigationResult:
+            nonlocal available_tokens
             if index >= max(0, max_hypotheses_per_pr):
-                return self._result(verdict="unknown", reason="budget-exhausted", severity=hypothesis.severity)
+                return self._result(
+                    verdict="unknown",
+                    reason="budget-exhausted",
+                    severity=hypothesis.severity,
+                    outcome="policy-deferred" if ledger.protocol_version >= 2 else "budget-exhausted",
+                )
             async with semaphore:
+                reserve = (self._max_steps if self._max_steps is not None else budget_steps(hypothesis)) * 4_000
+                if available_tokens is not None:
+                    if available_tokens < reserve:
+                        return self._result(
+                            verdict="unknown",
+                            reason="run-budget-exhausted",
+                            severity=hypothesis.severity,
+                            outcome="policy-deferred",
+                        )
+                    available_tokens -= reserve
                 worker = Investigator(
                     self._llm,
                     self._executor,
                     output_language=self._output_language,
                     max_steps=self._max_steps,
                     changeset=self._changeset,
+                    protocol_version=ledger.protocol_version,
+                    closing_llm=self._closing_llm,
                 )
                 try:
-                    return await worker.investigate(hypothesis, state, pack, changed_paths=changed)
+                    result = await worker.investigate(hypothesis, state, pack, changed_paths=changed)
                 except Exception as exc:
                     logger.warning("investigation failed for %s: %s", hypothesis.identity, exc)
-                    return self._result(
+                    result = worker._result(
                         verdict="unknown",
                         reason=f"investigation error: {exc}",
                         severity=hypothesis.severity,
                         retryable=True,
+                        outcome="output-error",
                     )
+                if available_tokens is not None:
+                    available_tokens += reserve - result.tokens
+                return result
 
-        async def complete(index: int, hypothesis: Hypothesis) -> InvestigationResult:
+        async def complete(index: int, task: InvestigationTask) -> InvestigationResult:
+            hypothesis = task.hypothesis
             result = await _investigate(index, hypothesis)
-            ledger.apply_verdict(
-                hypothesis.identity,
+            verdict = dict(
                 status=result.verdict,
                 evidence_strength=result.strength,
                 verdict_reason=result.reason,
@@ -964,12 +1149,18 @@ class Investigator:
                 investigation_tokens=result.tokens,
                 retryable=result.retryable,
                 assessment=result.assessment,
+                counterevidence=result.counterevidence,
+                investigation_outcome=result.outcome,
             )
+            if ledger.protocol_version >= 2:
+                ledger.apply_task_verdict(task.id, task.members, hypothesis.identity, **verdict)
+            else:
+                ledger.apply_verdict(hypothesis.identity, **verdict)
             if on_update is not None:
                 await on_update(ledger)
             return result
 
-        jobs = [asyncio.create_task(complete(index, hypothesis)) for index, hypothesis in enumerate(targets)]
+        jobs = [asyncio.create_task(complete(index, task)) for index, task in enumerate(tasks)]
         try:
             return list(await asyncio.gather(*jobs))
         finally:

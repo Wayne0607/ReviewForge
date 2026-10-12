@@ -54,6 +54,7 @@ class TrackedChatLLM(BaseChatModel):
     _ctx: RunContext
     _agent_name: str
     _usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None
+    _request_options: dict[str, Any]
 
     class Config:
         arbitrary_types_allowed = True
@@ -64,12 +65,14 @@ class TrackedChatLLM(BaseChatModel):
         ctx: RunContext,
         agent_name: str,
         usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        request_options: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self._inner = inner
         self._ctx = ctx
         self._agent_name = agent_name
         self._usage_sink = usage_sink
+        self._request_options = dict(request_options or {})
 
     async def _agenerate(
         self,
@@ -78,7 +81,7 @@ class TrackedChatLLM(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        result = await self._inner._agenerate(messages, stop, run_manager, **kwargs)
+        result = await self._inner._agenerate(messages, stop, run_manager, **(self._request_options | kwargs))
 
         # Extract token usage from LangChain response
         usage = result.llm_output or {}
@@ -136,7 +139,7 @@ class TrackedChatLLM(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        return self._inner._generate(messages, stop, run_manager, **kwargs)
+        return self._inner._generate(messages, stop, run_manager, **(self._request_options | kwargs))
 
     @property
     def _llm_type(self) -> str:
@@ -158,6 +161,10 @@ class TrackedChatLLM(BaseChatModel):
 
     def with_structured_output(self, schema, **kwargs):
         return self._inner.with_structured_output(schema, **kwargs)
+
+    @property
+    def json_object_output(self) -> bool:
+        return self._request_options.get("response_format", {}).get("type") == "json_object"
 
 
 def create_tracked_llm(

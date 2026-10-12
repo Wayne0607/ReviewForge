@@ -15,7 +15,12 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-_SCRIPTS = {"runner": "martian_runner.py", "context": "context_snapshot.py", "judge": "martian_judge.py"}
+_SCRIPTS = {
+    "runner": "martian_runner.py",
+    "context": "context_snapshot.py",
+    "judge": "martian_judge.py",
+    "protocol": "v4_protocol_probe.py",
+}
 _MIB = 1024 * 1024
 
 

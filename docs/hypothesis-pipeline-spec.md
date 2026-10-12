@@ -5,6 +5,21 @@
 > 基线：`main@892de6a`。所有路径相对 `backend/src/reviewforge/`。
 > 本文是执行的唯一事实源；与旧文档冲突时以本文为准。
 
+### v4 调查边界修订（2026-10-12，用户授权）
+
+用户在固定 dev10 失败分析后授权按推荐方案优化。以下 `protocol_version=2` 规则用于新运行；旧 checkpoint 缺少版本时按 v1 读取，既有账本、完成状态和评测结果不重写。legacy 与生产 main 保持原行为。
+
+- **覆盖与调查分开。** 原 unit/候选 identity 保留。调查前只归并 head/workspace、文件/锚点、mechanism、claim、trigger、impact、open_question、refutation 和 sites 全部一致的候选；无命名锚点的不同 unit 不归并。一个实际调查对应多个候选，原位置与覆盖关系都保存，token 仅在实际执行者记录一次。不同触发条件不能因同一函数而合并。
+  同一旧 coverage identity 上出现不同 claim/trigger/impact/question/refutation 时，新 v2 候选增加稳定风险变体，保存 `coverage_identity` 原绑定；首条与全部 v1 identity 不改。变体仍保留末尾函数锚点，避免覆盖不同输入下的风险或破坏编辑定位。
+- **上下文按实际锚点交付。** 同文件包含主 site 的最内层语义单元优先，原声明 unit 为补充；共同受原 12000 字符调查上下文限额约束。选择关系与证据需求只是导航，不能充当 Observation；resource 的 locale/契约边界保留。
+- **阶段输出接口。** 新 v4 的生成/lens/editor 与调查收尾可请求 JSON object；DeepSeek 收尾可独立请求 disabled thinking。请求经原 ModelRouter 和 token/trace 包装，工具阶段不强制 JSON，收尾仍在同一调查预算内。未知提供方保持原默认；中转能力需真实小规模验证，不能根据请求参数声称实际生效。格式修复仍仅一次，空正文不修复，不能做发现重试。
+- **两种证明形态。** confirmed 继续要求 expected/actual 的两个成功精确引用及 conflict。refuted 可用相同的 compatible assessment，或 `counterevidence={premise,statement,evidence}`，其中 premise 为 trigger/mechanism/impact/regression，statement 明确说明哪一个必要前提被源码反证，evidence 为已保存成功 Observation 的引用。负向搜索、Context 与工具 error 不能成为反证；同时提供矛盾/多种裁决、非法结构或引用均为输出失败，不得确认或反驳。仅文字回答/assessment=null 保持 UNKNOWN，不被猜测升级。
+- **执行状态与不确定性分开。** 新调查持久化 outcome：resolved、insufficient-evidence、policy-deferred、provider-error、output-error、budget-exhausted、tool-error。有效且无工具错误的缺证据 UNKNOWN 是语义未决；按预声明每 PR 任务数上限未选中的候选为 policy-deferred，不能计为已取证。provider/输出/实际预算/工具错误与生成未覆盖块继续使执行 partial。摘要和事件同时报告未决、延期及执行失败数量；只有确认项发布。正式裁判仍要求完整固定队列；新协议的结果明确版本，未决/延期的漏报由正式质量指标体现，不能改写旧批次或挑子集计分。
+- **输入可靠性。** 固定 head 归档的瞬时传输错误允许最多两次网络尝试；每次最多 180 秒，同 repo/SHA，完整校验后才可用。认证、HTTP 拒绝或损坏归档不通过无限重试掩盖，fallback 继续明确标记，严格基准仍拒绝不完整 workspace。
+- **成本准入。** `max_tokens_per_pr=250000` 沿用原用量门槛；调查任务启动前从剩余 PR 用量中预留 16000 给编辑，再预占该调查原有完整额度，并发共享额度，结束后按实际 usage 释放余量。不足的任务明确 policy-deferred，不谎称已取证。提供方用量仍完整记录，估算超支会使 budget stage 失败，不隐藏或删改实际花费。
+
+修订覆盖下文 §4.3/4.6/4.8 中 v1 的共享任务、反证与完成语义；v1 的两前提协议和 error UNKNOWN→partial 保留供旧 checkpoint 使用。原模型、步骤、输出/调查 token 限额、每 PR 任务数、发布与资源上限不提高。先复现已知失败，再冻结新版本做小范围真实验证。
+
 ---
 
 ## 0. 给执行模型的须知

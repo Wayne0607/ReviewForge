@@ -253,6 +253,7 @@ class HypothesisGenerator:
         skill_body: str = "",
         on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
         anchor_resolver: AnchorResolver | None = None,
+        json_object_output: bool | None = None,
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
@@ -264,6 +265,9 @@ class HypothesisGenerator:
         self._skill_body = skill_body
         self._on_update = on_update
         self._anchor_resolver = anchor_resolver
+        self._json_object_output = (
+            bool(getattr(llm, "json_object_output", False)) if json_object_output is None else json_object_output
+        )
 
     def _system_prompt(self) -> str:
         lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
@@ -444,6 +448,11 @@ class HypothesisGenerator:
         return self._parse_response(content), content
 
     async def _invoke_repair(self, original: str) -> dict[str, Any] | None:
+        failure = (
+            'return {"unrepairable":true}. Output only the repaired JSON object or that failure object.'
+            if self._json_object_output
+            else "return null. Output only the repaired JSON or null."
+        )
         messages = [
             SystemMessage(
                 content=(
@@ -451,8 +460,7 @@ class HypothesisGenerator:
                     'The schema is an object with "hypotheses" and "no_issue_units" arrays. '
                     "Preserve every entry and its facts verbatim; do not review code again, "
                     "add hypotheses, invent missing field values, or discard incomplete entries. "
-                    "If the response is truncated or lacks enough information for a faithful repair, "
-                    "return null. Output only the repaired JSON or null."
+                    "If the response is truncated or lacks enough information for a faithful repair, " + failure
                 )
             ),
             AIMessage(content=original),

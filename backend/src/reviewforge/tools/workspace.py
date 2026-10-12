@@ -12,6 +12,7 @@ that degraded mode because the API search endpoint is not SHA-scoped.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import hashlib
 import io
@@ -27,6 +28,8 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+import httpx
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine import symbol_extractor
@@ -342,6 +345,20 @@ def _relative_member_name(member_name: str, prefix: str) -> str | None:
 
 
 async def _download_tarball(github: Any, repo: str, sha: str) -> bytes:
+    """Retry only bounded, transient transport failures at the identical head."""
+    for attempt in range(2):
+        try:
+            async with asyncio.timeout(180):
+                return await _download_tarball_once(github, repo, sha)
+        except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException, TimeoutError) as exc:
+            logger.warning("PR head transport attempt %s/2 for %s@%s: %s", attempt + 1, repo, sha, type(exc).__name__)
+            if attempt == 1:
+                raise
+            await asyncio.sleep(1)
+    raise AssertionError("unreachable")
+
+
+async def _download_tarball_once(github: Any, repo: str, sha: str) -> bytes:
     """Download a tarball through a public fake hook or GitHubClient transport.
 
     ``GitHubClient`` predates the workspace contract and intentionally keeps

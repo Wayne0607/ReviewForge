@@ -83,6 +83,9 @@ class BenchmarkLLM(BaseChatModel):
                 "agent": self._agent,
                 "messages": [{"role": m.type, "content": m.content} for m in messages],
                 "max_tokens": kwargs.get("max_tokens", getattr(self._inner, "max_tokens", None)),
+                "request_options": {
+                    key: kwargs[key] for key in ("response_format", "extra_body", "reasoning_effort") if key in kwargs
+                },
             },
         )
         try:
@@ -548,6 +551,13 @@ async def main_async(args: argparse.Namespace) -> None:
         metadata["provider"] = {"host": endpoint.hostname, "path": endpoint.path}
         metadata["effective_model"] = effective.model
         metadata["effective_generator_max_input_chars"] = orchestrator._pipeline_v4_config.generator_max_input_chars
+        if args.pipeline in {"hypothesis", "shadow"}:
+            metadata["v4_protocol"] = {
+                "version": 2,
+                "json_output_mode": orchestrator._pipeline_v4_config.json_output_mode,
+                "investigator_closure_thinking": orchestrator._pipeline_v4_config.investigator_closure_thinking,
+                "max_tokens_per_pr": orchestrator._pipeline_v4_config.max_tokens_per_pr,
+            }
         validate_resume_metadata(read_metadata(root / "metadata.json"), metadata, has_results=output_path.exists())
         _atomic_json(root / "metadata.json", metadata)
         for index, item in enumerate(workload, 1):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import threading
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -121,6 +122,38 @@ class ContractAssessment:
         return cls(**fields)
 
 
+@dataclass(frozen=True)
+class CounterEvidence:
+    """A cited contradiction of one necessary defect premise, not a preference."""
+
+    premise: str
+    statement: str
+    evidence: list[EvidenceCitation]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> CounterEvidence:
+        if not isinstance(raw, dict) or raw.get("premise") not in {"trigger", "mechanism", "impact", "regression"}:
+            raise ValueError("counterevidence requires a necessary premise")
+        statement = raw.get("statement")
+        if not isinstance(statement, str) or not statement.strip():
+            raise ValueError("counterevidence requires a statement")
+        # Reuse exactly the existing citation parser; this adds a proof shape,
+        # not a weaker source/quote validation rule.
+        evidence = ContractAssessment.from_dict(
+            {
+                "expected": statement,
+                "actual": statement,
+                "comparison": "compatible",
+                "expected_evidence": raw.get("evidence"),
+                "actual_evidence": raw.get("evidence"),
+            }
+        ).actual_evidence
+        return cls(raw["premise"], statement.strip(), evidence)
+
+
 @dataclass
 class Hypothesis:
     id: str
@@ -144,6 +177,10 @@ class Hypothesis:
     investigation_tokens: int = 0
     retryable: bool = False
     assessment: ContractAssessment | None = None
+    counterevidence: CounterEvidence | None = None
+    investigation_outcome: str = ""
+    investigation_task_id: str = ""
+    coverage_identity: str = ""
 
     def __post_init__(self) -> None:
         if self.severity not in _SEVERITY_RANK:
@@ -157,6 +194,11 @@ class Hypothesis:
         data = asdict(self)
         data["mechanism"] = self.mechanism.value
         data["status"] = self.status.value
+        # Empty v2 metadata must not inflate the v1 model prompt/budget or
+        # change the shape of old candidate snapshots.
+        for name in ("counterevidence", "investigation_outcome", "investigation_task_id", "coverage_identity"):
+            if data[name] is None or data[name] == "":
+                data.pop(name)
         return data
 
     @classmethod
@@ -190,6 +232,12 @@ class Hypothesis:
             investigation_tokens=int(data.get("investigation_tokens", 0)),
             retryable=bool(data.get("retryable", False)),
             assessment=ContractAssessment.from_dict(data["assessment"]) if data.get("assessment") is not None else None,
+            counterevidence=CounterEvidence.from_dict(data["counterevidence"])
+            if data.get("counterevidence") is not None
+            else None,
+            investigation_outcome=str(data.get("investigation_outcome", "")),
+            investigation_task_id=str(data.get("investigation_task_id", "")),
+            coverage_identity=str(data.get("coverage_identity", "")),
         )
 
 
@@ -204,13 +252,37 @@ class HypothesisLedger:
     items: dict[str, Hypothesis] = field(default_factory=dict)
     no_issue_units: dict[str, str] = field(default_factory=dict)
     unresolved_units: dict[str, str] = field(default_factory=dict)
+    protocol_version: int = 1
+    investigation_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.protocol_version not in {1, 2}:
+            raise ValueError("unsupported investigation protocol")
 
     def upsert(self, hypothesis: Hypothesis) -> tuple[Hypothesis, bool]:
         if not hypothesis.identity or not hypothesis.sites:
             raise ValueError("hypothesis requires identity and at least one site")
         with self._lock:
             current = self.items.get(hypothesis.identity)
+            fact_fields = ("claim", "trigger", "impact", "open_question", "refutation")
+            if (
+                self.protocol_version >= 2
+                and current is not None
+                and any(getattr(current, name) != getattr(hypothesis, name) for name in fact_fields)
+            ):
+                # The old coverage identity cannot also identify distinct risks
+                # in the same function. Keep its first row and original binding;
+                # assign a stable variant only to the newly distinct candidate.
+                base = hypothesis.identity
+                facts = tuple(getattr(hypothesis, name) for name in fact_fields)
+                digest = hashlib.sha256(repr((base, facts)).encode()).hexdigest()[:24]
+                prefix, separator, anchor = base.rpartition("::")
+                hypothesis = copy.deepcopy(hypothesis)
+                hypothesis.coverage_identity = base
+                hypothesis.identity = f"{prefix}::risk_{digest}::{anchor}" if separator else f"{base}::risk_{digest}"
+                hypothesis.id = "h_" + hashlib.sha256(hypothesis.identity.encode()).hexdigest()[:8]
+                current = self.items.get(hypothesis.identity)
             if current is None:
                 current = copy.deepcopy(hypothesis)
                 self.items[hypothesis.identity] = current
@@ -246,6 +318,9 @@ class HypothesisLedger:
         investigation_tokens: int = 0,
         retryable: bool = False,
         assessment: ContractAssessment | None = None,
+        counterevidence: CounterEvidence | None = None,
+        investigation_outcome: str = "",
+        investigation_task_id: str = "",
     ) -> Hypothesis:
         """Apply an investigation verdict to one hypothesis.
 
@@ -270,6 +345,9 @@ class HypothesisLedger:
             current.investigation_tokens = investigation_tokens
             current.retryable = retryable
             current.assessment = copy.deepcopy(assessment)
+            current.counterevidence = copy.deepcopy(counterevidence)
+            current.investigation_outcome = investigation_outcome
+            current.investigation_task_id = investigation_task_id
             if observations:
                 known = {observation.id for observation in current.observations}
                 for observation in observations:
@@ -285,6 +363,43 @@ class HypothesisLedger:
                         seen.add(key)
             return copy.deepcopy(current)
 
+    def apply_task_verdict(self, task_id: str, members: tuple[str, ...], charged_to: str, **verdict: Any) -> None:
+        """Atomically link one actual investigation to all equal OPEN candidates."""
+        with self._lock:
+            if charged_to not in members or any(key not in self.items for key in members):
+                raise ValueError("task members must exist and contain its actual investigator")
+            if any(self.items[key].status != HypothesisStatus.OPEN for key in members):
+                raise ValueError("cannot overwrite a closed candidate with a shared verdict")
+            tokens = int(verdict.get("investigation_tokens", 0))
+            outcome = verdict.get("investigation_outcome")
+            allowed = {
+                "resolved",
+                "insufficient-evidence",
+                "policy-deferred",
+                "provider-error",
+                "output-error",
+                "budget-exhausted",
+                "tool-error",
+            }
+            if outcome not in allowed or ((str(verdict["status"]) != "unknown") != (outcome == "resolved")):
+                raise ValueError("task verdict requires a consistent typed outcome")
+            previous = self.investigation_tasks.get(task_id, {})
+            for identity in members:
+                self.apply_verdict(
+                    identity,
+                    **{**verdict, "investigation_tokens": tokens if identity == charged_to else 0},
+                    investigation_task_id=task_id,
+                )
+            self.investigation_tasks[task_id] = {
+                "members": list(members),
+                "charged_to": charged_to,
+                "outcome": verdict.get("investigation_outcome", ""),
+                "verdict": str(verdict["status"]),
+                "tokens": tokens,
+                "total_tokens": int(previous.get("total_tokens", 0)) + tokens,
+                "attempts": int(previous.get("attempts", 0)) + 1,
+            }
+
     def open(self) -> list[Hypothesis]:
         with self._lock:
             return [copy.deepcopy(item) for item in self.items.values() if item.status == HypothesisStatus.OPEN]
@@ -298,6 +413,8 @@ class HypothesisLedger:
                 "items": {key: value.to_dict() for key, value in sorted(self.items.items())},
                 "no_issue_units": dict(sorted(self.no_issue_units.items())),
                 "unresolved_units": dict(sorted(self.unresolved_units.items())),
+                "protocol_version": self.protocol_version,
+                "investigation_tasks": copy.deepcopy(self.investigation_tasks),
             }
 
     @classmethod
@@ -309,4 +426,6 @@ class HypothesisLedger:
             items={key: Hypothesis.from_dict(value) for key, value in data.get("items", {}).items()},
             no_issue_units=dict(data.get("no_issue_units", {})),
             unresolved_units=dict(data.get("unresolved_units", {})),
+            protocol_version=int(data.get("protocol_version", 1)),
+            investigation_tasks=copy.deepcopy(data.get("investigation_tasks", {})),
         )

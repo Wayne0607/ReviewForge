@@ -287,6 +287,7 @@ class Investigator:
         self._progress: list[dict[str, Any]] = []
         self._unreported_tokens = 0
         self._task_request_budget: Any = None
+        self._closure_constraints: list[str] = []
 
     def _build_tools(self) -> list[StructuredTool]:
         async def read_file(path: str, start: int | None = None, end: int | None = None) -> str:
@@ -883,6 +884,7 @@ class Investigator:
         """Answer one hypothesis's open_question within its budget_steps."""
 
         self._state = state
+        self._closure_constraints = self._closing_contract_constraints(hypothesis, state, pack)
         self._prepare_read_focus(hypothesis, pack)
         self._observations = [
             obs for obs in hypothesis.observations if self._protocol_version < 3 or obs.sha == state.head_sha
@@ -932,7 +934,7 @@ class Investigator:
         )
 
         for step in range(first_step, steps):
-            closing = self._closing_chat(initial, token_limit)
+            closing = self._closing_chat(initial, token_limit, hypothesis=hypothesis)
             # A tool round is useful only if we can still ask for a verdict.
             # Reserve the closing input and output within the SAME budget,
             # before spending on more tools. The output reserve is capped at
@@ -1027,7 +1029,7 @@ class Investigator:
                     if any(obs.query == _query_string(navigation["tool"], args) for obs in self._observations):
                         self._progress.append({"phase": "budget", "event": "close-after-repeated-evidence"})
                         return await self._close(
-                            self._closing_chat(initial, token_limit),
+                            self._closing_chat(initial, token_limit, hypothesis=hypothesis),
                             hypothesis,
                             changed,
                             token_limit=token_limit,
@@ -1044,7 +1046,7 @@ class Investigator:
                 if parsed is not None:
                     return self._finalize(parsed, hypothesis, changed, steps=step + 1)
                 return await self._close(
-                    self._closing_chat(initial, token_limit),
+                    self._closing_chat(initial, token_limit, hypothesis=hypothesis),
                     hypothesis,
                     changed,
                     token_limit=token_limit,
@@ -1080,7 +1082,7 @@ class Investigator:
             if self._protocol_version >= 3 and len(self._observations) == before_observations:
                 self._progress.append({"phase": "budget", "event": "close-after-repeated-evidence"})
                 return await self._close(
-                    self._closing_chat(initial, token_limit),
+                    self._closing_chat(initial, token_limit, hypothesis=hypothesis),
                     hypothesis,
                     changed,
                     token_limit=token_limit,
@@ -1088,7 +1090,11 @@ class Investigator:
                 )
 
         return await self._close(
-            self._closing_chat(initial, token_limit), hypothesis, changed, token_limit=token_limit, steps=steps
+            self._closing_chat(initial, token_limit, hypothesis=hypothesis),
+            hypothesis,
+            changed,
+            token_limit=token_limit,
+            steps=steps,
         )
 
     def _render_observations(self) -> str:
@@ -1130,7 +1136,95 @@ class Investigator:
         ]
         return json.dumps(observations, ensure_ascii=False)
 
-    def _closing_chat(self, initial: list[Any], token_limit: int) -> list[Any]:
+    def _closing_contract_constraints(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> list[str]:
+        """Keep applicable contract rules, never initial Context or author intent."""
+        constraints = []
+        boundary = self._resource_boundary(hypothesis)
+        if boundary:
+            constraints.append(boundary)
+        unit = (
+            next((unit for unit in self._changeset.units if unit.id == hypothesis.unit_id), None)
+            if self._changeset
+            else None
+        )
+        if hypothesis.mechanism is Mechanism.I18N or (
+            unit is not None and unit.kind is UnitKind.RESOURCE and is_localization_path(unit.path)
+        ):
+            constraints.append(localization_guidance())
+        paths = {site.path for site in hypothesis.sites}
+        if unit is not None:
+            paths.add(unit.path)
+        if any(has_python_concurrency(path, (state.file_diffs or {}).get(path, "")) for path in paths):
+            constraints.append(python_concurrency_guidance())
+        units = (
+            context_units(hypothesis, self._changeset, pack) if self._protocol_version >= 2 else [hypothesis.unit_id]
+        )
+        if any(has_state_navigation(pack, unit_id) for unit_id in units):
+            constraints.append(state_guidance())
+        return constraints
+
+    def _closing_chat(self, initial: list[Any], token_limit: int, *, hypothesis: Hypothesis | None = None) -> list[Any]:
+        if self._protocol_version >= 3 and hypothesis is not None:
+            candidate = {
+                key: getattr(hypothesis, key)
+                for key in (
+                    "id",
+                    "identity",
+                    "unit_id",
+                    "claim",
+                    "trigger",
+                    "impact",
+                    "open_question",
+                    "refutation",
+                    "severity",
+                )
+            }
+            candidate["mechanism"] = hypothesis.mechanism.value
+            candidate["sites"] = [
+                {"path": site.path, "line": site.line, "excerpt": site.excerpt} for site in hypothesis.sites
+            ]
+            if hypothesis.change_anchor is not None:
+                candidate["change_anchor"] = {
+                    "id": hypothesis.change_anchor.id,
+                    "path": hypothesis.change_anchor.path,
+                    "previous_path": hypothesis.change_anchor.previous_path,
+                }
+            observations = []
+            for observation in self._observations:
+                record = {"id": observation.id, "tool": observation.tool, "status": observation.status}
+                if observation.path:
+                    record["path"] = observation.path
+                if observation.status == "success":
+                    record.update(
+                        {
+                            "sha": observation.sha,
+                            "line_range": observation.excerpt_line_range or observation.line_range,
+                            "evidence": {
+                                reference: citation.quote
+                                for reference, citation in _evidence_segments(observation).items()
+                            },
+                        }
+                    )
+                    if any(
+                        entry.get("phase") == "diff-navigation" and entry.get("observation_id") == observation.id
+                        for entry in self._progress
+                    ):
+                        record["source_view"] = "partial diff excerpt; not a complete hunk"
+                observations.append(record)
+            packet = {
+                "head_sha": self._state.head_sha if self._state is not None else "",
+                "candidate": candidate,
+                "contract_constraints": self._closure_constraints,
+                "observations": observations,
+            }
+            return [
+                SystemMessage(
+                    content=load_prompt(
+                        "investigator_closure_v3", output_language=_language_directive(self._output_language)
+                    )
+                ),
+                HumanMessage(content=json.dumps(packet, ensure_ascii=False, separators=(",", ":"))),
+            ]
         return [
             *initial,
             HumanMessage(
@@ -1339,6 +1433,20 @@ class Investigator:
                         validation_failed = True
                     elif assessment.comparison != required:
                         verdict, reason = "unknown", "inconsistent-assessment"
+                        validation_failed = True
+                    elif (
+                        self._protocol_version >= 3
+                        and hypothesis.change_anchor is not None
+                        and verdict == "confirmed"
+                        and not any(
+                            by_id[citation.observation_id].tool in {"read_file", "read_diff"}
+                            for citation in assessment.actual_evidence
+                        )
+                    ):
+                        # A rename and an old-name consumer do not establish
+                        # actual resolution failure. This is a proof-shape
+                        # gate, not a semantic guarantee or absence inference.
+                        verdict, reason = "unknown", "structural-actual-needs-source-evidence"
                         validation_failed = True
                     else:
                         evidence_ids = list(dict.fromkeys(citation.observation_id for citation in proof))

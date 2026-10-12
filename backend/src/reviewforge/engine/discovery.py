@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
 from reviewforge.core.change_manifest import FileChange, is_verified_rename, render_change_fact
-from reviewforge.engine.context_pack import ContextPack
+from reviewforge.engine.context_pack import ContextPack, UnitContext
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 
@@ -125,6 +125,9 @@ class DiscoveryBlock:
     change_text: str = ""
     source_refs: dict[str, SourceLine] = field(default_factory=dict)
     reference_spans: dict[tuple[str, str, int], list[tuple[str, int, int]]] = field(default_factory=dict)
+    source_hunks: list[_Hunk] = field(default_factory=list, repr=False)
+    unit_hunk_keys: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    delivered_context: ContextPack = field(default_factory=ContextPack, repr=False)
 
     def source_matches(self, raw: object) -> bool:
         if not isinstance(raw, dict):
@@ -209,9 +212,12 @@ class DiscoveryBlock:
         self.diff_text = "\n".join(rendered)
         rendered = []
         for raw in self.context_text.splitlines():
-            header = re.match(r"^### \S+ \S+ (.+):\d+-\d+$", raw)
-            if header:
-                path = header[1]
+            for unit in self.units:
+                prefix = f"### {unit.id} "
+                if raw.startswith(prefix):
+                    # Unit IDs and repository paths may both contain spaces.
+                    path = raw[len(prefix) :].split(" ", 1)[1].rsplit(":", 1)[0]
+                    break
             line = re.match(r"^\s*(\d+) \| (.*)$", raw)
             if line:
                 number = int(line[1])
@@ -410,16 +416,20 @@ def _overview(changeset: SemanticChangeSet, pack: ContextPack, limit: int) -> st
     return (header + _bounded_lines(inventory, max(0, limit - len(header)), "PR units"))[:limit]
 
 
-def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple[str, list[SourceLine], list[str]]:
+def _context(
+    units: list[SemanticUnit], pack: ContextPack, budget: int
+) -> tuple[str, list[SourceLine], list[str], ContextPack]:
     sections, facts, unchecked = [], [], []
     seen: dict[tuple, str] = {}
     seen_facts: dict[tuple, list[SourceLine]] = {}
+    delivered = ContextPack()
     per_unit = max(0, budget // max(1, len(units)))
     for unit in units:
         ctx = pack.units.get(unit.id)
         if ctx is None:
             continue
         remaining = per_unit
+        delivered.units[unit.id] = UnitContext(unit.id)
         for slice_ in ctx.slices:
             key = (slice_.path, slice_.start_line, slice_.end_line, slice_.sha, slice_.text)
             header = f"### {unit.id} {slice_.kind} {slice_.path}:{slice_.start_line}-{slice_.end_line}\n"
@@ -433,6 +443,7 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
                         SourceLine(item.side, item.path, item.line, item.text, kind=slice_.kind, unit_id=unit.id)
                         for item in seen_facts[key]
                     )
+                    delivered.units[unit.id].slices.append(replace(slice_))
                 else:
                     unchecked.append(f"{unit.id}: context {slice_.kind} omitted by context budget")
                 continue
@@ -455,6 +466,13 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
                 sections.append(piece)
                 remaining -= size
                 facts.extend(selected)
+                delivered.units[unit.id].slices.append(
+                    replace(
+                        slice_,
+                        end_line=selected[-1].line,
+                        text="\n".join(item.text for item in selected) + ("\n" if selected[-1].text == "" else ""),
+                    )
+                )
                 # A shared reference can only reuse the actually delivered prefix.
                 if len(rendered) == len(lines):
                     seen[key] = f"{unit.id} {slice_.kind} {slice_.path}:{slice_.start_line}-{slice_.end_line}"
@@ -462,7 +480,7 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
             if len(rendered) < len(lines):
                 unchecked.append(f"{unit.id}: context {slice_.kind} only {len(rendered)}/{len(lines)} lines delivered")
         unchecked.extend(f"{unit.id}: unavailable context {kind}" for kind in ctx.truncated_kinds)
-    return "\n\n".join(sections), facts, unchecked
+    return "\n\n".join(sections), facts, unchecked, delivered
 
 
 def _block(
@@ -474,9 +492,10 @@ def _block(
     context_budget: int,
     before_states: dict[str, str] | None = None,
     structural_changes: dict[str, FileChange] | None = None,
+    unit_hunk_keys: dict[str, set[str]] | None = None,
 ) -> DiscoveryBlock:
     diffs = "\n\n".join(f"### Shared before/after diff: {h.path}\n{h.text}" for h in selected)
-    context, context_facts, unchecked = _context(units, pack, context_budget)
+    context, context_facts, unchecked, delivered_context = _context(units, pack, context_budget)
     nav = []
     for unit in units:
         ctx = pack.units.get(unit.id)
@@ -534,6 +553,9 @@ def _block(
     )
     block.structural_changes = changes
     block.change_text = change_text
+    block.source_hunks = selected
+    block.unit_hunk_keys = {unit.id: set((unit_hunk_keys or {}).get(unit.id, [])) for unit in units}
+    block.delivered_context = delivered_context
     # Source identity and coverage identity are separate. Quotes from a nearby
     # function in the same file cannot complete this unit's behavior check.
     # Before deletions use their post-image boundary, since old coordinates
@@ -630,6 +652,7 @@ def plan_discovery(
             min(limits.context_max_chars, context_left),
             before_states,
             structural_changes,
+            keys,
         )
 
     while remaining:
@@ -696,4 +719,52 @@ def plan_discovery(
     return blocks
 
 
-__all__ = ["DiscoveryBlock", "DiscoveryLimits", "SourceLine", "plan_discovery"]
+def split_discovery(block: DiscoveryBlock, limits: DiscoveryLimits) -> list[DiscoveryBlock]:
+    """Bisect unit delivery without removing any attributable source material.
+
+    No source collection runs here. Children retain their complete original
+    hunks and all actually delivered context, including shared reference bodies.
+    The caller enforces the aggregate context and physical request budgets.
+    """
+    if len(block.units) < 2 or block.failure:
+        return []
+    midpoint = (len(block.units) + 1) // 2
+    children = []
+    for units in (block.units[:midpoint], block.units[midpoint:]):
+        keys = set().union(*(block.unit_hunk_keys.get(unit.id, set()) for unit in units))
+        if any(unit.id not in block.structural_changes and not block.unit_hunk_keys.get(unit.id) for unit in units):
+            return []
+        # The generous renderer allowance prevents a second clipping of the
+        # saved slices. The resulting text still must fit the original cap.
+        child = _block(
+            units,
+            block.delivered_context,
+            block.overview,
+            [hunk for hunk in block.source_hunks if hunk.key in keys],
+            limits,
+            max(limits.context_max_chars, len(block.context_text)) * len(units) + 2_000,
+            block.unit_before_states,
+            block.structural_changes,
+            block.unit_hunk_keys,
+        )
+        ids = {unit.id for unit in units}
+        required = {
+            (f.side, f.path, f.line, f.text, f.kind, f.unit_id)
+            for f in block.facts
+            if f.side == "context" and f.unit_id in ids
+        }
+        actual = {(f.side, f.path, f.line, f.text, f.kind, f.unit_id) for f in child.facts if f.side == "context"}
+        if child.failure or len(child.context_text) > limits.context_max_chars or not required <= actual:
+            return []
+        child.navigation = block.navigation
+        child.unchecked = list(
+            dict.fromkeys(
+                child.unchecked
+                + [item for item in block.unchecked if any(item.startswith(unit.id + ":") for unit in units)]
+            )
+        )
+        children.append(child)
+    return children
+
+
+__all__ = ["DiscoveryBlock", "DiscoveryLimits", "SourceLine", "plan_discovery", "split_discovery"]

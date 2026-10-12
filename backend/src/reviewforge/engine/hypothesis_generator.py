@@ -25,6 +25,7 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables.base import RunnableBindingBase
 
 from reviewforge.core.change_manifest import FileChange, is_verified_rename
 from reviewforge.core.json_output import extract_json_value
@@ -32,9 +33,10 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, render_numbered_diff, select_diff_hunks
-from reviewforge.engine.discovery import DiscoveryBlock, DiscoveryLimits, plan_discovery
+from reviewforge.engine.discovery import DiscoveryBlock, DiscoveryLimits, plan_discovery, split_discovery
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.request_budget import RequestBudgetExceededError, RequestPlan, plan_request
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 from reviewforge.engine.symbol_extractor import _find_enclosing_function
 from reviewforge.engine.verification_guidance import (
@@ -50,6 +52,41 @@ from reviewforge.engine.verification_guidance import (
 from reviewforge.tools.workspace import WorkspaceUnavailable
 
 _EXCERPT_MIN_CHARS = 12
+
+
+def _discovery_output_floor(unit_count: int, allowance: int) -> int:
+    """Policy estimate for useful structured coverage, not a truncation guarantee."""
+    return min(8192, 256 + 256 * unit_count + 448 * min(allowance, unit_count))
+
+
+def _discovery_available(ledger: HypothesisLedger) -> int:
+    """Fallback snapshot only; a live physical budget view remains authoritative."""
+    saved = ledger.request_budget
+    pending = list(saved.get("pending", {}).values())
+    remaining = (
+        saved.get("limit", 250_000)
+        - saved.get("reported_tokens", 0)
+        - saved.get("unreported_reserved_tokens", 0)
+        - saved.get("editor_reserve", 16_000)
+        - sum(item["reserved_tokens"] for item in pending)
+    )
+    phase = saved.get("discovery_limit", 80_000) - saved.get("charged_by_phase", {}).get("discovery", 0)
+    phase -= sum(item["reserved_tokens"] for item in pending if item["phase"] == "discovery")
+    return max(0, min(remaining, phase))
+
+
+def _discovery_request_plan(llm, messages, ledger: HypothesisLedger) -> RequestPlan:
+    """Use live configuration, pending reservations and task limits when present."""
+    node, options = llm, {"max_tokens": 8192}
+    while isinstance(node, RunnableBindingBase):
+        options = node.kwargs | options
+        node = node.bound
+    viewer = getattr(node, "request_budget_view", None)
+    view = viewer(messages, options) if callable(viewer) else None
+    available = view.available_tokens if view is not None else _discovery_available(ledger)
+    return plan_request(llm, messages, max_output_tokens=8192, fallback_available=available)
+
+
 _SEVERITIES = frozenset({"error", "warning", "info"})
 _SEVERITY_PRIORITY = {"info": 0, "warning": 1, "error": 2}
 logger = logging.getLogger(__name__)
@@ -536,7 +573,8 @@ class HypothesisGenerator:
             and (record.get("request_attempted") or "attempted_responsibilities" in record)
             for record in ledger.discovery_blocks.values()
         )
-        for block in blocks:
+        planned_context_chars = sum(len(block.context_text) for block in blocks)
+        for index, block in enumerate(blocks):
             key = f"{self._source}:{block.id}"
             if key in ledger.discovery_blocks:
                 # A repeated delivery retains the earlier failure and request
@@ -594,6 +632,11 @@ class HypothesisGenerator:
                 ),
             )
             record["input_chars"] = len(user)
+            messages = [
+                SystemMessage(content=self._discovery_system_prompt(allowance, responsibilities)),
+                HumanMessage(content=user),
+            ]
+            record["system_chars"] = len(messages[0].content)
             failure = block.failure
             if any(not self._responsibility_rules.get(name, "").strip() for name in responsibilities):
                 failure = "missing responsibility rules"
@@ -601,6 +644,35 @@ class HypothesisGenerator:
                 failure = "capacity-deferred: discovery block limit"
             elif not failure and len(user) > self._max_input_chars:
                 failure = "input-too-large"
+            if not failure:
+                plan = _discovery_request_plan(self._llm, messages, ledger)
+                floor = _discovery_output_floor(len(block.units), allowance)
+                record["request_plan"] = {
+                    "input_tokens": plan.input_tokens,
+                    "available_tokens": plan.available_tokens,
+                    "max_output_tokens": plan.max_output_tokens,
+                    "useful_output_floor": floor,
+                    "floor_is_policy_estimate": True,
+                }
+                if plan.max_output_tokens < floor:
+                    children = split_discovery(block, self._discovery_limits)
+                    replacement_context = sum(len(child.context_text) for child in children)
+                    total_context = planned_context_chars - len(block.context_text) + replacement_context
+                    if children and total_context <= self._discovery_limits.global_context_max_chars:
+                        planned_context_chars = total_context
+                        blocks[index + 1 : index + 1] = children
+                        record["status"] = "partitioned"
+                        record["split_reason"] = "budget-exhausted: input plus useful output does not fit"
+                        record["child_ids"] = [child.id for child in children]
+                        record["units"] = {unit.id: {"status": "partitioned"} for unit in block.units}
+                        if self._on_update is not None:
+                            await self._on_update(ledger)
+                        continue
+                    failure = "budget-exhausted: input plus useful output does not fit"
+                    if children:
+                        record["split_rejected"] = "preserved context exceeds aggregate context budget"
+                    elif len(block.units) > 1:
+                        record["split_rejected"] = "no complete source-preserving partition fits context limits"
             if failure:
                 record["status"] = "capacity-deferred" if failure.startswith("capacity-deferred") else "unresolved"
                 for unit in block.units:
@@ -616,17 +688,14 @@ class HypothesisGenerator:
             record["attempted_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
             try:
                 response = await self._llm.ainvoke(
-                    [
-                        SystemMessage(content=self._discovery_system_prompt(allowance, responsibilities)),
-                        HumanMessage(content=user),
-                    ],
-                    max_tokens=8192,
+                    messages,
+                    max_tokens=plan.max_output_tokens,
                 )
                 record["delivered_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
                 original = getattr(response, "content", "") or ""
                 parsed = self._parse_response(original)
                 if parsed is None and isinstance(original, str) and original.strip():
-                    parsed = await self._invoke_repair(original)
+                    parsed = await self._invoke_repair(original, ledger=ledger, request_floor=floor, record=record)
                 if parsed is None:
                     failure = (
                         "empty model response"
@@ -988,7 +1057,14 @@ class HypothesisGenerator:
         content = getattr(response, "content", "") or ""
         return self._parse_response(content), content
 
-    async def _invoke_repair(self, original: str) -> dict[str, Any] | None:
+    async def _invoke_repair(
+        self,
+        original: str,
+        *,
+        ledger: HypothesisLedger | None = None,
+        request_floor: int = 0,
+        record: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         failure = (
             'return {"unrepairable":true}. Output only the repaired JSON object or that failure object.'
             if self._json_object_output
@@ -1007,7 +1083,21 @@ class HypothesisGenerator:
             AIMessage(content=original),
             HumanMessage(content="Repair the supplied response without changing its contents."),
         ]
-        response = await self._llm.ainvoke(messages, max_tokens=8192)
+        output_tokens = 8192
+        if ledger is not None and ledger.protocol_version >= 3:
+            plan = _discovery_request_plan(self._llm, messages, ledger)
+            if record is not None:
+                record["repair_plan"] = {
+                    "input_tokens": plan.input_tokens,
+                    "available_tokens": plan.available_tokens,
+                    "max_output_tokens": plan.max_output_tokens,
+                    "useful_output_floor": request_floor,
+                    "floor_is_policy_estimate": True,
+                }
+            if plan.max_output_tokens < request_floor:
+                raise RequestBudgetExceededError("format repair input plus useful output does not fit")
+            output_tokens = plan.max_output_tokens
+        response = await self._llm.ainvoke(messages, max_tokens=output_tokens)
         return self._parse_response(getattr(response, "content", "") or "")
 
     @staticmethod

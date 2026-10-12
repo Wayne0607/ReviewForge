@@ -33,7 +33,9 @@ flowchart LR
 - **行为说明带源码定位。** v3 候选及 no_issue 都给出 before/after/observable 与来自本块的源码事实引用；有删除行的修改还需 before 引用。未改变行同时标出 LEFT/RIGHT 坐标；目标事实范围和新增声明状态明确交付。只有可见新增声明且没有对应旧声明/目标删除操作时才判断旧实现不存在，不把漂移到新方法范围内的旧右括号当作其旧实现；声明关系不明仍保持保守。候选另含具体差异及触发依据。代码只验证字段完整、定位属于交付源码、引用精确，不声称已经证明语义正确。候选的这些引用是发现依据，不能代替调查阶段的 Observation；确认仍走原两前提证明。无效候选不能因为带有 unit_id 就算已覆盖。
 - **共享事实，保持裁决独立。** 原 exact-facts 任务共享保留；不同文字的疑点不自动共享结论。新调查在 run/head/workspace 内共享成功只读工具结果，最多 512 项 / 4 MiB，并合并相同在途读取；失败和未找到结果不成为共享证据。各疑点保存自己的 Observation 和引用，`shared_result_id` 仅提供相同源结果的审计关联。缓存不跨 run 持久化。
 - **引用与未覆盖边界。** 发现输入在原源码坐标旁交付程序生成的短 `source_ref`，绑定本块、side/path/line 与精确片段；长行仅增加分段列区间，不再复制一份源码正文。模型引用先解析回原始事实，再执行原目标/修改范围约束；未知 ID、跨块 ID、拿 before/context 当 RIGHT site 均拒绝。兼容旧字段的精确长引用，不因未声明的 240 字符门槛拒绝真实源码。同一 unit 的合法候选可与显式 deferred 共存，保留候选并记录未覆盖；no_issue 与候选仍冲突。模型 deferred 不冒充程序已知的 capacity-deferred；恢复保留每次发现尝试，不重置原发现调用上限或请求预算。
+- **发现请求按实际余量规划。** 完整 system/user 与绑定选项在发送前使用物理预算估算；输出仍最多 8192。有效输出的策略下限为 `min(8192, 256 + 256*units + 448*min(candidate_allowance, units))`，它不是不会截断的保证。不能容纳输入和该下限时，仅按原单元二分，保留各自完整原 hunk、实际已交付 Context、全 PR 概览和导航，不补搜或截去关键证据。父块仅记 partitioned，不算模型尝试；子块仍受原 8 次调用、全局 Context 和候选上限约束。单元不可再分或完整共享源码仍超额时明确 unresolved。一次纯格式修复也按剩余预算重新规划，不能重置额度。
 - **先交付事实，再追缺失前提。** 调查先读取实际锚点和 before/after diff，作为真实工具 Observation，纳入原上下文与步骤预算。查到具体调用位置后优先读取实际生产调用，不把导航列表当成完成取证。`investigation_progress` 只保存缺失前提、下一取证位置和执行事件，不保存隐藏推理。正向反证允许及时结束；没有证据仍 UNKNOWN。任务数上限仍 12，同严重程度下按机制与锚点交错，近重复疑点不抢占所有调查名额。
+- **v3 收尾单独交付裁决材料。** 专用收尾规则与紧凑包保留候选全文、适用的资源/格式/并发/状态契约规则，以及全部成功 Observation 的原 ID、版本、位置和逐字引用；失败仅交付状态，不可引用。不重发初始 Context、PR 意图、导航与工具操作流程。明确的正向源码反证可推翻一个必要前提，不因无关 open_question 未答而强迫 UNKNOWN；仅有 reason 文字仍不能升级裁决。结构确认的 actual 至少包含真实 read_file/read_diff 源码，不能仅靠重命名元数据；这只是证明形态门槛，具体 loader/root/alias/fallback 契约仍需语义核实。v1/v2 保留旧收尾。
 - **请求级预算。** 所有 v3 模型请求在每次实际尝试前共享准入预算，默认每 PR 250000、发现阶段最多 80000、为编辑保留 16000。并发先预占输入估算加输出上限，成功按实际 usage 结算。失败或中断后的未知费用单独保守保留估算，不伪称为实付 tokens；旧预占在恢复后不能清零。提供方超出估算仍记录真实数值并使 budget stage 失败。调查探索与收尾使用同一物理请求估算，包含绑定工具和提供方选项，并取任务/PR 的较小可用额度；探索预留收尾，输出不足 512 时直接收尾，收尾本身也不足时明确 budget-exhausted。逻辑请求在进入重试前确定输出上限，重试请求保持相同；并发变化仍由实际发送时的硬准入裁决。估算无法保证提供方账单绝不超出上限。
 - **有限传输重试。** 产品 v3 默认每个逻辑请求最多 3 次尝试，SDK 自身重试设为 0，避免重试层相乘。重发相同请求，不改提示词、不重执行业务工具。连接/超时/429/5xx可有限重试；401/403/参数错误不重试。已知中转瞬时 404 仅经显式配置允许，普通 404 不自动归为瞬时故障。每次 attempt 和未知费用可审计，取消立即传递。评测显式记录重试参数；单 PR 失败保留记录并继续其它 PR，资源保护不以“出现任何 error trace”为整批终止条件。
 
@@ -347,7 +349,7 @@ budget_steps = base(severity) + bonus
 ```
 每 PR 调查总预算 `investigator.max_hypotheses_per_pr`（默认 12）。先按 severity 分层；层内按 mechanism 轮转取一条，组内仍按 sites 数量降序 → identity 排序，mechanism 的轮转顺序由其首条的原排序确定。避免同一广泛机制挤占全部调查名额，不改变严重级别优先或增加预算。超出的标 `unknown`，reason `budget-exhausted`；不按类别过滤、自动推翻或确认。
 
-预算包含结论调用，不能把全部额度用于工具循环。每轮先预留结论输入及输出（输出预留为总预算的四分之一，最多 4000 tokens），不足以继续工具调用时提前结束调查。结论输入重用原始假设/上下文及代码保存的 Observation excerpts，不重放完整工具结果或模型探索文字。估算计入工具参数、schema 与非 ASCII 文本，并用已测 provider input usage 校正遗漏的开销；实际 usage 仍如实记账，超支不可写已确认结论。
+预算包含结论调用，不能把全部额度用于工具循环。每轮先预留结论输入及输出（输出预留为总预算的四分之一，最多 4000 tokens），不足以继续工具调用时提前结束调查。v1/v2 结论输入重用原始假设/上下文及代码保存的 Observation excerpts；v3 使用顶部修订规定的紧凑裁决包。都不重放完整工具结果或模型探索文字。估算计入工具参数、schema 与非 ASCII 文本；v3 使用与物理请求一致的估算和实际剩余额度。实际 usage 仍如实记账，超支不可写已确认结论。
 
 **工具（通过 gateway，绑定 workspace）。** `read_file(path, start?, end?)`、`grep(pattern, glob, max_hits)`、`find_definition(symbol)`、`find_callers(symbol)`、`read_diff(path, start?, end?)`。diff 行窗口选择与指定 RIGHT 行相交的完整 before/after hunk，保留删除行与上下文；省略窗口保留原完整 diff 行为，未命中为空/`not_found`，不得用作反证。每次工具结果 ≤ 6000 字符，同一 (tool,args) ≤ 2 次。每次工具调用自动记录一条 `Observation`（tool/query/path/sha/digest/excerpt/status）——**observation 由代码写，不由模型写**。
 
@@ -355,7 +357,7 @@ v4 的 `read_file` 两个边界都省略时，优先使用该文件最近一个�
 
 宽范围 `read_file` 的请求与原 6000 字符工具水位不变。在已返回的源码内部，若保存的成功搜索命中落在 1200 字符前缀之外，保存区优先选择该命中前 3 / 后 8 行；长前导行会再次挤掉命中时从命中行开始。不得补读工具水位之外的正文，也不得使用未保存、负向或请求窗口之外的位置。`excerpt_line_range` 独立记录实际保存的起止行，query/line_range 继续记录请求，收尾、editor 和失败模板使用实际位置；旧 checkpoint 缺该字段按原前缀位置展示。超出已返回源码的搜索命中只给窄读导航提示，无证据 ID，不能作为 verdict 引用。digest 仍取原有界工具结果，引用校验、UNKNOWN 门槛和预算不变。
 
-**输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。额外交付 `pack.pr_intent` 的前 2000 字符；作者意图是理解行为变化的背景，不能作为正确性证据或豁免契约。收尾保留这份背景。
+**探索输入。** 系统提示（§5.2）+ 假设全文 + 该 unit 的 diff hunk + `pack.render_for_unit(unit_id)` + 已有 observations。额外交付 `pack.pr_intent` 的前 2000 字符；作者意图是理解行为变化的背景，不能作为正确性证据或豁免契约。v1/v2 收尾保留这份背景，v3 收尾不重发。
 
 `i18n` 的主 unit 为 resource 时，额外交付该 unit 与 sites 对应 resource 的 path/provenance，逐文件保留已编译的 locale 信息。直接语言/字形违规以声明 locale 和变更文本为本地契约，无需页面引用；格式语法/参数和运行时后果仍需实际消费端及输入契约。生成器/lens 的问题与反证必须决定所述契约，而非无关调用方事实。metadata 不构成 defect evidence，Observation、精确引用及 UNKNOWN 门槛不变。
 

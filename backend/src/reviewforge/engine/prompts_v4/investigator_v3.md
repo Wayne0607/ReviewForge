@@ -45,3 +45,13 @@ claimed consumer contract in actual source. Do not invent a diff hunk or a
 RIGHT line for a rename-only file. Confirmed structural issues are published in
 the review summary with evidence and immutable source links.
 
+For a lookup/import failure claim, read the concrete loader binding, resource
+root and alias/fallback rules. An old-name call plus rename metadata does not
+show that resolution fails or that the old path is absent at head. The old path
+may have been rebuilt, and a loader may resolve the old name to the new file.
+Positive saved source can refute this premise immediately. A failed read,
+not_found result or absent search hit never proves file absence. Missing loader
+or resolution facts remain UNKNOWN. A structural confirmation's actual_evidence
+must include real saved source; read_change may supplement it but cannot be the
+entire actual premise. This minimum evidence shape does not itself prove the
+semantic contract violation.

@@ -29,15 +29,27 @@ from reviewforge.tools.workspace import PRHeadWorkspace, WorkspaceInfo
 HEAD = "a" * 40
 BASE = "b" * 40
 MERGE_BASE = "c" * 40
-CONSUMER = 'return load("old.properties")'
+CONSUMER = 'if Path(path).stem != payload["id"]:'
+PAYLOAD = '{"id": "old"}\n'
+CONSUMER_SOURCE = """import json
+from pathlib import Path
+ROOT = Path(__file__).parent
+
+def load_configuration():
+    path = "data/new.json"
+    payload = json.loads((ROOT / path).read_text(encoding="utf-8"))
+    if Path(path).stem != payload["id"]:
+        raise ValueError("resource id does not match filename")
+    return payload
+"""
 
 
 def change():
     item = FileChange(
         repo="owner/repo",
         head_repo="fork/repo",
-        path="data/new.properties",
-        previous_path="data/old.properties",
+        path="data/new.json",
+        previous_path="data/old.json",
         status="renamed",
         base_sha=BASE,
         comparison_base_sha=MERGE_BASE,
@@ -60,11 +72,11 @@ def candidate():
         identity="unit::contract-mismatch::rename",
         unit_id="unit",
         mechanism=Mechanism.CONTRACT_MISMATCH,
-        claim="Resource lookup still uses the old path",
-        trigger="Loading the resource",
-        impact="Resource is not found",
-        open_question="Does the live consumer still require the removed path?",
-        refutation="The consumer uses the new path",
+        claim="The renamed resource filename no longer agrees with its unchanged id",
+        trigger="Loading data/new.json through load_configuration",
+        impact="The concrete loader raises ValueError",
+        open_question="Does the loader require the filename stem to equal the parsed resource id?",
+        refutation="The loader accepts a filename different from the payload id",
         sites=[],
         severity="error",
         source="generator",
@@ -73,14 +85,14 @@ def candidate():
             "trigger_basis": {
                 "side": "context",
                 "path": "loader.py",
-                "line": 1,
-                "excerpt": CONSUMER,
+                "line": 3,
+                "excerpt": "ROOT = Path(__file__).parent",
             }
         },
     )
 
 
-def inputs():
+def inputs(*, consumer_source=CONSUMER_SOURCE, extra_sources=None):
     state = StateStore(
         repo="owner/repo",
         head_repo="fork/repo",
@@ -96,12 +108,21 @@ def inputs():
             "unit": UnitContext(
                 "unit",
                 slices=[
-                    ContextSlice("reference", "loader.py", 1, 1, "", CONSUMER, "literal old-path consumer", HEAD),
+                    ContextSlice(
+                        "reference",
+                        "loader.py",
+                        1,
+                        len(consumer_source.splitlines()),
+                        "",
+                        consumer_source,
+                        "concrete resource consumer",
+                        HEAD,
+                    ),
                 ],
             )
         }
     )
-    sources = {"loader.py": CONSUMER, change().path: "value=example\n"}
+    sources = {"loader.py": consumer_source, change().path: PAYLOAD, **(extra_sources or {})}
     return state, pack, build_workspace_executor(SimpleNamespace(read=sources.get), state)
 
 
@@ -133,13 +154,151 @@ class ScriptedLLM(BaseChatModel):
 def confirmation():
     return {
         "assessment": {
-            "expected": "The live loader needs the old resource path",
-            "actual": "The pinned change moved that resource to a different path",
+            "expected": "The concrete loader requires the filename stem to equal the parsed resource id",
+            "actual": "The new filename stem is new while its unchanged JSON id is old",
             "comparison": "conflict",
             "expected_evidence": [{"observation_id": "obs_1", "quote": CONSUMER}],
-            "actual_evidence": [{"observation_id": "obs_0", "quote": "data/old.properties"}],
+            "actual_evidence": [
+                {"observation_id": "obs_0", "quote": "data/new.json"},
+                {"observation_id": "obs_2", "quote": '"id": "old"'},
+            ],
         }
     }
+
+
+def test_filename_id_contract_fixture_is_an_executable_regression(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / change().path).write_text(PAYLOAD, encoding="utf-8")
+    namespace = {"__file__": str(tmp_path / "loader.py")}
+    exec(CONSUMER_SOURCE, namespace)
+    with pytest.raises(ValueError, match="resource id does not match filename"):
+        namespace["load_configuration"]()
+    (tmp_path / change().previous_path).write_text(PAYLOAD, encoding="utf-8")
+    exec(CONSUMER_SOURCE.replace("data/new.json", "data/old.json"), namespace)
+    assert namespace["load_configuration"]() == {"id": "old"}
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_structural_actual_cannot_confirm_lookup_failure():
+    state, pack, executor = inputs()
+    proof = confirmation()
+    proof["assessment"]["actual"] = "The old path is unavailable because the change is a rename"
+    proof["assessment"]["actual_evidence"] = [{"observation_id": "obs_0", "quote": "data/old.json"}]
+    result = await Investigator(ScriptedLLM(turns=[proof]), executor, protocol_version=3).investigate(
+        candidate(), state, pack
+    )
+    assert result.verdict == "unknown"
+    assert result.outcome == "output-error"
+    assert result.reason == "structural-actual-needs-source-evidence"
+
+
+@pytest.mark.asyncio
+async def test_unknown_loader_binding_remains_unknown_without_promoting_reason():
+    source = 'ROOT = Path(__file__).parent\nreturn load("data/old.json")'
+    state, pack, executor = inputs(consumer_source=source)
+    item = replace(candidate(), discovery_basis={}, claim="Old resource lookup now fails")
+    result = await Investigator(
+        ScriptedLLM(
+            turns=[
+                {
+                    "assessment": None,
+                    "counterevidence": None,
+                    "reason": "The loader implementation, aliases and fallback are not saved",
+                }
+            ]
+        ),
+        executor,
+        protocol_version=3,
+    ).investigate(item, state, pack)
+    assert result.verdict == "unknown" and result.outcome == "insufficient-evidence"
+
+
+@pytest.mark.asyncio
+async def test_explicit_loader_alias_positively_refutes_old_name_failure():
+    alias = 'ALIASES = {"data/old.json": "data/new.json"}'
+    source = f"""from pathlib import Path
+ROOT = Path(__file__).parent
+{alias}
+def load_configuration():
+    return (ROOT / ALIASES["data/old.json"]).read_text(encoding="utf-8")
+"""
+    state, pack, executor = inputs(consumer_source=source)
+    item = replace(
+        candidate(),
+        claim="The old resource name now causes lookup failure",
+        discovery_basis={
+            "trigger_basis": {
+                "side": "context",
+                "path": "loader.py",
+                "line": 2,
+                "excerpt": "ROOT = Path(__file__).parent",
+            },
+        },
+    )
+    proof = {
+        "assessment": None,
+        "counterevidence": {
+            "premise": "mechanism",
+            "statement": "The concrete loader resolves the old name to the present new file",
+            "evidence": [
+                {"observation_id": "obs_1", "quote": alias},
+                {"observation_id": "obs_2", "quote": '"id": "old"'},
+            ],
+        },
+    }
+    result = await Investigator(ScriptedLLM(turns=[proof]), executor, protocol_version=3).investigate(item, state, pack)
+    assert result.verdict == "refuted" and result.counterevidence is not None
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_old_path_is_read_as_positive_counterevidence():
+    source = """from pathlib import Path
+ROOT = Path(__file__).parent
+def load_configuration():
+    return (ROOT / "data/old.json").read_text(encoding="utf-8")
+"""
+    state, pack, executor = inputs(consumer_source=source, extra_sources={change().previous_path: PAYLOAD})
+    item = replace(
+        candidate(),
+        claim="The old resource path is no longer readable",
+        discovery_basis={
+            "trigger_basis": {
+                "side": "context",
+                "path": "loader.py",
+                "line": 2,
+                "excerpt": "ROOT = Path(__file__).parent",
+            }
+        },
+    )
+    llm = ScriptedLLM(
+        turns=[
+            {
+                "progress": {
+                    "missing_premise": "mechanism",
+                    "question": "Is the old resource still present at head?",
+                    "next_evidence": {
+                        "tool": "read_file",
+                        "args": {"path": change().previous_path, "start": 1, "end": 5},
+                    },
+                }
+            },
+            {
+                "assessment": None,
+                "counterevidence": {
+                    "premise": "mechanism",
+                    "statement": "The concrete old-path reader still has the intended head resource",
+                    "evidence": [
+                        {"observation_id": "obs_1", "quote": 'ROOT / "data/old.json"'},
+                        {"observation_id": "obs_3", "quote": '"id": "old"'},
+                    ],
+                },
+            },
+        ]
+    )
+    result = await Investigator(llm, executor, protocol_version=3).investigate(item, state, pack)
+    assert result.verdict == "refuted"
+    assert result.observations[-1].path == change().previous_path
+    assert result.observations[-1].status == "success"
 
 
 def ledger(item):
@@ -205,8 +364,8 @@ async def test_real_structural_reads_confirm_then_publish_summary_and_resume_wit
     assert not editor_llm.calls and not publication.comments
     body = render_review_body(publication, current)
     assert CONSUMER in body and "Expected:" in body and "Actual:" in body
-    assert f"/owner/repo/blob/{MERGE_BASE}/data/old.properties" in body
-    assert f"/fork/repo/blob/{HEAD}/data/new.properties" in body
+    assert f"/owner/repo/blob/{MERGE_BASE}/data/old.json" in body
+    assert f"/fork/repo/blob/{HEAD}/data/new.json" in body
     assert f"/fork/repo/blob/{HEAD}/loader.py#L1" in body
     assert f"/blob/{BASE}/" not in body
     coverage = _publication_coverage(current, publication, {"comments": [], "body": body})
@@ -286,8 +445,8 @@ async def test_restored_summary_delivery_requires_fresh_matching_change_proof(tm
         state.file_changes = {}
     source = tmp_path / "data"
     source.mkdir()
-    (source / "new.properties").write_text("value=example\n", encoding="utf-8")
-    (tmp_path / "loader.py").write_text(CONSUMER, encoding="utf-8")
+    (source / "new.json").write_text(PAYLOAD, encoding="utf-8")
+    (tmp_path / "loader.py").write_text(CONSUMER_SOURCE, encoding="utf-8")
     info = WorkspaceInfo("owner/repo", "fork/repo", HEAD, tmp_path, 2, 50, "workspace", False, "tarball")
     workspace = PRHeadWorkspace(info, None, fallback_repo="owner/repo", temp_dir=tmp_path)
     gateway = ToolGateway(build_registry(), None, pipeline_mode="hypothesis")

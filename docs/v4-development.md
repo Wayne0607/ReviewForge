@@ -545,3 +545,40 @@ keycloak#37429 与 calcom#10967 超过每 PR 250k 门槛；6 条其它已审查�
 `verification-audit.json` 核实 111 个冻结源文件、输入 SHA 与逐请求用量和总报告一致。零模型对原 Keycloak 四条重复候选执行新任务归并，形成两项任务；它不是实际 token 节省测量。全部旧 ledger、十 PR 报告及裁判结果不改，未使用 holdout。发布保护与诊断脚本的 CI 格式修复在该模型快照之后，仅以相应回归验证，没有重跑已完成的付费诊断。首次 dev CI 发现诊断脚本在 backend 配置下的 import/长行检查遗漏，后续检查范围已与 CI 对齐。
 
 生产只读核实仍为 main `00c667556c88241d72d96f24430c7c16b4add24e`、service active / HTTP 200；未部署 v4。固定十 PR 的新完整配对质量测评及旧 MiniMax/holdout 最终门槛仍待验收。
+
+### 固定 dev10 的 v2 实跑与未通过项（2026-10-12）
+
+按用户要求，仍选 canonical50 中原来的固定 dev10，共 39 条 golden；没有重选容易样本或使用 holdout。冻结 `d1ba6f854f86ca397d976b131db33e1527e15b73`，136 个实现、配置、技能及评测文件逐项验证摘要；所有角色统一 `deepseek-v4-flash-0731`，GEN/lens/editor disabled、INV exploration enabled/requested low、closing disabled + JSON object，原调查额度、12 项任务上限、每 PR 250k 与整批 2.5m recorded token 门槛保留。产物目录为 `.reviewforge/benchmarks/v4-v2-dev10-20261012-111828/`。
+
+原进程在 Discourse #4 调查时遇到提供方 HTTP 404，被保护器以 125 停止；已完成的模型结果和未完成 checkpoint 均保留。四条源码前置失败及两条未开始记录的完整固定 head 归档随后缓存、校验；其中五份原归档 SHA256、工作区摘要、文件数与总字节数均与旧 v1 完整输入一致。两个源码/适配器诊断进程没有模型调用，原始失败记录未修改。私有只读适配器只委托归档入口，不改冻结审查代码，GitHub review 写入仍为本地回执。
+
+恢复后 Keycloak #36882 完成部分审查，Sentry #93824 在 lens 请求超时后再次停止。两组各 2 次的合成健康请求接受后，只继续尚未调用模型的四条记录；没有重开已结束或中断候选，没有用重跑结果覆盖失败。`cohort-results.json` 按固定十条顺序汇总三个不可变执行段，保留两次中断的 OPEN、错误及已记录用量。以下 completed 仅指流水线运行结束，不表示质量通过。
+
+| PR | 运行状态 | 本地评论 | recorded tokens |
+|---|---|---:|---:|
+| keycloak/keycloak #37429 | partial：2 个生成单元遗漏 | 2 | 198716 |
+| keycloak/keycloak #36882 | partial：1 项 ungrounded-assessment 输出错误 | 0 | 134008 |
+| getsentry/sentry #93824 | failed：提供方 APITimeoutError，中断 | 0 | 24990 |
+| sentry-greptile #1 | completed | 1 | 152789 |
+| grafana/grafana #97529 | completed | 0 | 86853 |
+| grafana/grafana #90045 | completed | 1 | 202526 |
+| discourse-graphite #10 | partial：1 个生成单元遗漏 | 2 | 203517 |
+| discourse-graphite #4 | failed：提供方 HTTP 404，中断 | 0 | 50965 |
+| calcom/cal.com #14740 | completed | 1 | 210168 |
+| calcom/cal.com #10967 | completed | 0 | 204551 |
+
+**运行协议偏差必须保留：** 最后一段四 PR 的操作者启动命令漏传 `--require-complete-workspace`，实际 metadata 为 false，原预声明为 true；私有启动器没有拦截该不一致。不得事后修改原 protocol/metadata 或声称强制检查执行过。`actual-workspace-audit.json` 对全部十次审查的 `workspace.built`、账本 head/digest 与先前完整归档/原生预检逐项验证：均为 tarball、未截断，文件数、字节数和摘要匹配。这证明实际源码没有降级，却不能补回漏掉的执行保护。本批只作诊断，不具备正式计分资格；后续启动必须先核对实际参数与预声明，确认完整工作区检查开关启用。
+
+三段审查共 226 次成功响应、1469083 recorded tokens；另 4 次健康诊断为 677 tokens，合计 1469760。停止时可能有未记账在途调用，这不是中转账单的完整计费统计。八条已结束审查均在单 PR 250k 内；两条中断的低用量不算效率成果。峰值 1154883584 bytes（约 1101.4 MiB），未触发本机 2 GiB、CPU 10%、reserve 2 GiB 或有限运行时间保护；没有向生产部署。原 main 仍为 `00c667556c88241d72d96f24430c7c16b4add24e`。
+
+72 次 INV closing 均为有效 JSON object、无 length/空正文，5 次 editor 及生成/lens 的保存响应也无 JSON 语法错误。这不等于单元覆盖或引用绑定有效。探索阶段累计 3 次 length、4 次无工具空正文；Cal.com #10967 其中一次实际 `max_tokens=114`，5761 输入 + 114 推理 = 5875 tokens，没有正文。不可将这次归为原 4000/8192 额度的截断，也不能断言中转忽略 requested low。
+
+严格完成检查实际拒绝五条未完成记录，固定裁判在客户端创建前退出 1，裁判模型请求为 0；另有上述协议偏差。`dev10-report.json` / `judge-gate-audit.json` 中质量指标为 null，没有 F1、precision、recall 或 Qodo 优劣结论，没有 legacy 配对或旧 MiniMax 最终验收。两条运行结束但零评论的 Grafana #97529、Cal.com #10967 分别有 2、5 条 golden：这七条均未被评论报告；这是具体样本的遗漏事实，不是从成功子集拼出的质量分。七条本地评论也不能直接当成七个正确命中。
+
+后续优化应由实录驱动：
+
+- **生成覆盖与候选质量。** Keycloak #37429、Discourse #10 在有效 JSON 中分别漏报 2、1 个 required unit；Grafana #97529 有候选已声称改动正确后继续猜测问题，未生成 TotalDocs 并发读取的明确候选。JSON 请求选项解决语法交付，尚未解决完整覆盖与缺陷召回。
+- **调查重复与共享证据。** Keycloak #36882 三对候选的 site、trigger、impact、open question 等相同，仅 claim 措辞不同，冻结精确事实键仍分为六次调查，共 77091 tokens；这不是已测量的可节省额度。Cal.com #14740 两条确认也指向同一权限缺陷，编辑阶段按同一修复证据合为一条评论，但调查仍重复。应改善候选表达及可验证观察的复用，不能按语义相似度直接共用裁决或丢弃不同风险。
+- **证明计划与用量分配。** 已保存任务共 62 次 insufficient-evidence、52 次 policy-deferred、1 次 output-error、1 次 provider-error；未完成任务不冒充已取证。Keycloak 初始化先后关系仍未证明，调查反复读取不等于完成证明。Cal.com #14740 的 29 次保存工具观察全部成功，其中 13 次 definition；资源修复未重现旧工具异常，但不足以证明完整流水线内存收益的因果归属。114-token 探索请求还说明剩余预算应支持有效下一步，而非在无法交付正文时继续付出整段输入费用。
+
+本轮冻结实现与旧 v1 的任务、证明和完成语义不同，不能用总 token 或不同轨迹的峰值直接作单项收益比较。私有后续入口 `launch_checked_proxy_cache_v2.py` 在创建 Job/模型客户端前核对预声明与完整工作区开关，缺失就拒绝；本轮原启动器、驱动及摘要保留。下一轮需先保证启动协议一致、生成覆盖闭合及调查目标有效，再冻结完整十条重新验收；旧账本、失败和本轮协议偏差继续保留。

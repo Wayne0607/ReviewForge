@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from langchain_core.language_models import BaseChatModel
@@ -86,7 +87,9 @@ def test_plan_covers_every_unit_once_and_shares_hunks():
     assert len(ids) == len(set(ids))
     assert all(len(block.units) <= 12 for block in plan)
     for block in plan:
-        assert block.diff_text.count("-    1 | return old_value") == len({u.path for u in block.units})
+        assert len(re.findall(r"^-    1 \[sr_\w+\] \| return old_value$", block.diff_text, re.M)) == len(
+            {u.path for u in block.units}
+        )
 
 
 def test_related_changed_file_is_grouped_and_navigation_survives_context_budget():
@@ -110,8 +113,8 @@ def test_condition_inversion_has_numbered_before_after_and_focus():
     u = unit("create.ts")
     patch = diff("...(!FEATURE_ENABLED && { slug })", "...(FEATURE_ENABLED ? { slug } : {})")
     block = plan_discovery(changeset(u), ContextPack(), {u.path: patch}, limits=DiscoveryLimits())[0]
-    assert "-    1 | ...(!FEATURE_ENABLED && { slug })" in block.diff_text
-    assert "+    1 | ...(FEATURE_ENABLED ? { slug } : {})" in block.diff_text
+    assert re.search(r"-    1 \[sr_\w+\] \| \.\.\.\(!FEATURE_ENABLED && \{ slug \}\)", block.diff_text)
+    assert re.search(r"\+    1 \[sr_\w+\] \| \.\.\.\(FEATURE_ENABLED \? \{ slug \} : \{\}\)", block.diff_text)
     assert "condition" in block.focus
     assert "true" in block.focus and "false" in block.focus
     assert "bug" not in block.focus.lower()
@@ -338,7 +341,7 @@ def test_context_fact_cannot_quote_omitted_line_or_navigation_reason():
     )
     pack = ContextPack(units={u.id: UnitContext(u.id, [slice_])})
     header = f"### {u.id} caller caller.py:5-6\nNavigation reason (not evidence): reason not source\n"
-    budget = len(header) + len("    5 | supported_call(argument)") + 3
+    budget = len(header) + len("    5 [sr_123456789abc] | supported_call(argument)") + 3
     block = plan_discovery(changeset(u), pack, {u.path: diff()}, limits=DiscoveryLimits(context_max_chars=budget))[0]
     assert block.source_matches({"side": "context", "path": "caller.py", "line": 5, "excerpt": "supported_call"})
     assert not block.source_matches({"side": "context", "path": "caller.py", "line": 6, "excerpt": "hidden_call"})
@@ -440,15 +443,12 @@ async def test_request_budget_denial_is_not_misclassified_as_provider_failure():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["oversized_fact", "too_many_facts", "oversized_prose"])
+@pytest.mark.parametrize("change", ["too_many_facts", "oversized_prose"])
 async def test_discovery_navigation_metadata_limits_are_enforced(change):
     u = unit("a.py")
     bad = candidate(u)
     patch = diff()
-    if change == "oversized_fact":
-        patch = diff(after="return new_value # " + "x" * 250)
-        bad["behavior"]["source_facts"][1]["excerpt"] = "return new_value # " + "x" * 250
-    elif change == "too_many_facts":
+    if change == "too_many_facts":
         bad["behavior"]["source_facts"] *= 3
     else:
         bad["discrepancy"] = "x" * 601
@@ -559,7 +559,7 @@ def test_unchanged_source_prints_both_explicit_coordinates_and_scope_is_exact():
     u.start_line, u.end_line = 49, 51
     patch = "@@ -41,3 +48,4 @@\n public void run() {\n     process();\n+    processExtra();\n }"
     block = plan_discovery(changeset(u), ContextPack(), {u.path: patch}, limits=DiscoveryLimits())[0]
-    assert "before=   42 RIGHT=   49 |     process();" in block.diff_text
+    assert re.search(r"before=   42 \[sr_\w+\] RIGHT=   49 \[sr_\w+\] \|     process\(\);", block.diff_text)
     assert block.source_matches({"side": "before", "path": u.path, "line": 42, "excerpt": "process();"})
     assert not block.source_matches({"side": "before", "path": u.path, "line": 49, "excerpt": "process();"})
     user = HypothesisGenerator(ScriptedLLM())._render_discovery_message(

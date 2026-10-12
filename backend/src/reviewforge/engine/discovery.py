@@ -10,8 +10,10 @@ use the original input hard cap and is explicitly labelled oversize.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
 from reviewforge.core.change_manifest import FileChange, is_verified_rename, render_change_fact
@@ -39,6 +41,33 @@ _OPERATIONS = (
         "Compare the returned/computed result for the same supported input, including the changed boundary.",
     ),
 )
+
+
+def _source_segments(text: str) -> list[tuple[int, str]]:
+    """Bind short excerpts to columns without rendering source a second time."""
+    if not text.strip():
+        return []
+    count = math.ceil(len(text) / 240)
+    width = math.ceil(len(text) / count)
+    return [
+        (start, text[start : start + width])
+        for start in range(0, len(text), width)
+        if text[start : start + width].strip()
+    ]
+
+
+def _reference_labels(spans: list[tuple[str, int, int]]) -> str:
+    if not spans:
+        return ""
+    return (
+        "[" + " ".join(ref_id if len(spans) == 1 else f"{ref_id}:{start}-{end}" for ref_id, start, end in spans) + "]"
+    )
+
+
+def _reference_overhead(text: str) -> int:
+    spans = [("sr_" + "0" * 12, start + 1, start + len(excerpt)) for start, excerpt in _source_segments(text)]
+    # One separating space is added even for an unreferenced blank source line.
+    return len(_reference_labels(spans)) + 1
 
 
 @dataclass(frozen=True)
@@ -94,6 +123,8 @@ class DiscoveryBlock:
     unit_before_states: dict[str, str] = field(default_factory=dict)
     structural_changes: dict[str, FileChange] = field(default_factory=dict)
     change_text: str = ""
+    source_refs: dict[str, SourceLine] = field(default_factory=dict)
+    reference_spans: dict[tuple[str, str, int], list[tuple[str, int, int]]] = field(default_factory=dict)
 
     def source_matches(self, raw: object) -> bool:
         if not isinstance(raw, dict):
@@ -110,7 +141,6 @@ class DiscoveryBlock:
         return (
             isinstance(excerpt, str)
             and bool(excerpt.strip())
-            and len(excerpt) <= 240
             and any(
                 item.side == raw["side"]
                 and item.path == raw.get("path")
@@ -119,6 +149,75 @@ class DiscoveryBlock:
                 for item in self.facts
             )
         )
+
+    def resolve_source_fact(self, raw: object) -> dict[str, object] | None:
+        reference = raw if isinstance(raw, str) else raw.get("source_ref") if isinstance(raw, dict) else None
+        if reference is not None:
+            if (
+                not isinstance(reference, str)
+                or reference not in self.source_refs
+                or isinstance(raw, dict)
+                and set(raw) != {"source_ref"}
+            ):
+                return None
+            source = self.source_refs[reference]
+            return {"side": source.side, "path": source.path, "line": source.line, "excerpt": source.text}
+        return dict(raw) if isinstance(raw, dict) and "source_ref" not in raw else None
+
+    def register_source_refs(self) -> None:
+        for fact in self.facts:
+            key = (fact.side, fact.path, fact.line)
+            spans = self.reference_spans.setdefault(key, [])
+            for start, excerpt in _source_segments(fact.text):
+                identity = json.dumps([self.id, fact.side, fact.path, fact.line, excerpt], ensure_ascii=False)
+                digest = hashlib.sha256(identity.encode()).hexdigest()
+                ref_id = "sr_" + digest[:12]
+                existing = self.source_refs.get(ref_id)
+                if existing is not None and (existing.side, existing.path, existing.line, existing.text) != (
+                    fact.side,
+                    fact.path,
+                    fact.line,
+                    excerpt,
+                ):
+                    ref_id = "sr_" + digest
+                self.source_refs.setdefault(ref_id, replace(fact, text=excerpt))
+                span = (ref_id, start + 1, start + len(excerpt))
+                if span not in spans:
+                    spans.append(span)
+
+    def reference_labels(self, side: str, path: str, line: int) -> str:
+        return _reference_labels(self.reference_spans.get((side, path, line), []))
+
+    def annotate_sources(self) -> None:
+        rendered = []
+        path = ""
+        for raw in self.diff_text.splitlines():
+            if raw.startswith("### Shared before/after diff: "):
+                path = raw.removeprefix("### Shared before/after diff: ")
+            both = re.match(r"^ before=\s*(\d+) RIGHT=\s*(\d+) \| (.*)$", raw)
+            single = re.match(r"^([-+])\s*(\d+) \| (.*)$", raw)
+            if both:
+                old, new = int(both[1]), int(both[2])
+                raw = (
+                    f" before={old:>5} {self.reference_labels('before', path, old)} "
+                    f"RIGHT={new:>5} {self.reference_labels('after', path, new)} | {both[3]}"
+                )
+            elif single:
+                side, line = ("before" if single[1] == "-" else "after"), int(single[2])
+                raw = f"{single[1]}{line:>5} {self.reference_labels(side, path, line)} | {single[3]}"
+            rendered.append(raw)
+        self.diff_text = "\n".join(rendered)
+        rendered = []
+        for raw in self.context_text.splitlines():
+            header = re.match(r"^### \S+ \S+ (.+):\d+-\d+$", raw)
+            if header:
+                path = header[1]
+            line = re.match(r"^\s*(\d+) \| (.*)$", raw)
+            if line:
+                number = int(line[1])
+                raw = f"{number:>5} {self.reference_labels('context', path, number)} | {line[2]}"
+            rendered.append(raw)
+        self.context_text = "\n".join(rendered)
 
     def unit_source_matches(self, unit_id: str, raw: object, *, changed: bool = False) -> bool:
         if not self.source_matches(raw):
@@ -345,15 +444,16 @@ def _context(units: list[SemanticUnit], pack: ContextPack, budget: int) -> tuple
                 if line > slice_.end_line:
                     break
                 numbered = f"{line:>5} | {text}"
-                if size + len(numbered) + 1 > remaining:
+                source_size = len(numbered) + _reference_overhead(text)
+                if size + source_size + 1 > remaining:
                     break
                 rendered.append(numbered)
                 selected.append(SourceLine("context", slice_.path, line, text, kind=slice_.kind, unit_id=unit.id))
-                size += len(numbered) + 1
+                size += source_size + 1
             if rendered:
                 piece = header + "\n".join(rendered)
                 sections.append(piece)
-                remaining -= len(piece) + 2
+                remaining -= size
                 facts.extend(selected)
                 # A shared reference can only reuse the actually delivered prefix.
                 if len(rendered) == len(lines):
@@ -451,6 +551,9 @@ def _block(
             and (not unit.start_line or unit.start_line <= fact.right_line <= unit.end_line)
             and (fact.side != "before" or not state.startswith("absent-"))
         ]
+    block.register_source_refs()
+    block.annotate_sources()
+    block.oversize = len(block.diff_text) + len(block.change_text) > limits.diff_max_chars
     return block
 
 
@@ -574,9 +677,7 @@ def plan_discovery(
                 )
                 # An oversize hunk can still be shared without expanding it.
                 shared_oversize = (
-                    block.oversize
-                    and candidate.diff_text == block.diff_text
-                    and candidate.change_text == block.change_text
+                    block.oversize and candidate_keys == group_keys and candidate.change_text == block.change_text
                 )
                 if (
                     len(candidate.diff_text) + len(candidate.change_text) <= limits.diff_max_chars

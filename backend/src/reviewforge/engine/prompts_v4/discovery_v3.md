@@ -9,14 +9,20 @@ changes. For a changed conditional, explicitly compare true and false branches,
 including which values are written or omitted. Intent alone does not establish
 equivalence or correctness.
 
-Shared hunks are supplied once for all the units that use them. `- line | code`
-is before source, `+ line | code` is after source, and unchanged
-`before=LEFT RIGHT=NEW | code` has two explicit coordinates. A before fact uses
+Shared hunks are supplied once for all the units that use them. `- line [sr_ID] | code`
+is before source, `+ line [sr_ID] | code` is after source, and unchanged
+`before=LEFT [sr_ID] RIGHT=NEW [sr_OTHER] | code` has two explicit coordinates. A before fact uses
 LEFT; an after fact or site uses RIGHT. Do not copy RIGHT into a before fact.
 Context lines are separately numbered and require side=context even when the
 same text also appears in diff; alternatively cite its exact diff side/line.
-Copy excerpts
-from the code after `|`; preserve any `|` in the code itself. Only after/RIGHT
+Use `{"source_ref":"sr_ID"}` for source_facts, trigger_basis and sites. Copy a
+delivered ID exactly; the program resolves its side, path, line and exact source
+excerpt. IDs belong only to this block. Long lines show `sr_ID:start-end` column
+ranges for short fragments of the same source body; copy only the ID, without
+the column suffix. The source text is not repeated in an index. Legacy explicit
+side/path/line/excerpt facts also remain valid when the excerpt is an exact
+substring of the delivered line. Copy such excerpts from the code after `|`;
+preserve any `|` in the code itself. Only after/RIGHT
 locations can become `sites`. Facts must cite delivered source, not navigation,
 an omitted slice, a hypothetical call, or an invented input.
 
@@ -38,8 +44,11 @@ are outside this review. Missing context cannot prove a defect or clean result.
 
 Return one JSON object. Each allowed unit must have a hypothesis, a concrete
 `no_issue_units` check, or an explicit `deferred_units` reason. Independent
-hypotheses may share a unit; do not mix clean/deferred with a hypothesis for
-that unit. No blanket "looks correct" or "logic equivalent" clean assessments:
+hypotheses may share a unit. A hypothesis may coexist with deferred_units when
+another hunk, supported input or contract remains unchecked; state that boundary
+explicitly. The candidate is retained and this unit remains incompletely covered.
+Do not mix a no_issue_units clean assessment with any other answer for that unit.
+No blanket "looks correct" or "logic equivalent" clean assessments:
 show which before/after behavior and contract you actually compared.
 `absent-before-in-delivered-source` means only that the delivered fragments have
 no before source; a zero-context insertion can have this state. It does not mean
@@ -70,16 +79,16 @@ Schema (the example IDs and source are not available IDs):
     "open_question": "One source-verifiable fact deciding the regression?",
     "refutation": "Specific source fact that would refute the regression",
     "severity": "warning",
-    "sites": [{"path": "source.py", "line": 12, "excerpt": "changed_call(argument)"}],
+    "sites": [{"source_ref": "sr_AFTER_ID"}],
     "discrepancy": "Observed mismatch between the change and an input/caller/contract",
-    "trigger_basis": {"side": "context", "path": "caller.py", "line": 8, "excerpt": "observed_supported_call()"},
+    "trigger_basis": {"source_ref": "sr_CALLER_ID"},
     "behavior": {
       "before": "Result for the same concrete input before the change",
       "after": "Result for that input after the change",
       "observable": "The changed return value, state, error or other observable result",
       "source_facts": [
-        {"side": "before", "path": "source.py", "line": 12, "excerpt": "prior_call(argument)"},
-        {"side": "after", "path": "source.py", "line": 12, "excerpt": "changed_call(argument)"}
+        {"source_ref": "sr_BEFORE_ID"},
+        {"source_ref": "sr_AFTER_ID"}
       ]
     }
   }],
@@ -91,8 +100,8 @@ Schema (the example IDs and source are not available IDs):
       "after": "New behavior for the same input",
       "observable": "Actual checked result and why it respects the supplied contract",
       "source_facts": [
-        {"side": "before", "path": "other.py", "line": 2, "excerpt": "return 1000"},
-        {"side": "after", "path": "other.py", "line": 2, "excerpt": "return 1_000"}
+        {"source_ref": "sr_OTHER_BEFORE_ID"},
+        {"source_ref": "sr_OTHER_AFTER_ID"}
       ]
     }
   }],
@@ -112,8 +121,9 @@ range, not merely a neighboring function in the same file. A candidate must
 have at least one RIGHT site in that target unit; shared parent/child ranges
 may refer to the same operation. Additional cross-file facts/sites may explain
 the contract but cannot replace the target's own source.
-Use at most four source_facts per behavior and at most 240 characters per fact
-excerpt, including trigger_basis. Limit each prose field to at most 600
+Use at most four source_facts per behavior. Program source_ref excerpts are at
+most 240 characters; explicit legacy exact quotes have no separate length limit.
+Prefer the short IDs to repeating source text. Limit each prose field to at most 600
 characters; these are hard schema limits, not length targets. The behavior,
 discrepancy and trigger basis will be delivered as bounded navigation to the
 investigator; they are not Observations or confirmed evidence.

@@ -476,9 +476,10 @@ class HypothesisGenerator:
             sections.append(guidance)
         sections.append(
             f"## Required assessments ({len(block.units)})\n"
-            f"New candidate allowance this block: {allowance}. Assess each ID in exactly one category: hypotheses, "
-            "source-backed no_issue check, or explicit deferred_units. Independent risks may have multiple "
-            "hypotheses for one unit. A deferred answer is not clean.\n" + ids
+            f"New candidate allowance this block: {allowance}. Assess each ID with hypotheses, "
+            "a source-backed no_issue check, or explicit deferred_units. Independent risks may have multiple "
+            "hypotheses for one unit and explicitly defer an additional unchecked boundary. "
+            "A no_issue check cannot coexist with another answer for its unit. A deferred answer is not clean.\n" + ids
         )
         return "\n\n".join(sections)
 
@@ -530,8 +531,20 @@ class HypothesisGenerator:
             },
         )
         right_lines = _right_lines_by_path(state)
+        attempted_blocks = sum(
+            record.get("source") == self._source
+            and (record.get("request_attempted") or "attempted_responsibilities" in record)
+            for record in ledger.discovery_blocks.values()
+        )
         for block in blocks:
             key = f"{self._source}:{block.id}"
+            if key in ledger.discovery_blocks:
+                # A repeated delivery retains the earlier failure and request
+                # accounting. Recovery is another attempt, not a fresh budget.
+                recovery = 2
+                while f"{key}:attempt-{recovery}" in ledger.discovery_blocks:
+                    recovery += 1
+                key = f"{key}:attempt-{recovery}"
             record = {
                 "source": self._source,
                 "unit_ids": [unit.id for unit in block.units],
@@ -584,7 +597,7 @@ class HypothesisGenerator:
             failure = block.failure
             if any(not self._responsibility_rules.get(name, "").strip() for name in responsibilities):
                 failure = "missing responsibility rules"
-            if not failure and result.blocks >= self._discovery_max_blocks:
+            if not failure and attempted_blocks >= self._discovery_max_blocks:
                 failure = "capacity-deferred: discovery block limit"
             elif not failure and len(user) > self._max_input_chars:
                 failure = "input-too-large"
@@ -598,6 +611,8 @@ class HypothesisGenerator:
                     await self._on_update(ledger)
                 continue
             result.blocks += 1
+            attempted_blocks += 1
+            record["request_attempted"] = True
             record["attempted_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
             try:
                 response = await self._llm.ainvoke(
@@ -725,9 +740,9 @@ class HypothesisGenerator:
             if not entries:
                 failed[unit_id] = "missing unit assessment"
                 continue
-            # Several independent candidates for one unit are permitted. A
-            # candidate plus clean/deferred or repeated clean is contradictory.
-            if len(entries) > 1 and any(kind != "hypothesis" for kind, _ in entries):
+            # A valid candidate can coexist with an explicitly unchecked
+            # boundary. Only a clean assessment conflicts with another answer.
+            if len(entries) > 1 and any(kind == "no_issue" for kind, _ in entries):
                 failed[unit_id] = "contradictory unit assessments"
                 result.dropped_invalid += sum(kind == "hypothesis" for kind, _ in entries)
                 continue
@@ -736,8 +751,9 @@ class HypothesisGenerator:
                     if not isinstance(raw.get("reason"), str) or not raw["reason"].strip() or len(raw["reason"]) > 600:
                         failed[unit_id] = "invalid deferred assessment"
                     else:
-                        failed[unit_id] = "capacity-deferred: " + raw["reason"].strip()
+                        failed[unit_id] = "deferred: " + raw["reason"].strip()
                     continue
+                raw = self._resolve_discovery_sources(raw, block)
                 if not self._valid_behavior(raw, unit, block, require_consumer=kind == "no_issue"):
                     failed[unit_id] = "invalid source-backed behavior assessment"
                     result.dropped_invalid += int(kind == "hypothesis")
@@ -819,6 +835,9 @@ class HypothesisGenerator:
                 status = "capacity-deferred" if reason.startswith("capacity-deferred") else "unresolved"
                 self._discovery_unresolved(ledger, result, unit_id, reason)
                 record["units"][unit_id] = {"status": status, "reason": reason}
+                retained = [raw for raw in kept if raw["unit_id"] == unit_id]
+                if retained:
+                    record["units"][unit_id]["candidates"] = retained
                 continue
             prior = ledger.unresolved_units.get(unit_id, "")
             if prior.startswith(f"{self._source} "):
@@ -838,7 +857,7 @@ class HypothesisGenerator:
                     if all(row.get("status") in {"assessed", "recovered"} for row in previous["units"].values()):
                         previous["status"] = "recovered"
             if kind == "hypothesis":
-                record["units"][unit_id]["candidates"] = [raw for _, raw in entries]
+                record["units"][unit_id]["candidates"] = [raw for raw in kept if raw["unit_id"] == unit_id]
             elif unit_id not in ledger.unresolved_units and not any(
                 item.unit_id == unit_id for item in ledger.items.values()
             ):
@@ -846,6 +865,33 @@ class HypothesisGenerator:
         record["status"] = "partial" if failed or invalid_other else "completed"
         if failed or invalid_other:
             result.failed_blocks += 1
+
+    @staticmethod
+    def _resolve_discovery_sources(raw: dict[str, Any], block: DiscoveryBlock) -> dict[str, Any]:
+        """Resolve navigation IDs before the same source/target schema checks.
+
+        Unknown IDs stay invalid. Model-provided coordinates cannot override
+        an ID, and a before/context reference never becomes a RIGHT site.
+        """
+        item = copy.deepcopy(raw)
+        behavior = item.get("behavior")
+        if isinstance(behavior, dict) and isinstance(behavior.get("source_facts"), list):
+            behavior["source_facts"] = [block.resolve_source_fact(fact) for fact in behavior["source_facts"]]
+        if "trigger_basis" in item:
+            item["trigger_basis"] = block.resolve_source_fact(item["trigger_basis"])
+        if isinstance(item.get("sites"), list):
+            sites = []
+            for site in item["sites"]:
+                if isinstance(site, str) or isinstance(site, dict) and "source_ref" in site:
+                    fact = block.resolve_source_fact(site)
+                    site = (
+                        {field: fact[field] for field in ("path", "line", "excerpt")}
+                        if fact is not None and fact["side"] == "after"
+                        else None
+                    )
+                sites.append(site)
+            item["sites"] = sites
+        return item
 
     def _chunk_units(
         self,

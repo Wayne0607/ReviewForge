@@ -1,4 +1,4 @@
-"""Protocol-v4 presentation only: share identical delivered source bodies.
+"""Protocol-v4 presentation: share source and separate navigation from targets.
 
 These helpers do not select source, change provenance or complete coverage.
 The caller must retain the original DiscoveryBlock for reference validation.
@@ -18,6 +18,7 @@ _BOTH = re.compile(r"^ before=(\d+)( \[[^\]]+\])? RIGHT=(\d+)( \[[^\]]+\])? \| (
 _CONTEXT = re.compile(r"^(\d+)( \[[^\]]+\])? \| (.*)$")
 _NAVIGATION = re.compile(r"^- (.+?) -> ([a-z_]+) (.+):(\d+)-(\d+) (.*?): (.*)$")
 _UNIT_ID = re.compile(r"su_[0-9a-f]{16}")
+_OVERVIEW_UNIT = re.compile(r"^- (su_[0-9a-f]{16}) (.+:\d+-\d+ .+)$")
 _ALIASES = "Context aliases reuse complete source lines; IDs stay context, never RIGHT sites."
 
 
@@ -30,6 +31,20 @@ class DiscoveryPresentation:
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def present_pr_overview(text: str) -> str:
+    """Hide only inventory identity tokens; keep paths, ranges, symbols/order.
+
+    The original bounded overview remains on DiscoveryBlock for audit. Unknown
+    rows, intent and omission notices are preserved; no source is selected here.
+    Global inventory must not form a second list of assessable unit IDs.
+    """
+    rendered = []
+    for line in text.split("\n"):
+        match = _OVERVIEW_UNIT.fullmatch(line)
+        rendered.append("- " + match[2] if match is not None else line)
+    return "\n".join(rendered)
 
 
 def _context_path(line: str, block: DiscoveryBlock) -> tuple[str, str] | None:

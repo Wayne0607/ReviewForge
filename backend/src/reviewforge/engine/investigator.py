@@ -21,7 +21,7 @@ from typing import Any, Literal
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
-from pydantic import create_model
+from pydantic import ConfigDict, Field, create_model
 
 from reviewforge.core.change_manifest import is_verified_rename, render_change_fact
 from reviewforge.core.json_output import extract_json_value
@@ -1166,9 +1166,12 @@ class Investigator:
             closing_output = min(4_000, token_limit // 4)
             if self._protocol_version >= 3:
                 closer = self._closing_llm if self._closing_llm is not None else self._llm
+                closing_input = closing
+                if self._protocol_version >= 4:
+                    closer, closing_input, _ = self._typed_closing_request(closer, closing)
                 closing_plan = plan_request(
                     closer,
-                    closing,
+                    closing_input,
                     max_output_tokens=closing_output,
                     fallback_available=remaining,
                 )
@@ -1506,6 +1509,100 @@ class Investigator:
             ),
         ]
 
+    def _closing_submission_tool(self) -> StructuredTool:
+        """Describe a result, not an executable source operation or a verdict repair."""
+        references = tuple(
+            reference for observation in self._observations for reference in _evidence_segments(observation)
+        )
+        config = ConfigDict(extra="forbid", strict=True)
+        assessment_type: Any = type(None)
+        counter_type: Any = type(None)
+        if references:
+            reference_type = Literal[references]
+            assessment = create_model(
+                "SavedContractAssessment",
+                __config__=config,
+                expected=(str, Field(min_length=1)),
+                actual=(str, Field(min_length=1)),
+                comparison=(Literal["conflict", "compatible", "unresolved"], ...),
+                expected_evidence=(list[reference_type], Field(min_length=1)),
+                actual_evidence=(list[reference_type], Field(min_length=1)),
+            )
+            counter = create_model(
+                "SavedCounterEvidence",
+                __config__=config,
+                premise=(Literal["trigger", "mechanism", "impact", "regression"], ...),
+                statement=(str, Field(min_length=1)),
+                evidence=(list[reference_type], Field(min_length=1)),
+            )
+            assessment_type, counter_type = assessment | None, counter | None
+        site = create_model(
+            "InvestigationSite",
+            __config__=config,
+            path=(str, ...),
+            line=(int, ...),
+            excerpt=(str, ...),
+        )
+        schema = create_model(
+            "SubmitInvestigation",
+            __config__=config,
+            answer=(str, ...),
+            severity=(Literal["error", "warning", "info"], ...),
+            assessment=(assessment_type, ...),
+            counterevidence=(counter_type, ...),
+            reason=(str, ...),
+            additional_sites=(list[site], ...),
+        )
+
+        def submit_investigation(**kwargs: Any) -> str:
+            raise RuntimeError("submission is an output format, not an executable tool")
+
+        return StructuredTool.from_function(
+            func=submit_investigation,
+            name="submit_investigation",
+            description="Submit the final investigation using saved exact evidence. Missing facts remain unknown.",
+            args_schema=schema,
+        )
+
+    def _typed_closing_request(self, closer: Any, chat: list[Any]) -> tuple[Any, list[Any], StructuredTool]:
+        tool = self._closing_submission_tool()
+        bound = closer.bind_tools([tool], tool_choice="any")
+        messages = list(chat)
+        if messages and isinstance(messages[0], SystemMessage):
+            # Keep all source/semantic rules and examples of the original
+            # closure. Only its transport changes from prose JSON to arguments.
+            content = (
+                messages[0]
+                .content.replace(
+                    "the final request: no tools, navigation requests or exploration.",
+                    "the final request: no source navigation or exploration.",
+                )
+                .replace(
+                    "Return ONE JSON object, no verdict, confidence, fences or surrounding prose:",
+                    "Call submit_investigation exactly once with the fields below. "
+                    "No verdict, confidence, fences or surrounding prose:",
+                )
+            )
+            messages[0] = messages[0].model_copy(update={"content": content})
+        return bound, messages, tool
+
+    def _parse_closing_submission(self, response: Any, tool: StructuredTool) -> dict[str, Any] | None:
+        calls = getattr(response, "tool_calls", None) or []
+        if getattr(response, "invalid_tool_calls", None):
+            raise ValueError("invalid-closing-submission")
+        if calls:
+            if len(calls) != 1 or calls[0].get("name") != tool.name or not isinstance(calls[0].get("args"), dict):
+                raise ValueError("invalid-closing-submission")
+            args = calls[0]["args"]
+            tool.args_schema.model_validate(args)
+            # Validate shape without replacing, coercing or filling the raw
+            # dict. Existing parsing and evidence/verdict checks remain final.
+            return self._parse_verdict(json.dumps(args, ensure_ascii=False))
+        # A provider that ignores tool choice may still return the original
+        # legal JSON contract. This is parsing the same response, never retrying
+        # a changed request or interpreting explanatory prose as an enum.
+        return self._parse_verdict(getattr(response, "content", "") or "")
+
     async def _close(
         self,
         chat: list[Any],
@@ -1516,6 +1613,9 @@ class Investigator:
         steps: int,
     ) -> InvestigationResult:
         closer = self._closing_llm if self._closing_llm is not None else self._llm
+        submission_tool = None
+        if self._protocol_version >= 4:
+            closer, chat, submission_tool = self._typed_closing_request(closer, chat)
         if self._protocol_version >= 3:
             closing_plan = plan_request(
                 closer,
@@ -1547,7 +1647,8 @@ class Investigator:
         try:
             final = await closer.ainvoke(chat, max_tokens=min(4_000, available_output))
             self._record_tokens(final, chat)
-            parsed = self._parse_verdict(getattr(final, "content", "") or "")
+            if submission_tool is None:
+                parsed = self._parse_verdict(getattr(final, "content", "") or "")
         except Exception as exc:
             if getattr(exc, "outcome", "") == "budget-exhausted":
                 return self._result(
@@ -1558,6 +1659,16 @@ class Investigator:
                     outcome="budget-exhausted",
                 )
             logger.warning("investigator final call failed for %s: %s", hypothesis.identity, exc)
+            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            if submission_tool is not None and status == 400:
+                return self._result(
+                    verdict="unknown",
+                    reason="provider-parameters-rejected",
+                    severity=hypothesis.severity,
+                    steps=steps,
+                    outcome="provider-error",
+                    retryable=False,
+                )
             return self._result(
                 verdict="unknown", reason="provider error", severity=hypothesis.severity, steps=steps, retryable=True
             )
@@ -1569,6 +1680,11 @@ class Investigator:
                 steps=steps,
                 outcome="budget-exhausted",
             )
+        if submission_tool is not None:
+            try:
+                parsed = self._parse_closing_submission(final, submission_tool)
+            except (ValueError, TypeError):
+                return self._invalid_output("invalid-closing-submission", hypothesis, steps)
         if parsed is None:
             return self._invalid_output("step-exhausted", hypothesis, steps)
         return self._finalize(parsed, hypothesis, changed, steps=steps)

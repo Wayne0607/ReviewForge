@@ -1,8 +1,9 @@
-"""Deterministic publication of independently verified v3 facts.
+"""Deterministic publication of independently verified facts.
 
 V3 selection requires a current ProofGate receipt; comments preserve the
 accepted original facts and citations without another model call. V1/v2 keep
 their original LLM comment writing and deterministic failure template (§4.7).
+V4 presents the final gate's scoped proof statements and exact source quotes.
 """
 
 from __future__ import annotations
@@ -21,12 +22,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from reviewforge.core.json_output import extract_json_value
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Site
 from reviewforge.engine.prompts_v4 import load_prompt
-from reviewforge.engine.proof_gate import accepted, completed
+from reviewforge.engine.proof_gate import _references, accepted, completed
 
 logger = logging.getLogger(__name__)
 
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
 _STRENGTH_RANK = {"none": 0, "weak": 1, "strong": 2}
+
+# Version 1 was the implicit claim/assessment renderer. Frozen version 2 bodies
+# are statements from the accepted final proof, not the earlier candidate draft.
+V4_PUBLICATION_RENDERER_VERSION = 2
 
 
 @dataclass
@@ -202,11 +207,50 @@ def fallback_comment(cluster: ConfirmedCluster, *, output_language: str = "en") 
     )
 
 
-def proof_comment(cluster: ConfirmedCluster, *, output_language: str = "en") -> PublicationComment:
+def _reviewed_parts(item: Hypothesis, ledger: HypothesisLedger, output_language: str) -> list[str]:
+    """Present the final gate's scoped statements, not an earlier draft claim."""
+    if not accepted(item, ledger):
+        raise ValueError("publication requires a current accepted proof")
+    review = ledger.publication_reviews[item.id]
+    english = output_language != "zh-CN"
+    names = (
+        ("supported_input", "When" if english else "触发条件"),
+        ("required_behavior", "Required" if english else "要求"),
+        ("introduced_regression", "Change" if english else "引入的变化"),
+        ("bad_consequence", "Impact" if english else "影响"),
+    )
+    parts = [review["reason"]]
+    references = _references(item)
+    by_id = {observation.id: observation for observation in item.observations}
+    seen = set()
+    for name, label in names:
+        obligation = review["obligations"][name]
+        parts.append(f"{label}: {obligation['statement']}")
+        for reference in obligation["evidence"]:
+            citation = references[reference]
+            key = (citation["observation_id"], citation["quote"])
+            if key in seen:
+                continue
+            seen.add(key)
+            observation = by_id[citation["observation_id"]]
+            location = observation.path or observation.tool
+            span = observation.excerpt_line_range or observation.line_range
+            if span:
+                location += f":{span[0]}"
+            parts.append(f"{location}:\n" + "\n".join("> " + line for line in citation["quote"].splitlines()))
+    return parts
+
+
+def proof_comment(
+    cluster: ConfirmedCluster, *, output_language: str = "en", ledger: HypothesisLedger | None = None
+) -> PublicationComment:
     """Publish immutable reviewed facts; no second model may invent a new defect."""
     english = output_language != "zh-CN"
     parts = []
     for item in cluster.hypotheses:
+        if ledger is not None and ledger.protocol_version >= 4:
+            parts.extend(_reviewed_parts(item, ledger, output_language))
+            continue
         assessment = item.assessment
         if assessment is None:
             raise ValueError("publication requires an independently verified assessment")
@@ -237,15 +281,24 @@ def proof_comment(cluster: ConfirmedCluster, *, output_language: str = "en") -> 
         hypothesis_ids=list(cluster.hypothesis_ids),
         path=cluster.sites[0].path,
         line=cluster.sites[0].line,
-        title=cluster.hypotheses[0].claim[:60],
+        title=(
+            ledger.publication_reviews[cluster.hypotheses[0].id]["reason"]
+            if ledger is not None and ledger.protocol_version >= 4
+            else cluster.hypotheses[0].claim
+        )[:60],
         body="\n\n".join(parts),
     )
 
 
-def fallback_summary(cluster: ConfirmedCluster) -> tuple[str, str]:
+def fallback_summary(
+    cluster: ConfirmedCluster, *, ledger: HypothesisLedger | None = None, output_language: str = "en"
+) -> tuple[str, str]:
     if _structural(cluster):
-        return cluster.hypothesis_ids[0], _structural_summary(cluster)
+        return cluster.hypothesis_ids[0], _structural_summary(cluster, ledger=ledger, output_language=output_language)
     where = ", ".join(f"{site.path}:{site.line}" for site in cluster.sites)
+    if ledger is not None and ledger.protocol_version >= 4:
+        parts = [part for item in cluster.hypotheses for part in _reviewed_parts(item, ledger, output_language)]
+        return cluster.hypothesis_ids[0], "\n\n".join([*parts, where])
     return cluster.hypothesis_ids[0], f"{cluster.hypotheses[0].claim} ({where})"
 
 
@@ -253,7 +306,9 @@ def _structural(cluster: ConfirmedCluster) -> bool:
     return any(item.change_anchor is not None for item in cluster.hypotheses)
 
 
-def _structural_summary(cluster: ConfirmedCluster) -> str:
+def _structural_summary(
+    cluster: ConfirmedCluster, *, ledger: HypothesisLedger | None = None, output_language: str = "en"
+) -> str:
     """Keep grounded structural proof even if the editor omits/rewrites it."""
     parts = []
     for item in cluster.hypotheses:
@@ -265,6 +320,10 @@ def _structural_summary(cluster: ConfirmedCluster) -> str:
             f"{quote(change.previous_path, safe='/')}"
         )
         after = f"https://github.com/{change.head_repo}/blob/{change.head_sha}/{quote(change.path, safe='/')}"
+        if ledger is not None and ledger.protocol_version >= 4:
+            parts.extend(_reviewed_parts(item, ledger, output_language))
+            parts.append(f"[Before]({before}) → [After]({after}); `{change.previous_path}` → `{change.path}`.")
+            continue
         parts.append(
             f"{item.claim}\n\n{item.trigger}\n\n{item.impact}\n\n"
             f"[Before]({before}) → [After]({after}); `{change.previous_path}` → `{change.path}`."
@@ -297,8 +356,14 @@ def _structural_summary(cluster: ConfirmedCluster) -> str:
     return "\n\n".join(parts)
 
 
-def confirmed_fact_digest(hypothesis: Hypothesis) -> str:
-    """Track changes to published facts, including new sites of the same issue."""
+def confirmed_fact_digest(
+    hypothesis: Hypothesis, *, ledger: HypothesisLedger | None = None, legacy_renderer: bool = False
+) -> str:
+    """Bind rendered facts to their final proof as well as the source candidate.
+
+    The legacy projection is retained only to compare already-delivered old
+    outboxes. It must not authorize an old pending body under the new renderer.
+    """
     facts = {
         "claim": hypothesis.claim,
         "trigger": hypothesis.trigger,
@@ -311,6 +376,23 @@ def confirmed_fact_digest(hypothesis: Hypothesis) -> str:
         facts["change_anchor"] = hypothesis.change_anchor.to_dict()
     if hypothesis.assessment is not None:
         facts["assessment"] = hypothesis.assessment.to_dict()
+    if ledger is not None and ledger.protocol_version >= 4 and not legacy_renderer:
+        review = ledger.publication_reviews.get(hypothesis.id, {})
+        facts["renderer_version"] = V4_PUBLICATION_RENDERER_VERSION
+        facts["final_proof"] = {
+            key: review.get(key)
+            for key in (
+                "proof_version",
+                "fingerprint",
+                "run_id",
+                "head_sha",
+                "workspace_digest",
+                "source_audit_hash",
+                "reason",
+                "obligations",
+                "contract_refs",
+            )
+        }
     return hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -338,12 +420,16 @@ def resumed_publication(
     inline_keys = {cluster.key for cluster in inline}
     return Publication(
         comments=[
-            (proof_comment if ledger.protocol_version >= 3 else fallback_comment)(
-                cluster, output_language=output_language
-            )
+            proof_comment(cluster, output_language=output_language, ledger=ledger)
+            if ledger.protocol_version >= 3
+            else fallback_comment(cluster, output_language=output_language)
             for cluster in inline
         ],
-        summary_items=[fallback_summary(cluster) for cluster in ordered if cluster.key not in inline_keys],
+        summary_items=[
+            fallback_summary(cluster, ledger=ledger, output_language=output_language)
+            for cluster in ordered
+            if cluster.key not in inline_keys
+        ],
         merged=[cluster.hypothesis_ids for cluster in inline if len(cluster.hypothesis_ids) > 1],
         unknown_ids=(
             [item.id for item in ledger.items.values() if item.status == HypothesisStatus.UNKNOWN]

@@ -20,20 +20,26 @@ tests or browse advisories. Questions must fit these capabilities.
 
 ## Sources and coverage
 
-- Copy unit_id exactly. Its path/LEFT/RIGHT ranges are the target, not the entire
+- Only the final Allowed unit_id values list grants output permission. Assess
+  exactly those targets; every hypothesis, clean or deferred record must copy
+  an ID from that list. PR-wide overview/navigation and existing risks are not
+  additional targets, even when their source or relationships are visible.
+  Copy unit_id exactly. Its path/LEFT/RIGHT ranges are the target, not the entire
   shared hunk. A class header does not cover changed operations. Parent/child
   scopes may share a line but each needs assessment.
 - `- LEFT [rN]` is before, `+ RIGHT [rN]` is after. Unchanged rows have distinct
   before/RIGHT refs; Context refs stay context even when their body is shared
   with RIGHT. Copy {"source_ref":"rN"} or a supplied sr_ID, WITHOUT column suffixes
   or coordinate/quote overrides. References are valid only in this block.
-- behavior.source_facts: 1–4 refs including the target's changed after operation
+- behavior.source_facts: 1–12 refs including the target's changed after operation
   AND its removed/replaced before operation. This applies equally to hypotheses
   and clean assessments. For pure additions omit the unchanged before ref.
   Other-file/context refs can supplement, never replace target changed evidence.
   Units lists eligible before/after refs to avoid guessing ownership. Select
-  relevant operations from both nonempty lists; these lists do not select facts
-  for you or establish that a unit is clean. Use one rN per source_ref, never a
+  relevant operations from both nonempty lists, using more refs only for distinct
+  changes or necessary context; do not copy every eligible ref to fill the limit.
+  These lists do not select facts for you or establish that a unit is clean.
+  Use one rN per source_ref, never a
   joined label such as "r3:1-120 r8:121-240".
 - Describe only supplied local changes. absent-new-declaration proves that
   visible added declaration; absent-before-in-delivered-source or unresolved

@@ -194,7 +194,10 @@ async def test_v4_rebuilds_each_tool_round_from_saved_state_inside_original_budg
     assert result.steps <= 6
     assert result.tokens <= 24_000
     assert len(llm.calls) == 3
-    assert llm.tools_seen == ["read_file", "grep", "find_definition", "find_callers", "read_diff"]
+    assert llm.tools_seen[:5] == ["read_file", "grep", "find_definition", "find_callers", "read_diff"]
+    # v4 closure schemas are also bound during reserve forecasts, without
+    # adding source tools or replaying the exploration transcript.
+    assert llm.tools_seen[5:] == ["submit_investigation"] * len(llm.calls)
     for index, call in enumerate(llm.calls):
         assert [message.type for message in call["messages"]] == ["system", "human"]
         packet = json.loads(call["messages"][-1].content)

@@ -20,6 +20,7 @@ from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import compile_changeset_v4
 from reviewforge.engine.detectors.unified_diff import iter_added_lines, iter_right_lines
 from reviewforge.engine.editor import (
+    V4_PUBLICATION_RENDERER_VERSION,
     Editor,
     Publication,
     cluster_confirmed,
@@ -37,6 +38,7 @@ from reviewforge.engine.llm_protocol_v4 import request_options
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.phase0 import scan_changed_files
 from reviewforge.engine.proof_gate import PROOF_VERSION, ProofGate, accepted, completed, proof_fingerprint
+from reviewforge.engine.proof_gate import _scope_matches as proof_scope_matches
 from reviewforge.engine.proof_gate import retryable as proof_retryable
 from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
 from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
@@ -486,10 +488,12 @@ def _publication_coverage(
     return {
         "confirmed_ids": sorted(covered),
         "cluster_keys": [list(cluster.key) for cluster in clusters if covered.intersection(cluster.hypothesis_ids)],
-        "fact_hashes": {item.id: confirmed_fact_digest(item) for item in ledger.items.values() if item.id in covered},
+        "fact_hashes": {
+            item.id: confirmed_fact_digest(item, ledger=ledger) for item in ledger.items.values() if item.id in covered
+        },
         **(
             {
-                "publication_proof_version": PROOF_VERSION,
+                "publication_proof_version": 2 if ledger.protocol_version >= 4 else PROOF_VERSION,
                 "proof_fingerprints": {
                     identity: ledger.publication_reviews[identity]["fingerprint"] for identity in covered
                 },
@@ -497,7 +501,90 @@ def _publication_coverage(
             if ledger.protocol_version >= 3
             else {}
         ),
+        **({"publication_renderer_version": V4_PUBLICATION_RENDERER_VERSION} if ledger.protocol_version >= 4 else {}),
     }
+
+
+def _frozen_publication_problem(ledger: HypothesisLedger, coverage: dict[str, Any]) -> str:
+    """A frozen pending body must match the proof and renderer that produced it."""
+    version = 2 if ledger.protocol_version >= 4 else PROOF_VERSION
+    error = "frozen review lacks matching independent proof verification"
+    if ledger.protocol_version >= 4:
+        error += "; start a new isolated review run"
+        identities = coverage.get("confirmed_ids")
+        hashes = coverage.get("fact_hashes")
+        fingerprints = coverage.get("proof_fingerprints")
+        if (
+            coverage.get("publication_renderer_version") != V4_PUBLICATION_RENDERER_VERSION
+            or not isinstance(identities, list)
+            or any(not isinstance(identity, str) for identity in identities)
+            or len(set(identities)) != len(identities)
+            or not isinstance(hashes, dict)
+            or set(hashes) != set(identities)
+            or not isinstance(fingerprints, dict)
+            or set(fingerprints) != set(identities)
+        ):
+            return error
+    by_id = {item.id: item for item in ledger.items.values()}
+    if coverage.get("publication_proof_version") != version or any(
+        identity not in by_id
+        or not accepted(by_id[identity], ledger)
+        or coverage.get("proof_fingerprints", {}).get(identity)
+        != ledger.publication_reviews[identity].get("fingerprint")
+        or (
+            ledger.protocol_version >= 4
+            and coverage["fact_hashes"].get(identity) != confirmed_fact_digest(by_id[identity], ledger=ledger)
+        )
+        for identity in coverage.get("confirmed_ids", [])
+    ):
+        return error
+    return ""
+
+
+def _covered_publication_ids(ledger: HypothesisLedger, records: list[dict[str, Any]]) -> set[str]:
+    """Compare each fact with its last receipt, including delivered old renderers."""
+    receipts = {
+        identity: (digest, record)
+        for record in records
+        for identity, digest in record["payload"].get("coverage", {}).get("fact_hashes", {}).items()
+    }
+    covered = set()
+    for item in ledger.items.values():
+        if item.id not in receipts:
+            continue
+        digest, record = receipts[item.id]
+        coverage = record["payload"].get("coverage", {})
+        # Old delivered facts stay covered only while their original candidate,
+        # assessment and sites still match. New facts can still earn a supplement.
+        legacy_renderer = (
+            ledger.protocol_version >= 4
+            and record["status"] == "delivered"
+            and coverage.get("publication_renderer_version") in (None, 1)
+            and item.id in coverage.get("confirmed_ids", [])
+        )
+        if digest == confirmed_fact_digest(item, ledger=ledger, legacy_renderer=legacy_renderer):
+            covered.add(item.id)
+    return covered
+
+
+def _legacy_delivered_coverage_missing(record: dict[str, Any]) -> bool:
+    """Without the old fact hash and cluster, safe migration cannot be inferred."""
+    coverage = record["payload"].get("coverage", {})
+    if record["status"] != "delivered" or coverage.get("publication_renderer_version") not in (None, 1):
+        return False
+    identities = coverage.get("confirmed_ids")
+    hashes = coverage.get("fact_hashes")
+    clusters = coverage.get("cluster_keys")
+    return (
+        not isinstance(identities, list)
+        or any(not isinstance(identity, str) for identity in identities)
+        or not isinstance(hashes, dict)
+        or set(hashes) != set(identities)
+        or any(not isinstance(value, str) or not value for value in hashes.values())
+        or not isinstance(clusters, list)
+        or any(not isinstance(key, list) or len(key) != 2 for key in clusters)
+        or (bool(identities) and not clusters)
+    )
 
 
 async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
@@ -591,15 +678,8 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     for record in records:
         if ledger.protocol_version >= 3 and record["status"] != "delivered":
             coverage = record["payload"].get("coverage", {})
-            by_id = {item.id: item for item in ledger.items.values()}
-            if coverage.get("publication_proof_version") != PROOF_VERSION or any(
-                identity not in by_id
-                or not accepted(by_id[identity], ledger)
-                or coverage.get("proof_fingerprints", {}).get(identity)
-                != ledger.publication_reviews[identity].get("fingerprint")
-                for identity in coverage.get("confirmed_ids", [])
-            ):
-                outcome = DeliveryOutcome(error="frozen review lacks matching independent proof verification")
+            if problem := _frozen_publication_problem(ledger, coverage):
+                outcome = DeliveryOutcome(error=problem)
                 break
         rejected += int(record["payload"].get("rejected", 0))
         outcome = await deliver_saved_publication(
@@ -608,12 +688,7 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         delivered += outcome.delivered
         if outcome.error:
             break
-    fact_hashes = {
-        identity: digest
-        for record in records
-        for identity, digest in record["payload"].get("coverage", {}).get("fact_hashes", {}).items()
-    }
-    covered_ids = {item.id for item in ledger.items.values() if fact_hashes.get(item.id) == confirmed_fact_digest(item)}
+    covered_ids = _covered_publication_ids(ledger, records)
     published_clusters = {
         tuple(key) for record in records for key in record["payload"].get("coverage", {}).get("cluster_keys", [])
     }
@@ -630,6 +705,8 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         review = ledger.publication_reviews.get(item.id, {})
         # Absent/stale receipts are new work. Current budget refusals and capped
         # execution errors cannot acquire another attempt merely by resuming.
+        if ledger.protocol_version >= 4:
+            return not proof_scope_matches(review, item, ledger)
         return (
             review.get("proof_version") != PROOF_VERSION
             or review.get("fingerprint") != proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest)
@@ -648,6 +725,10 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         # Old dev records cannot prove which confirmed facts were published.
         # Do not guess coverage and risk duplicating or dropping findings.
         outcome = DeliveryOutcome(error="frozen review lacks coverage metadata; start a new isolated review run")
+    if ledger.protocol_version >= 4 and any(_legacy_delivered_coverage_missing(record) for record in records):
+        outcome = DeliveryOutcome(
+            error="delivered review lacks comparable fact coverage; start a new isolated review run"
+        )
 
     if not saved and state.files_changed:
         try:

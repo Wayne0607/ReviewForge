@@ -53,7 +53,7 @@ from reviewforge.engine.discovery_aliases import (
     target_source_choices,
 )
 from reviewforge.engine.discovery_output import frame_discovery_output
-from reviewforge.engine.discovery_presentation import present_discovery_block
+from reviewforge.engine.discovery_presentation import present_discovery_block, present_pr_overview
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import RequestBudgetExceededError, RequestPlan, plan_request
@@ -528,7 +528,13 @@ class HypothesisGenerator:
         if shown:
             columns += ",allowed_changed_before_refs,allowed_after_refs"
         sections = [
-            "## PR overview\n" + compact_overview(block.overview),
+            "## PR overview\n"
+            + (
+                "PR-wide navigation only; these paths/ranges/symbols are not assessment targets.\n"
+                + present_pr_overview(block.overview)
+                if shown
+                else compact_overview(block.overview)
+            ),
             "## Source relationship navigation (not evidence)\n"
             + ((shown.navigation if shown else block.navigation) or "(none collected)"),
             "## Units\nAllowed IDs/target scopes; each JSON row is "
@@ -569,6 +575,10 @@ class HypothesisGenerator:
             f"## Required assessments ({len(block.units)})\n"
             f"New candidate allowance this block: {allowance}. Assess every Units row using the output contract."
         )
+        if shown:
+            sections[-1] += "\nAllowed unit_id values for this block (copy exactly; no others): " + json.dumps(
+                [unit.id for unit in block.units], ensure_ascii=False, separators=(",", ":")
+            )
         rendered = "\n\n".join(sections)
         return render_source_aliases(rendered, aliases) if ledger.protocol_version >= 4 else rendered
 
@@ -814,9 +824,13 @@ class HypothesisGenerator:
         ):
             return False
         facts = behavior.get("source_facts")
+        # A resource unit can contain several distinct before/after pairs.
+        # Short v4 refs need bounded metadata, not the old four-quote ceiling;
+        # every fact still passes the same source and target checks below.
+        max_facts = 12 if protocol_version >= 4 else 4
         if (
             not isinstance(facts, list)
-            or not 1 <= len(facts) <= 4
+            or not 1 <= len(facts) <= max_facts
             or not all(block.source_matches(fact) for fact in facts)
         ):
             return False

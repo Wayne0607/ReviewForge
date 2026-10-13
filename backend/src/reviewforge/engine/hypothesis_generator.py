@@ -46,7 +46,12 @@ from reviewforge.engine.discovery import (
     plan_discovery,
     split_discovery,
 )
-from reviewforge.engine.discovery_aliases import expand_response_refs, render_source_aliases, source_aliases
+from reviewforge.engine.discovery_aliases import (
+    expand_response_refs,
+    render_source_aliases,
+    source_aliases,
+    target_source_choices,
+)
 from reviewforge.engine.discovery_output import frame_discovery_output
 from reviewforge.engine.discovery_presentation import present_discovery_block
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
@@ -485,6 +490,7 @@ class HypothesisGenerator:
         self, block: DiscoveryBlock, ledger: HypothesisLedger, allowance: int, guidance: str = ""
     ) -> str:
         shown = present_discovery_block(block) if ledger.protocol_version >= 4 else None
+        aliases = source_aliases(block.source_refs) if shown else {}
         anchors = []
         for unit in block.units:
             target = block.unit_facts.get(unit.id, [])
@@ -502,6 +508,7 @@ class HypothesisGenerator:
                         coordinates,
                         self._unit_responsibilities.get(unit.id, []),
                         change.id if change else "",
+                        *(target_source_choices(block, unit.id, aliases) if shown else []),
                     ],
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -517,12 +524,15 @@ class HypothesisGenerator:
             existing_text = (
                 existing_text[:1_900] + "\n(existing-hypothesis navigation truncated; not proof of coverage)"
             )
+        columns = "unit_id,path,symbol,before_state,LEFT_ranges,RIGHT_ranges,responsibilities,change_id"
+        if shown:
+            columns += ",allowed_changed_before_refs,allowed_after_refs"
         sections = [
             "## PR overview\n" + compact_overview(block.overview),
             "## Source relationship navigation (not evidence)\n"
             + ((shown.navigation if shown else block.navigation) or "(none collected)"),
             "## Units\nAllowed IDs/target scopes; each JSON row is "
-            "[unit_id,path,symbol,before_state,LEFT_ranges,RIGHT_ranges,responsibilities,change_id]. "
+            f"[{columns}]. "
             "Empty ranges mean no target source delivered on that side; "
             "[] responsibilities means general correctness.\n" + "\n".join(anchors),
             "## Changes\n" + (shown.diff_text if shown else compact_source_coordinates(block.diff_text)),
@@ -536,6 +546,14 @@ class HypothesisGenerator:
             "## Unchecked\n" + ("\n".join(block.unchecked) or "(no collected direction omitted)"),
             "## Existing hypotheses\n" + (existing_text or "(none)"),
         ]
+        if shown:
+            sections[2] += (
+                "\nAllowed refs are navigation to the target operation, not completed evidence checks. "
+                "Select relevant refs yourself in behavior.source_facts: at least one from each nonempty "
+                "allowed side. Empty before choices mean no removed before citation is required, not global "
+                "prior absence. Structural change rows have empty choices and still need their separate "
+                "change_facts and consumer-source checks."
+            )
         if block.change_text:
             sections.insert(
                 3, "## Structural changes (typed facts; not source lines or Observations)\n" + block.change_text
@@ -552,11 +570,7 @@ class HypothesisGenerator:
             f"New candidate allowance this block: {allowance}. Assess every Units row using the output contract."
         )
         rendered = "\n\n".join(sections)
-        return (
-            render_source_aliases(rendered, source_aliases(block.source_refs))
-            if ledger.protocol_version >= 4
-            else rendered
-        )
+        return render_source_aliases(rendered, aliases) if ledger.protocol_version >= 4 else rendered
 
     async def _run_discovery(
         self,

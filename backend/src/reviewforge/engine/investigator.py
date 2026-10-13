@@ -16,11 +16,12 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from itertools import groupby, zip_longest
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from pydantic import create_model
 
 from reviewforge.core.change_manifest import is_verified_rename, render_change_fact
 from reviewforge.core.json_output import extract_json_value
@@ -330,7 +331,15 @@ class Investigator:
                 coroutine=find_definition, name="find_definition", description="按符号名查找其定义（含签名与上下文）"
             ),
             StructuredTool.from_function(
-                coroutine=find_callers, name="find_callers", description="查找某符号的调用位置"
+                coroutine=find_callers,
+                name="find_callers",
+                description=(
+                    "Find direct textual symbol(...) calls; qualified Java also checks bound owners. "
+                    "Does not resolve aliases, route/property bindings or JSX. Empty results do not prove "
+                    "no consumers. Use grep on already observed symbols/references, then read_file for bindings."
+                    if self._protocol_version >= 4
+                    else "查找某符号的调用位置"
+                ),
             ),
             StructuredTool.from_function(
                 coroutine=read_diff,
@@ -338,21 +347,40 @@ class Investigator:
                 description="读取 PR before/after diff；可用 start/end RIGHT 行窗口定位 hunk，保留删除行与上下文",
             ),
         ]
-        if (
-            self._protocol_version >= 3
-            and self._state is not None
-            and any(is_verified_rename(change, self._state.head_sha) for change in self._state.file_changes.values())
-        ):
+        verified_paths = (
+            tuple(
+                sorted(
+                    change.path
+                    for change in self._state.file_changes.values()
+                    if is_verified_rename(change, self._state.head_sha)
+                )
+            )
+            if self._protocol_version >= 3 and self._state is not None
+            else ()
+        )
+        if verified_paths:
 
             async def read_change(path: str) -> str:
                 return await self._run_tool("read_change", {"path": path})
 
+            schema_options = {}
+            description = (
+                "Read verified PR rename metadata bound to the comparison base and head. "
+                "This proves paths and blob identity, not consumer compatibility or runtime behavior."
+            )
+            if self._protocol_version >= 4:
+                # The set belongs to this pinned PR, not just this candidate.
+                # Keep all verified renames available as possible counterevidence.
+                schema_options["args_schema"] = create_model(
+                    "ReadVerifiedChangeInput", path=(Literal[verified_paths], ...)
+                )
+                description += " Only the enumerated paths are valid; use read_diff for other textual changes."
             tools.append(
                 StructuredTool.from_function(
                     coroutine=read_change,
                     name="read_change",
-                    description="Read verified PR rename metadata bound to the comparison base and head. "
-                    "This proves paths and blob identity, not consumer compatibility or runtime behavior.",
+                    description=description,
+                    **schema_options,
                 )
             )
         return tools
@@ -407,6 +435,7 @@ class Investigator:
             logger.warning("investigator tool %s failed: %s (%s:%d)", name, type(exc).__name__, origin, origin_line)
             text = ""
             failed = True
+        original_chars = len(text)
         text = text[:_TOOL_RESULT_CHARS]
         if failed:
             status = "error"
@@ -445,6 +474,19 @@ class Investigator:
             )
             if diff_navigation:
                 self._progress.append({"phase": "diff-navigation", "observation_id": observation.id, **diff_navigation})
+            if self._protocol_version >= 4 and status == "success" and original_chars > len(excerpt):
+                # Preserve the warning when v4 rebuilds chat and on checkpoint
+                # restore. Only sizes survive; omitted source is not evidence.
+                self._progress.append(
+                    {
+                        "phase": "observation-window",
+                        "observation_id": observation.id,
+                        "original_chars": original_chars,
+                        "saved_chars": len(excerpt),
+                        "truncated": True,
+                        "next_action": "Use a narrower read_file/read_diff range or more specific search.",
+                    }
+                )
         return self._observation_reply(observation, text=text)
 
     def _observation_reply(self, observation: Observation, *, text: str | None = None) -> str:
@@ -1208,6 +1250,19 @@ class Investigator:
             record = {"id": observation.id, "tool": observation.tool, "status": observation.status}
             if observation.path:
                 record["path"] = observation.path
+            if self._protocol_version >= 4:
+                window = next(
+                    (
+                        entry
+                        for entry in reversed(self._progress)
+                        if entry.get("phase") == "observation-window" and entry.get("observation_id") == observation.id
+                    ),
+                    None,
+                )
+                if window is not None:
+                    record["source_window"] = {
+                        key: window[key] for key in ("original_chars", "saved_chars", "truncated", "next_action")
+                    }
             if observation.status == "success":
                 record.update(
                     {
@@ -1240,6 +1295,12 @@ class Investigator:
             # Queries preserve both positive navigation and failed/repeated-read
             # state. Only successful named evidence remains citable.
             record["query"] = observation.query
+            if observation.tool == "find_callers":
+                record["lookup_scope"] = {
+                    "kind": "direct-call-expression",
+                    "indirect_references_resolved": False,
+                    "not_found_means": "No direct match in this lookup; consumers may exist.",
+                }
         packet["context_navigation"] = context_navigation(
             hypothesis,
             self._changeset,

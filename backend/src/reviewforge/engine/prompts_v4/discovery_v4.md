@@ -31,6 +31,10 @@ tests or browse advisories. Questions must fit these capabilities.
   AND its removed/replaced before operation. This applies equally to hypotheses
   and clean assessments. For pure additions omit the unchanged before ref.
   Other-file/context refs can supplement, never replace target changed evidence.
+  Units lists eligible before/after refs to avoid guessing ownership. Select
+  relevant operations from both nonempty lists; these lists do not select facts
+  for you or establish that a unit is clean. Use one rN per source_ref, never a
+  joined label such as "r3:1-120 r8:121-240".
 - Describe only supplied local changes. absent-new-declaration proves that
   visible added declaration; absent-before-in-delivered-source or unresolved
   correspondence does not prove global prior absence. Never invent before code.

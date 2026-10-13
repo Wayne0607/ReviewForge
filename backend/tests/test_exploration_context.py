@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import asdict, replace
 
 import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
 from reviewforge.engine.exploration_context import context_navigation
 from reviewforge.engine.hypothesis import Hypothesis, Mechanism, Observation, Site
-from reviewforge.engine.investigator import Investigator
+from reviewforge.engine.investigator import Investigator, _evidence_segments, build_workspace_executor
 from reviewforge.engine.request_budget import estimate_request
 
 
@@ -214,3 +215,196 @@ async def test_old_protocols_do_not_use_compact_exploration(monkeypatch, protoco
     await Investigator(RecordingLLM(), executor, protocol_version=protocol, max_steps=1).investigate(
         candidate(), state(), context()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("symbol", "reference"),
+    [
+        ("handler", "const dispatch = handler; dispatch();"),
+        ("addGuests", "const mutation = trpc.viewer.bookings.addGuests.useMutation({});"),
+        ("AddGuestsDialog", "export const Screen = () => <AddGuestsDialog />;"),
+    ],
+)
+async def test_direct_caller_miss_keeps_indirect_references_reachable_by_grep(tmp_path, symbol, reference):
+    from reviewforge.tools.workspace import PRHeadWorkspace, WorkspaceInfo
+
+    (tmp_path / "handler.ts").write_text(f"export function {symbol}() {{ return true; }}\n", encoding="utf-8")
+    (tmp_path / "consumer.tsx").write_text(reference + "\n", encoding="utf-8")
+    workspace = PRHeadWorkspace(
+        WorkspaceInfo("o/r", "o/r", "head", tmp_path, 2, 0, "fixture", False, "tarball"),
+        None,
+        fallback_repo="o/r",
+        temp_dir=tmp_path,
+    )
+    worker = Investigator(None, build_workspace_executor(workspace, state()), protocol_version=4)
+    worker._state = state()
+    await worker._run_tool("find_callers", {"symbol": symbol})
+    missing = worker._observations[0]
+    assert missing.status == "not_found"
+    assert _evidence_segments(missing) == {}
+    entry = json.loads(worker._exploration_chat(candidate(), ContextPack())[1].content)["observations"][0]
+    assert entry["lookup_scope"]["kind"] == "direct-call-expression"
+    assert entry["lookup_scope"]["indirect_references_resolved"] is False
+    assert entry["lookup_scope"]["not_found_means"] == "No direct match in this lookup; consumers may exist."
+    assert "evidence" not in entry
+
+    await worker._run_tool("grep", {"pattern": symbol, "glob": "consumer.tsx", "max_hits": 10})
+    hit = worker._observations[1]
+    assert hit.status == "success"
+    assert f"consumer.tsx:1: {reference}" in hit.excerpt
+    await worker._run_tool("read_file", {"path": "consumer.tsx", "start": 1, "end": 1})
+    assert worker._observations[2].excerpt == reference + "\n"
+    assert len(worker._observations) == 3  # No automatic alias lookup or fabricated caller read.
+    invalid = worker._finalize(
+        {
+            "assessment": None,
+            "counterevidence": {"premise": "trigger", "statement": "No callers exist.", "evidence": ["obs_0:e1"]},
+            "reason": "No callers exist.",
+            "severity": "error",
+        },
+        candidate(),
+        {"check.ts"},
+        steps=1,
+    )
+    assert invalid.verdict == "unknown"
+
+
+@pytest.mark.parametrize("protocol", [1, 2, 3, 4])
+def test_caller_tool_scope_is_explicit_only_for_v4(protocol):
+    worker = Investigator(None, executor, protocol_version=protocol)
+    description = next(tool.description for tool in worker._build_tools() if tool.name == "find_callers")
+    if protocol < 4:
+        assert description == "查找某符号的调用位置"
+    else:
+        assert "direct textual" in description
+        assert "qualified Java" in description
+        assert "JSX" in description
+        assert "grep" in description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["grep", "find_definition", "read_file"])
+async def test_compact_packets_preserve_recorded_truncation_without_unsaved_evidence(tool):
+    original = "saved source\n" * 600 + "UNSAVED_FINAL_LINE\n"
+
+    async def long_result(name, args):
+        return original
+
+    worker = Investigator(None, long_result, protocol_version=4)
+    worker._state = state()
+    args = {"path": "source.ts", "start": 1, "end": 601} if tool == "read_file" else {"symbol": "source"}
+    await worker._run_tool(tool, args)
+    source = worker._observations[0]
+    snapshot = asdict(source)
+    packet = json.loads(worker._exploration_chat(candidate(), ContextPack())[1].content)
+    window = packet["observations"][0]["source_window"]
+    assert window["truncated"] is True
+    assert window["original_chars"] == len(original)
+    assert window["saved_chars"] == len(source.excerpt)
+    assert "narrower" in window["next_action"]
+    assert "UNSAVED_FINAL_LINE" not in json.dumps(packet)
+    assert asdict(source) == snapshot
+    closing = json.loads(worker._closing_chat([], 24_000, hypothesis=candidate())[1].content)
+    assert closing["observations"][0]["source_window"] == window
+
+    # This is the same serialization boundary used by persisted hypotheses.
+    saved = candidate()
+    saved.observations = worker._observations
+    saved.investigation_progress = worker._progress
+    restored = Hypothesis.from_dict(saved.to_dict())
+    resumed = Investigator(None, long_result, protocol_version=4)
+    resumed._state = state()
+    resumed._observations = restored.observations
+    resumed._progress = restored.investigation_progress
+    later = json.loads(resumed._exploration_chat(restored, ContextPack())[1].content)
+    assert later["observations"][0]["source_window"] == window
+    assert later["observations"][0]["evidence"] == packet["observations"][0]["evidence"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", [3, 4])
+async def test_truncation_metadata_does_not_change_old_protocol_or_invent_historical_sizes(protocol):
+    worker = Investigator(None, executor, protocol_version=protocol)
+    worker._state = state()
+    worker._observations = [observation(text="x" * 1200)]
+    before = worker._evidence_packet(candidate())
+    assert "source_window" not in before["observations"][0]
+    if protocol == 3:
+
+        async def long_result(name, args):
+            return "x" * 2000
+
+        worker._executor = long_result
+        await worker._run_tool("find_definition", {"symbol": "target"})
+        assert not any(entry.get("phase") == "observation-window" for entry in worker._progress)
+
+
+def verified_rename(path):
+    from reviewforge.core.change_manifest import FileChange, file_change_id
+
+    change = FileChange(
+        repo="o/r",
+        head_repo="o/r",
+        path=path,
+        previous_path="old/" + path,
+        status="renamed",
+        base_sha="b" * 40,
+        head_sha="a" * 40,
+        comparison_base_sha="c" * 40,
+        base_blob_sha="d" * 40,
+        head_blob_sha="d" * 40,
+        base_mode="100644",
+        head_mode="100644",
+        base_type="blob",
+        head_type="blob",
+        patch_state="verified-no-text-change",
+        source="github-pr-files+git-tree",
+    )
+    return replace(change, id=file_change_id(change))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 2])
+async def test_v4_read_change_schema_keeps_all_verified_paths_for_ordinary_candidates(count):
+    from reviewforge.core.change_manifest import is_verified_rename
+
+    current = state()
+    current.head_sha = "a" * 40
+    renames = [verified_rename(f"data/{i}.json") for i in range(count)]
+    invalid = replace(verified_rename("unverified.json"), patch_state="absent-unverified")
+    current.file_changes = {change.path: change for change in [*renames, invalid]}
+    current.files_changed = ["check.ts", *current.file_changes]
+    assert candidate().change_anchor is None
+    assert all(is_verified_rename(change, current.head_sha) for change in renames)
+    worker = Investigator(None, build_workspace_executor(None, current), protocol_version=4)
+    worker._state = current
+    tool = next(tool for tool in worker._build_tools() if tool.name == "read_change")
+    property_schema = convert_to_openai_tool(tool)["function"]["parameters"]["properties"]["path"]
+    allowed = property_schema.get("enum", [property_schema.get("const")])
+    assert set(allowed) == {change.path for change in renames}
+    assert "read_diff" in tool.description
+    for change in renames:
+        assert tool.args_schema.model_validate({"path": change.path}).path == change.path
+    for bad_path in ("check.ts", invalid.path, renames[0].previous_path):
+        with pytest.raises(ValidationError):
+            tool.args_schema.model_validate({"path": bad_path})
+    # Native execution still checks trusted state independently of model schema.
+    with pytest.raises(ValueError, match="has not been verified"):
+        await worker._executor("read_change", {"path": "check.ts"})
+    assert renames[0].path in await worker._executor("read_change", {"path": renames[0].path})
+
+
+def test_v3_read_change_schema_stays_unrestricted_and_v4_requires_verified_paths():
+    current = state()
+    current.head_sha = "a" * 40
+    change = verified_rename("data/new.json")
+    current.file_changes = {change.path: change}
+    worker = Investigator(None, executor, protocol_version=3)
+    worker._state = current
+    tool = next(tool for tool in worker._build_tools() if tool.name == "read_change")
+    assert tool.args_schema.model_validate({"path": "check.ts"}).path == "check.ts"
+    assert "enum" not in tool.args_schema.model_json_schema()["properties"]["path"]
+    worker._protocol_version = 4
+    current.file_changes = {change.path: replace(change, patch_state="absent-unverified")}
+    assert "read_change" not in [tool.name for tool in worker._build_tools()]

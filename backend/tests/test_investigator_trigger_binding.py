@@ -12,7 +12,8 @@ from langchain_core.messages import AIMessage
 from test_investigator_typed_closure import Model, candidate, close, submission, tool_response, wire_submission, worker
 
 from reviewforge.engine.context_pack import ContextPack
-from reviewforge.engine.hypothesis import Observation
+from reviewforge.engine.hypothesis import Hypothesis, Observation
+from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.openai_compat import ReasoningContentChatOpenAI
 from reviewforge.engine.request_budget import (
     BudgetedChatLLM,
@@ -71,6 +72,53 @@ async def test_positive_counterevidence_refutes_original_trigger_without_rewriti
     }
     result = await close(worker(Model(reply=tool_response(wire_submission(raw)))))
     assert result.verdict == "refuted" and result.counterevidence.premise == "trigger"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("premise", ["mechanism", "impact"])
+@pytest.mark.parametrize("saved_source", [True, False])
+async def test_same_case_bad_outcome_counterevidence_requires_saved_positive_source(premise, saved_source):
+    # A hand-authored proof tests the existing protocol, not model reasoning.
+    # Original source and trigger stay unchanged; this does not amend the run.
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/investigator_unbound_trigger.json").read_text(encoding="utf-8")
+    )
+    value = worker(Model())
+    missing = value._observations[-1]
+    value._observations = [Observation(**row) for row in fixture["observations"]] + [missing]
+    value._state.head_sha = fixture["observations"][0]["sha"]
+    hypothesis = Hypothesis.from_dict(fixture["candidate"] | {"source": "test-replay"})
+    source = value._observations[1]
+    reference = next(
+        identity
+        for identity, citation in _evidence_segments(source).items()
+        if "if (!isTeamAdminOrOwner" in citation.quote
+    )
+    raw = submission() | {
+        "assessed_trigger": hypothesis.trigger,
+        "assessment": None,
+        "answer": "The original organizer or attendee case passes this guard.",
+        "reason": "The claimed permission denial does not occur in the original case.",
+        "counterevidence": {
+            "premise": premise,
+            "statement": "An organizer or attendee makes the shown FORBIDDEN condition false.",
+            "evidence": [reference if saved_source else "obs_2:e1"],
+        },
+    }
+    value._llm.reply = tool_response(wire_submission(raw))
+    result = await value._close(
+        value._closing_chat([], 24000, hypothesis=hypothesis),
+        hypothesis,
+        {source.path},
+        token_limit=24000,
+        steps=1,
+    )
+    if saved_source:
+        assert result.verdict == "refuted" and result.counterevidence.premise == premise
+        assert result.counterevidence.evidence[0].quote in source.excerpt
+    else:
+        assert result.verdict == "unknown" and result.outcome == "output-error"
+    assert hypothesis.trigger == fixture["candidate"]["trigger"]
 
 
 @pytest.mark.asyncio

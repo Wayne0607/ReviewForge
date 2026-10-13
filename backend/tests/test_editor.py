@@ -229,7 +229,7 @@ def test_render_review_body_lists_summary_and_unknown() -> None:
 
     assert "<details>" in body
     assert "one-line summary" in body
-    assert "could not be confirmed within budget" in body
+    assert "**Unconfirmed**" in body
     assert "claim 1" in body  # UNKNOWN claim text resolved from the ledger
 
 
@@ -239,7 +239,37 @@ def test_render_review_body_uses_fixed_zh_wording() -> None:
 
     body = render_review_body(publication, ledger, output_language="zh-CN")
 
-    assert "未能在预算内确认" in body
+    assert "**未确认**" in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome,language",
+    [
+        (None, "en"),  # Historical ledgers did not record a typed cause.
+        ("insufficient-evidence", "zh-CN"),
+        ("budget-exhausted", "en"),
+        ("provider-error", "en"),
+        ("output-error", "zh-CN"),
+    ],
+)
+async def test_persisted_unknown_uses_neutral_summary_without_guessing_a_cause(outcome, language) -> None:
+    raw = _hyp(1, Mechanism.NULL_PATH, "f", "warning", "none").to_dict()
+    raw.update(status="unknown", verdict_reason="Confirmed contract mismatch")
+    if outcome is None:
+        raw.pop("investigation_outcome", None)
+    else:
+        raw["investigation_outcome"] = outcome
+    item = Hypothesis.from_dict(raw)
+    ledger = _ledger(item)
+    ledger.protocol_version = 4
+    publication = await Editor(_ScriptedLLM(responses=[])).run(ledger, None)
+    body = render_review_body(publication, ledger, output_language=language)
+    assert publication.comments == [] and publication.summary_items == []
+    assert publication.unknown_ids == [item.id]
+    assert ("**Unconfirmed**" if language == "en" else "**未确认**") in body
+    assert item.claim in body and item.verdict_reason not in body
+    assert "budget" not in body and "预算" not in body
 
 
 def _raw_comment(*ids: str, line: int = 1, body: str = "Where: a.py:1") -> dict:

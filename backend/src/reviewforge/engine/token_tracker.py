@@ -17,6 +17,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.outputs import ChatResult
 
 from reviewforge.core.database import Database
+from reviewforge.engine.request_budget import _actual_usage
 
 logger = logging.getLogger(__name__)
 
@@ -90,25 +91,29 @@ class TrackedChatLLM(BaseChatModel):
     ) -> ChatResult:
         result = await self._inner._agenerate(messages, stop, run_manager, **(self._request_options | kwargs))
 
-        # Extract token usage from LangChain response
+        # A valid response may omit usage or expose token_usage=None. Preserve
+        # its content without fabricating a zero-cost receipt: the physical
+        # budget wrapper retains the unknown reservation independently.
+        total_tokens = _actual_usage(result)
+        if total_tokens is None:
+            return result
+
         usage = result.llm_output or {}
-        token_usage = usage.get("token_usage", {})
+        token_usage = usage.get("token_usage") or {}
 
         prompt_tokens = token_usage.get("prompt_tokens", 0)
         completion_tokens = token_usage.get("completion_tokens", 0)
-        total_tokens = token_usage.get("total_tokens", prompt_tokens + completion_tokens)
         model = usage.get("model_name", "")
 
         # Also check usage_metadata (newer LangChain versions). _agenerate returns a
         # ChatResult whose .generations is a flat list[ChatGeneration], not nested —
         # so index once. (Indexing twice crashed on any provider that omits token_usage.)
-        if total_tokens == 0 and result.generations:
+        if not token_usage and result.generations:
             msg = getattr(result.generations[0], "message", None)
             if msg and hasattr(msg, "usage_metadata") and msg.usage_metadata:
                 um = msg.usage_metadata
                 prompt_tokens = um.get("input_tokens", prompt_tokens)
                 completion_tokens = um.get("output_tokens", completion_tokens)
-                total_tokens = um.get("total_tokens", prompt_tokens + completion_tokens)
 
         receipt = {
             "prompt_tokens": prompt_tokens,

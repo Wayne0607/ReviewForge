@@ -4,6 +4,18 @@
 
 ## 当前修订：调查改变触发条件的根因
 
+修订已提交 `867e4801e74b7185af5310e2628463626f1cb01c`，推送 dev 且 [CI 通过](https://github.com/Wayne0607/ReviewForge/actions/runs/38399491795)。新冻结收尾诊断 `.reviewforge/benchmarks/v4-bound-trigger-closure-867e480-20261013-204416/` 正常完成：1 次物理请求、3094 实报、未知/在途/提供方错误/准入拒绝均 0。原 OPEN 候选和同样两条 Observation 不变，重读原 query 后 SHA/状态/范围/原文/摘要完全相同；没有补人工反证或消费者链、没有 GEN/探索/独立核验/发布。原任务已用 3139 未重置，本段只在剩余 8861 中运行，PR 账从 17474 续接到 20568。
+
+新工具调用逐字声明原触发条件，校验 matched；结果为 **unknown / insufficient-evidence**，不是上次错误 confirmed。模型正文明确承认组织者或参会者能通过，但没有提交原案例所称拒绝的正向反证，仍在 answer 开头写“Confirmed contract mismatch”并由变量名解释意图。程序没有把这段措辞升级成裁决。这次输出没有错误确认，**未证明已正确反驳，也未证明发现或完整质量通过**；精确字段绑定的语义局限在真实实录中依然存在。
+
+独立 audit SHA256 `a71da6cc29d2e78e5f253912127c6703b22d8a352bb6adcdc9a6cae1018303c2` 核实 trace/DB/receipt/各层预算、原输入/历史/源码 hash、实际工具与触发绑定一致，原错误确认与原 helper 不变。Job 约 39.87 秒，峰值 1067126784 bytes，原 2 GiB/CPU10%/reserve2 GiB/disk16 GiB 限制保持。累计实报 2416664 + 历史未知预占 368868 = 2785532；追加 300000 已记账 294031，余 5969。历史预占不是账单。未重新采样来追求有利裁决，未完成两 PR/10 PR/holdout/Qodo 对比或正式验收；main 保持原生产版本。
+
+只读追踪确认 `answer` 不写入 Hypothesis 账本、不会进入 v4 后续证据包；unknown 不能被正文措辞或 reason 升级为 confirmed，发布仍限定结构化 confirmed 与独立许可。`ledger_recall` 的 unknown 候选覆盖统计与只选 confirmed 的 `confirmed_recall` 分开，不是质量确认数。原触发输入可以发生而权限拒绝不发生，因此恰当反证是 mechanism/impact；不是把可发生的 trigger 判为不存在。后续仅修订这一 v4 指引及未确认摘要的错误预算归因，不从正文关键词推导新裁决，原真实 unknown 仍保持。
+
+真实 SDK 离线重放另复现 usage 缺失/null 导致追踪器 `None.get`，以及空 usage 生成错误的零用量已知回执。两问回溯：`361dc42` 的追踪假设键存在即为字典，`bcc7a9c` 只修过 generations 形状；SDK 当前可能返回 `token_usage=None`，原假设失效。修复仅在追踪器复用物理预算的真实用量判定：未知用量原样返回已收到的 ChatResult，不伪造已知零费用、不写已知 receipt/DB，物理任务/PR 未知预占保持。11 项新测试与相关 72 项通过；真实 SDK+Budgeted+Tracked+Retry 离线请求验证缺失/null 只调用一次、原工具参数字节不变、有用量正常记账。没有新模型消费，该修复未混入上面的 `867e480` 实跑。
+
+最新增量的全量回归 `2657 passed, 1 skipped, 6 existing warnings`（65.25 秒），Ruff / 270 文件 format 通过。未确认摘要与反证指引相关 160 项通过；真实保存源码引用的 mechanism/impact 正反例只验证协议与引证能力，手写模型 stub 不是质量提升证据。下一收尾验证只测这一新指引，额度同时扣两次已用 `3139+3094=6233`，更紧原 12000 任务余 5767、外层余 5969，原自然任务 16000 余 9767；无新步骤或人工事实，不混淆历史 unknown 与新结果。
+
 固定 `9c8cdbe` 的三单元实际路由诊断 `.reviewforge/benchmarks/v4-discovery-routing-9c8cdbe-20261013-181750/` 正常结束：1 次物理请求、14335 实报、未知/在途/提供方错误 0；完整固定 head 源码 5823 文件。标准 planner 把原首块前两个单元和原权限单元合成一个多单元文本块，3/3 记录有效（1 个 OPEN 候选、2 个 no_issue），没有 unresolved；因此验证了该多单元路径，未真实验证修订后单单元 native 路径。原 report 的 partial_reasons 仍含旧的“12 of 18”文案，实际范围为 3/18；保留错误原文，不改原实录。Job 约 37.6 秒、峰值 1097842688 bytes；独立 audit SHA256 `52a0a550a55fefb488d68836ef95148983371bc666a199dfc291db675c4e742f`。原自然调查因外层余额与收尾预留无法承载原任务额度而 policy-deferred，未取证。
 
 随后只对这个真实新候选做首次调查，冻结同代码/原 head/原 OPEN 候选，新增独立诊断根 `.reviewforge/benchmarks/v4-saved-investigation-9c8cdbe-20261013-183538/`。它没有重开旧已裁决候选；诊断任务主动缩小为 3 步/12000，PR 账续接发现阶段 14335。实际 1 次请求、3139 实报、未知/在途/提供方错误 0。只执行 bootstrap 的 read_diff/read_file 两条观察，探索输入加必要收尾预留无法放入额度，直接收尾；没有实际使用新增引用导航或独立核验/发布。

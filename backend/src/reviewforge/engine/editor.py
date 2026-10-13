@@ -722,8 +722,9 @@ def render_review_body(publication: Publication, ledger: HypothesisLedger, *, ou
             lines.append(f"- {one_line}\n")
 
     if publication.unknown_ids:
-        wording = "could not be confirmed within budget" if english else "未能在预算内确认"
-        lines.append(f"\n**{'Unconfirmed' if english else '未能确认'}**（{wording}）\n")
+        # UNKNOWN also includes missing evidence and execution failures; old
+        # ledgers may not record an outcome. Do not invent a budget cause.
+        lines.append(f"\n**{'Unconfirmed' if english else '未确认'}**\n")
         for identity in publication.unknown_ids:
             lines.append(f"- {claims_by_id.get(identity, identity)}\n")
 

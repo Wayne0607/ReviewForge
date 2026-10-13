@@ -685,8 +685,10 @@ class Investigator:
                 "must be one complete JSON object with assessed_trigger copied exactly from packet.candidate.trigger. "
                 "Preserve every condition and negation; evaluate only that original case. "
                 "Do not combine a final result with progress or source tool calls. Tool queries and progress are not "
-                "final results and need no assessed_trigger. If positive source disproves the original case, "
-                "return trigger counterevidence, not a confirmed narrower or opposite case. Variable names and "
+                "final results and need no assessed_trigger. Use trigger counterevidence only when positive source "
+                "shows the original input or preconditions cannot occur. If that input can occur but the claimed "
+                "bad behavior cannot, give mechanism or impact counterevidence with source. Do not confirm a "
+                "narrower or opposite case. Variable names and "
                 "absence of a contrary policy do not establish requirements; missing contracts remain UNKNOWN."
             )
         return prompt
@@ -1702,7 +1704,9 @@ class Investigator:
                 "never JSON-encoded strings. No verdict, confidence or surrounding prose.\n"
                 "assessed_trigger must copy packet.candidate.trigger exactly, including every condition and negation. "
                 "Evaluate that original case only; do not replace it with a repaired, narrower or opposite case. "
-                "If saved positive source disproves its trigger, submit trigger counterevidence for the original case. "
+                "Use trigger counterevidence only when saved positive source shows the original input or "
+                "preconditions cannot occur. If that input can occur but the claimed bad behavior cannot, "
+                "submit mechanism or impact counterevidence with source for the original case. "
                 "A variable name does not establish required behavior, and absence of a contrary policy is not proof "
                 "of a requirement. Missing contract evidence remains UNKNOWN.\n"
                 "assessment_comparison: conflict confirms, compatible refutes, unresolved remains unknown; "

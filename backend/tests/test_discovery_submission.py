@@ -8,7 +8,7 @@ import json
 import httpx
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field, ValidationError
@@ -18,17 +18,25 @@ from test_structural_discovery_v3 import Workspace, inputs
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.discovery import DiscoveryLimits, plan_discovery
-from reviewforge.engine.discovery_aliases import source_aliases, target_site_choices, target_source_choices
+from reviewforge.engine.discovery_aliases import (
+    expand_response_refs,
+    source_aliases,
+    target_site_choices,
+    target_source_choices,
+)
 from reviewforge.engine.discovery_submission import (
+    _record_payload,
     bind_discovery_submission,
     discovery_submission_tools,
     parse_discovery_submission,
 )
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.hypothesis_generator import (
+    HypothesisGenerationResult,
     HypothesisGenerator,
     _discovery_output_floor,
     _discovery_request_plan,
+    _right_lines_by_path,
 )
 from reviewforge.engine.openai_compat import ReasoningContentChatOpenAI
 from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
@@ -53,7 +61,7 @@ def assessment(block, aliases, item=None):
         "after": "The operation returns the replacement value.",
         "observable": "The caller receives the replacement value for the same input.",
         "source_refs": [*left[:1], *right[:1]],
-        "change_fields": [],
+        **({"change_fields": []} if block.structural_changes else {}),
     }
 
 
@@ -88,6 +96,32 @@ async def run_response(response, *, protocol=4, count=2):
     return result, ledger, llm, block, aliases
 
 
+async def consume_native_response(response, *, count=2):
+    """Exercise the multi-call parser independently of production wire routing.
+
+    Production uses native tools only for a single target. The collector itself
+    still validates multiple calls/targets, complete prefixes and global errors.
+    The scripted request here is solely a parser fixture, not a routed GEN pass.
+    """
+    state, _, block, aliases = fixture(count)
+    llm = ScriptedLLM(responses=[response])
+    tools = discovery_submission_tools(block, aliases)
+    receipt = await bind_discovery_submission(llm, tools).ainvoke([HumanMessage(content="Native collector fixture")])
+    framed, errors = parse_discovery_submission(receipt, tools, block, aliases)
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=4)
+    record = {
+        "units": {},
+        "submission_errors": errors,
+        "output_framing": {"complete": framed.complete, "recovery": framed.recovery},
+    }
+    ledger.discovery_blocks[f"generator:{block.id}"] = record
+    result = HypothesisGenerationResult()
+    await HypothesisGenerator(llm)._consume_discovery(
+        expand_response_refs(framed.payload, aliases), block, ledger, result, _right_lines_by_path(state), 12, record
+    )
+    return result, ledger, llm, block, aliases
+
+
 def test_flat_schemas_require_all_fields_and_keep_provider_syntax_separate_from_membership():
     _, _, block, aliases = fixture()
     saved = copy.deepcopy(block)
@@ -96,6 +130,7 @@ def test_flat_schemas_require_all_fields_and_keep_provider_syntax_separate_from_
     for tool in tools:
         parameters = tool.args_schema.model_json_schema()
         assert parameters["additionalProperties"] is False
+        assert "change_fields" not in parameters["properties"]
         assert set(parameters["required"]) == set(parameters["properties"])
         assert all(field["type"] in {"string", "array"} for field in parameters["properties"].values())
         assert all(
@@ -123,6 +158,52 @@ def test_flat_schemas_require_all_fields_and_keep_provider_syntax_separate_from_
     assert block == saved
     assert set(tools[-1].args_schema.model_fields) == {"unit_id", "reason"}
     assert "refutation" not in tools[1].args_schema.model_fields
+
+
+@pytest.mark.parametrize("name", ["submit_hypothesis", "submit_no_issue"])
+@pytest.mark.parametrize("old_fields", [[], ["path"], ["previous_path", "path"]])
+def test_text_records_reject_old_or_invented_structural_fields_instead_of_ignoring_them(name, old_fields):
+    _, _, block, aliases = fixture(1)
+    args = (hypothesis if name == "submit_hypothesis" else assessment)(block, aliases)
+    tools = discovery_submission_tools(block, aliases)
+    schema = next(tool.args_schema for tool in tools if tool.name == name)
+    schema.model_validate(args)
+    args["change_fields"] = old_fields
+    with pytest.raises(ValidationError):
+        schema.model_validate(args)
+    framed, errors = parse_discovery_submission(
+        AIMessage(content="", tool_calls=[call(name, args)]), tools, block, aliases
+    )
+    assert errors and not framed.complete and not any(framed.payload.values())
+    with pytest.raises(ValueError):
+        _record_payload(name, args, block, aliases)
+
+
+def test_mixed_block_still_requires_explicit_empty_structural_selection_for_text_target():
+    state, changes, pack, _ = inputs(workspace=Workspace(updated=True), protocol=4)
+    text_unit = unit("service.py")
+    changes.units.append(text_unit)
+    state.file_diffs[text_unit.path] = diff()
+    block = plan_discovery(changes, pack, state.file_diffs, limits=DiscoveryLimits(), file_changes=state.file_changes)[
+        0
+    ]
+    assert block.structural_changes and text_unit in block.units
+    aliases = source_aliases(block.source_refs)
+    tools = discovery_submission_tools(block, aliases)
+    args = assessment(block, aliases, text_unit)
+    assert args["change_fields"] == []
+    framed, errors = parse_discovery_submission(
+        AIMessage(content="", tool_calls=[call("submit_no_issue", args)]), tools, block, aliases
+    )
+    assert framed.complete and not errors and len(framed.payload["no_issue_units"]) == 1
+    for invalid in (
+        args | {"change_fields": ["path"]},
+        {key: value for key, value in args.items() if key != "change_fields"},
+    ):
+        framed, errors = parse_discovery_submission(
+            AIMessage(content="", tool_calls=[call("submit_no_issue", invalid)]), tools, block, aliases
+        )
+        assert errors and not framed.complete and not framed.payload["no_issue_units"]
 
 
 def test_provider_schema_does_not_repeat_large_source_alias_inventories():
@@ -197,7 +278,7 @@ async def test_multiple_same_name_calls_and_deferred_keep_distinct_candidates_wi
             call("submit_no_issue", assessment(block, aliases, block.units[1]), "clean"),
         ],
     )
-    result, ledger, llm, _, _ = await run_response(response)
+    result, ledger, llm, _, _ = await consume_native_response(response)
     assert result.accepted == 2 and len(llm.calls) == 1
     assert all(item.status.value == "open" for item in ledger.items.values())
     assert first["unit_id"] in ledger.unresolved_units
@@ -257,7 +338,7 @@ async def test_bad_native_record_retains_valid_candidate_and_never_repairs_or_cl
             call("submit_no_issue", assessment(block, aliases, block.units[1]), "clean"),
         ],
     )
-    result, ledger, llm, _, _ = await run_response(response)
+    result, ledger, llm, _, _ = await consume_native_response(response)
     assert result.accepted == 1 and len(llm.calls) == 1
     assert set(ledger.unresolved_units) == {item.id for item in block.units}
     assert not ledger.no_issue_units
@@ -278,7 +359,7 @@ async def test_raw_truncated_tail_preserves_only_complete_call_and_not_text_fall
         invalid_tool_calls=[{"name": "submit_no_issue", "args": '{"unit_id":', "id": "cut", "error": "truncated"}],
         additional_kwargs={"reviewforge_raw_tool_calls": [raw, tail]},
     )
-    result, ledger, llm, _, _ = await run_response(response)
+    result, ledger, llm, _, _ = await consume_native_response(response)
     assert result.accepted == 1 and not ledger.no_issue_units and len(llm.calls) == 1
     assert len(ledger.unresolved_units) == len(block.units)
 
@@ -294,7 +375,7 @@ async def test_length_finish_cannot_make_complete_native_clean_calls_prove_full_
         ],
         response_metadata={"finish_reason": "length"},
     )
-    _, ledger, llm, _, _ = await run_response(response)
+    _, ledger, llm, _, _ = await consume_native_response(response)
     assert not ledger.no_issue_units and len(ledger.unresolved_units) == len(block.units)
     assert len(llm.calls) == 1
 
@@ -329,7 +410,7 @@ async def test_v3_still_uses_text_and_one_original_format_repair():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selection", [[], ["path"], ["previous_path", "path"]])
+@pytest.mark.parametrize("selection", [None, [], ["path"], ["path", "path"], ["previous_path", "path"]])
 async def test_structural_records_require_explicit_fields_and_real_consumer(selection):
     state, changes, pack, item = inputs(workspace=Workspace(updated=True), protocol=4)
     block = plan_discovery(changes, pack, state.file_diffs, limits=DiscoveryLimits(), file_changes=state.file_changes)[
@@ -346,12 +427,21 @@ async def test_structural_records_require_explicit_fields_and_real_consumer(sele
         "source_refs": [consumer],
         "change_fields": selection,
     }
+    if selection is None:
+        args.pop("change_fields")
+        with pytest.raises(ValueError):
+            _record_payload("submit_no_issue", args, block, aliases)
+    for tool in discovery_submission_tools(block, aliases)[:-1]:
+        schema = tool.args_schema.model_json_schema()
+        assert "change_fields" in schema["required"]
+        assert schema["properties"]["change_fields"]["maxItems"] == 2
     llm = ScriptedLLM(responses=[AIMessage(content="", tool_calls=[call("submit_no_issue", args)])])
     ledger = HypothesisLedger("run", state.head_sha, "digest", protocol_version=4)
     await HypothesisGenerator(llm).run(state, pack, changes, ledger)
-    assert bool(ledger.no_issue_units) == (len(selection) == 2)
-    assert bool(ledger.unresolved_units) == (len(selection) != 2)
-    if len(selection) == 2:
+    valid = selection == ["previous_path", "path"]
+    assert bool(ledger.no_issue_units) == valid
+    assert bool(ledger.unresolved_units) != valid
+    if valid:
         saved = next(iter(ledger.discovery_blocks.values()))["units"][item.id]["behavior"]["change_facts"]
         assert {fact["field"] for fact in saved} == {"previous_path", "path"}
         assert all(fact["change_id"] == state.file_changes[item.path].id for fact in saved)
@@ -378,14 +468,32 @@ class NativeModel(BaseChatModel):
                 "after": "The operation returns the new value.",
                 "observable": "The caller sees the new value.",
                 "source_refs": [*row[8][:1], *row[9][:1]],
-                "change_fields": [],
             }
             calls.append(call("submit_no_issue", args, f"record-{len(calls)}"))
+        content = ""
+        if not kwargs.get("tools"):
+            content = json.dumps(
+                {
+                    "hypotheses": [],
+                    "no_issue_units": [
+                        {
+                            "unit_id": entry["args"]["unit_id"],
+                            "checked": entry["args"]["checked"],
+                            "behavior": {
+                                **{field: entry["args"][field] for field in ("before", "after", "observable")},
+                                "source_facts": [{"source_ref": ref} for ref in entry["args"]["source_refs"]],
+                            },
+                        }
+                        for entry in calls
+                    ],
+                }
+            )
+            calls = []
         return ChatResult(
             generations=[
                 ChatGeneration(
                     message=AIMessage(
-                        content="",
+                        content=content,
                         tool_calls=calls,
                         usage_metadata={"input_tokens": 99, "output_tokens": 1, "total_tokens": 100},
                     )
@@ -399,7 +507,7 @@ class NativeModel(BaseChatModel):
 
 
 @pytest.mark.asyncio
-async def test_final_bound_schema_drives_budget_split_without_lowering_floor_or_call_limit():
+async def test_final_batch_request_drives_budget_split_without_lowering_floor_or_call_limit():
     state, changes, block, aliases = fixture(4)
     ledger = HypothesisLedger("run", "abc", "digest", protocol_version=4)
     model = NativeModel()
@@ -407,11 +515,10 @@ async def test_final_bound_schema_drives_budget_split_without_lowering_floor_or_
     from langchain_core.messages import HumanMessage, SystemMessage
 
     messages = [
-        SystemMessage(content=generator._discovery_system_prompt(12, protocol_version=4)),
+        SystemMessage(content=generator._discovery_system_prompt(12, protocol_version=4, unit_count=len(block.units))),
         HumanMessage(content=generator._render_discovery_message(block, ledger, 12)),
     ]
-    bound = bind_discovery_submission(model, discovery_submission_tools(block, aliases))
-    plan = _discovery_request_plan(bound, messages, ledger)
+    plan = _discovery_request_plan(model, messages, ledger)
     floor = _discovery_output_floor(4, 12, protocol_version=4)
     budget = RequestBudget(250_000, discovery_limit=plan.input_tokens + floor - 1)
     result = await HypothesisGenerator(
@@ -422,17 +529,21 @@ async def test_final_bound_schema_drives_budget_split_without_lowering_floor_or_
     assert parent["request_plan"]["input_tokens"] == plan.input_tokens
     assert parent["request_plan"]["useful_output_floor"] == floor
     assert 0 < len(model.calls) == result.blocks <= 2
-    assert all(len(options["tools"]) == 3 for _, options in model.calls)
+    assert all("tools" not in options for _, options in model.calls)
     assert set(ledger.no_issue_units) | set(ledger.unresolved_units) == {item.id for item in changes.units}
     assert budget.discovery_limit == plan.input_tokens + floor - 1 and budget.limit == 250_000
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("response_kind", ["complete", "text", "400", "truncated", "duplicate"])
+@pytest.mark.parametrize(
+    "response_kind", ["complete", "text", "400", "truncated", "duplicate", "invented-path", "old-empty-change"]
+)
 async def test_real_adapter_serializes_tools_and_budget_includes_schema_without_400_fallback(response_kind):
     state, changes, block, aliases = fixture(1)
     requests, snapshots = [], []
     args = hypothesis(block, aliases)
+    if response_kind in {"invented-path", "old-empty-change"}:
+        args["change_fields"] = ["path"] if response_kind == "invented-path" else []
 
     def handle(request):
         payload = json.loads(request.content)
@@ -508,6 +619,7 @@ async def test_real_adapter_serializes_tools_and_budget_includes_schema_without_
     assert wire["enable_thinking"] is False and wire["tool_choice"] == "required"
     assert len(wire["tools"]) == 3 and "response_format" not in wire
     assert all(tool["function"]["parameters"]["additionalProperties"] is False for tool in wire["tools"])
+    assert all("change_fields" not in tool["function"]["parameters"]["properties"] for tool in wire["tools"])
     record = next(iter(ledger.discovery_blocks.values()))
     reservation = next(iter(snapshots[0]["pending"].values()))["reserved_tokens"]
     assert reservation == record["request_plan"]["input_tokens"] + record["request_plan"]["max_output_tokens"]
@@ -518,6 +630,10 @@ async def test_real_adapter_serializes_tools_and_budget_includes_schema_without_
         assert result.accepted == 0 and ledger.unresolved_units and budget.snapshot()["unreported_reserved_tokens"] > 0
     elif response_kind in {"complete", "text"}:
         assert result.accepted == 1 and not ledger.unresolved_units and budget.snapshot()["reported_tokens"] == 200
+    elif response_kind in {"invented-path", "old-empty-change"}:
+        assert result.accepted == 0 and ledger.unresolved_units and not ledger.no_issue_units
+        assert record["submission_errors"] and not record["output_framing"]["complete"]
+        assert budget.snapshot()["reported_tokens"] == 200
     else:
         assert result.accepted == 1 and ledger.unresolved_units and not ledger.no_issue_units
         assert record["submission_errors"] and not record["output_framing"]["complete"]

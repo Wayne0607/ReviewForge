@@ -62,8 +62,12 @@ def discovery_submission_tools(block: DiscoveryBlock, aliases: dict[str, str]) -
         "after": prose(),
         "observable": prose(),
         "source_refs": (list[reference_type], Field(min_length=1, max_length=12)),
-        "change_fields": (list[Literal["previous_path", "path"]], Field(max_length=2)),
     }
+    if block.structural_changes:
+        # Text-only targets have no structural facts to select. Do not expose
+        # irrelevant path choices and then ask the model to leave them empty.
+        # Mixed blocks still require an explicit [] for their text targets.
+        common["change_fields"] = (list[Literal["previous_path", "path"]], Field(max_length=2))
     hypothesis = {
         **common,
         "mechanism": (Literal[tuple(value.value for value in Mechanism)], ...),
@@ -115,7 +119,14 @@ def _record_payload(
         return "deferred_units", {"unit_id": unit_id, "reason": args["reason"]}
     if any(reference not in aliases for reference in args["source_refs"]):
         raise ValueError("unknown-discovery-source-alias")
-    fields = args["change_fields"]
+    if block.structural_changes:
+        if "change_fields" not in args:
+            raise ValueError("missing-discovery-change-selection")
+        fields = args["change_fields"]
+    else:
+        if "change_fields" in args:
+            raise ValueError("unexpected-discovery-change-selection")
+        fields = []
     change = block.structural_changes.get(unit_id)
     if change is None and fields or change is not None and set(fields) != {"previous_path", "path"}:
         raise ValueError("invalid-discovery-change-selection")

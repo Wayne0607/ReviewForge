@@ -79,12 +79,12 @@ async def test_v4_discovers_a_source_grounded_lead_without_pretending_to_prove_t
         "source_refs": [*behavior_refs, source_alias(raw["trigger_basis"])],
         "source_roles": ["behavior"] * len(behavior_refs) + ["trigger"],
         "site_refs": [source_alias({"side": "after", **raw["sites"][0]})],
-        "change_fields": [],
     }
     schema = next(
         tool.args_schema for tool in discovery_submission_tools(block, aliases) if tool.name == "submit_hypothesis"
     )
     assert "violation" not in schema.model_fields
+    assert "change_fields" not in schema.model_fields
     schema.model_validate(wire)
     book = HypothesisLedger("run", "abc", "digest", protocol_version=4)
     model = ScriptedLLM(

@@ -7,8 +7,9 @@ Explicit before/RIGHT coordinates and declaration presence keep new code and
 old implementations distinct. V3 candidate violation obligations separately bind
 the proposed requirement, supported input, incompatible after behavior and harm;
 an observed before/after delta alone does not enter the hypothesis queue.
-These checks validate source and schema, never semantic proof. V4 uses required
-flat native records, preserving complete candidate records
+These checks validate source and schema, never semantic proof. V4 uses strict
+JSON batches for multiple targets and flat native records for a single target,
+preserving complete candidate records
 without treating a malformed call stream as clean coverage. Protocol v3 keeps
 its text output and violation obligations. The generator
 only *proposes*; it never investigates and never
@@ -81,6 +82,11 @@ from reviewforge.engine.verification_guidance import (
 from reviewforge.tools.workspace import WorkspaceUnavailable
 
 _EXCERPT_MIN_CHARS = 12
+
+
+def discovery_uses_native(protocol_version: int, unit_count: int) -> bool:
+    """Choose the wire contract before planning; required tools do not guarantee N calls."""
+    return protocol_version >= 4 and unit_count == 1
 
 
 def _discovery_output_floor(unit_count: int, allowance: int, *, protocol_version: int = 3) -> int:
@@ -475,10 +481,18 @@ class HypothesisGenerator:
         return result
 
     def _discovery_system_prompt(
-        self, allowance: int, responsibilities: list[str] | None = None, *, protocol_version: int = 3
+        self,
+        allowance: int,
+        responsibilities: list[str] | None = None,
+        *,
+        protocol_version: int = 3,
+        unit_count: int = 1,
     ) -> str:
+        template = "discovery_v3"
+        if protocol_version >= 4:
+            template = "discovery_v4" if discovery_uses_native(protocol_version, unit_count) else "discovery_batch_v4"
         prompt = load_prompt(
-            "discovery_v4" if protocol_version >= 4 else "discovery_v3",
+            template,
             output_language=_language_directive(self._output_language),
             max_hypotheses=allowance,
             lens=self._source[len("lens:") :] if self._source.startswith("lens:") else "general correctness",
@@ -563,12 +577,22 @@ class HypothesisGenerator:
             "## Existing hypotheses\n" + (existing_text or "(none)"),
         ]
         if shown:
+            behavior_slot = (
+                "behavior refs"
+                if discovery_uses_native(ledger.protocol_version, len(block.units))
+                else "behavior.source_facts"
+            )
+            change_slot = (
+                "structural fact selections"
+                if discovery_uses_native(ledger.protocol_version, len(block.units))
+                else "behavior.change_facts"
+            )
             sections[2] += (
                 "\nAllowed refs are navigation to the target operation, not completed evidence checks. "
-                "Select relevant behavior refs yourself: at least one from each nonempty "
+                f"Select relevant refs yourself in {behavior_slot}: at least one from each nonempty "
                 "allowed side. Empty before choices mean no removed before citation is required, not global "
                 "prior absence. Structural change rows have empty choices and still need their separate "
-                "explicit change_fields and consumer-source checks. Sites must select allowed_site_refs."
+                f"{change_slot} and consumer-source checks. Sites must select allowed_site_refs."
             )
         if block.change_text:
             sections.insert(
@@ -710,7 +734,10 @@ class HypothesisGenerator:
             messages = [
                 SystemMessage(
                     content=self._discovery_system_prompt(
-                        allowance, responsibilities, protocol_version=ledger.protocol_version
+                        allowance,
+                        responsibilities,
+                        protocol_version=ledger.protocol_version,
+                        unit_count=len(block.units),
                     )
                 ),
                 HumanMessage(content=user),
@@ -725,7 +752,11 @@ class HypothesisGenerator:
                 failure = "input-too-large"
             request_llm = self._llm
             submission_tools = []
-            if not failure and ledger.protocol_version >= 4:
+            if ledger.protocol_version >= 4:
+                record["submission_mode"] = (
+                    "native" if discovery_uses_native(ledger.protocol_version, len(block.units)) else "batch-text"
+                )
+            if not failure and discovery_uses_native(ledger.protocol_version, len(block.units)):
                 try:
                     submission_tools = discovery_submission_tools(block, aliases)
                     request_llm = bind_discovery_submission(self._llm, submission_tools)
@@ -782,7 +813,7 @@ class HypothesisGenerator:
                 record["delivered_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
                 original = getattr(response, "content", "") or ""
                 framed = None
-                if submission_tools:
+                if ledger.protocol_version >= 4:
                     framed, submission_errors = parse_discovery_submission(response, submission_tools, block, aliases)
                     if submission_errors:
                         record["submission_errors"] = submission_errors

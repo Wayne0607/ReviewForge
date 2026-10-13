@@ -55,8 +55,9 @@ tests or browse advisories. Questions must fit these capabilities.
 
 Submit records through the supplied result tools, with multiple calls in this
 same response as needed to assess every target. They collect output, not source
-operations; no further tool round or surrounding prose is needed. Every field is
-required. Use native strings and arrays, never JSON-encoded arrays/objects.
+operations; no further tool round or surrounding prose is needed. Every supplied
+schema field is required; do not add fields absent from that schema. Use native
+strings and arrays, never JSON-encoded arrays/objects.
 Prose: one concise nonempty sentence, <=600 characters. The ceiling is not a target.
 
 - submit_hypothesis: claim is the specific lead, trigger the concrete input,
@@ -77,8 +78,9 @@ At most {{max_hypotheses}} new hypotheses, not a quota. Distinct risks on the sa
 unit may use separate submit_hypothesis calls. Independent investigation and
 publication review establish proof; do not submit a violation object.
 
-For text changes choose change_fields=[]. Verified structural renames have equal
-blobs and no textual hunk: choose site_refs=[] and explicitly select both
+Use change_fields only when the supplied schema includes it: choose [] for text
+targets in a mixed block. Verified structural renames have equal blobs and no
+textual hunk: choose site_refs=[] and explicitly select both
 change_fields=["previous_path","path"] to cite the delivered metadata. The
 program binds their exact values; metadata are not source.
 Still select delivered head/consumer sources and the trigger role;

@@ -29,7 +29,8 @@ requirements explicit. Output a JSON object, no prose outside it:
 "gaps":["specific missing fact, if any"]}]}
 
 One entry for every input ID. Each array has at most 8 entries; each statement
-is at most 600 characters with 1–8 exact references. An empty contracts array is
+is at most 600 characters with 1–8 exact references. Keep gaps concise; their
+combined text must not exceed 4800 characters. An empty contracts array is
 correct when no binding requirement is visible. At least one execution, contract
 or gap is required. Do not fabricate completeness, callers, examples or runtime
 test results. These are source interpretations for subsequent independent review.

@@ -62,6 +62,18 @@ def test_reconstruction_cannot_invent_sources_or_contract_kinds(change):
         validate(raw, candidate())
 
 
+def test_caveat_total_budget_preserves_long_individual_gap_without_changing_evidence():
+    raw = audit()
+    raw["gaps"] = ["The concrete binding remains unverified. " * 20]
+    assert len(raw["gaps"][0]) > 600
+    saved = validate(raw, candidate())
+    assert saved["gaps"] == [raw["gaps"][0].strip()]
+    assert saved["contracts"] == raw["contracts"]
+    raw["gaps"] = ["x" * 4801]
+    with pytest.raises(ValueError, match="unbounded-source-gap"):
+        validate(raw, candidate())
+
+
 @pytest.mark.asyncio
 async def test_v4_requires_blind_reconstruction_before_claim_review_and_persists_it():
     item = candidate()

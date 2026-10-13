@@ -44,8 +44,6 @@ def validate(raw: Any, item) -> dict[str, Any]:
         for row in rows:
             if name == "gaps":
                 statement = _text(row, "source-gap")
-                if len(statement) > 600:
-                    raise ValueError("unbounded-source-gap")
                 result[name].append(statement)
                 continue
             if name == "contracts":
@@ -63,6 +61,11 @@ def validate(raw: Any, item) -> dict[str, Any]:
             if name == "execution" and set(row) != {"statement", "evidence"}:
                 raise ValueError("invalid-source-execution")
             result[name].append({"kind": row["kind"], **proof} if name == "contracts" else proof)
+    # Gaps are caveats, not evidence statements. Preserve an unevenly sized
+    # explanation verbatim within the original 8 * 600 character total rather
+    # than discard valid evidence because one caveat exceeded a style limit.
+    if sum(map(len, result["gaps"])) > 8 * 600:
+        raise ValueError("unbounded-source-gap")
     if not any(result[name] for name in ("execution", "contracts", "gaps")):
         raise ValueError("empty-source-audit")
     return result

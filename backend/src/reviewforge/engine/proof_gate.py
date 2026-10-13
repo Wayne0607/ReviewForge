@@ -23,6 +23,7 @@ from reviewforge.core.json_output import strip_reasoning_blocks
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus
 from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.publication_contracts import contract_catalog
 from reviewforge.engine.request_budget import plan_request
 from reviewforge.engine.source_audit import audit_hash, run_source_audit
 from reviewforge.engine.source_audit import current as audit_current
@@ -227,7 +228,7 @@ def _publication_problem(item: Hypothesis, ledger: HypothesisLedger) -> tuple[st
             "independent-source-audit-not-complete",
         )
     facts = ledger.source_audits[item.id]["facts"]
-    if not facts["contracts"] or not facts["execution"]:
+    if not contract_catalog(item, ledger) or not facts["execution"]:
         return "insufficient-evidence", "no-independent-contract-or-execution"
     return None
 
@@ -238,7 +239,7 @@ def _validate_v4_review(raw: Any, item: Hypothesis, ledger: HypothesisLedger) ->
         raise ValueError("invalid-review-shape")
     decision = raw.get("decision")
     extra = {
-        "accepted": {"obligations", "contract_indices"},
+        "accepted": {"obligations", "contract_refs"},
         "refuted": {"counterevidence"},
         "unknown": {"missing_obligations"},
     }.get(decision)
@@ -250,22 +251,22 @@ def _validate_v4_review(raw: Any, item: Hypothesis, ledger: HypothesisLedger) ->
         "counterevidence": raw.get("counterevidence"),
         "missing_obligations": raw.get("missing_obligations", []),
     }
-    indices = normalized.pop("contract_indices", None)
+    selected = normalized.pop("contract_refs", None)
     result = _validate_review(normalized, item)
     if decision == "accepted":
-        contracts = ledger.source_audits.get(item.id, {}).get("facts", {}).get("contracts", [])
+        contracts = contract_catalog(item, ledger)
         if (
             not audit_current(item, ledger)
-            or not isinstance(indices, list)
-            or not indices
-            or any(type(index) is not int or not 0 <= index < len(contracts) for index in indices)
-            or len(set(indices)) != len(indices)
+            or not isinstance(selected, list)
+            or not selected
+            or any(not isinstance(reference, str) or reference not in contracts for reference in selected)
+            or len(set(selected)) != len(selected)
         ):
             raise ValueError("missing-independent-contract-binding")
         requirement = set(result["obligations"]["required_behavior"]["evidence"])
-        if any(not requirement.intersection(contracts[index]["evidence"]) for index in indices):
+        if any(not requirement.intersection(contracts[reference]["evidence"]) for reference in selected):
             raise ValueError("independent-contract-evidence-mismatch")
-        result["contract_indices"] = indices
+        result["contract_refs"] = selected
     return result
 
 
@@ -283,7 +284,7 @@ def _completed_review(record: dict[str, Any], item: Hypothesis, ledger: Hypothes
         if ledger.protocol_version >= 4:
             decision = raw["decision"]
             fields = {
-                "accepted": ("obligations", "contract_indices"),
+                "accepted": ("obligations", "contract_refs"),
                 "refuted": ("counterevidence",),
                 "unknown": ("missing_obligations",),
             }.get(decision, ())
@@ -475,6 +476,7 @@ class ProofGate:
         if ledger.protocol_version >= 4:
             for item, packet in zip(batch, packets, strict=True):
                 packet["independent_source_audit"] = ledger.source_audits[item.id]["facts"]
+                packet["independent_contracts"] = contract_catalog(item, ledger)
         return [
             SystemMessage(
                 content=load_prompt(

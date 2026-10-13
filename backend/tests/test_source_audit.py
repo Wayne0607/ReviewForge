@@ -7,17 +7,20 @@ from test_proof_gate import GateLLM, candidate, ledger, review
 
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.proof_gate import ProofGate, accepted, completed
+from reviewforge.engine.publication_contracts import contract_catalog
 from reviewforge.engine.source_audit import messages, validate
 
 
 def verdict(decision="accepted"):
     original = review(decision=decision)
     fields = {"accepted": ("obligations",), "refuted": ("counterevidence",), "unknown": ("missing_obligations",)}
+    book = ledger(candidate(), protocol=4)
+    book.source_audits["h_bug"] = {"facts": audit()}
     return {
         key: value
         for key, value in original.items()
         if key in {"hypothesis_id", "decision", "reason", *fields[decision]}
-    } | ({"contract_indices": [0]} if decision == "accepted" else {})
+    } | ({"contract_refs": [next(iter(contract_catalog(candidate(), book)))]} if decision == "accepted" else {})
 
 
 def audit(identity="h_bug"):
@@ -132,11 +135,11 @@ async def test_non_acceptance_does_not_require_irrelevant_four_obligations(decis
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("indices", [[], [1], [True], [0, 0]])
-async def test_accepted_requires_an_actual_independent_contract_index(indices):
+async def test_accepted_requires_an_actual_independent_contract_reference(indices):
     item = candidate()
     book = ledger(item, protocol=4)
     raw = verdict()
-    raw["contract_indices"] = indices
+    raw["contract_refs"] = indices
     llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [raw]}])
     await ProofGate(llm).run(book)
     assert not accepted(item, book) and not completed(item, book)

@@ -57,16 +57,17 @@ obligations for refutation or uncertainty. Do not return null placeholder fields
 
 ACCEPTED:
 {"hypothesis_id":"COPY_ID","decision":"accepted","reason":"specific proof",
-"contract_indices":[0],
+"contract_refs":["COPY_CONTRACT_ID"],
 "obligations":{
 "supported_input":{"statement":"actual supported witness","evidence":["COPY_REF"]},
 "required_behavior":{"statement":"independently established requirement","evidence":["COPY_REF"]},
 "introduced_regression":{"statement":"PR-introduced violation","evidence":["COPY_REF"]},
 "bad_consequence":{"statement":"actual original claimed result","evidence":["COPY_REF"]}}}
 
-contract_indices selects one or more ZERO-BASED entries from
-independent_source_audit.contracts. required_behavior must cite the selected
-contract's actual source evidence. The index is not authority: verify that this
+contract_refs copies one or more EXACT KEYS from independent_contracts.
+Never count array positions or invent an ID. The catalog identifies whether the
+contract came from source reconstruction or a program-bound review rule. required_behavior must cite the selected
+contract's actual source evidence. The identifier is not authority: verify that this
 contract really imposes the ORIGINAL claim's requirement. Do not replace it with
 a different interpretation or infer it from an implementation/class name.
 No independent contract means no acceptance. Every proof requires nonempty exact

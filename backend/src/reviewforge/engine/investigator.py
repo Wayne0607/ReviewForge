@@ -562,7 +562,10 @@ class Investigator:
             if self._protocol_version >= 2
             else "investigator"
         )
-        return load_prompt(name, output_language=_language_directive(self._output_language))
+        prompt = load_prompt(name, output_language=_language_directive(self._output_language))
+        if self._protocol_version >= 4:
+            prompt += "\n\n" + load_prompt("contract_search_v4")
+        return prompt
 
     def _render_user(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> str:
         diffs = state.file_diffs or {}
@@ -916,12 +919,16 @@ class Investigator:
         if self._protocol_version >= 3:
             first_step = int(await self._bootstrap(hypothesis, pack))
 
-        chat = [
-            SystemMessage(content=self._system_prompt()),
-            HumanMessage(content=self._render_user(hypothesis, state, pack)),
-        ]
+        chat = (
+            []
+            if self._protocol_version >= 4
+            else [
+                SystemMessage(content=self._system_prompt()),
+                HumanMessage(content=self._render_user(hypothesis, state, pack)),
+            ]
+        )
         initial = list(chat)
-        if self._protocol_version >= 3:
+        if self._protocol_version == 3:
             chat.append(HumanMessage(content="## Recorded observations\n" + self._render_observations()))
         tools = self._build_tools()
         known_tools = {tool.name: tool for tool in tools}
@@ -934,6 +941,11 @@ class Investigator:
         )
 
         for step in range(first_step, steps):
+            if self._protocol_version >= 4:
+                # The saved evidence is the state, not the expanding tool chat.
+                # Preserve every Observation while discarding duplicate Context
+                # bodies and the previous model's speculative transcript.
+                chat = self._exploration_chat(hypothesis, pack)
             closing = self._closing_chat(initial, token_limit, hypothesis=hypothesis)
             # A tool round is useful only if we can still ask for a verdict.
             # Reserve the closing input and output within the SAME budget,
@@ -1163,62 +1175,88 @@ class Investigator:
             constraints.append(state_guidance())
         return constraints
 
+    def _evidence_packet(self, hypothesis: Hypothesis) -> dict[str, Any]:
+        """One exact saved-evidence representation for exploration and closure."""
+        candidate = {
+            key: getattr(hypothesis, key)
+            for key in (
+                "id",
+                "identity",
+                "unit_id",
+                "claim",
+                "trigger",
+                "impact",
+                "open_question",
+                "refutation",
+                "severity",
+            )
+        }
+        candidate["mechanism"] = hypothesis.mechanism.value
+        if hypothesis.discovery_basis.get("violation"):
+            candidate["proposed_violation"] = hypothesis.discovery_basis["violation"]
+        candidate["sites"] = [
+            {"path": site.path, "line": site.line, "excerpt": site.excerpt} for site in hypothesis.sites
+        ]
+        if hypothesis.change_anchor is not None:
+            candidate["change_anchor"] = {
+                "id": hypothesis.change_anchor.id,
+                "path": hypothesis.change_anchor.path,
+                "previous_path": hypothesis.change_anchor.previous_path,
+            }
+        observations = []
+        for observation in self._observations:
+            record = {"id": observation.id, "tool": observation.tool, "status": observation.status}
+            if observation.path:
+                record["path"] = observation.path
+            if observation.status == "success":
+                record.update(
+                    {
+                        "sha": observation.sha,
+                        "line_range": observation.excerpt_line_range or observation.line_range,
+                        "evidence": {
+                            reference: citation.quote for reference, citation in _evidence_segments(observation).items()
+                        },
+                    }
+                )
+                if any(
+                    entry.get("phase") == "diff-navigation" and entry.get("observation_id") == observation.id
+                    for entry in self._progress
+                ):
+                    record["source_view"] = "partial diff excerpt; not a complete hunk"
+            observations.append(record)
+        return {
+            "head_sha": self._state.head_sha if self._state is not None else "",
+            "candidate": candidate,
+            "contract_constraints": self._closure_constraints,
+            "observations": observations,
+        }
+
+    def _exploration_chat(self, hypothesis: Hypothesis, pack: ContextPack) -> list[Any]:
+        from reviewforge.engine.exploration_context import context_navigation
+
+        packet = self._evidence_packet(hypothesis)
+        packet["review_scope"] = defect_scope_guidance()
+        for record, observation in zip(packet["observations"], self._observations, strict=True):
+            # Queries preserve both positive navigation and failed/repeated-read
+            # state. Only successful named evidence remains citable.
+            record["query"] = observation.query
+        packet["context_navigation"] = context_navigation(
+            hypothesis,
+            self._changeset,
+            pack,
+            head_sha=self._state.head_sha if self._state is not None else "",
+        )
+        packet["proof_duty"] = next(
+            (entry for entry in reversed(self._progress) if entry.get("phase") == "proof-duty"), None
+        )
+        return [
+            SystemMessage(content=self._system_prompt()),
+            HumanMessage(content=json.dumps(packet, ensure_ascii=False, separators=(",", ":"))),
+        ]
+
     def _closing_chat(self, initial: list[Any], token_limit: int, *, hypothesis: Hypothesis | None = None) -> list[Any]:
         if self._protocol_version >= 3 and hypothesis is not None:
-            candidate = {
-                key: getattr(hypothesis, key)
-                for key in (
-                    "id",
-                    "identity",
-                    "unit_id",
-                    "claim",
-                    "trigger",
-                    "impact",
-                    "open_question",
-                    "refutation",
-                    "severity",
-                )
-            }
-            candidate["mechanism"] = hypothesis.mechanism.value
-            if hypothesis.discovery_basis.get("violation"):
-                candidate["proposed_violation"] = hypothesis.discovery_basis["violation"]
-            candidate["sites"] = [
-                {"path": site.path, "line": site.line, "excerpt": site.excerpt} for site in hypothesis.sites
-            ]
-            if hypothesis.change_anchor is not None:
-                candidate["change_anchor"] = {
-                    "id": hypothesis.change_anchor.id,
-                    "path": hypothesis.change_anchor.path,
-                    "previous_path": hypothesis.change_anchor.previous_path,
-                }
-            observations = []
-            for observation in self._observations:
-                record = {"id": observation.id, "tool": observation.tool, "status": observation.status}
-                if observation.path:
-                    record["path"] = observation.path
-                if observation.status == "success":
-                    record.update(
-                        {
-                            "sha": observation.sha,
-                            "line_range": observation.excerpt_line_range or observation.line_range,
-                            "evidence": {
-                                reference: citation.quote
-                                for reference, citation in _evidence_segments(observation).items()
-                            },
-                        }
-                    )
-                    if any(
-                        entry.get("phase") == "diff-navigation" and entry.get("observation_id") == observation.id
-                        for entry in self._progress
-                    ):
-                        record["source_view"] = "partial diff excerpt; not a complete hunk"
-                observations.append(record)
-            packet = {
-                "head_sha": self._state.head_sha if self._state is not None else "",
-                "candidate": candidate,
-                "contract_constraints": self._closure_constraints,
-                "observations": observations,
-            }
+            packet = self._evidence_packet(hypothesis)
             return [
                 SystemMessage(
                     content=load_prompt(

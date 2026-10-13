@@ -46,7 +46,9 @@ from reviewforge.engine.discovery import (
     plan_discovery,
     split_discovery,
 )
+from reviewforge.engine.discovery_aliases import expand_response_refs, render_source_aliases, source_aliases
 from reviewforge.engine.discovery_output import frame_discovery_output
+from reviewforge.engine.discovery_presentation import present_discovery_block
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import RequestBudgetExceededError, RequestPlan, plan_request
@@ -67,8 +69,14 @@ from reviewforge.tools.workspace import WorkspaceUnavailable
 _EXCERPT_MIN_CHARS = 12
 
 
-def _discovery_output_floor(unit_count: int, allowance: int) -> int:
+def _discovery_output_floor(unit_count: int, allowance: int, *, protocol_version: int = 3) -> int:
     """Policy estimate for useful structured coverage, not a truncation guarantee."""
+    if protocol_version >= 4:
+        # V4 emits leads, without v3's six-field violation proof, and uses short
+        # source aliases. Reserve per-unit coverage plus incremental candidates.
+        # This is only a useful-output floor; the unchanged hard cap is 8192 and
+        # incomplete/invalid responses still leave their units unresolved.
+        return min(8192, 256 + 192 * unit_count + 384 * min(allowance, unit_count))
     return min(8192, 256 + 256 * unit_count + 640 * min(allowance, unit_count))
 
 
@@ -476,6 +484,7 @@ class HypothesisGenerator:
     def _render_discovery_message(
         self, block: DiscoveryBlock, ledger: HypothesisLedger, allowance: int, guidance: str = ""
     ) -> str:
+        shown = present_discovery_block(block) if ledger.protocol_version >= 4 else None
         anchors = []
         for unit in block.units:
             target = block.unit_facts.get(unit.id, [])
@@ -510,13 +519,18 @@ class HypothesisGenerator:
             )
         sections = [
             "## PR overview\n" + compact_overview(block.overview),
-            "## Source relationship navigation (not evidence)\n" + (block.navigation or "(none collected)"),
+            "## Source relationship navigation (not evidence)\n"
+            + ((shown.navigation if shown else block.navigation) or "(none collected)"),
             "## Units\nAllowed IDs/target scopes; each JSON row is "
             "[unit_id,path,symbol,before_state,LEFT_ranges,RIGHT_ranges,responsibilities,change_id]. "
             "Empty ranges mean no target source delivered on that side; "
             "[] responsibilities means general correctness.\n" + "\n".join(anchors),
-            "## Changes\n" + compact_source_coordinates(block.diff_text),
-            "## Context\n" + (compact_source_coordinates(block.context_text) or "(no context delivered)"),
+            "## Changes\n" + (shown.diff_text if shown else compact_source_coordinates(block.diff_text)),
+            "## Context\n"
+            + (
+                (shown.context_text if shown else compact_source_coordinates(block.context_text))
+                or "(no context delivered)"
+            ),
             "## Structured difference focus (attention cues, not defect verdicts)\n"
             + (block.focus or "Compare before/after behavior."),
             "## Unchecked\n" + ("\n".join(block.unchecked) or "(no collected direction omitted)"),
@@ -537,7 +551,12 @@ class HypothesisGenerator:
             f"## Required assessments ({len(block.units)})\n"
             f"New candidate allowance this block: {allowance}. Assess every Units row using the output contract."
         )
-        return "\n\n".join(sections)
+        rendered = "\n\n".join(sections)
+        return (
+            render_source_aliases(rendered, source_aliases(block.source_refs))
+            if ledger.protocol_version >= 4
+            else rendered
+        )
 
     async def _run_discovery(
         self,
@@ -634,6 +653,9 @@ class HypothesisGenerator:
                 },
             }
             ledger.discovery_blocks[key] = record
+            aliases = source_aliases(block.source_refs) if ledger.protocol_version >= 4 else {}
+            if aliases:
+                record["source_ref_aliases"] = aliases
             used = sum(item.source == "generator" or item.source.startswith("lens:") for item in ledger.items.values())
             allowance = min(self._discovery_max_hypotheses_per_block, max(0, self._max_hypotheses - used))
             responsibilities = list(
@@ -669,7 +691,7 @@ class HypothesisGenerator:
                 failure = "input-too-large"
             if not failure:
                 plan = _discovery_request_plan(self._llm, messages, ledger)
-                floor = _discovery_output_floor(len(block.units), allowance)
+                floor = _discovery_output_floor(len(block.units), allowance, protocol_version=ledger.protocol_version)
                 record["request_plan"] = {
                     "input_tokens": plan.input_tokens,
                     "available_tokens": plan.available_tokens,
@@ -743,6 +765,8 @@ class HypothesisGenerator:
                     record["units"][unit.id] = {"status": "unresolved", "reason": failure}
                 result.failed_blocks += 1
             else:
+                if aliases:
+                    parsed = expand_response_refs(parsed, aliases)
                 await self._consume_discovery(parsed, block, ledger, result, right_lines, allowance, record)
             if self._on_update is not None:
                 await self._on_update(ledger)

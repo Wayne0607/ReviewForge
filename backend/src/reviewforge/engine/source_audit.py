@@ -75,12 +75,12 @@ def current(item, ledger: HypothesisLedger) -> bool:
     from reviewforge.engine.proof_gate import proof_fingerprint
 
     record = ledger.source_audits.get(item.id, {})
-    if (
-        record.get("version") != 1
-        or record.get("run_id") != ledger.run_id
-        or record.get("fingerprint") != proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest)
-        or record.get("outcome") != "resolved"
-    ):
+    if record.get("version") != 1 or record.get("run_id") != ledger.run_id or record.get("outcome") != "resolved":
+        return False
+    if record.get("input_fingerprint"):
+        if record["input_fingerprint"] != input_fingerprint(item, ledger):
+            return False
+    elif record.get("fingerprint") != proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest):
         return False
     try:
         validate(record.get("facts"), item)
@@ -143,6 +143,12 @@ def messages(batch, ledger):
     ]
 
 
+def input_fingerprint(item, ledger: HypothesisLedger) -> str:
+    """Bind the blind request to exactly its sources/rules, not prior verdicts."""
+    value = [{"role": message.type, "content": message.content} for message in messages([item], ledger)]
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 async def run_source_audit(llm, ledger, on_update=None):
     from reviewforge.engine.proof_gate import _over_budget, _source_problem, _unique_object, _usage, proof_fingerprint
 
@@ -158,12 +164,14 @@ async def run_source_audit(llm, ledger, on_update=None):
             continue
         fingerprint = proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest)
         old = ledger.source_audits.get(item.id, {})
-        if old.get("fingerprint") != fingerprint or old.get("run_id") != ledger.run_id:
+        same_input = old.get("input_fingerprint") == input_fingerprint(item, ledger)
+        if old.get("run_id") != ledger.run_id or not same_input and old.get("fingerprint") != fingerprint:
             old = {}
         if old.get("attempts", 0) >= 2 or old.get("outcome") == "budget-exhausted":
             continue
         pending.append((item, old, fingerprint))
-    spent = calls = 0
+    spent = 0
+    calls = ledger.source_audit_batches
     while pending:
         batch = []
         request = plan = None
@@ -189,11 +197,17 @@ async def run_source_audit(llm, ledger, on_update=None):
         selected = pending[: len(batch)] if batch and calls < 4 else pending[:1]
         del pending[: len(selected)]
         refused = not batch or calls >= 4
+        if not refused:
+            calls += 1
+            # Checkpoint the run-wide allowance before dispatch. Feedback and
+            # resumed execution share the original four-batch ceiling.
+            ledger.source_audit_batches = calls
         for item, old, fingerprint in selected:
             ledger.source_audits[item.id] = {
                 "version": 1,
                 "run_id": ledger.run_id,
                 "fingerprint": fingerprint,
+                "input_fingerprint": input_fingerprint(item, ledger),
                 "attempts": old.get("attempts", 0) + 1,
                 "tokens": old.get("tokens", 0),
                 "outcome": "budget-exhausted" if refused else "provider-error",
@@ -202,7 +216,6 @@ async def run_source_audit(llm, ledger, on_update=None):
         await save()
         if refused:
             continue
-        calls += 1
         try:
             response = await llm.ainvoke(request, max_tokens=plan.max_output_tokens)
         except Exception as exc:

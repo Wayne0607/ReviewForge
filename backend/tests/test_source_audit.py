@@ -8,7 +8,7 @@ from test_proof_gate import GateLLM, candidate, ledger, review
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.proof_gate import ProofGate, accepted, completed
 from reviewforge.engine.publication_contracts import contract_catalog
-from reviewforge.engine.source_audit import messages, validate
+from reviewforge.engine.source_audit import current, input_fingerprint, messages, run_source_audit, validate
 
 
 def verdict(decision="accepted"):
@@ -183,3 +183,65 @@ async def test_v4_delimiter_recovery_still_requires_complete_bound_proof(damage)
         assert book.publication_reviews[item.id]["output_framing"]["recovery"] == "missing-container-closers"
     if damage != "closers":
         assert book.publication_reviews[item.id]["outcome"] == "output-error"
+
+
+@pytest.mark.asyncio
+async def test_blind_sources_are_not_resampled_for_candidate_or_progress_only_changes():
+    item = candidate()
+    book = ledger(item, protocol=4)
+    llm = GateLLM(replies=[{"audits": [audit()]}])
+    await run_source_audit(llm, book)
+    original = copy.deepcopy(book.source_audits[item.id])
+    source_hash = input_fingerprint(item, book)
+    item.claim = "A different candidate description with the same supplied sources."
+    item.investigation_progress.append({"phase": "navigation", "note": "No new source."})
+    assert input_fingerprint(item, book) == source_hash and current(item, book)
+    await run_source_audit(llm, book)
+    assert len(llm.calls) == 1 and book.source_audits[item.id] == original
+    assert book.source_audit_batches == 1
+    item.observations[0] = replace(item.observations[0], excerpt="return a_different_value.id")
+    assert not current(item, book)
+
+
+@pytest.mark.asyncio
+async def test_source_audit_four_batch_limit_survives_new_facts_and_checkpoint_restore():
+    item = candidate()
+    book = ledger(item, protocol=4)
+    llm = GateLLM(replies=[{"audits": [audit()]} for _ in range(4)])
+    for index in range(4):
+        item.observations.append(replace(item.observations[1], id=f"obs_{index + 2}"))
+        await run_source_audit(llm, book)
+        assert book.source_audit_batches == index + 1
+        book = HypothesisLedger.from_dict(book.to_dict())
+        item = next(iter(book.items.values()))
+    assert len(llm.calls) == 4
+    item.observations.append(replace(item.observations[1], id="obs_new"))
+    await run_source_audit(llm, book)
+    assert len(llm.calls) == 4 and book.source_audit_batches == 4
+    assert book.source_audits[item.id]["outcome"] == "budget-exhausted"
+
+
+def test_old_saved_source_audits_do_not_restore_a_fresh_batch_allowance():
+    book = ledger(candidate(), protocol=4)
+    value = book.to_dict()
+    value.pop("source_audit_batches")
+    value["source_audits"] = {"a": {"attempts": 2}, "b": {"attempts": 3}}
+    assert HypothesisLedger.from_dict(value).source_audit_batches == 4
+    value["source_audits"] = {}
+    assert HypothesisLedger.from_dict(value).source_audit_batches == 0
+
+
+@pytest.mark.asyncio
+async def test_source_audit_dispatch_allowance_is_checkpointed_before_the_model_call():
+    item = candidate()
+    book = ledger(item, protocol=4)
+    snapshots = []
+
+    async def save(current_book):
+        snapshots.append(current_book.to_dict())
+
+    llm = GateLLM(replies=["malformed source response"])
+    await run_source_audit(llm, book, save)
+    assert snapshots[0]["source_audit_batches"] == 1
+    assert snapshots[0]["source_audits"][item.id]["reason"] == "source-audit-interrupted"
+    assert len(llm.calls) == 1 and book.source_audit_batches == 1

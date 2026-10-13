@@ -27,6 +27,7 @@ from reviewforge.engine.editor import (
     render_review_body,
     resumed_publication,
 )
+from reviewforge.engine.evidence_followup import run_evidence_followup
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator, build_anchor_resolver
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
@@ -327,7 +328,25 @@ async def _run_llm_stages(
         )
 
     if ledger.protocol_version >= 3:
-        await ProofGate(routed("editor"), output_language=language, on_update=checkpoint).run(ledger)
+        gate = ProofGate(routed("editor"), output_language=language, on_update=checkpoint)
+        await gate.run(ledger)
+        if ledger.protocol_version >= 4:
+
+            def collector():
+                return Investigator(
+                    routed("investigator"),
+                    executor,
+                    output_language=language,
+                    changeset=changeset,
+                    protocol_version=ledger.protocol_version,
+                )
+
+            changed_evidence = await run_evidence_followup(collector, ledger, state, pack, on_update=checkpoint)
+            if changed_evidence:
+                # New saved source invalidates prior permission. The independent
+                # reconstruction and original gate must judge it again.
+                await gate.run(ledger)
+            events.emit("evidence_followup.completed", {"new_source_evidence": changed_evidence})
         events.emit(
             "publication_proof.completed",
             {

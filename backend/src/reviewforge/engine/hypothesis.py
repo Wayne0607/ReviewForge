@@ -287,12 +287,15 @@ class HypothesisLedger:
     request_budget: dict[str, Any] = field(default_factory=dict)
     publication_reviews: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_audits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    source_audit_batches: int = 0
     structural_checks: dict[str, Any] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.protocol_version not in {1, 2, 3, 4}:
             raise ValueError("unsupported investigation protocol")
+        if type(self.source_audit_batches) is not int or self.source_audit_batches < 0:
+            raise ValueError("source audit batch count must be a nonnegative integer")
         for item in self.items.values():
             self._validate_change_anchor(item)
 
@@ -447,6 +450,20 @@ class HypothesisLedger:
                     investigation_task_id=task_id,
                 )
             self.investigation_tasks[task_id] = {
+                **{key: previous[key] for key in ("budget_steps_limit", "token_limit") if key in previous},
+                **(
+                    {"total_steps": int(previous["total_steps"]) + int(verdict.get("investigation_steps", 0))}
+                    if "total_steps" in previous
+                    else {}
+                ),
+                **(
+                    {
+                        "total_unreported_tokens": int(previous["total_unreported_tokens"])
+                        + int(verdict.get("investigation_unreported_tokens", 0))
+                    }
+                    if "total_unreported_tokens" in previous
+                    else {}
+                ),
                 "members": list(members),
                 "charged_to": charged_to,
                 "outcome": verdict.get("investigation_outcome", ""),
@@ -476,7 +493,14 @@ class HypothesisLedger:
                 "unresolved_units": dict(sorted(self.unresolved_units.items())),
                 "protocol_version": self.protocol_version,
                 "investigation_tasks": copy.deepcopy(self.investigation_tasks),
-                **({"source_audits": copy.deepcopy(self.source_audits)} if self.protocol_version >= 4 else {}),
+                **(
+                    {
+                        "source_audits": copy.deepcopy(self.source_audits),
+                        "source_audit_batches": self.source_audit_batches,
+                    }
+                    if self.protocol_version >= 4
+                    else {}
+                ),
                 **(
                     {
                         "discovery_blocks": copy.deepcopy(self.discovery_blocks),
@@ -504,5 +528,13 @@ class HypothesisLedger:
             request_budget=copy.deepcopy(data.get("request_budget", {})),
             publication_reviews=copy.deepcopy(data.get("publication_reviews", {})),
             source_audits=copy.deepcopy(data.get("source_audits", {})),
+            # Old records do not identify shared batches. Count each persisted
+            # attempt conservatively rather than give a restored run new calls.
+            source_audit_batches=int(
+                data.get(
+                    "source_audit_batches",
+                    min(4, sum(max(0, int(row.get("attempts", 0))) for row in data.get("source_audits", {}).values())),
+                )
+            ),
             structural_checks=copy.deepcopy(data.get("structural_checks", {})),
         )

@@ -130,10 +130,13 @@ async def test_repair_cannot_turn_ambiguous_or_incomplete_output_into_clean_cove
     result = await HypothesisGenerator(model).run(
         StateStore(file_diffs={u.path: diff()}), ContextPack(), changeset(u), ledger
     )
-    assert len(model.calls) == 2 and result.accepted == 0
+    assert len(model.calls) == (2 if protocol_version == 3 else 1) and result.accepted == 0
     assert not ledger.no_issue_units and u.id in ledger.unresolved_units
     record = next(iter(ledger.discovery_blocks.values()))
     assert record["status"] == "unresolved"
+    if protocol_version >= 4:
+        assert "repair_output_framing" not in record
+        return
     assert record["repair_output_framing"] == {
         "complete": False,
         "recovery": "complete-record-prefix" if shape == "truncated-record" else "invalid",
@@ -168,6 +171,10 @@ async def test_complete_repair_keeps_reference_identity_and_records_framing(prot
     model = ScriptedLLM(responses=["unparseable original", raw])
     ledger = HypothesisLedger("run", "abc", "digest", protocol_version=protocol_version)
     await HypothesisGenerator(model).run(StateStore(file_diffs={u.path: diff()}), ContextPack(), changeset(u), ledger)
+    if protocol_version >= 4:
+        assert len(model.calls) == 1 and ledger.unresolved_units and not ledger.no_issue_units
+        assert "repair_output_framing" not in next(iter(ledger.discovery_blocks.values()))
+        return
     assert len(model.calls) == 2 and not ledger.unresolved_units
     assert ledger.no_issue_units == {u.id: assessment["checked"]}
     record = next(iter(ledger.discovery_blocks.values()))

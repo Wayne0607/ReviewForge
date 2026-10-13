@@ -14,7 +14,8 @@ from collections import Counter
 from typing import Any
 
 from reviewforge.engine import symbol_extractor
-from reviewforge.engine.semantic_diff import SemanticChangeSet, compile_semantic_changeset
+from reviewforge.engine.detectors.unified_diff import iter_added_lines
+from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind, compile_semantic_changeset
 
 _JAVA_EXPRESSION_STARTS = frozenset(
     {
@@ -156,4 +157,27 @@ def compile_changeset_v4(state: Any) -> SemanticChangeSet:
         ):
             setattr(existing, field, _union(getattr(existing, field), getattr(unit, field)))
     changeset.units = list(unique.values())
+    _restore_changed_lines(changeset, getattr(state, "file_diffs", None) or {})
     return changeset
+
+
+def _restore_changed_lines(changeset: SemanticChangeSet, file_diffs: dict[str, str]) -> None:
+    """Separate legacy display samples from v4's internal source coordinates.
+
+    ContextEngine's 12 symbol/40 file lines are prompt samples. Using those
+    samples as a membership set hid later changed calls from ContextPack.
+    Only actual mapped additions in the supplied diff may restore coordinates;
+    hunk counts never synthesize unseen rows, and unknown extents stay unknown.
+    Manifest/rendering limits and existing semantic identities are unchanged.
+    """
+    by_path: dict[str, list[int]] = {}
+    for unit in changeset.units:
+        patch = file_diffs.get(unit.path)
+        if not isinstance(patch, str) or not patch:
+            continue  # Old states without source cannot reconstruct omitted anchors.
+        if unit.path not in by_path:
+            by_path[unit.path] = sorted({line for line, _ in iter_added_lines(patch)})
+        if unit.kind == UnitKind.RESOURCE:
+            unit.added_lines = list(by_path[unit.path])
+        elif 0 < unit.start_line <= unit.end_line:
+            unit.added_lines = [line for line in by_path[unit.path] if unit.start_line <= line <= unit.end_line]

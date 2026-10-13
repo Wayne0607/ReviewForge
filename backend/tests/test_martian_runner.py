@@ -349,6 +349,58 @@ async def test_provider_trace_survives_token_wrapper_private_call(runner, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_provider_trace_preserves_original_tool_arguments_and_bound_schema(runner, tmp_path):
+    from langchain_core.messages import HumanMessage
+
+    from reviewforge.engine.openai_compat import ReasoningContentChatOpenAI
+
+    arguments = '{"unit_id":"foreign","unit_id":"target"}'
+    tool = {"type": "function", "function": {"name": "submit", "parameters": {"type": "object"}}}
+    reply = {
+        "id": "offline",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "offline",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "one",
+                            "type": "function",
+                            "function": {"name": "submit", "arguments": arguments},
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply))
+    ) as client:
+        model = ReasoningContentChatOpenAI(
+            api_key="offline-test-only",
+            base_url="https://example.invalid/v1",
+            model="offline",
+            max_retries=0,
+            http_async_client=client,
+        )
+        traced = runner.BenchmarkLLM(model, tmp_path, "test", interval=0)
+        await traced.ainvoke([HumanMessage(content="review")], tools=[tool], tool_choice="required")
+    request = json.loads(next(tmp_path.glob("*-input.json")).read_text())
+    response = json.loads(next(tmp_path.glob("*-output.json")).read_text())["responses"][0]
+    assert request["request_options"]["tools"] == [tool]
+    assert request["request_options"]["tool_choice"] == "required"
+    assert response["tool_calls"][0]["args"] == {"unit_id": "target"}
+    assert response["raw_tool_calls"][0]["function"]["arguments"] == arguments
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_failure_closes_database_thread_and_http_client(runner, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
     monkeypatch.setenv("LLM_API_KEY", "test-placeholder")

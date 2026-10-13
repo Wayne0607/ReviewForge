@@ -1,13 +1,16 @@
 """Hypothesis generator for the hypothesis pipeline.
 
 Protocols v1/v2 keep their original PR pass and risk-ordered input chunking.
-Protocol v3 delivers bounded groups of related changes, exact per-unit source
+Protocols v3/v4 deliver bounded groups of related changes, exact per-unit source
 scope and domain responsibilities, sharing each complete before/after hunk.
 Explicit before/RIGHT coordinates and declaration presence keep new code and
-old implementations distinct. Candidate violation obligations separately bind
+old implementations distinct. V3 candidate violation obligations separately bind
 the proposed requirement, supported input, incompatible after behavior and harm;
 an observed before/after delta alone does not enter the hypothesis queue.
-These checks validate source and schema, never semantic proof. The generator
+These checks validate source and schema, never semantic proof. V4 uses required
+flat native records, preserving complete candidate records
+without treating a malformed call stream as clean coverage. Protocol v3 keeps
+its text output and violation obligations. The generator
 only *proposes*; it never investigates and never
 retries with a "look harder" signal — explicit clean assessments are valid
 NO_ISSUE results. Units omitted from an otherwise valid response, or in a
@@ -50,10 +53,16 @@ from reviewforge.engine.discovery_aliases import (
     expand_response_refs,
     render_source_aliases,
     source_aliases,
+    target_site_choices,
     target_source_choices,
 )
 from reviewforge.engine.discovery_output import frame_discovery_output
 from reviewforge.engine.discovery_presentation import present_discovery_block, present_pr_overview
+from reviewforge.engine.discovery_submission import (
+    bind_discovery_submission,
+    discovery_submission_tools,
+    parse_discovery_submission,
+)
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import RequestBudgetExceededError, RequestPlan, plan_request
@@ -509,6 +518,7 @@ class HypothesisGenerator:
                         self._unit_responsibilities.get(unit.id, []),
                         change.id if change else "",
                         *(target_source_choices(block, unit.id, aliases) if shown else []),
+                        *([target_site_choices(block, unit.id, aliases)] if shown else []),
                     ],
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -526,7 +536,7 @@ class HypothesisGenerator:
             )
         columns = "unit_id,path,symbol,before_state,LEFT_ranges,RIGHT_ranges,responsibilities,change_id"
         if shown:
-            columns += ",allowed_changed_before_refs,allowed_after_refs"
+            columns += ",allowed_changed_before_refs,allowed_after_refs,allowed_site_refs"
         sections = [
             "## PR overview\n"
             + (
@@ -555,10 +565,10 @@ class HypothesisGenerator:
         if shown:
             sections[2] += (
                 "\nAllowed refs are navigation to the target operation, not completed evidence checks. "
-                "Select relevant refs yourself in behavior.source_facts: at least one from each nonempty "
+                "Select relevant behavior refs yourself: at least one from each nonempty "
                 "allowed side. Empty before choices mean no removed before citation is required, not global "
                 "prior absence. Structural change rows have empty choices and still need their separate "
-                "change_facts and consumer-source checks."
+                "explicit change_fields and consumer-source checks. Sites must select allowed_site_refs."
             )
         if block.change_text:
             sections.insert(
@@ -713,8 +723,17 @@ class HypothesisGenerator:
                 failure = "capacity-deferred: discovery block limit"
             elif not failure and len(user) > self._max_input_chars:
                 failure = "input-too-large"
+            request_llm = self._llm
+            submission_tools = []
+            if not failure and ledger.protocol_version >= 4:
+                try:
+                    submission_tools = discovery_submission_tools(block, aliases)
+                    request_llm = bind_discovery_submission(self._llm, submission_tools)
+                    record["submission_tools"] = [tool.name for tool in submission_tools]
+                except Exception as exc:
+                    failure = f"provider error: {type(exc).__name__}"
             if not failure:
-                plan = _discovery_request_plan(self._llm, messages, ledger)
+                plan = _discovery_request_plan(request_llm, messages, ledger)
                 floor = _discovery_output_floor(len(block.units), allowance, protocol_version=ledger.protocol_version)
                 record["request_plan"] = {
                     "input_tokens": plan.input_tokens,
@@ -756,17 +775,23 @@ class HypothesisGenerator:
             record["request_attempted"] = True
             record["attempted_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
             try:
-                response = await self._llm.ainvoke(
+                response = await request_llm.ainvoke(
                     messages,
                     max_tokens=plan.max_output_tokens,
                 )
                 record["delivered_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
                 original = getattr(response, "content", "") or ""
-                framed = frame_discovery_output(original)
+                framed = None
+                if submission_tools:
+                    framed, submission_errors = parse_discovery_submission(response, submission_tools, block, aliases)
+                    if submission_errors:
+                        record["submission_errors"] = submission_errors
+                if framed is None:
+                    framed = frame_discovery_output(original)
                 parsed = framed.payload if framed is not None else None
                 if framed is not None:
                     record["output_framing"] = {"complete": framed.complete, "recovery": framed.recovery}
-                if parsed is None and isinstance(original, str) and original.strip():
+                if parsed is None and ledger.protocol_version < 4 and isinstance(original, str) and original.strip():
                     parsed = await self._invoke_repair(original, ledger=ledger, request_floor=floor, record=record)
                 if parsed is None:
                     failure = (

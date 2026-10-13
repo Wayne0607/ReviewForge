@@ -29,9 +29,9 @@ tests or browse advisories. Questions must fit these capabilities.
   scopes may share a line but each needs assessment.
 - `- LEFT [rN]` is before, `+ RIGHT [rN]` is after. Unchanged rows have distinct
   before/RIGHT refs; Context refs stay context even when their body is shared
-  with RIGHT. Copy {"source_ref":"rN"} or a supplied sr_ID, WITHOUT column suffixes
-  or coordinate/quote overrides. References are valid only in this block.
-- behavior.source_facts: 1–12 refs including the target's changed after operation
+  with RIGHT. Copy supplied rN strings WITHOUT column suffixes or coordinate/quote
+  overrides. The wire pattern is syntax only: only actual refs in this block are valid.
+- Behavior sources: 1–12 refs including the target's changed after operation
   AND its removed/replaced before operation. This applies equally to hypotheses
   and clean assessments. For pure additions omit the unchanged before ref.
   Other-file/context refs can supplement, never replace target changed evidence.
@@ -44,8 +44,8 @@ tests or browse advisories. Questions must fit these capabilities.
 - Describe only supplied local changes. absent-new-declaration proves that
   visible added declaration; absent-before-in-delivered-source or unresolved
   correspondence does not prove global prior absence. Never invent before code.
-- sites: own-target RIGHT ref with excerpt >=12 characters. trigger_basis: a
-  real ref for the observed input/discrepancy; it does not prove the contract.
+- site_refs: own-target allowed_site_refs, RIGHT with excerpt >=12 characters.
+  A trigger-role ref identifies the observed input/discrepancy, not its contract.
 - Respond to every unit, including tests. Missing/invalid output is unresolved,
   never clean. A candidate may coexist with deferred boundaries, but clean may
   not coexist with either for the same unit. Preserve distinct trigger/impact
@@ -53,34 +53,38 @@ tests or browse advisories. Questions must fit these capabilities.
 
 ## Output
 
-One JSON object, no surrounding prose. Prose fields: one concise nonempty
-sentence, <=600 characters. The ceiling is not a target. No redundant violation object:
-independent investigation and publication review establish the proof.
+Submit records through the supplied result tools, with multiple calls in this
+same response as needed to assess every target. They collect output, not source
+operations; no further tool round or surrounding prose is needed. Every field is
+required. Use native strings and arrays, never JSON-encoded arrays/objects.
+Prose: one concise nonempty sentence, <=600 characters. The ceiling is not a target.
 
-{"hypotheses":[{"unit_id":"COPY_ID","mechanism":"contract-mismatch",
-"claim":"specific defect lead","trigger":"concrete input/lifecycle condition",
-"impact":"harmful observable result","open_question":"one missing contract fact",
-"refutation":"fact that would disprove the risk","severity":"warning",
-"sites":[{"source_ref":"COPY_RIGHT_REF"}],"discrepancy":"observed inconsistency",
-"trigger_basis":{"source_ref":"COPY_REF"},
-"behavior":{"before":"local prior behavior or unavailable","after":"changed behavior",
-"observable":"result for the same input","source_facts":[{"source_ref":"BEFORE_IF_CHANGED"},{"source_ref":"AFTER"}]}}],
-"no_issue_units":[{"unit_id":"OTHER_ID","checked":"changed operation and checked boundary",
-"behavior":{"before":"prior behavior","after":"changed behavior","observable":"result",
-"source_facts":[{"source_ref":"BEFORE_IF_CHANGED"},{"source_ref":"AFTER"}]}}],
-"deferred_units":[{"unit_id":"ANOTHER_ID","reason":"specific unavailable boundary"}]}
+- submit_hypothesis: claim is the specific lead, trigger the concrete input,
+  impact the harmful result, open_question the missing repository contract fact,
+  refutation the fact that would disprove it, discrepancy the observed inconsistency.
+  before/after/observable describe local behavior. source_refs and source_roles
+  are equally sized arrays matched by position: 1–12 behavior roles and exactly
+  one trigger role. A ref may support both by repeating it with the other role.
+  site_refs select the unit's real RIGHT locations. Choose supplied mechanism/severity.
+- submit_no_issue: checked names the changed operation and concrete checked
+  boundary; before/after/observable and source_refs supply its actual behavior
+  sources. Every source_ref here is a behavior source. No candidate fields.
+- defer_unit: reason names the particular unavailable boundary. No empty
+  candidate fields or fabricated facts. It may accompany a hypothesis when a
+  separate boundary remains unchecked, keeping that unit unresolved.
 
-mechanism: wrong-argument|wrong-operator|null-path|contract-mismatch|missing-await|
-lock-scope|state-leak|error-path|regression-removed|security-sink|i18n|a11y|perf|test-gap|doc.
-severity: error|warning|info. At most {{max_hypotheses}} new hypotheses, not a quota.
+At most {{max_hypotheses}} new hypotheses, not a quota. Distinct risks on the same
+unit may use separate submit_hypothesis calls. Independent investigation and
+publication review establish proof; do not submit a violation object.
 
-Verified structural renames have equal blobs and no textual hunk. Use sites=[];
-behavior.change_facts must include both exact metadata records:
-{"kind":"file-change","change_id":"COPY_ID","field":"previous_path","value":"OLD_PATH"}
-and the same shape with field="path", value="NEW_PATH". Metadata are not source.
-Still cite delivered head/consumer source in source_facts and trigger_basis;
+For text changes choose change_fields=[]. Verified structural renames have equal
+blobs and no textual hunk: choose site_refs=[] and explicitly select both
+change_fields=["previous_path","path"] to cite the delivered metadata. The
+program binds their exact values; metadata are not source.
+Still select delivered head/consumer sources and the trigger role;
 clean requires actual consumer references. No hits/equal blobs alone cannot
 prove lookup/import compatibility.
 
-Close every record and container within the output budget.
+Complete each tool record within the output budget. Missing or malformed calls
+cannot establish clean coverage; tool shape does not prove source semantics.
 Output language: {{output_language}}. Preserve source identifiers unchanged.

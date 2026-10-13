@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
 from reviewforge.core.change_manifest import FileChange, is_verified_rename, render_change_fact
-from reviewforge.engine.context_pack import ContextPack, UnitContext
+from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
 
@@ -465,13 +465,56 @@ def _overview(changeset: SemanticChangeSet, pack: ContextPack, limit: int) -> st
     return (header + _bounded_lines(inventory, max(0, limit - len(header)), "PR units"))[:limit]
 
 
+def _context_header(unit_id: str, slice_: ContextSlice, start: int, end: int) -> str:
+    return (
+        f"### {unit_id} {slice_.kind} {slice_.path}:{start}-{end}\nNavigation reason (not evidence): {slice_.reason}\n"
+    )
+
+
+def _focused_context_bounds(unit_id: str, slice_: ContextSlice, lines: list[str], budget: int) -> tuple[int, int]:
+    """Choose complete consecutive collected lines around a known source hit.
+
+    Return half-open offsets in the original slice. A line that cannot fit is
+    omitted whole; no prefix fallback may pretend the hit was delivered.
+    """
+    focus = slice_.focus_line - slice_.start_line
+    prefix = [0]
+    for offset, text in enumerate(lines):
+        number = slice_.start_line + offset
+        prefix.append(prefix[-1] + len(f"{number:>5} | {text}") + _reference_overhead(text) + 1)
+
+    def fits(start: int, end: int) -> bool:
+        header = _context_header(unit_id, slice_, slice_.start_line + start, slice_.start_line + end - 1)
+        return len(header) + 2 + prefix[end] - prefix[start] <= budget
+
+    if fits(0, len(lines)):
+        return 0, len(lines)
+    start, end = focus, focus + 1
+    if not fits(start, end):
+        return focus, focus
+    blocked = set()
+    while True:
+        choices = []
+        if start > 0 and "before" not in blocked:
+            choices.append((focus - start + 1, "before", start - 1, end))
+        if end < len(lines) and "after" not in blocked:
+            choices.append((end - focus, "after", start, end + 1))
+        if not choices:
+            return start, end
+        _, side, left, right = min(choices, key=lambda choice: (choice[0], choice[1] != "before"))
+        if fits(left, right):
+            start, end = left, right
+        else:
+            blocked.add(side)
+
+
 def _context(
     units: list[SemanticUnit], pack: ContextPack, budget: int
 ) -> tuple[str, list[SourceLine], list[str], ContextPack]:
     sections, facts, unchecked = [], [], []
     seen: dict[tuple, str] = {}
     seen_facts: dict[tuple, list[SourceLine]] = {}
-    delivered = ContextPack()
+    delivered = ContextPack(protocol_version=pack.protocol_version)
     per_unit = max(0, budget // max(1, len(units)))
     for unit in units:
         ctx = pack.units.get(unit.id)
@@ -481,8 +524,7 @@ def _context(
         delivered.units[unit.id] = UnitContext(unit.id)
         for slice_ in ctx.slices:
             key = (slice_.path, slice_.start_line, slice_.end_line, slice_.sha, slice_.text)
-            header = f"### {unit.id} {slice_.kind} {slice_.path}:{slice_.start_line}-{slice_.end_line}\n"
-            header += f"Navigation reason (not evidence): {slice_.reason}\n"
+            header = _context_header(unit.id, slice_, slice_.start_line, slice_.end_line)
             if key in seen:
                 piece = header + f"Same delivered source as {seen[key]}."
                 if len(piece) + 2 <= remaining:
@@ -497,9 +539,37 @@ def _context(
                     unchecked.append(f"{unit.id}: context {slice_.kind} omitted by context budget")
                 continue
             lines = slice_.text.splitlines()
+            focused = (
+                pack.protocol_version >= 4
+                and type(slice_.focus_line) is int
+                and slice_.start_line <= slice_.focus_line <= slice_.end_line
+                and slice_.focus_line - slice_.start_line < len(lines)
+            )
+            first, last = 0, len(lines)
+            if focused:
+                lines = lines[: slice_.end_line - slice_.start_line + 1]
+                first, last = _focused_context_bounds(unit.id, slice_, lines, remaining)
+                if first == last:
+                    unchecked.append(
+                        f"{unit.id}: context {slice_.kind} focus line {slice_.focus_line} "
+                        "and surrounding source omitted by context budget"
+                    )
+                    continue
+                header = _context_header(unit.id, slice_, slice_.start_line + first, slice_.start_line + last - 1)
+                if first:
+                    unchecked.append(
+                        f"{unit.id}: context {slice_.kind} lines {slice_.start_line}-{slice_.start_line + first - 1} "
+                        "omitted before focused window"
+                    )
+                if last < len(lines):
+                    unchecked.append(
+                        f"{unit.id}: context {slice_.kind} lines {slice_.start_line + last}-{slice_.end_line} "
+                        "omitted after focused window"
+                    )
             rendered, selected = [], []
             size = len(header) + 2
-            for offset, text in enumerate(lines):
+            for offset in range(first, last):
+                text = lines[offset]
                 line = slice_.start_line + offset
                 if line > slice_.end_line:
                     break
@@ -518,6 +588,7 @@ def _context(
                 delivered.units[unit.id].slices.append(
                     replace(
                         slice_,
+                        start_line=selected[0].line,
                         end_line=selected[-1].line,
                         text="\n".join(item.text for item in selected) + ("\n" if selected[-1].text == "" else ""),
                     )

@@ -6,12 +6,15 @@ import copy
 import json
 
 import pytest
+from langchain_core.messages import AIMessage
 from test_discovery_source_refs import reference
 from test_discovery_v3 import ScriptedLLM, candidate, changeset, clean, diff, unit
 
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack, ContextSlice, UnitContext
 from reviewforge.engine.discovery import DiscoveryLimits, plan_discovery
+from reviewforge.engine.discovery_aliases import source_aliases
+from reviewforge.engine.discovery_submission import discovery_submission_tools
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.prompts_v4 import load_prompt
@@ -48,16 +51,61 @@ def contracted_input():
 
 @pytest.mark.asyncio
 async def test_v4_discovers_a_source_grounded_lead_without_pretending_to_prove_the_contract():
-    u, state, pack, _, raw = contracted_input()
+    u, state, pack, block, raw = contracted_input()
     raw.pop("violation")
+    aliases = source_aliases(block.source_refs)
+    reverse = {reference: alias for alias, reference in aliases.items()}
+
+    def source_alias(fact):
+        return reverse[reference(block, fact["side"], fact["path"], fact["line"])["source_ref"]]
+
+    behavior_refs = [source_alias(fact) for fact in raw["behavior"]["source_facts"]]
+    wire = {
+        **{
+            field: raw[field]
+            for field in (
+                "unit_id",
+                "mechanism",
+                "severity",
+                "claim",
+                "trigger",
+                "impact",
+                "open_question",
+                "refutation",
+                "discrepancy",
+            )
+        },
+        **{field: raw["behavior"][field] for field in ("before", "after", "observable")},
+        "source_refs": [*behavior_refs, source_alias(raw["trigger_basis"])],
+        "source_roles": ["behavior"] * len(behavior_refs) + ["trigger"],
+        "site_refs": [source_alias({"side": "after", **raw["sites"][0]})],
+        "change_fields": [],
+    }
+    schema = next(
+        tool.args_schema for tool in discovery_submission_tools(block, aliases) if tool.name == "submit_hypothesis"
+    )
+    assert "violation" not in schema.model_fields
+    schema.model_validate(wire)
     book = HypothesisLedger("run", "abc", "digest", protocol_version=4)
-    model = ScriptedLLM(responses=[json.dumps({"hypotheses": [raw]})])
+    model = ScriptedLLM(
+        responses=[
+            AIMessage(
+                content="", tool_calls=[{"name": "submit_hypothesis", "args": wire, "id": "lead", "type": "tool_call"}]
+            )
+        ]
+    )
     result = await HypothesisGenerator(model).run(state, pack, changeset(u), book)
     assert result.accepted == 1 and not book.unresolved_units
     item = next(iter(book.items.values()))
     assert item.status.value == "open" and item.assessment is None and not item.observations
     assert "violation" not in item.discovery_basis
-    assert "No redundant violation object" in model.calls[0][0].content
+    assert item.claim == raw["claim"]
+    assert item.discovery_basis["behavior"]["source_facts"] == [
+        block.resolve_source_fact(fact) for fact in raw["behavior"]["source_facts"]
+    ]
+    delivered = next(tool for tool in model.bindings[0]["tools"] if tool["function"]["name"] == "submit_hypothesis")
+    assert "violation" not in delivered["function"]["parameters"]["properties"]
+    assert len(model.calls) == 1
 
 
 @pytest.mark.asyncio

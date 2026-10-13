@@ -79,6 +79,9 @@ class ContextSlice:
     text: str
     reason: str
     sha: str
+    # A verified lookup location, used only to prioritize already-collected
+    # source delivery. This navigation hint is never an evidence citation.
+    focus_line: int | None = None
 
 
 @dataclass
@@ -98,6 +101,7 @@ class ContextPack:
     units: dict[str, UnitContext] = field(default_factory=dict)
     pr_intent: str = ""
     workspace_digest: str = ""
+    protocol_version: int = 1
     _unit_risks: dict[str, float] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @classmethod
@@ -141,6 +145,7 @@ class ContextPack:
         )
         pack = cls(
             pr_intent=resolved_intent,
+            protocol_version=protocol_version,
             workspace_digest=_workspace_value(workspace, "digest")
             or _workspace_value(_workspace_value(workspace, "info"), "digest")
             or str(_value(changeset, "head_sha", "") or ""),
@@ -398,6 +403,7 @@ class _PackBuilder:
                 symbol="",
                 reason=f"literal old/new path reference for {change.id}; navigation, not usage proof",
                 source=actual,
+                focus_line=line,
             )
             if reference is not None:
                 references.append(reference)
@@ -451,6 +457,7 @@ class _PackBuilder:
         reason: str,
         source: str | None = None,
         fallback_text: str = "",
+        focus_line: int | None = None,
     ) -> ContextSlice | None:
         start = max(1, int(start_line or 1))
         end = max(start, int(end_line or start))
@@ -483,6 +490,9 @@ class _PackBuilder:
             text=text,
             reason=str(reason or ""),
             sha=self.sha,
+            focus_line=(
+                focus_line if content is not None and type(focus_line) is int and start <= focus_line <= end else None
+            ),
         )
 
     def _collect_callers(self, unit: SemanticUnit) -> list[ContextSlice]:
@@ -524,6 +534,7 @@ class _PackBuilder:
                 symbol=symbol,
                 reason=f"calls {symbol} at line {line}",
                 fallback_text=hit["text"],
+                focus_line=line,
             )
             if result_slice is not None:
                 result.append(result_slice)

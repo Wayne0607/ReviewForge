@@ -7,6 +7,7 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field
 
 from reviewforge.core.state import StateStore
@@ -72,14 +73,22 @@ def candidate(u: SemanticUnit) -> dict:
 
 
 class ScriptedLLM(BaseChatModel):
-    responses: list[str] = Field(default_factory=list)
+    responses: list[str | AIMessage] = Field(default_factory=list)
     calls: list[list] = Field(default_factory=list)
     limits: list[int | None] = Field(default_factory=list)
+    bindings: list[dict] = Field(default_factory=list)
+
+    def bind_tools(self, tools, **kwargs):
+        options = {"tools": [convert_to_openai_tool(tool) for tool in tools], **kwargs}
+        self.bindings.append(options)
+        return self.bind(**options)
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.calls.append(messages)
         self.limits.append(kwargs.get("max_tokens"))
-        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.responses.pop(0)))])
+        response = self.responses.pop(0)
+        message = response if isinstance(response, AIMessage) else AIMessage(content=response)
+        return ChatResult(generations=[ChatGeneration(message=message)])
 
     @property
     def _llm_type(self):

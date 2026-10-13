@@ -24,7 +24,7 @@ import tarfile
 import tempfile
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -35,6 +35,14 @@ from reviewforge.core.state import StateStore
 from reviewforge.engine import symbol_extractor
 from reviewforge.engine.declarations_v4 import extract_code_definitions
 from reviewforge.engine.java_navigation import JavaSource, matches_qualified
+from reviewforge.engine.reference_navigation import (
+    MAX_REFERENCE_FILE_BYTES,
+    ReferenceSearchResult,
+    is_reference_text_path,
+    reference_hit_limit,
+    reference_pattern,
+    select_reference_hits,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -742,6 +750,60 @@ class PRHeadWorkspace:
                     )
                 )
         return hits
+
+    def find_references(
+        self, symbol: str, *, path: str = "", globs: list[str] | None = None, max_hits: int = 10
+    ) -> ReferenceSearchResult:
+        """Navigate literal identifiers across this head; not resolved callers.
+
+        ``path`` de-prioritizes the current file, never filters other files.
+        Only explicit globs filter paths. Text/size coverage and hit sampling
+        remain separate metadata, so no match cannot prove no consumer exists.
+        """
+        matcher = reference_pattern(symbol)
+        limit = reference_hit_limit(max_hits)
+        origin = _normalise_repo_path(path) if path else ""
+        if path and origin is None:
+            raise ValueError("find_references path must be repository-relative")
+        if self._closed or self.info.source == "api-fallback":
+            return ReferenceSearchResult(max_hits=limit, source_truncated=self.info.truncated, unavailable=True)
+        patterns = tuple(str(item).replace("\\", "/") for item in (globs or []) if str(item))
+        scanned = skipped = large = 0
+
+        def scan() -> Iterable[GrepHit]:
+            nonlocal scanned, skipped, large
+            for relative, candidate in self._iter_files():
+                if patterns and not any(_glob_matches(relative, item) for item in patterns):
+                    continue
+                if not is_reference_text_path(relative):
+                    skipped += 1
+                    continue
+                size = (
+                    self._archive_view.files[relative].size
+                    if self._archive_view is not None
+                    else candidate.stat().st_size
+                )
+                if size > MAX_REFERENCE_FILE_BYTES:
+                    skipped += 1
+                    large += 1
+                    continue
+                content = self._read_local(relative, candidate)
+                if "\x00" in content:
+                    skipped += 1
+                    continue
+                scanned += 1
+                for line, text in enumerate(content.splitlines(), 1):
+                    if matcher.search(text):
+                        yield GrepHit(path=relative, line=line, text=text)
+
+        result = select_reference_hits(scan(), path=origin or "", max_hits=limit)
+        return replace(
+            result,
+            scanned_files=scanned,
+            skipped_files=skipped,
+            skipped_large_files=large,
+            source_truncated=self.info.truncated,
+        )
 
     def find_callers(self, symbol: str, *, language: str, max_hits: int, diverse: bool = False) -> list[GrepHit]:
         """Find call expressions; optionally round-robin matching files."""

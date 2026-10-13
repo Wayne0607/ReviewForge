@@ -46,6 +46,7 @@ from reviewforge.engine.investigation_tasks import (
     fair_investigation_tasks,
     render_investigation_context,
 )
+from reviewforge.engine.native_submission import strict_tool_calls
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import plan_request
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
@@ -72,7 +73,9 @@ _OBS_EXCERPT_CHARS = 1_200
 _EVIDENCE_SEGMENT_CHARS = 400
 _MIN_USEFUL_OUTPUT = 512
 _CONTEXT_CHARS = 12_000
-_NOT_FOUND_MARKERS = frozenset({"no results", "not found", "no matches", "no definition found", "no callers found"})
+_NOT_FOUND_MARKERS = frozenset(
+    {"no results", "not found", "no matches", "no definition found", "no callers found", "no literal references found"}
+)
 
 _OUT_OF_DIFF_TOKENS = ("caller", "callee", "parent", "base class", "interface", "schema")
 _REQUIRES_CONTEXT_TOKENS = ("caller", "parent", "schema", "base class")
@@ -86,7 +89,7 @@ def _evidence_segments(observation: Observation) -> dict[str, EvidenceCitation]:
     """Name saved source spans; never synthesize quotes or include unsaved text."""
     if observation.status != "success":
         return {}
-    if observation.tool in {"grep", "find_callers"}:
+    if observation.tool in {"grep", "find_callers", "find_references"}:
         blocks = observation.excerpt.splitlines(keepends=True)
     elif observation.tool == "find_definition":
         blocks = re.split(r"(?m)(?=^- )", observation.excerpt)
@@ -154,10 +157,10 @@ def _query_string(name: str, args: dict[str, Any]) -> str:
     return f"{name} {json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
 
 
-def _observation_path(args: dict[str, Any]) -> str:
+def _observation_path(args: dict[str, Any], *, tool: str = "") -> str:
     # A search scope is not a source file. Search hit locations are resolved
     # from the actual result when checking the quoted evidence below.
-    return str(args.get("path") or "")
+    return "" if tool == "find_references" else str(args.get("path") or "")
 
 
 def _line_range(args: dict[str, Any]) -> tuple[int, int] | None:
@@ -203,6 +206,8 @@ def _changed_paths(state: StateStore) -> set[str]:
 def build_workspace_executor(workspace: Any, state: StateStore, *, language: str = "") -> ToolExecutor:
     """Bind the SPEC §4.6 tool names to a pinned :class:`PRHeadWorkspace`."""
 
+    reference_lookups: dict[str, dict[str, Any]] = {}
+
     async def _execute(name: str, args: dict[str, Any]) -> str:
         if name == "read_change":
             change = state.file_changes.get(args["path"])
@@ -241,6 +246,34 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
                 args["symbol"], language=language, max_hits=int(args.get("max_hits", 10)), diverse=True
             )
             return "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in hits) or "No callers found"
+        if name == "find_references":
+            result = workspace.find_references(
+                args["symbol"],
+                path=str(args.get("path") or ""),
+                globs=[args["glob"]] if args.get("glob") else None,
+                max_hits=int(args.get("max_hits", 10)),
+            )
+            reference_lookups[_query_string(name, args)] = {
+                "kind": "literal-identifier-reference",
+                "navigation_only": True,
+                "execution_resolved": False,
+                "aliases_resolved": False,
+                "head_sha": state.head_sha,
+                "truncated": result.truncated,
+                "returned_hits": len(result.hits),
+                "scanned_files": result.scanned_files,
+                "max_hits": result.max_hits,
+                "per_file_limit": result.per_file_limit,
+                **{
+                    field: getattr(result, field)
+                    for field in ("skipped_files", "skipped_large_files", "source_truncated", "unavailable")
+                    if hasattr(result, field)
+                },
+            }
+            return (
+                "\n".join(f"- {hit.path}:{hit.line}: {hit.text}" for hit in result.hits)
+                or "No literal references found"
+            )
         if name == "read_diff":
             patch = (state.file_diffs or {}).get(args["path"], "") or ""
             if args.get("start") is None and args.get("end") is None:
@@ -252,6 +285,7 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
             return select_diff_hunks(patch, [(start, end)])
         raise KeyError(f"unknown investigator tool: {name}")
 
+    _execute.reference_lookups = reference_lookups
     return _execute
 
 
@@ -309,6 +343,11 @@ class Investigator:
         async def find_callers(symbol: str, max_hits: int = 10) -> str:
             return await self._run_tool("find_callers", {"symbol": symbol, "max_hits": max_hits})
 
+        async def find_references(symbol: str, path: str = "", glob: str = "", max_hits: int = 10) -> str:
+            return await self._run_tool(
+                "find_references", {"symbol": symbol, "path": path, "glob": glob, "max_hits": max_hits}
+            )
+
         async def read_diff(path: str, start: int | None = None, end: int | None = None) -> str:
             payload: dict[str, Any] = {"path": path}
             if start is not None:
@@ -348,6 +387,18 @@ class Investigator:
                 description="读取 PR before/after diff；可用 start/end RIGHT 行窗口定位 hunk，保留删除行与上下文",
             ),
         ]
+        if self._protocol_version >= 4:
+            tools.append(
+                StructuredTool.from_function(
+                    coroutine=find_references,
+                    name="find_references",
+                    description="Find bounded literal identifier/property/JSX references in the pinned head, including "
+                    "indirect route bindings that direct-call lookup misses. Follow identifiers actually observed in "
+                    "source; read each binding before treating it as an execution or consumer contract. path ranks "
+                    "that declaration file last; only glob filters. Hits and empty results are navigation, not proof "
+                    "of reachability or absence. Aliases and full dataflow are not resolved.",
+                )
+            )
         verified_paths = (
             tuple(
                 sorted(
@@ -451,7 +502,7 @@ class Investigator:
             id=f"obs_{self._obs_counter}",
             tool=name,
             query=query,
-            path=_observation_path(args),
+            path=_observation_path(args, tool=name),
             line_range=_line_range(args),
             sha=self._state.head_sha if self._state else "",
             result_digest=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
@@ -475,6 +526,22 @@ class Investigator:
             )
             if diff_navigation:
                 self._progress.append({"phase": "diff-navigation", "observation_id": observation.id, **diff_navigation})
+            if self._protocol_version >= 4 and name == "find_references":
+                lookup = getattr(self._executor, "reference_lookups", {}).get(query)
+                self._progress.append(
+                    {
+                        "phase": "reference-navigation",
+                        "observation_id": observation.id,
+                        "lookup_scope": lookup
+                        or {
+                            "kind": "literal-identifier-reference",
+                            "navigation_only": True,
+                            "execution_resolved": False,
+                            "aliases_resolved": False,
+                            "metadata_available": False,
+                        },
+                    }
+                )
             if self._protocol_version >= 4 and status == "success" and original_chars > len(excerpt):
                 # Preserve the warning when v4 rebuilds chat and on checkpoint
                 # restore. Only sizes survive; omitted source is not evidence.
@@ -586,7 +653,12 @@ class Investigator:
         # Search scopes are not files. Use concrete locations in saved positive
         # hits, never an absent result or model-authored filename/line guess.
         for observation in reversed(self._observations):
-            if observation.status != "success" or observation.tool not in {"grep", "find_callers", "find_definition"}:
+            if observation.status != "success" or observation.tool not in {
+                "grep",
+                "find_callers",
+                "find_definition",
+                "find_references",
+            }:
                 continue
             for line in observation.excerpt.splitlines():
                 if observation.tool == "find_definition":
@@ -1423,6 +1495,23 @@ class Investigator:
             if observation.path:
                 record["path"] = observation.path
             if self._protocol_version >= 4:
+                if observation.tool == "find_references":
+                    lookup = next(
+                        (
+                            entry["lookup_scope"]
+                            for entry in reversed(self._progress)
+                            if entry.get("phase") == "reference-navigation"
+                            and entry.get("observation_id") == observation.id
+                        ),
+                        None,
+                    )
+                    record["lookup_scope"] = lookup or {
+                        "kind": "literal-identifier-reference",
+                        "navigation_only": True,
+                        "execution_resolved": False,
+                        "aliases_resolved": False,
+                        "metadata_available": False,
+                    }
                 window = next(
                     (
                         entry
@@ -1590,9 +1679,7 @@ class Investigator:
         return bound, messages, tool
 
     def _parse_closing_submission(self, response: Any, tool: StructuredTool) -> dict[str, Any] | None:
-        calls = getattr(response, "tool_calls", None) or []
-        if getattr(response, "invalid_tool_calls", None):
-            raise ValueError("invalid-closing-submission")
+        calls = strict_tool_calls(response)
         if calls:
             if len(calls) != 1 or calls[0].get("name") != tool.name or not isinstance(calls[0].get("args"), dict):
                 raise ValueError("invalid-closing-submission")
@@ -2026,7 +2113,7 @@ class Investigator:
     def _quote_outside_diff(observation: Observation, quote: str, changed: set[str]) -> bool:
         if observation.path:
             return observation.path not in changed
-        if observation.tool in {"grep", "find_callers"}:
+        if observation.tool in {"grep", "find_callers", "find_references"}:
             # Executor search results have one concrete path:line per hit. An
             # unrelated hit must not promote evidence quoted from the diff.
             for line in observation.excerpt.splitlines():

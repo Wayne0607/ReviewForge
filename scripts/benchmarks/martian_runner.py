@@ -104,7 +104,15 @@ class BenchmarkLLM(BaseChatModel):
                 "messages": [{"role": m.type, "content": m.content} for m in messages],
                 "max_tokens": kwargs.get("max_tokens", getattr(self._inner, "max_tokens", None)),
                 "request_options": {
-                    key: kwargs[key] for key in ("response_format", "extra_body", "reasoning_effort") if key in kwargs
+                    key: kwargs[key]
+                    for key in (
+                        "response_format",
+                        "extra_body",
+                        "reasoning_effort",
+                        "tools",
+                        "tool_choice",
+                    )
+                    if key in kwargs
                 },
             },
         )
@@ -135,6 +143,11 @@ class BenchmarkLLM(BaseChatModel):
                     if generation.generation_info
                     else "",
                     "tool_calls": getattr(message, "tool_calls", []),
+                    **(
+                        {"raw_tool_calls": message.additional_kwargs["reviewforge_raw_tool_calls"]}
+                        if "reviewforge_raw_tool_calls" in message.additional_kwargs
+                        else {}
+                    ),
                 }
             )
         _atomic_json(

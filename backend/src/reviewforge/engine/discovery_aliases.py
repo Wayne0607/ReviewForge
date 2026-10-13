@@ -44,6 +44,24 @@ def target_source_choices(block: DiscoveryBlock, unit_id: str, aliases: dict[str
     return choices
 
 
+def target_site_choices(block: DiscoveryBlock, unit_id: str, aliases: dict[str, str]) -> list[str]:
+    """Offer real target RIGHT locations, never short punctuation or metadata.
+
+    This mirrors the existing candidate-site boundary without selecting the
+    operation or asserting a defect. Another unit's eligible site still does
+    not grant ownership to this unit.
+    """
+    if unit_id in block.structural_changes:
+        return []
+    choices = []
+    for alias, reference in aliases.items():
+        source = block.source_refs[reference]
+        raw = {"side": source.side, "path": source.path, "line": source.line, "excerpt": source.text}
+        if source.side == "after" and len(source.text) >= 12 and block.unit_source_matches(unit_id, raw):
+            choices.append(alias)
+    return choices
+
+
 def render_source_aliases(text: str, aliases: dict[str, str]) -> str:
     """Replace only coordinate metadata, never source bodies or prose."""
     reverse = {canonical: short for short, canonical in aliases.items()}

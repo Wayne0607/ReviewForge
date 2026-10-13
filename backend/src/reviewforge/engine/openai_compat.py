@@ -11,6 +11,7 @@ It does not enable reasoning or send any provider-specific request option.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import openai
@@ -37,6 +38,17 @@ class ReasoningContentChatOpenAI(ChatOpenAI):
             if not isinstance(choice, dict):
                 continue
             raw_message = choice.get("message")
+            if (
+                isinstance(raw_message, dict)
+                and raw_message.get("tool_calls") is not None
+                and isinstance(generation.message, AIMessage)
+            ):
+                # Modern SDK conversion keeps only permissively parsed args.
+                # Native result validation must also inspect the exact string
+                # for duplicates/completeness; this metadata is never replayed.
+                generation.message.additional_kwargs["reviewforge_raw_tool_calls"] = copy.deepcopy(
+                    raw_message["tool_calls"]
+                )
             if (
                 isinstance(raw_message, dict)
                 and "reasoning_content" in raw_message

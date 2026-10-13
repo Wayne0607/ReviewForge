@@ -2,6 +2,16 @@
 
 更新时间：2026-10-13。开发分支：`dev`。生产分支：`main@00c667556c88241d72d96f24430c7c16b4add24e`。
 
+## 最新验证：扁平收尾真实兼容通过，完整质量尚未通过
+
+`711706ebede2be75b2a9aa69ae9e2b6db9331117` 已推dev且[CI通过](https://github.com/Wayne0607/ReviewForge/actions/runs/38367505379)。固定两例的第二次收尾诊断 `.reviewforge/benchmarks/v4-typed-closure-711706e-20261013-161101/` 正常退出，2次物理请求、8041实报、未知/在途/提供方/输出/准入错误0。两例均完成原类型、引用和裁决校验，得到调查confirmed；它们没有进入发布核验或发送，不把收尾confirmed当质量TP。Keycloak为原事实重建收尾，Cal为原实际收尾请求；原candidate和head均未改。
+
+Keycloak实际3259、Cal4782，低于扣历史诊断后的15647/7078任务余额；接续PR账分别159165/83309实报，全部原250k/PR限制保留。Cal角色事实已正确区分OWNER通过、ADMIN-only被拒，但expected仍由变量名/当前helper推断目标权限要求，没有实际消费者契约；这一探针不证明权限缺陷允许发布。最新完整两PR仍沿用下面的partial结果，未复跑发现阶段、严格裁判或10PR，F1/precision/recall仍无新值。
+
+Job约50.84秒，峰值124628992 bytes，原2 GiB/CPU10%/reserve2 GiB/disk16 GiB保护保留。只读 `usage-audit.json` SHA256 `f599f0d70a95b121d909bcba8089366078a6cfc12718a686b100d868a0b8bf5f` 核实trace、DB、budget、receipt及冻结源文件一致；原失败及helper保持。追加300000内累计242474，余57526；总计2365107实报 + 368868历史未知预占 = 2733975，未知预占不是账单。main远端仍为`00c667556c88241d72d96f24430c7c16b4add24e`，未部署v4。
+
+当前未完成的验收瓶颈是发现覆盖闭合和主动取得实际操作消费者/权限契约；确定性容量与scope修复尚需新冻结完整队列验证，不能把本地2456通过或两例收尾兼容通过写成v4已完成、超过Qodo或10PR验收通过。
+
 ## 2026-10-13：补证闭环完整两 PR 结果与后续根因修复
 
 冻结 `8393f53cbc7441c24d45f93988cd00c746635269` 的两条原完整 PR 回归自然退出，仍为 partial；36 次物理请求全部成功，226229 实报 tokens，未知/在途/累计拒绝均为 0。约20分钟，本机 Job 峰值1145712640 bytes、原2 GiB/CPU10%限制保持。严格裁判未启动，没有质量分。原结果目录 `.reviewforge/benchmarks/v4-confirm2-8393f53-20261013-143410/`，只读核账 `targeted2-usage-audit.json` SHA256 `0d27facd83281c6b82fba83948397b5a56089005335159e16cb174ea730cb8a6`。

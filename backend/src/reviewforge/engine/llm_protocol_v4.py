@@ -6,7 +6,13 @@ from typing import Any
 
 
 def request_options(
-    model: str, agent: str, *, closing: bool = False, json_mode: str = "auto", closure_thinking: str = "auto"
+    model: str,
+    agent: str,
+    *,
+    closing: bool = False,
+    json_mode: str = "auto",
+    closure_thinking: str = "auto",
+    protocol_version: int = 3,
 ) -> dict[str, Any]:
     if json_mode not in {"auto", "off", "json_object"} or closure_thinking not in {"auto", "default", "disabled"}:
         raise ValueError("unsupported v4 output mode")
@@ -17,4 +23,9 @@ def request_options(
         options["response_format"] = {"type": "json_object"}
     if deepseek and final_output and (agent != "investigator" or closure_thinking in {"auto", "disabled"}):
         options.update(extra_body={"thinking": {"type": "disabled"}}, reasoning_effort=None)
+    # The tested flash route uses the Qwen switch, not DeepSeek's thinking
+    # object. Bound all v4 stages; unknown providers and saved protocols keep
+    # their behavior. JSON mode remains an explicit opt-in for this route.
+    if protocol_version >= 4 and model.lower().startswith("qwen3.8-flash"):
+        options["extra_body"] = {"enable_thinking": False}
     return options

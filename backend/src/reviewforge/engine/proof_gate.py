@@ -24,6 +24,8 @@ from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Hypothes
 from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import plan_request
+from reviewforge.engine.source_audit import audit_hash, run_source_audit
+from reviewforge.engine.source_audit import current as audit_current
 from reviewforge.engine.verification_guidance import (
     defect_scope_guidance,
     has_python_concurrency,
@@ -209,7 +211,22 @@ def _scope_matches(record: dict[str, Any], item: Hypothesis, ledger: HypothesisL
         and record.get("head_sha") == ledger.head_sha
         and record.get("workspace_digest") == ledger.workspace_digest
         and record.get("run_id") == ledger.run_id
+        and (ledger.protocol_version < 4 or record.get("source_audit_hash") == audit_hash(item, ledger))
     )
+
+
+def _publication_problem(item: Hypothesis, ledger: HypothesisLedger) -> tuple[str, str] | None:
+    problem = _source_problem(item, ledger.head_sha)
+    if problem is not None or ledger.protocol_version < 4:
+        return problem
+    if not audit_current(item, ledger):
+        record = ledger.source_audits.get(item.id, {})
+        outcome = record.get("outcome", "output-error")
+        return (
+            outcome if outcome in {"budget-exhausted", "provider-error", "output-error"} else "output-error",
+            "independent-source-audit-not-complete",
+        )
+    return None
 
 
 def _completed_review(record: dict[str, Any], item: Hypothesis, ledger: HypothesisLedger) -> bool:
@@ -237,7 +254,7 @@ def accepted(item: Hypothesis, ledger: HypothesisLedger) -> bool:
         return False
     if sum(candidate.id == item.id for candidate in ledger.items.values()) != 1:
         return False
-    if _source_problem(item, ledger.head_sha) is not None:
+    if _publication_problem(item, ledger) is not None:
         return False
     record = ledger.publication_reviews.get(item.id, {})
     return isinstance(record, dict) and record.get("decision") == "accepted" and _completed_review(record, item, ledger)
@@ -252,7 +269,7 @@ def completed(item: Hypothesis, ledger: HypothesisLedger) -> bool:
     record = ledger.publication_reviews.get(item.id, {})
     if not _scope_matches(record, item, ledger):
         return False
-    problem = _source_problem(item, ledger.head_sha)
+    problem = _publication_problem(item, ledger)
     if problem is None:
         return _completed_review(record, item, ledger)
     return (
@@ -398,10 +415,15 @@ class ProofGate:
             await self._on_update(ledger)
 
     def _messages(self, ledger: HypothesisLedger, batch: list[Hypothesis]) -> list[Any]:
+        packets = [_packet(item) for item in batch]
+        if ledger.protocol_version >= 4:
+            for item, packet in zip(batch, packets, strict=True):
+                packet["independent_source_audit"] = ledger.source_audits[item.id]["facts"]
         return [
             SystemMessage(
                 content=load_prompt(
-                    "proof_gate_v3", output_language=("简体中文" if self._output_language == "zh-CN" else "English")
+                    "proof_gate_v4" if ledger.protocol_version >= 4 else "proof_gate_v3",
+                    output_language=("简体中文" if self._output_language == "zh-CN" else "English"),
                 )
             ),
             HumanMessage(
@@ -409,7 +431,7 @@ class ProofGate:
                     {
                         "head_sha": ledger.head_sha,
                         "workspace_digest": ledger.workspace_digest,
-                        "items": [_packet(item) for item in batch],
+                        "items": packets,
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -435,12 +457,15 @@ class ProofGate:
             "counterevidence": None,
             "missing_obligations": list(OBLIGATIONS),
             "validated": False,
+            **({"source_audit_hash": audit_hash(item, ledger)} if ledger.protocol_version >= 4 else {}),
             **fields,
         }
 
     async def run(self, ledger: HypothesisLedger) -> None:
         if ledger.protocol_version < 3:
             return
+        if ledger.protocol_version >= 4:
+            await run_source_audit(self._llm, ledger, self._on_update)
         candidates = [item for item in ledger.items.values() if item.status == HypothesisStatus.CONFIRMED]
         duplicate_ids = {identity for identity, count in Counter(item.id for item in candidates).items() if count > 1}
         pending = []
@@ -457,7 +482,7 @@ class ProofGate:
             problem = (
                 ("output-error", "duplicate-hypothesis-id")
                 if item.id in duplicate_ids
-                else (_source_problem(item, ledger.head_sha))
+                else (_publication_problem(item, ledger))
             )
             if problem is not None:
                 ledger.publication_reviews[item.id] = self._record(

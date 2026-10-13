@@ -6,6 +6,38 @@ import pytest
 from reviewforge.engine.symbol_extractor import extract_definitions
 
 
+@pytest.mark.parametrize("path", ["policy.js", "policy.ts"])
+def test_parenthesized_values_are_not_callable_units(path):
+    from reviewforge.engine.declarations_v4 import extract_code_definitions
+
+    source = """export async function authorize(user) {
+  const adminOrOwner =
+    (await isAdmin(user)) &&
+    (await isOwner(user));
+  if (!adminOrOwner) throw new Error('denied');
+}
+const count = (1 + 2);
+const apply = (value) => value + 1;
+"""
+    # Legacy's declaration guess must remain unchanged, but v4 cannot expose
+    # range 2..0 as an independently reviewable function.
+    assert any(item.name == "adminOrOwner" for item in extract_definitions(source, path))
+    result = extract_code_definitions(source, path)
+    assert [(item.name, item.end_line) for item in result] == [("authorize", 6), ("apply", 8)]
+
+
+def test_arrow_parameter_callbacks_and_types_remain_definitions():
+    from reviewforge.engine.declarations_v4 import extract_code_definitions
+
+    source = """const apply = (fn: (n: number) => number): number => fn(1);
+const object = ({value}: {value: string}): {value: string} => ({value});
+"""
+    assert [(item.name, item.end_line) for item in extract_code_definitions(source, "app.ts")] == [
+        ("apply", 1),
+        ("object", 2),
+    ]
+
+
 @pytest.mark.parametrize("path", ["image.png", "video.mp4", "README.md", "settings.yaml"])
 def test_v4_unsupported_definitions_do_not_allocate_a_code_mask(monkeypatch, path):
     from reviewforge.engine import symbol_extractor

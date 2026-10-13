@@ -43,6 +43,25 @@ _JAVA_EXPRESSION_STARTS = frozenset(
 )
 
 
+def _is_arrow_parameter_list(mask: str, opening: int) -> bool:
+    """A parenthesized initializer is not necessarily a callable declaration.
+
+    Check the token after the balanced parameter list. Nested callbacks and
+    destructuring may contain arrows, but those do not make the outer value a
+    function. A TypeScript return annotation is left to the range parser.
+    """
+    depth = 0
+    for index in range(opening, len(mask)):
+        if mask[index] == "(":
+            depth += 1
+        elif mask[index] == ")":
+            depth -= 1
+            if depth == 0:
+                following = mask[index + 1 :].lstrip()
+                return following.startswith(("=>", ":"))
+    return False
+
+
 def extract_code_definitions(content: str, path: str) -> list[symbol_extractor.SymbolInfo]:
     language = symbol_extractor.detect_language(path)
     patterns = symbol_extractor.DEFINITION_PATTERNS.get(language, [])
@@ -60,12 +79,21 @@ def extract_code_definitions(content: str, path: str) -> list[symbol_extractor.S
             prefix = re.search(r"[A-Za-z_$][\w$]*", mask[match.start() : match.start(1)])
             if language == "java" and kind == "function" and prefix and prefix.group() in _JAVA_EXPRESSION_STARTS:
                 continue
+            if (
+                language in {"javascript", "typescript"}
+                and kind == "function"
+                and re.search(r"\b(?:const|let|var)\s+", mask[match.start() : match.start(1)])
+                and not _is_arrow_parameter_list(mask, match.end() - 1)
+            ):
+                continue
             accepted.add((name, kind, content[: match.start(1)].count("\n") + 1))
     declarations = [
         item
         for item in symbol_extractor.extract_definitions(content, path)
         if (item.name, item.symbol_type, item.line) in accepted
     ]
+    # Rejected guesses must not act as boundaries for valid declarations.
+    symbol_extractor._populate_symbol_ranges(content, language, declarations)
     if language == "java":
         # The historical regex indexes classes only. Interface declarations
         # need the same ranges/owner identity for v4's bounded member lookup.

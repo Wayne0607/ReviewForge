@@ -46,6 +46,7 @@ from reviewforge.engine.discovery import (
     plan_discovery,
     split_discovery,
 )
+from reviewforge.engine.discovery_output import frame_discovery_output
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Mechanism, Site
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import RequestBudgetExceededError, RequestPlan, plan_request
@@ -451,9 +452,11 @@ class HypothesisGenerator:
                 await self._on_update(ledger)
         return result
 
-    def _discovery_system_prompt(self, allowance: int, responsibilities: list[str] | None = None) -> str:
+    def _discovery_system_prompt(
+        self, allowance: int, responsibilities: list[str] | None = None, *, protocol_version: int = 3
+    ) -> str:
         prompt = load_prompt(
-            "discovery_v3",
+            "discovery_v4" if protocol_version >= 4 else "discovery_v3",
             output_language=_language_directive(self._output_language),
             max_hypotheses=allowance,
             lens=self._source[len("lens:") :] if self._source.startswith("lens:") else "general correctness",
@@ -649,7 +652,11 @@ class HypothesisGenerator:
             )
             record["input_chars"] = len(user)
             messages = [
-                SystemMessage(content=self._discovery_system_prompt(allowance, responsibilities)),
+                SystemMessage(
+                    content=self._discovery_system_prompt(
+                        allowance, responsibilities, protocol_version=ledger.protocol_version
+                    )
+                ),
                 HumanMessage(content=user),
             ]
             record["system_chars"] = len(messages[0].content)
@@ -709,7 +716,10 @@ class HypothesisGenerator:
                 )
                 record["delivered_responsibilities"] = copy.deepcopy(record["requested_responsibilities"])
                 original = getattr(response, "content", "") or ""
-                parsed = self._parse_response(original)
+                framed = frame_discovery_output(original)
+                parsed = framed.payload if framed is not None else None
+                if framed is not None:
+                    record["output_framing"] = {"complete": framed.complete, "recovery": framed.recovery}
                 if parsed is None and isinstance(original, str) and original.strip():
                     parsed = await self._invoke_repair(original, ledger=ledger, request_floor=floor, record=record)
                 if parsed is None:
@@ -752,7 +762,12 @@ class HypothesisGenerator:
 
     @staticmethod
     def _valid_behavior(
-        item: dict[str, Any], unit: SemanticUnit, block: DiscoveryBlock, *, require_consumer: bool = False
+        item: dict[str, Any],
+        unit: SemanticUnit,
+        block: DiscoveryBlock,
+        *,
+        require_consumer: bool = False,
+        protocol_version: int = 3,
     ) -> bool:
         behavior = item.get("behavior")
         if not isinstance(behavior, dict) or any(
@@ -779,6 +794,11 @@ class HypothesisGenerator:
             return False
         for side in ("before", "after"):
             relevant = [fact for fact in target if fact.side == side]
+            # For an additive hunk the unchanged before context is not the
+            # changed operation. Do not demand an unrelated citation merely to
+            # fill a slot. A deletion/replacement still needs its exact before.
+            if protocol_version >= 4 and side == "before" and not any(fact.changed for fact in relevant):
+                continue
             if relevant and (
                 side not in sides
                 or not any(
@@ -867,7 +887,9 @@ class HypothesisGenerator:
                         failed[unit_id] = "deferred: " + raw["reason"].strip()
                     continue
                 raw = self._resolve_discovery_sources(raw, block)
-                if not self._valid_behavior(raw, unit, block, require_consumer=kind == "no_issue"):
+                if not self._valid_behavior(
+                    raw, unit, block, require_consumer=kind == "no_issue", protocol_version=ledger.protocol_version
+                ):
                     failed[unit_id] = "invalid source-backed behavior assessment"
                     result.dropped_invalid += int(kind == "hypothesis")
                     continue
@@ -879,7 +901,7 @@ class HypothesisGenerator:
                     ):
                         failed[unit_id] = "missing concrete checked boundary"
                     continue
-                if not self._valid_violation(raw, block):
+                if ledger.protocol_version < 4 and not self._valid_violation(raw, block):
                     failed[unit_id] = "invalid source-backed violation obligations"
                     result.dropped_invalid += 1
                     continue
@@ -945,6 +967,11 @@ class HypothesisGenerator:
                 structural_changes=block.structural_changes,
             )
         for unit_id, entries in answers.items():
+            if record.get("output_framing", {}).get("complete") is False:
+                # Complete prefix candidates are still useful leads; a damaged
+                # tail can hide contradictory/remaining assessments, so none of
+                # this response establishes complete coverage or a clean unit.
+                failed[unit_id] = "incomplete output record stream"
             if invalid_other and unit_id not in failed:
                 failed[unit_id] = "invalid block output entries"
             if unit_id in failed:
@@ -1214,7 +1241,11 @@ class HypothesisGenerator:
                     continue
                 if ledger.protocol_version >= 3:
                     payload["discovery_basis"] = copy.deepcopy(
-                        {field: item[field] for field in ("behavior", "discrepancy", "trigger_basis", "violation")}
+                        {
+                            field: item[field]
+                            for field in ("behavior", "discrepancy", "trigger_basis", "violation")
+                            if field in item
+                        }
                     )
                 payload["change_anchor"] = change
                 valid.append((payload, sites))

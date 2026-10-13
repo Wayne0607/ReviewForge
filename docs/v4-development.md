@@ -702,3 +702,33 @@ keycloak#37429 与 calcom#10967 超过每 PR 250k 门槛；6 条其它已审查�
 - **证明计划与用量分配。** 已保存任务共 62 次 insufficient-evidence、52 次 policy-deferred、1 次 output-error、1 次 provider-error；未完成任务不冒充已取证。Keycloak 初始化先后关系仍未证明，调查反复读取不等于完成证明。Cal.com #14740 的 29 次保存工具观察全部成功，其中 13 次 definition；资源修复未重现旧工具异常，但不足以证明完整流水线内存收益的因果归属。114-token 探索请求还说明剩余预算应支持有效下一步，而非在无法交付正文时继续付出整段输入费用。
 
 本轮冻结实现与旧 v1 的任务、证明和完成语义不同，不能用总 token 或不同轨迹的峰值直接作单项收益比较。私有后续入口 `launch_checked_proxy_cache_v2.py` 在创建 Job/模型客户端前核对预声明与完整工作区开关，缺失就拒绝；本轮原启动器、驱动及摘要保留。下一轮需先保证启动协议一致、生成覆盖闭合及调查目标有效，再冻结完整十条重新验收；旧账本、失败和本轮协议偏差继续保留。
+
+### Qwen 固定十 PR 诊断与下一轮修复（2026-10-13）
+
+用户将模型切换为 `qwen3.8-flash`。冻结实现 `f9e1fb50e00924bc1514b696908440f2d5f1800a`，仍是 canonical50 原固定 dev10、原 head 与 39 条 golden、完整缓存源码；使用非思考模式及普通 JSON 正文（不强制 response_format），不改变严格解析与裁判。兼容性探针未全通过语义检查，因此整批预声明为 diagnostic-not-accepted，不作正式验收。
+
+产物：`.reviewforge/benchmarks/v4-v3-fixed10-qwen-f9e1fb5-20261013-101354/`。10/10 均返回，全部 partial；100 次物理请求成功，提供方错误 0，实报 789739 tokens、未知和在途预占均 0。严格完成检查拒绝全部十条，裁判请求 0，F1/precision/recall 保持 null。共 3 条行内评论、152 个未覆盖单元；不能把评论数当正确命中。Job 正常退出，耗时约 56.6 分钟，峰值 1156509696 bytes（约 1103 MiB），本机 2 GiB / CPU 10% 上限，未部署生产。
+
+| PR | 状态 | 行内评论 | 实报 tokens |
+|---|---|---:|---:|
+| keycloak/keycloak #37429 | partial | 1 | 104230 |
+| keycloak/keycloak #36882 | partial | 0 | 29928 |
+| getsentry/sentry #93824 | partial | 0 | 80541 |
+| sentry-greptile #1 | partial | 0 | 17696 |
+| grafana/grafana #97529 | partial | 0 | 35586 |
+| grafana/grafana #90045 | partial | 0 | 66694 |
+| discourse-graphite #10 | partial | 0 | 121697 |
+| discourse-graphite #4 | partial | 1 | 140813 |
+| calcom/cal.com #14740 | partial | 1 | 76610 |
+| calcom/cal.com #10967 | partial | 0 | 115944 |
+
+`diagnostic-summary.json` 保存严格门槛与原结果摘要；`qwen10-usage-audit.json` 核实 trace、数据库、预算和结果账一致、冻结输入未改。含先前诊断的累计为 1528454 实报 + 368868 未知保守预占 = 1897322；未知预占不是账单。此次六个兼容探针单独消耗 15975 实报 + 14241 未知，已计入上述累计，不能重复相加。
+
+已确认的根因：
+
+- 立陶宛语混入意大利语的候选已在模型正文中提出，但整个块仅缺末尾根括号；一次模型修复原样返回，导致完整候选丢失。该例不是接口中断、length 截断或调查反驳。独立发现审计保存于 `manual-discovery-audit.json`。
+- 61 个单元因行为引用不合法未覆盖、24 个因 JSON 解析、45 个因发现预算/有效输出空间、11 个遗漏，其余为来源/候选形状或明确延期。相当一部分纯增加要求引用未改的 before；另有模型引用了声明而未引用被改操作。
+- Cal.com 的 `const isTeamAdminOrOwner = (await ...) && ...` 被正则当函数，范围为 `46..0`；已提出的权限疑点因空目标范围被丢弃。它是变量，不是新增函数；修复应在声明类型与范围来源，而非放宽任意源码引用。
+- 人工源码核对发现 Discourse 评论读反 `discourseUrl.indexOf(e.origin)` 的包含方向；Java 评论未建立独占异常类型契约和实际失败路径；邮件评论未建立新受邀者必须收到更新通知的产品契约。人工核对是具体诊断，不是 golden 评分。
+
+用户据此授权改架构且停止 6.1-sol 委派。新内部协议 4 将发现疑点与证明解耦，并在发布前先隐藏候选做源码还原，再对照原始候选裁决；保持原预算、源码证据与严格验收。声明过滤、完整记录恢复、已修改 before 的精确约束、盲输入隔离、引用/摘要/恢复门禁及 Qwen 原生参数已有确定性回归。首次全量 `2211 passed, 1 skipped, 6 existing warnings`；这不是质量验收，尚需冻结新代码的真实诊断。

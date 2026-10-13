@@ -47,6 +47,37 @@ def contracted_input():
 
 
 @pytest.mark.asyncio
+async def test_v4_discovers_a_source_grounded_lead_without_pretending_to_prove_the_contract():
+    u, state, pack, _, raw = contracted_input()
+    raw.pop("violation")
+    book = HypothesisLedger("run", "abc", "digest", protocol_version=4)
+    model = ScriptedLLM(responses=[json.dumps({"hypotheses": [raw]})])
+    result = await HypothesisGenerator(model).run(state, pack, changeset(u), book)
+    assert result.accepted == 1 and not book.unresolved_units
+    item = next(iter(book.items.values()))
+    assert item.status.value == "open" and item.assessment is None and not item.observations
+    assert "violation" not in item.discovery_basis
+    assert "No redundant violation object" in model.calls[0][0].content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_v4_requires_changed_before_not_unrelated_unchanged_context(replacement):
+    u = unit("app.py")
+    raw = clean(u)
+    raw["behavior"]["source_facts"] = [{"side": "after", "path": u.path, "line": 2, "excerpt": "return new_value"}]
+    patch = "@@ -1,1 +1,2 @@\n existing_line\n+return new_value"
+    if replacement:
+        patch = "@@ -1,2 +1,2 @@\n existing_line\n-return old_value\n+return new_value"
+    book = HypothesisLedger("run", "abc", "digest", protocol_version=4)
+    await HypothesisGenerator(ScriptedLLM(responses=[json.dumps({"hypotheses": [], "no_issue_units": [raw]})])).run(
+        StateStore(file_diffs={u.path: patch}), ContextPack(), changeset(u), book
+    )
+    assert bool(book.unresolved_units) == replacement
+    assert (u.id in book.no_issue_units) != replacement
+
+
+@pytest.mark.asyncio
 async def test_closing_markup_delta_without_violation_cannot_be_admitted():
     u = unit("messages.properties")
     before, after = "emailBody=<p>Welcome", "emailBody=<p>Welcome</p>"

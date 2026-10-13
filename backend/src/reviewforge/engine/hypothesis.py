@@ -286,11 +286,12 @@ class HypothesisLedger:
     discovery_blocks: dict[str, dict[str, Any]] = field(default_factory=dict)
     request_budget: dict[str, Any] = field(default_factory=dict)
     publication_reviews: dict[str, dict[str, Any]] = field(default_factory=dict)
+    source_audits: dict[str, dict[str, Any]] = field(default_factory=dict)
     structural_checks: dict[str, Any] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.protocol_version not in {1, 2, 3}:
+        if self.protocol_version not in {1, 2, 3, 4}:
             raise ValueError("unsupported investigation protocol")
         for item in self.items.values():
             self._validate_change_anchor(item)
@@ -475,6 +476,7 @@ class HypothesisLedger:
                 "unresolved_units": dict(sorted(self.unresolved_units.items())),
                 "protocol_version": self.protocol_version,
                 "investigation_tasks": copy.deepcopy(self.investigation_tasks),
+                **({"source_audits": copy.deepcopy(self.source_audits)} if self.protocol_version >= 4 else {}),
                 **(
                     {
                         "discovery_blocks": copy.deepcopy(self.discovery_blocks),
@@ -501,5 +503,6 @@ class HypothesisLedger:
             discovery_blocks=copy.deepcopy(data.get("discovery_blocks", {})),
             request_budget=copy.deepcopy(data.get("request_budget", {})),
             publication_reviews=copy.deepcopy(data.get("publication_reviews", {})),
+            source_audits=copy.deepcopy(data.get("source_audits", {})),
             structural_checks=copy.deepcopy(data.get("structural_checks", {})),
         )

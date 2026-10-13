@@ -199,6 +199,7 @@ async def _run_llm_stages(
                 closing=closing,
                 json_mode=config.json_output_mode,
                 closure_thinking=config.investigator_closure_thinking,
+                protocol_version=ledger.protocol_version,
             )
             events.emit("pipeline_v4.request_options", {"agent": name, "closing": closing, "options": options})
         raw = (

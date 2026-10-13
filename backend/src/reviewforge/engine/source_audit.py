@@ -86,6 +86,39 @@ def current(item, ledger: HypothesisLedger) -> bool:
     return True
 
 
+def consume(raw, item):
+    """Keep independently valid source records; never launder a bad citation.
+
+    The envelope and each retained record remain strict. Invalid records become
+    explicit gaps and audit metadata, not facts. A final proof still needs a
+    surviving independently sourced contract and execution observation.
+    """
+    if not isinstance(raw, dict) or set(raw) != {"hypothesis_id", "execution", "contracts", "gaps"}:
+        raise ValueError("invalid-source-audit-shape")
+    if raw["hypothesis_id"] != item.id or any(
+        not isinstance(raw[name], list) or len(raw[name]) > 8 for name in ("execution", "contracts", "gaps")
+    ):
+        raise ValueError("invalid-source-audit-envelope")
+    kept = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": raw["gaps"][:]}
+    rejected = []
+    # Validate model gaps before adding program diagnostics.
+    validate({**kept, "gaps": kept["gaps"] or ["Validation placeholder"]}, item)
+    for name in ("execution", "contracts"):
+        for index, row in enumerate(raw[name]):
+            trial = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": [], name: [row]}
+            try:
+                valid = validate(trial, item)
+            except (TypeError, ValueError) as exc:
+                rejected.append({"array": name, "index": index, "reason": str(exc)})
+            else:
+                kept[name].extend(valid[name])
+    if rejected:
+        kept["gaps"] = kept["gaps"][:7] + [
+            "Some source reconstruction records failed schema/reference validation; they supply no evidence."
+        ]
+    return validate(kept, item), rejected
+
+
 def messages(batch, ledger):
     from reviewforge.engine.proof_gate import _packet
 
@@ -205,9 +238,11 @@ async def run_source_audit(llm, ledger, on_update=None):
         else:
             for item in batch:
                 try:
-                    facts = validate(by_id[item.id], item)
+                    facts, rejected = consume(by_id[item.id], item)
                 except (TypeError, ValueError) as exc:
                     ledger.source_audits[item.id].update(outcome="output-error", reason=str(exc))
                 else:
-                    ledger.source_audits[item.id].update(outcome="resolved", reason="source-reconstructed", facts=facts)
+                    ledger.source_audits[item.id].update(
+                        outcome="resolved", reason="source-reconstructed", facts=facts, rejected_records=rejected
+                    )
         await save()

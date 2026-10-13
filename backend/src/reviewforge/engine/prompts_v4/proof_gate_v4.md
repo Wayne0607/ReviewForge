@@ -51,24 +51,39 @@ multiple obligations; references need not be distinct. A source excerpt may be
 partial: do not infer absence, full hunk coverage, or surrounding bindings from it.
 All citable Observations must belong to the supplied fixed head.
 
-Return one JSON object, exactly one entry for every supplied candidate, in
-{{output_language}}. No additional issue, replacement text, or speculative fix.
-Schema:
-{"reviews":[{"hypothesis_id":"h_abc","decision":"accepted|refuted|unknown",
-"reason":"specific explanation of the original candidate",
-"obligations":{"supported_input":{"statement":"why this witness is supported","evidence":["h_abc/obs_0:e1"]},
-"required_behavior":{"statement":"the binding requirement","evidence":["h_abc/obs_0:e1"]},
-"introduced_regression":{"statement":"why this PR introduces the violation","evidence":["h_abc/obs_0:e1"]},
-"bad_consequence":{"statement":"the concrete original claimed consequence","evidence":["h_abc/obs_0:e1"]}},
-"counterevidence":null,"missing_obligations":[]}]}
+Return {"reviews":[...]} with exactly one verdict per supplied item, in
+{{output_language}}. Use exactly ONE of these disjoint shapes; never fill unused
+obligations for refutation or uncertainty. Do not return null placeholder fields.
 
-accepted requires all four nonempty statements and successful exact evidence refs
-for each, counterevidence null, missing_obligations empty.
-refuted requires positive counterevidence {"premise":"trigger|mechanism|impact|regression",
-"statement":"which necessary premise is contradicted and how","evidence":["h_abc/obs_0:e1"]}.
-For refuted, include only independently established obligations, not all four.
-unknown requires counterevidence null and a nonempty missing_obligations list of
-the four obligation names. Its reason must state a concrete missing fact. Include
-only established obligations; never label a missing one established. Reason text
-alone does not accept or refute. Contradictory decisions or invented references
-cannot be published.
+ACCEPTED:
+{"hypothesis_id":"COPY_ID","decision":"accepted","reason":"specific proof",
+"contract_indices":[0],
+"obligations":{
+"supported_input":{"statement":"actual supported witness","evidence":["COPY_REF"]},
+"required_behavior":{"statement":"independently established requirement","evidence":["COPY_REF"]},
+"introduced_regression":{"statement":"PR-introduced violation","evidence":["COPY_REF"]},
+"bad_consequence":{"statement":"actual original claimed result","evidence":["COPY_REF"]}}}
+
+contract_indices selects one or more ZERO-BASED entries from
+independent_source_audit.contracts. required_behavior must cite the selected
+contract's actual source evidence. The index is not authority: verify that this
+contract really imposes the ORIGINAL claim's requirement. Do not replace it with
+a different interpretation or infer it from an implementation/class name.
+No independent contract means no acceptance. Every proof requires nonempty exact
+refs; never emit empty evidence lists or invent a ref.
+
+REFUTED:
+{"hypothesis_id":"COPY_ID","decision":"refuted","reason":"specific contradiction",
+"counterevidence":{"premise":"trigger|mechanism|impact|regression",
+"statement":"the original necessary premise is contradicted by this source",
+"evidence":["COPY_REF"]}}
+
+UNKNOWN:
+{"hypothesis_id":"COPY_ID","decision":"unknown","reason":"specific missing fact",
+"missing_obligations":["supported_input"]}
+
+For unknown, each missing_obligations entry is one of supported_input,
+required_behavior, introduced_regression, bad_consequence. Missing proof is not
+positive counterevidence. Refuted contains NO obligations or missing_obligations;
+unknown contains NO obligations or counterevidence; accepted contains neither.
+Do not rewrite the candidate, create a substitute issue, or invent a test run.

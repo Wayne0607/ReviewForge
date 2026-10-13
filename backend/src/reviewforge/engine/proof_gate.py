@@ -206,7 +206,7 @@ def _validate_review(raw: Any, item: Hypothesis) -> dict[str, Any]:
 def _scope_matches(record: dict[str, Any], item: Hypothesis, ledger: HypothesisLedger) -> bool:
     return (
         isinstance(record, dict)
-        and record.get("proof_version") == PROOF_VERSION
+        and record.get("proof_version") == (2 if ledger.protocol_version >= 4 else PROOF_VERSION)
         and record.get("fingerprint") == proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest)
         and record.get("head_sha") == ledger.head_sha
         and record.get("workspace_digest") == ledger.workspace_digest
@@ -226,23 +226,79 @@ def _publication_problem(item: Hypothesis, ledger: HypothesisLedger) -> tuple[st
             outcome if outcome in {"budget-exhausted", "provider-error", "output-error"} else "output-error",
             "independent-source-audit-not-complete",
         )
+    facts = ledger.source_audits[item.id]["facts"]
+    if not facts["contracts"] or not facts["execution"]:
+        return "insufficient-evidence", "no-independent-contract-or-execution"
     return None
+
+
+def _validate_v4_review(raw: Any, item: Hypothesis, ledger: HypothesisLedger) -> dict[str, Any]:
+    """Disjoint verdict shapes plus a program-checked independent contract link."""
+    if not isinstance(raw, dict):
+        raise ValueError("invalid-review-shape")
+    decision = raw.get("decision")
+    extra = {
+        "accepted": {"obligations", "contract_indices"},
+        "refuted": {"counterevidence"},
+        "unknown": {"missing_obligations"},
+    }.get(decision)
+    if extra is None or set(raw) != {"hypothesis_id", "decision", "reason"} | extra:
+        raise ValueError("invalid-discriminated-verdict")
+    normalized = {
+        **raw,
+        "obligations": raw.get("obligations", {}),
+        "counterevidence": raw.get("counterevidence"),
+        "missing_obligations": raw.get("missing_obligations", []),
+    }
+    indices = normalized.pop("contract_indices", None)
+    result = _validate_review(normalized, item)
+    if decision == "accepted":
+        contracts = ledger.source_audits.get(item.id, {}).get("facts", {}).get("contracts", [])
+        if (
+            not audit_current(item, ledger)
+            or not isinstance(indices, list)
+            or not indices
+            or any(type(index) is not int or not 0 <= index < len(contracts) for index in indices)
+            or len(set(indices)) != len(indices)
+        ):
+            raise ValueError("missing-independent-contract-binding")
+        requirement = set(result["obligations"]["required_behavior"]["evidence"])
+        if any(not requirement.intersection(contracts[index]["evidence"]) for index in indices):
+            raise ValueError("independent-contract-evidence-mismatch")
+        result["contract_indices"] = indices
+    return result
 
 
 def _completed_review(record: dict[str, Any], item: Hypothesis, ledger: HypothesisLedger) -> bool:
     if not _scope_matches(record, item, ledger) or record.get("validated") is not True:
         return False
     try:
-        validated = _validate_review(
-            {
-                "hypothesis_id": item.id,
-                **{
-                    key: record.get(key)
-                    for key in ("decision", "reason", "obligations", "counterevidence", "missing_obligations")
-                },
+        raw = {
+            "hypothesis_id": item.id,
+            **{
+                key: record.get(key)
+                for key in ("decision", "reason", "obligations", "counterevidence", "missing_obligations")
             },
-            item,
-        )
+        }
+        if ledger.protocol_version >= 4:
+            decision = raw["decision"]
+            fields = {
+                "accepted": ("obligations", "contract_indices"),
+                "refuted": ("counterevidence",),
+                "unknown": ("missing_obligations",),
+            }.get(decision, ())
+            validated = _validate_v4_review(
+                {
+                    "hypothesis_id": item.id,
+                    "decision": decision,
+                    "reason": record.get("reason"),
+                    **{key: record.get(key) for key in fields},
+                },
+                item,
+                ledger,
+            )
+        else:
+            validated = _validate_review(raw, item)
     except (TypeError, ValueError):
         return False
     return record.get("outcome") == validated["outcome"]
@@ -442,7 +498,7 @@ class ProofGate:
     @staticmethod
     def _record(item: Hypothesis, ledger: HypothesisLedger, old: dict[str, Any], **fields) -> dict[str, Any]:
         return {
-            "proof_version": PROOF_VERSION,
+            "proof_version": 2 if ledger.protocol_version >= 4 else PROOF_VERSION,
             "fingerprint": proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest),
             "run_id": ledger.run_id,
             "head_sha": ledger.head_sha,
@@ -585,7 +641,11 @@ class ProofGate:
             else:
                 for item in batch:
                     try:
-                        validated = _validate_review(by_id[item.id], item)
+                        validated = (
+                            _validate_v4_review(by_id[item.id], item, ledger)
+                            if ledger.protocol_version >= 4
+                            else _validate_review(by_id[item.id], item)
+                        )
                     except (TypeError, ValueError) as exc:
                         ledger.publication_reviews[item.id].update(outcome="output-error", reason=str(exc))
                     else:

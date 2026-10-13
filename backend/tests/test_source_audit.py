@@ -10,6 +10,16 @@ from reviewforge.engine.proof_gate import ProofGate, accepted, completed
 from reviewforge.engine.source_audit import messages, validate
 
 
+def verdict(decision="accepted"):
+    original = review(decision=decision)
+    fields = {"accepted": ("obligations",), "refuted": ("counterevidence",), "unknown": ("missing_obligations",)}
+    return {
+        key: value
+        for key, value in original.items()
+        if key in {"hypothesis_id", "decision", "reason", *fields[decision]}
+    } | ({"contract_indices": [0]} if decision == "accepted" else {})
+
+
 def audit(identity="h_bug"):
     return {
         "hypothesis_id": identity,
@@ -53,7 +63,7 @@ def test_reconstruction_cannot_invent_sources_or_contract_kinds(change):
 async def test_v4_requires_blind_reconstruction_before_claim_review_and_persists_it():
     item = candidate()
     book = ledger(item, protocol=4)
-    llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [review()]}])
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [verdict()]}])
     await ProofGate(llm).run(book)
     assert len(llm.calls) == 2 and accepted(item, book)
     first = llm.calls[0][0][-1].content
@@ -86,8 +96,48 @@ async def test_source_audit_refutation_is_not_silently_promoted_or_retried():
     raw = copy.deepcopy(audit())
     raw["contracts"] = []
     raw["gaps"] = ["No caller requirement is supplied."]
-    llm = GateLLM(replies=[{"audits": [raw]}, {"reviews": [review(decision="unknown")]}])
+    llm = GateLLM(replies=[{"audits": [raw]}])
     await ProofGate(llm).run(book)
     assert completed(item, book) and not accepted(item, book)
     await ProofGate(llm).run(book)
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 1
+    assert book.publication_reviews[item.id]["reason"] == "no-independent-contract-or-execution"
+
+
+@pytest.mark.asyncio
+async def test_invalid_contract_record_does_not_destroy_independent_valid_execution():
+    item = candidate()
+    book = ledger(item, protocol=4)
+    raw = audit()
+    raw["contracts"][0]["evidence"] = []
+    llm = GateLLM(replies=[{"audits": [raw]}])
+    await ProofGate(llm).run(book)
+    saved = book.source_audits[item.id]
+    assert saved["facts"]["execution"] == raw["execution"]
+    assert not saved["facts"]["contracts"] and saved["rejected_records"]
+    assert not accepted(item, book) and completed(item, book)
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["refuted", "unknown"])
+async def test_non_acceptance_does_not_require_irrelevant_four_obligations(decision):
+    item = candidate()
+    book = ledger(item, protocol=4)
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [verdict(decision)]}])
+    await ProofGate(llm).run(book)
+    assert completed(item, book) and not accepted(item, book)
+    assert book.publication_reviews[item.id]["decision"] == decision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("indices", [[], [1], [True], [0, 0]])
+async def test_accepted_requires_an_actual_independent_contract_index(indices):
+    item = candidate()
+    book = ledger(item, protocol=4)
+    raw = verdict()
+    raw["contract_indices"] = indices
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [raw]}])
+    await ProofGate(llm).run(book)
+    assert not accepted(item, book) and not completed(item, book)
+    assert book.publication_reviews[item.id]["outcome"] == "output-error"

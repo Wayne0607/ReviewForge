@@ -96,3 +96,105 @@ async def test_generator_keeps_complete_candidates_without_model_repair(shape):
     assert bool(ledger.unresolved_units) == (shape == "truncated")
     assert not ledger.no_issue_units
     assert next(iter(ledger.items.values())).status.value == "open"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", [3, 4])
+@pytest.mark.parametrize("shape", ["duplicate-root", "duplicate-reference", "truncated-record"])
+async def test_repair_cannot_turn_ambiguous_or_incomplete_output_into_clean_coverage(protocol_version, shape):
+    from test_discovery_v3 import ScriptedLLM, changeset, clean, diff, unit
+
+    from reviewforge.core.state import StateStore
+    from reviewforge.engine.context_pack import ContextPack
+    from reviewforge.engine.discovery import DiscoveryLimits, plan_discovery
+    from reviewforge.engine.discovery_aliases import source_aliases
+    from reviewforge.engine.hypothesis import HypothesisLedger
+    from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+
+    u = unit("app.py")
+    block = plan_discovery(changeset(u), ContextPack(), {u.path: diff()}, limits=DiscoveryLimits())[0]
+    aliases = source_aliases(block.source_refs)
+    references = [alias if protocol_version >= 4 else ref for alias, ref in aliases.items()]
+    assessment = clean(u)
+    assessment["behavior"]["source_facts"] = [{"source_ref": ref} for ref in references]
+    raw = json.dumps({"hypotheses": [], "no_issue_units": [assessment]})
+    if shape == "duplicate-root":
+        raw = raw.replace('"no_issue_units":', '"no_issue_units": [], "no_issue_units":', 1)
+    elif shape == "duplicate-reference":
+        token = json.dumps(references[0])
+        raw = raw.replace(f'"source_ref": {token}', f'"source_ref": "invalid", "source_ref": {token}', 1)
+    else:
+        raw = raw[:-1] + ',"deferred_units":[{"unit_id":"cut'
+    model = ScriptedLLM(responses=["unparseable original", raw])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=protocol_version)
+    result = await HypothesisGenerator(model).run(
+        StateStore(file_diffs={u.path: diff()}), ContextPack(), changeset(u), ledger
+    )
+    assert len(model.calls) == 2 and result.accepted == 0
+    assert not ledger.no_issue_units and u.id in ledger.unresolved_units
+    record = next(iter(ledger.discovery_blocks.values()))
+    assert record["status"] == "unresolved"
+    assert record["repair_output_framing"] == {
+        "complete": False,
+        "recovery": "complete-record-prefix" if shape == "truncated-record" else "invalid",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", [3, 4])
+@pytest.mark.parametrize("shape", ["complete", "missing-root-closer", "record-array"])
+async def test_complete_repair_keeps_reference_identity_and_records_framing(protocol_version, shape):
+    from test_discovery_v3 import ScriptedLLM, changeset, clean, diff, unit
+
+    from reviewforge.core.state import StateStore
+    from reviewforge.engine.context_pack import ContextPack
+    from reviewforge.engine.discovery import DiscoveryLimits, plan_discovery
+    from reviewforge.engine.discovery_aliases import source_aliases
+    from reviewforge.engine.hypothesis import HypothesisLedger
+    from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+
+    u = unit("app.py")
+    block = plan_discovery(changeset(u), ContextPack(), {u.path: diff()}, limits=DiscoveryLimits())[0]
+    aliases = source_aliases(block.source_refs)
+    assessment = clean(u)
+    assessment["behavior"]["source_facts"] = [
+        {"source_ref": alias if protocol_version >= 4 else ref} for alias, ref in aliases.items()
+    ]
+    raw = json.dumps({"hypotheses": [], "no_issue_units": [assessment]})
+    if shape == "missing-root-closer":
+        raw = raw[:-1]
+    elif shape == "record-array":
+        raw = json.dumps([assessment])
+    model = ScriptedLLM(responses=["unparseable original", raw])
+    ledger = HypothesisLedger("run", "abc", "digest", protocol_version=protocol_version)
+    await HypothesisGenerator(model).run(StateStore(file_diffs={u.path: diff()}), ContextPack(), changeset(u), ledger)
+    assert len(model.calls) == 2 and not ledger.unresolved_units
+    assert ledger.no_issue_units == {u.id: assessment["checked"]}
+    record = next(iter(ledger.discovery_blocks.values()))
+    assert record["status"] == "completed"
+    assert record["repair_output_framing"] == {
+        "complete": True,
+        "recovery": {"complete": "none", "record-array": "record-array-envelope"}.get(shape, shape),
+    }
+    saved_refs = record["units"][u.id]["behavior"]["source_facts"]
+    assert {item["source_ref"] for item in saved_refs} == set(block.source_refs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", [1, 2])
+async def test_legacy_repair_parser_contract_remains_unchanged(protocol_version):
+    from test_discovery_v3 import ScriptedLLM
+
+    from reviewforge.engine.hypothesis import HypothesisLedger
+    from reviewforge.engine.hypothesis_generator import HypothesisGenerator
+
+    raw = '{"hypotheses":[{}],"hypotheses":[],"no_issue_units":[]}'
+    record = {}
+    model = ScriptedLLM(responses=[raw])
+    parsed = await HypothesisGenerator(model)._invoke_repair(
+        "unparseable original",
+        ledger=HypothesisLedger("run", "abc", "digest", protocol_version=protocol_version),
+        record=record,
+    )
+    assert parsed == {"hypotheses": [], "no_issue_units": []}
+    assert "repair_output_framing" not in record

@@ -1202,7 +1202,19 @@ class HypothesisGenerator:
                 raise RequestBudgetExceededError("format repair input plus useful output does not fit")
             output_tokens = plan.max_output_tokens
         response = await self._llm.ainvoke(messages, max_tokens=output_tokens)
-        return self._parse_response(getattr(response, "content", "") or "")
+        content = getattr(response, "content", "") or ""
+        if ledger is not None and ledger.protocol_version >= 3:
+            # A model formatting pass must not bypass the original response's
+            # duplicate-key and complete-record checks. Keep the repair's audit
+            # separate from the original provider output and its framing.
+            framed = frame_discovery_output(content)
+            if record is not None:
+                record["repair_output_framing"] = {
+                    "complete": framed.complete if framed is not None else False,
+                    "recovery": framed.recovery if framed is not None else "invalid",
+                }
+            return framed.payload if framed is not None and framed.complete else None
+        return self._parse_response(content)
 
     @staticmethod
     def _parse_response(content: str) -> dict[str, Any] | None:

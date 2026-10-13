@@ -63,7 +63,7 @@ sentence, nonempty and <=600 characters; 600 is a ceiling, not a target.
 "source_facts":[{"source_ref":"COPY_BEFORE_IF_CHANGED"},{"source_ref":"COPY_AFTER"}]}}],
 "no_issue_units":[{"unit_id":"OTHER_ID","checked":"specific changed operation and checked boundary",
 "behavior":{"before":"prior behavior","after":"changed behavior","observable":"actual result",
-"source_facts":[{"source_ref":"COPY_SOURCE_ID"}]}}],
+"source_facts":[{"source_ref":"COPY_BEFORE_IF_CHANGED"},{"source_ref":"COPY_AFTER"}]}}],
 "deferred_units":[{"unit_id":"ANOTHER_ID","reason":"specific unavailable boundary"}]}
 
 mechanism: wrong-argument|wrong-operator|null-path|contract-mismatch|missing-await|
@@ -71,6 +71,10 @@ lock-scope|state-leak|error-path|regression-removed|security-sink|i18n|a11y|perf
 severity: error|warning|info. At most {{max_hypotheses}} new hypotheses, not a quota.
 No redundant violation object: proving requirements/input/consequences belongs
 to investigation, followed by blind source reconstruction and publication review.
+The same changed-source requirements apply to hypotheses and clean assessments:
+for a replacement, cite both removed and added operations. A declaration/name or
+unchanged context ref alone cannot establish that the changed behavior is clean.
+Omit COPY_BEFORE_IF_CHANGED only when the delivered target has no removed line.
 
 Structural rename units have verified equal old/new blobs but no textual hunk.
 Use sites=[] and add behavior.change_facts with both exact metadata refs:

@@ -39,6 +39,8 @@ def frame_discovery_output(content: object) -> DiscoveryOutput | None:
     source = strip_reasoning_blocks(content)
     if source.startswith("```json\n") and source.endswith("\n```"):
         source = source[8:-4].strip()
+    if source.startswith("["):
+        return _record_array(source)
     if not source.startswith("{"):
         return None
     decoder = json.JSONDecoder(object_pairs_hook=_object)
@@ -103,3 +105,27 @@ def frame_discovery_output(content: object) -> DiscoveryOutput | None:
         return None
     except json.JSONDecodeError:
         return prefix()
+
+
+def _record_array(source: str) -> DiscoveryOutput | None:
+    """Normalize an unambiguous complete record list; never infer its contents.
+
+    Discovery's schema validation still owns required fields, citations and unit
+    coverage. Empty or damaged lists cannot establish a completed block.
+    """
+    try:
+        records = json.loads(source, object_pairs_hook=_object)
+    except (json.JSONDecodeError, _DuplicateKeyError):
+        return None
+    if not isinstance(records, list) or not records:
+        return None
+    markers = {"claim": "hypotheses", "checked": "no_issue_units", "reason": "deferred_units"}
+    payload = {name: [] for name in markers.values()}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("unit_id"), str) or not record["unit_id"]:
+            return None
+        kinds = [name for marker, name in markers.items() if marker in record]
+        if len(kinds) != 1:
+            return None
+        payload[kinds[0]].append(record)
+    return DiscoveryOutput(payload, True, "record-array-envelope")

@@ -144,3 +144,30 @@ async def test_accepted_requires_an_actual_independent_contract_reference(indice
     await ProofGate(llm).run(book)
     assert not accepted(item, book) and not completed(item, book)
     assert book.publication_reviews[item.id]["outcome"] == "output-error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["closers", "missing-proof", "string", "extra-root", "duplicate"])
+async def test_v4_delimiter_recovery_still_requires_complete_bound_proof(damage):
+    item = candidate()
+    book = ledger(item, protocol=4)
+    value = verdict()
+    if damage == "missing-proof":
+        del value["obligations"]["bad_consequence"]
+    raw = json.dumps({"reviews": [value]})
+    if damage in {"closers", "missing-proof"}:
+        raw = raw[:-3]  # Observed failure: closed obligations, missing verdict/root closers.
+    elif damage == "string":
+        raw = raw[: raw.rfind('"')]
+    elif damage == "extra-root":
+        raw += ' {"reviews":[]}'
+    else:
+        raw = raw.replace('"decision":', '"decision":"refuted","decision":', 1)[:-3]
+    llm = GateLLM(replies=[{"audits": [audit()]}, raw])
+    await ProofGate(llm).run(book)
+    assert len(llm.calls) == 2
+    assert accepted(item, book) == (damage == "closers")
+    if damage == "closers":
+        assert book.publication_reviews[item.id]["output_framing"]["recovery"] == "missing-container-closers"
+    if damage != "closers":
+        assert book.publication_reviews[item.id]["outcome"] == "output-error"

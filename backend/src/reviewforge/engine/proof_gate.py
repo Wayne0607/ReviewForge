@@ -415,15 +415,59 @@ def _unique_object(pairs):
     return result
 
 
-def _parse_response(content: Any) -> list[dict[str, Any]]:
-    # Strict single envelope: no substring salvage or pure-format repair.
+def _parse_response(
+    content: Any, *, allow_container_closers: bool = False, framing: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
+    # Single envelope and unique keys; never extract a substring or invent a
+    # value. V4 can close outer containers after a fully closed nested value.
     source = strip_reasoning_blocks(content)
     if source.startswith("```json\n") and source.endswith("\n```"):
         source = source[8:-4]
-    raw = json.loads(source, object_pairs_hook=_unique_object)
+    try:
+        raw = json.loads(source, object_pairs_hook=_unique_object)
+    except json.JSONDecodeError:
+        if not allow_container_closers:
+            raise
+        source = _close_containers(source)
+        raw = json.loads(source, object_pairs_hook=_unique_object)
+        if framing is not None:
+            framing["recovery"] = "missing-container-closers"
     if not isinstance(raw, dict) or set(raw) != {"reviews"} or not isinstance(raw["reviews"], list):
         raise ValueError("invalid-review-envelope")
     return raw["reviews"]
+
+
+def _close_containers(source: str) -> str:
+    """Append only missing delimiters, never complete strings or scalar values.
+
+    Every requested ID and every verdict field must still pass the caller's
+    exact schema and evidence validators; a syntactic repair grants no proof.
+    """
+    source = source.strip()
+    if not source.startswith("{"):
+        raise ValueError("invalid-review-envelope")
+    if not source.endswith(("}", "]")):
+        raise ValueError("incomplete-review-value")
+    stack = []
+    quoted = escaped = False
+    for char in source:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack or stack.pop() != char:
+                raise ValueError("mismatched-review-delimiter")
+    if quoted or not stack:
+        raise ValueError("invalid-review-envelope")
+    return source + "".join(reversed(stack))
 
 
 def _usage(response: Any) -> int | None:
@@ -632,7 +676,12 @@ class ProofGate:
                 await self._changed(ledger)
                 continue
             try:
-                reviews = _parse_response(response.content)
+                framing: dict[str, str] = {"recovery": "none"}
+                reviews = _parse_response(
+                    response.content, allow_container_closers=ledger.protocol_version >= 4, framing=framing
+                )
+                for item in batch:
+                    ledger.publication_reviews[item.id]["output_framing"] = dict(framing)
                 ids = [review.get("hypothesis_id") for review in reviews if isinstance(review, dict)]
                 if len(ids) != len(reviews) or len(ids) != len(set(ids)) or set(ids) != {item.id for item in batch}:
                     raise ValueError("missing-duplicate-or-unexpected-review-id")

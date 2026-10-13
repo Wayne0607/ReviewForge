@@ -680,6 +680,15 @@ class Investigator:
         prompt = load_prompt(name, output_language=_language_directive(self._output_language))
         if self._protocol_version >= 4:
             prompt += "\n\n" + load_prompt("contract_search_v4")
+            prompt += (
+                "\n\nAny final assessment or counterevidence, including an early result during exploration, "
+                "must be one complete JSON object with assessed_trigger copied exactly from packet.candidate.trigger. "
+                "Preserve every condition and negation; evaluate only that original case. "
+                "Do not combine a final result with progress or source tool calls. Tool queries and progress are not "
+                "final results and need no assessed_trigger. If positive source disproves the original case, "
+                "return trigger counterevidence, not a confirmed narrower or opposite case. Variable names and "
+                "absence of a contrary policy do not establish requirements; missing contracts remain UNKNOWN."
+            )
         return prompt
 
     def _render_user(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> str:
@@ -1306,11 +1315,28 @@ class Investigator:
                     outcome="budget-exhausted",
                 )
             tool_calls = getattr(response, "tool_calls", None) or []
+            if self._protocol_version >= 4:
+                content = getattr(response, "content", "") or ""
+                # Detect the existing two terminal shapes, then require the
+                # original, complete response to pass the shared bound decoder.
+                # Permissive extraction is never itself a licence to finalize.
+                if self._parse_verdict(content) is not None:
+                    try:
+                        if strict_tool_calls(response):
+                            raise ValueError("mixed-investigation-result")
+                        parsed = self._parse_bound_text_proof(
+                            content, self._trigger_binding(chat[:-1]), phase="exploration"
+                        )
+                    except (ValueError, TypeError):
+                        return self._invalid_output("invalid-exploration-submission", hypothesis, step + 1)
+                    return self._finalize(parsed, hypothesis, changed, steps=step + 1)
             if self._protocol_version >= 3:
                 content = getattr(response, "content", "") or ""
                 proof = self._parse_verdict(content)
-                if proof is not None and (
-                    proof.get("assessment") is not None or proof.get("counterevidence") is not None
+                if (
+                    self._protocol_version < 4
+                    and proof is not None
+                    and (proof.get("assessment") is not None or proof.get("counterevidence") is not None)
                 ):
                     return self._finalize(proof, hypothesis, changed, steps=step + 1)
                 try:
@@ -1340,7 +1366,9 @@ class Investigator:
                         chat.append(HumanMessage(content=follow))
                     continue
             if not tool_calls:
-                parsed = self._parse_verdict(getattr(response, "content", "") or "")
+                parsed = (
+                    self._parse_verdict(getattr(response, "content", "") or "") if self._protocol_version < 4 else None
+                )
                 if parsed is not None:
                     return self._finalize(parsed, hypothesis, changed, steps=step + 1)
                 return await self._close(
@@ -1618,6 +1646,7 @@ class Investigator:
         schema = create_model(
             "SubmitInvestigation",
             __config__=config,
+            assessed_trigger=(str, Field(description="Copy candidate.trigger exactly; assess this original case.")),
             answer=(str, ...),
             severity=(Literal["error", "warning", "info"], ...),
             reason=(str, ...),
@@ -1645,8 +1674,17 @@ class Investigator:
         )
 
     def _typed_closing_request(self, closer: Any, chat: list[Any]) -> tuple[Any, list[Any], StructuredTool]:
+        # Bind to what this request actually delivers, not a model-authored
+        # restatement or mutable worker state from an earlier investigation.
+        binding = self._trigger_binding(chat)
         tool = self._closing_submission_tool()
         bound = closer.bind_tools([tool], tool_choice="any")
+        schema = tool.args_schema.model_json_schema()
+        tool.metadata = {
+            **binding,
+            "schema_version": "trigger-bound-flat-v1",
+            "schema_sha256": hashlib.sha256(json.dumps(schema, sort_keys=True).encode("utf-8")).hexdigest(),
+        }
         messages = list(chat)
         if messages and isinstance(messages[0], SystemMessage):
             # Preserve the original source/semantic rules, but remove its
@@ -1662,6 +1700,11 @@ class Investigator:
             content += (
                 "Call submit_investigation exactly once. All fields are required; use native strings and arrays, "
                 "never JSON-encoded strings. No verdict, confidence or surrounding prose.\n"
+                "assessed_trigger must copy packet.candidate.trigger exactly, including every condition and negation. "
+                "Evaluate that original case only; do not replace it with a repaired, narrower or opposite case. "
+                "If saved positive source disproves its trigger, submit trigger counterevidence for the original case. "
+                "A variable name does not establish required behavior, and absence of a contrary policy is not proof "
+                "of a requirement. Missing contract evidence remains UNKNOWN.\n"
                 "assessment_comparison: conflict confirms, compatible refutes, unresolved remains unknown; "
                 "supply assessment_expected/actual and both assessment_expected_evidence/actual_evidence arrays "
                 "with exact saved refs. For no assessment, use comparison none, empty expected/actual strings "
@@ -1684,16 +1727,70 @@ class Investigator:
             if len(calls) != 1 or calls[0].get("name") != tool.name or not isinstance(calls[0].get("args"), dict):
                 raise ValueError("invalid-closing-submission")
             args = calls[0]["args"]
+            self._check_assessed_trigger(args, tool.metadata or {}, phase="closing")
             tool.args_schema.model_validate(args)
             # Required flat fields have been checked without coercion. The
             # explicit none sentinel maps to null, never to a guessed verdict.
             # Existing parsing and evidence/verdict checks remain final.
             payload = self._closing_submission_payload(args)
             return self._parse_verdict(json.dumps(payload, ensure_ascii=False))
-        # A provider that ignores tool choice may still return the original
-        # legal JSON contract. This is parsing the same response, never retrying
-        # a changed request or interpreting explanatory prose as an enum.
-        return self._parse_verdict(getattr(response, "content", "") or "")
+        # Same-response text compatibility must not bypass either binding or
+        # the complete, unique JSON envelope. Legacy v1-v3 parsing is unchanged.
+        return self._parse_bound_text_proof(getattr(response, "content", None), tool.metadata or {}, phase="closing")
+
+    def _trigger_binding(self, chat: list[Any]) -> dict[str, str]:
+        packet = self._strict_closing_json(chat[-1].content if chat else None)
+        candidate = packet.get("candidate")
+        trigger = candidate.get("trigger") if isinstance(candidate, dict) else None
+        if not isinstance(trigger, str) or not trigger.strip():
+            raise ValueError("missing-original-investigation-trigger")
+        return {"assessed_trigger": trigger, "trigger_sha256": hashlib.sha256(trigger.encode("utf-8")).hexdigest()}
+
+    def _parse_bound_text_proof(self, content: Any, binding: dict[str, Any], *, phase: str) -> dict[str, Any]:
+        payload = self._strict_closing_json(content)
+        if "progress" in payload or not {"assessment", "counterevidence", "verdict"}.intersection(payload):
+            raise ValueError("invalid-investigation-proof-envelope")
+        self._check_assessed_trigger(payload, binding, phase=phase)
+        # The original proof validator still handles relationships and exact
+        # saved references. Do not recover a nested object or fill missing data.
+        return payload
+
+    @staticmethod
+    def _strict_closing_json(content: Any) -> dict[str, Any]:
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate-closing-field")
+                result[key] = value
+            return result
+
+        def nonfinite(value: str) -> Any:
+            raise ValueError("non-json-closing-constant")
+
+        if not isinstance(content, str):
+            raise ValueError("invalid-closing-json")
+        parsed = json.loads(content, object_pairs_hook=unique, parse_constant=nonfinite)
+        if not isinstance(parsed, dict):
+            raise ValueError("invalid-closing-json")
+        return parsed
+
+    def _check_assessed_trigger(self, args: dict[str, Any], binding: dict[str, Any], *, phase: str) -> None:
+        expected = binding.get("assessed_trigger")
+        declared = args.get("assessed_trigger")
+        matched = isinstance(expected, str) and isinstance(declared, str) and declared == expected
+        self._progress.append(
+            {
+                "phase": f"{phase}-trigger-check",
+                "trigger_sha256": binding.get("trigger_sha256"),
+                "declared_trigger_sha256": (
+                    hashlib.sha256(declared.encode("utf-8")).hexdigest() if isinstance(declared, str) else None
+                ),
+                "matched": matched,
+            }
+        )
+        if not matched:
+            raise ValueError("unbound-closing-trigger")
 
     @staticmethod
     def _closing_submission_payload(args: dict[str, Any]) -> dict[str, Any]:
@@ -1736,6 +1833,7 @@ class Investigator:
             )
         ]
         return {
+            "assessed_trigger": args["assessed_trigger"],
             "answer": args["answer"],
             "severity": args["severity"],
             "assessment": assessment,
@@ -1756,7 +1854,20 @@ class Investigator:
         closer = self._closing_llm if self._closing_llm is not None else self._llm
         submission_tool = None
         if self._protocol_version >= 4:
-            closer, chat, submission_tool = self._typed_closing_request(closer, chat)
+            try:
+                closer, chat, submission_tool = self._typed_closing_request(closer, chat)
+            except (ValueError, TypeError):
+                return self._invalid_output("invalid-closing-trigger-binding", hypothesis, steps)
+            self._progress.append(
+                {
+                    "phase": "closing-trigger-binding",
+                    "source": "candidate.trigger",
+                    **{
+                        key: submission_tool.metadata[key]
+                        for key in ("trigger_sha256", "schema_version", "schema_sha256")
+                    },
+                }
+            )
         if self._protocol_version >= 3:
             closing_plan = plan_request(
                 closer,
@@ -1887,6 +1998,12 @@ class Investigator:
     def _finalize(
         self, parsed: dict[str, Any], hypothesis: Hypothesis, changed: set[str], *, steps: int
     ) -> InvestigationResult:
+        if self._protocol_version >= 4 and (
+            not isinstance(parsed.get("assessed_trigger"), str) or parsed["assessed_trigger"] != hypothesis.trigger
+        ):
+            # Every terminal model path must preserve its checked declaration.
+            # A model-supplied boolean cannot mark a different case as trusted.
+            return self._invalid_output("unbound-investigation-trigger", hypothesis, steps)
         if self._protocol_version >= 2 and parsed.get("assessment") is not None:
             raw = parsed["assessment"]
             if not isinstance(raw, dict) or raw.get("comparison") not in {"conflict", "compatible", "unresolved"}:

@@ -95,6 +95,7 @@ class RecordingLLM(BaseChatModel):
             message = AIMessage(
                 content=json.dumps(
                     {
+                        "assessed_trigger": json.loads(messages[-1].content)["candidate"]["trigger"],
                         "answer": "The consumer rejects this input before the operation.",
                         "severity": "error",
                         "assessment": None,

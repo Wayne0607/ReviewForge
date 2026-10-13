@@ -63,6 +63,7 @@ def wire_submission(raw=None):
     raw = submission() if raw is None else raw
     assessment, counter = raw["assessment"], raw["counterevidence"]
     return {
+        "assessed_trigger": raw.get("assessed_trigger", candidate().trigger),
         "answer": raw["answer"],
         "severity": raw["severity"],
         "reason": raw["reason"],
@@ -213,7 +214,7 @@ async def test_result_tool_uses_original_parsing_and_verdict_validation(monkeypa
 
     monkeypatch.setattr(value, "_finalize", capture)
     result = await close(value)
-    assert seen == [raw] and result.verdict == verdict
+    assert seen == [raw | {"assessed_trigger": candidate().trigger}] and result.verdict == verdict
     assert value._observations == original
     assert len(model.calls) == 1
     assert model.bindings[0][1] == {"tool_choice": "any"}
@@ -328,13 +329,14 @@ async def test_flat_none_is_explicit_unknown_and_sites_preserve_exact_binding(mo
 
     monkeypatch.setattr(value, "_finalize", capture)
     result = await close(value)
-    assert seen == [raw]
+    assert seen == [raw | {"assessed_trigger": candidate().trigger}]
     assert result.verdict == "unknown" and result.outcome != "output-error"
 
 
 @pytest.mark.asyncio
 async def test_legal_complete_text_json_remains_compatible():
-    result = await close(worker(Model(reply=AIMessage(content=json.dumps(submission())))))
+    bound = submission() | {"assessed_trigger": candidate().trigger}
+    result = await close(worker(Model(reply=AIMessage(content=json.dumps(bound)))))
     assert result.verdict == "confirmed"
 
 
@@ -364,7 +366,8 @@ async def test_schema_and_choice_are_reserved_at_actual_admission_without_extra_
     messages, options = model.calls[0]
     reservation = next(iter(snapshots[0]["pending"].values()))["reserved_tokens"]
     assert reservation == estimate_request(messages, options) + options["max_tokens"]
-    assert value._progress[-1]["input_tokens"] == estimate_request(messages, options)
+    plan = next(item for item in value._progress if item.get("stage") == "closing")
+    assert plan["input_tokens"] == estimate_request(messages, options)
     assert task_snapshot["limit"] == 12_000 and task_snapshot["reported_tokens"] == result.tokens == 200
     assert budget.limit == 24_000
 

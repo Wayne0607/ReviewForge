@@ -1,0 +1,70 @@
+{
+  "provenance": "Unchanged tool_calls and candidate from v4-saved-investigation-9c8cdbe-20261013-183538; no credentials, no benchmark answer labels.",
+  "candidate": {
+    "id": "h_6ff3d8d1",
+    "identity": "su_4f55d1b4d6edc1dc::contract-mismatch::addGuestsHandler",
+    "unit_id": "su_4f55d1b4d6edc1dc",
+    "claim": "Team admin permission check requires both ADMIN and OWNER roles, excluding admins who are not owners.",
+    "trigger": "A user with role 'ADMIN' (but not 'OWNER') attempts to add guests to a team booking they organize or attend.",
+    "impact": "The request fails with FORBIDDEN despite the user having administrative privileges for the team.",
+    "open_question": "Does the application contract allow Team Admins (non-owners) to manage bookings/guests?",
+    "refutation": "If the business rule explicitly restricts guest management to Team Owners only, the logic is correct.",
+    "severity": "warning",
+    "mechanism": "contract-mismatch",
+    "sites": [
+      {
+        "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "line": 47,
+        "excerpt": "    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&"
+      }
+    ]
+  },
+  "observations": [
+    {
+      "id": "obs_0",
+      "tool": "read_diff",
+      "query": "read_diff {\"end\": 47, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 47}",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line_range": [
+        47,
+        47
+      ],
+      "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+      "result_digest": "ac3f1c4eec8ff070",
+      "excerpt": "+    },\n+    include: {\n+      attendees: true,\n+      eventType: true,\n+      destinationCalendar: true,\n+      references: true,\n+      user: {\n+        include: {\n+          destinationCalendar: true,\n+          credentials: true,\n+        },\n+      },\n+    },\n+  });\n+\n+  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });\n+\n+  const isTeamAdminOrOwner =\n+    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n+    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n+\n+  const isOrganizer = booking.userId === user.id;\n+\n+  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n+\n+  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n+    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n+  }\n+\n+  const organizer = await prisma.user.findFirstOrThrow({\n+    where: {\n+      id: booking.userId || 0,\n+    },\n+    select: {\n+      name: true,\n+      email: true,\n+      timeZone: true,\n+      locale: true,\n+    },\n+  });\n+\n+  const blacklistedGuestEmails = process.env.BLACKLISTED_GUEST_EMAILS\n+    ? process.env.BLACKLISTED_GUEST_EMAILS.split(\",\").map((emai",
+      "status": "success",
+      "excerpt_line_range": null,
+      "shared_result_id": "sr_7f856d757fcea50b3fb70e01"
+    },
+    {
+      "id": "obs_1",
+      "tool": "read_file",
+      "query": "read_file {\"end\": 55, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 44}",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line_range": [
+        44,
+        55
+      ],
+      "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+      "result_digest": "b328af0734390578",
+      "excerpt": "  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });\n\n  const isTeamAdminOrOwner =\n    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n\n  const isOrganizer = booking.userId === user.id;\n\n  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n\n  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n",
+      "status": "success",
+      "excerpt_line_range": [
+        44,
+        55
+      ],
+      "shared_result_id": "sr_476507696cd7686f6a32e80e"
+    }
+  ],
+  "raw_tool_calls": [
+    {
+      "id": "call_7b975c31e91041da905ef3b9",
+      "function": {
+        "arguments": "{\"answer\": \"The claim is supported by the saved evidence. In packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts, the permission variable named `isTeamAdminOrOwner` is computed with a logical AND: `(await isTeamAdmin(...)) && (await isTeamOwner(...))`. This means the team-administration branch only passes when the user is BOTH an admin AND an owner; a user who is an ADMIN but not an OWNER gets `isTeamAdminOrOwner = false`, and if they are also neither organizer nor attendee, the handler throws TRPCError FORBIDDEN \\\"you_do_not_have_permission\\\". The variable name (\\\"Or\\\") contradicts the actual conjunctive condition, indicating the intended contract was OR semantics. No saved source establishes a business rule restricting guest management to owners only, so the refutation premise cannot be confirmed.\", \"severity\": \"warning\", \"reason\": \"Trigger: an ADMIN-but-not-OWNER user calls addGuests on a team booking they do not organize/attend (obs_1:e1). Mechanism: the guard uses `&&` between isTeamAdmin and isTeamOwner while naming the result isTeamAdminOrOwner, so admins who are not owners fail the check (obs_0:e2, obs_1:e1). Impact/regression: the combined condition `!isTeamAdminOrOwner && !isOrganizer && !isAttendee` throws FORBIDDEN for such users (obs_0:e3, obs_1:e2). The open question about whether non-owner admins may manage guests remains unanswered by any saved source, and no explicit contract/test restricts this to owners, so the mismatch between the declared intent (name) and implementation stands as a warning-level contract mismatch rather than a confirmed error.\", \"assessment_comparison\": \"conflict\", \"assessment_expected\": \"A team ADMIN (even without OWNER role), or the organizer/attendee, should satisfy the permission check implied by the variable name `isTeamAdminOrOwner` and be allowed to add guests.\", \"assessment_actual\": \"The check requires both isTeamAdmin AND isTeamOwner simultaneously; an ADMIN who is not an OWNER yields false, and if also not organizer/attendee the request throws FORBIDDEN.\", \"assessment_expected_evidence\": \n[\"obs_1:e1\"]\n\n, \"assessment_actual_evidence\": \n[\"obs_1:e1\", \"obs_1:e2\"]\n\n, \"counter_premise\": \"none\", \"counter_statement\": \"\", \"counter_evidence\": \n[]\n\n, \"additional_site_paths\": \n[\"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\"]\n\n, \"additional_site_lines\": \n[47, 53]\n\n, \"additional_site_excerpts\": \n[\"(await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\\n    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\", \"if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\\n    throw new TRPCError({ code: \\\"FORBIDDEN\\\", message: \\\"you_do_not_have_permission\\\" });\"]\n\n}",
+        "name": "submit_investigation"
+      },
+      "type": "function",
+      "index": 0
+    }
+  ]
+}

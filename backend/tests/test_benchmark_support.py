@@ -74,6 +74,144 @@ async def test_async_request_pacing_rechecks_shared_slot_after_wait(support, tmp
     assert waits == [30.0] and state.read_text() == "160.0"
 
 
+class _PacingClock:
+    """Advance only explicitly released sleepers, without changing asyncio's clock."""
+
+    def __init__(self):
+        self.now = 100.0
+        self.sleepers = []
+
+    async def sleep(self, delay):
+        future = asyncio.get_running_loop().create_future()
+        self.sleepers.append((asyncio.current_task().get_name(), delay, future))
+        await future
+
+    def wake(self, name, at):
+        self.now = at
+        sleeper = next(item for item in self.sleepers if item[0] == name and not item[2].done())
+        sleeper[2].set_result(None)
+
+
+@pytest.mark.asyncio
+async def test_async_pacing_fifo_prevents_later_requests_overtaking_older_waiters(support, tmp_path, monkeypatch):
+    state = tmp_path / "request-rate"
+    state.write_text("100")
+    clock, admitted = _PacingClock(), []
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(support, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(support.asyncio, "sleep", clock.sleep)
+
+    async def request(name, path):
+        await support.wait_for_request_slot_async(path, 30)
+        admitted.append((name, clock.now))
+
+    tasks = []
+    try:
+        for name in ("first", "second", "third"):
+            # Equivalent path spelling must share the same local queue.
+            path = state if name != "second" else state.parent / "." / state.name
+            tasks.append(asyncio.create_task(request(name, path), name=name))
+            await real_sleep(0)
+        assert [name for name, _, future in clock.sleepers if not future.done()] == ["first"]
+        clock.wake("first", 130)
+        await real_sleep(0)
+        await real_sleep(0)
+        tasks.append(asyncio.create_task(request("newcomer", state), name="newcomer"))
+        await real_sleep(0)
+        for name, at in (("second", 160), ("third", 190), ("newcomer", 220)):
+            clock.wake(name, at)
+            await real_sleep(0)
+            await real_sleep(0)
+        await asyncio.gather(*tasks)
+        assert admitted == [("first", 130), ("second", 160), ("third", 190), ("newcomer", 220)]
+        assert all(delay == 30 for _, delay, _ in clock.sleepers)
+        assert state.read_text() == "220"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", ["head", "middle"])
+async def test_async_pacing_cancelled_head_or_queued_waiter_does_not_stall_next(
+    support, tmp_path, monkeypatch, cancelled
+):
+    state = tmp_path / "request-rate"
+    state.write_text("100")
+    clock, admitted = _PacingClock(), []
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(support, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(support.asyncio, "sleep", clock.sleep)
+
+    async def request(name):
+        await support.wait_for_request_slot_async(state, 30)
+        admitted.append((name, clock.now))
+
+    tasks = {}
+    try:
+        for name in ("head", "middle", "tail"):
+            tasks[name] = asyncio.create_task(request(name), name=name)
+            await real_sleep(0)
+        assert [name for name, _, future in clock.sleepers if not future.done()] == ["head"]
+        tasks[cancelled].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[cancelled]
+        await real_sleep(0)
+        assert state.read_text() == "100"
+        # The local FIFO lock may stay held, but no process lock is held while sleeping.
+        with support.exclusive_file_lock(state.with_suffix(".lock"), blocking=False):
+            pass
+        survivors = [name for name in tasks if name != cancelled]
+        for index, name in enumerate(survivors, 1):
+            clock.wake(name, 100 + index * 30)
+            await real_sleep(0)
+            await real_sleep(0)
+        await asyncio.gather(*(tasks[name] for name in survivors))
+        assert admitted == [(survivors[0], 130), (survivors[1], 160)]
+    finally:
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_async_fifo_rechecks_other_process_timestamp_without_claiming_future_slot(support, tmp_path, monkeypatch):
+    state = tmp_path / "request-rate"
+    state.write_text("100")
+    clock = _PacingClock()
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(support, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(support.asyncio, "sleep", clock.sleep)
+    task = asyncio.create_task(support.wait_for_request_slot_async(state, 30), name="waiting")
+    try:
+        await real_sleep(0)
+        assert state.read_text() == "100"
+        # Simulate a different process admitting at t=120 while this process waits.
+        with support.exclusive_file_lock(state.with_suffix(".lock"), blocking=False):
+            state.write_text("120")
+        clock.wake("waiting", 130)
+        await real_sleep(0)
+        assert not task.done() and state.read_text() == "120"
+        assert [delay for _, delay, _ in clock.sleepers] == [30, 20]
+        clock.wake("waiting", 150)
+        await task
+        assert state.read_text() == "150"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_async_pacing_same_path_can_be_reused_across_event_loops(support, tmp_path):
+    state = tmp_path / "request-rate"
+
+    async def pair():
+        await asyncio.gather(*(support.wait_for_request_slot_async(state, 0.001) for _ in range(2)))
+
+    asyncio.run(pair())
+    asyncio.run(pair())
+
+
 def test_portable_lock_excludes_other_process_then_releases(support, tmp_path):
     script = """
 import sys

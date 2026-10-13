@@ -149,6 +149,10 @@ runs keep them disabled. SIGTERM cancels the benchmark task and cleans its known
 workspaces and connections. Windows also handles Ctrl+Break; forcefully terminating
 a Windows process cannot promise Python cleanup. Request pacing uses a portable
 process lock and discards stale monotonic timestamps from before a host reboot.
+Within one event loop, requests for the same rate file enter that limiter in
+FIFO order. Cancellation releases the local queue without booking a future
+slot; the file lock still enforces spacing across processes, not cross-process
+FIFO ordering.
 
 The strict judge preserves the existing matching prompts, threshold, one-to-one
 matching and duplicate penalties. Its settings-path adapter permits use of the

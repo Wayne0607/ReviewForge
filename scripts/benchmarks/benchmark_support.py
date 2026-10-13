@@ -9,6 +9,24 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from weakref import WeakKeyDictionary, WeakValueDictionary
+
+# asyncio locks are loop-bound once contended. Weak values also prevent a
+# completed lock from keeping its old loop alive through the registry.
+_ASYNC_RATE_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, WeakValueDictionary[str, asyncio.Lock]] = (
+    WeakKeyDictionary()
+)
+
+
+def _async_request_lock(path: Path) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    locks = _ASYNC_RATE_LOCKS.setdefault(loop, WeakValueDictionary())
+    key = os.path.normcase(str(path.resolve()))
+    lock = locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[key] = lock
+    return lock
 
 
 @contextmanager
@@ -68,28 +86,35 @@ def wait_for_request_slot(path: Path, interval: float) -> None:
 
 
 async def wait_for_request_slot_async(path: Path, interval: float) -> None:
-    """Reserve the same cross-process slot without uncancellable worker sleeps."""
+    """Fair local admission, then the original cross-process physical interval.
+
+    Keep the FIFO asyncio lock while sleeping, but release the file lock before
+    every wait. Cancellation releases local admission without reserving a future
+    timestamp. Other processes still use the shared timestamp and file lock;
+    this provides no cross-process ordering guarantee.
+    """
     if interval <= 0:
         return
-    while True:
-        delay = 0.05
-        try:
-            with exclusive_file_lock(path.with_suffix(".lock"), blocking=False):
-                with path.open("a+", encoding="utf-8") as handle:
-                    handle.seek(0)
-                    previous = float(handle.read().strip() or 0)
-                    now = time.monotonic()
-                    delay = interval - (now - previous) if 0 < previous <= now else 0
-                    if delay <= 0:
+    async with _async_request_lock(path):
+        while True:
+            delay = 0.05
+            try:
+                with exclusive_file_lock(path.with_suffix(".lock"), blocking=False):
+                    with path.open("a+", encoding="utf-8") as handle:
                         handle.seek(0)
-                        handle.truncate()
-                        handle.write(str(now))
-                        handle.flush()
-                        return
-        except BlockingIOError:
-            pass
-        # Release the file lock before waiting; cancellation never owns a slot.
-        await asyncio.sleep(delay)
+                        previous = float(handle.read().strip() or 0)
+                        now = time.monotonic()
+                        delay = interval - (now - previous) if 0 < previous <= now else 0
+                        if delay <= 0:
+                            handle.seek(0)
+                            handle.truncate()
+                            handle.write(str(now))
+                            handle.flush()
+                            return
+            except BlockingIOError:
+                pass
+            # Recheck after sleeping: another process may have claimed a slot.
+            await asyncio.sleep(delay)
 
 
 def is_complete_result(row: dict) -> bool:

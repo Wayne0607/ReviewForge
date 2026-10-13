@@ -1510,48 +1510,39 @@ class Investigator:
         ]
 
     def _closing_submission_tool(self) -> StructuredTool:
-        """Describe a result, not an executable source operation or a verdict repair."""
+        """Flat transport for a result; never execute a tool or repair a verdict.
+
+        The relay returned nullable nested proof objects as JSON strings in
+        successful native tool calls. Keep the wire schema primitive-only and
+        deterministically assemble the existing proof contract after validation.
+        """
         references = tuple(
             reference for observation in self._observations for reference in _evidence_segments(observation)
         )
         config = ConfigDict(extra="forbid", strict=True)
-        assessment_type: Any = type(None)
-        counter_type: Any = type(None)
-        if references:
-            reference_type = Literal[references]
-            assessment = create_model(
-                "SavedContractAssessment",
-                __config__=config,
-                expected=(str, Field(min_length=1)),
-                actual=(str, Field(min_length=1)),
-                comparison=(Literal["conflict", "compatible", "unresolved"], ...),
-                expected_evidence=(list[reference_type], Field(min_length=1)),
-                actual_evidence=(list[reference_type], Field(min_length=1)),
-            )
-            counter = create_model(
-                "SavedCounterEvidence",
-                __config__=config,
-                premise=(Literal["trigger", "mechanism", "impact", "regression"], ...),
-                statement=(str, Field(min_length=1)),
-                evidence=(list[reference_type], Field(min_length=1)),
-            )
-            assessment_type, counter_type = assessment | None, counter | None
-        site = create_model(
-            "InvestigationSite",
-            __config__=config,
-            path=(str, ...),
-            line=(int, ...),
-            excerpt=(str, ...),
+        reference_type = Literal[references] if references else str
+        reference_field = Field() if references else Field(max_length=0)
+        comparison_type = Literal["none", "conflict", "compatible", "unresolved"] if references else Literal["none"]
+        premise_type = (
+            Literal["none", "trigger", "mechanism", "impact", "regression"] if references else Literal["none"]
         )
         schema = create_model(
             "SubmitInvestigation",
             __config__=config,
             answer=(str, ...),
             severity=(Literal["error", "warning", "info"], ...),
-            assessment=(assessment_type, ...),
-            counterevidence=(counter_type, ...),
             reason=(str, ...),
-            additional_sites=(list[site], ...),
+            assessment_comparison=(comparison_type, ...),
+            assessment_expected=(str, ...),
+            assessment_actual=(str, ...),
+            assessment_expected_evidence=(list[reference_type], reference_field),
+            assessment_actual_evidence=(list[reference_type], reference_field),
+            counter_premise=(premise_type, ...),
+            counter_statement=(str, ...),
+            counter_evidence=(list[reference_type], reference_field),
+            additional_site_paths=(list[str], ...),
+            additional_site_lines=(list[int], ...),
+            additional_site_excerpts=(list[str], ...),
         )
 
         def submit_investigation(**kwargs: Any) -> str:
@@ -1569,19 +1560,31 @@ class Investigator:
         bound = closer.bind_tools([tool], tool_choice="any")
         messages = list(chat)
         if messages and isinstance(messages[0], SystemMessage):
-            # Keep all source/semantic rules and examples of the original
-            # closure. Only its transport changes from prose JSON to arguments.
+            # Preserve the original source/semantic rules, but remove its
+            # nested JSON examples: they describe a different wire contract.
             content = (
                 messages[0]
-                .content.replace(
+                .content.partition("Return ONE JSON object, no verdict, confidence, fences or surrounding prose:")[0]
+                .replace(
                     "the final request: no tools, navigation requests or exploration.",
                     "the final request: no source navigation or exploration.",
                 )
-                .replace(
-                    "Return ONE JSON object, no verdict, confidence, fences or surrounding prose:",
-                    "Call submit_investigation exactly once with the fields below. "
-                    "No verdict, confidence, fences or surrounding prose:",
-                )
+            )
+            content += (
+                "Call submit_investigation exactly once. All fields are required; use native strings and arrays, "
+                "never JSON-encoded strings. No verdict, confidence or surrounding prose.\n"
+                "assessment_comparison: conflict confirms, compatible refutes, unresolved remains unknown; "
+                "supply assessment_expected/actual and both assessment_expected_evidence/actual_evidence arrays "
+                "with exact saved refs. For no assessment, use comparison none, empty expected/actual strings "
+                "and empty evidence arrays.\n"
+                "For direct counterevidence, set counter_premise to trigger, mechanism, impact or regression, "
+                "counter_statement to the contradicted premise and counter_evidence to saved refs. "
+                "For no counterevidence, use premise none, empty statement and evidence array. "
+                "Never emit both proof shapes. Without either proof, remain UNKNOWN and explain missing facts.\n"
+                "additional_site_paths/lines/excerpts are equally sized arrays, matched by index, "
+                "requiring real RIGHT diff sites; all empty when absent. "
+                "Do not invent a diff line for a structural claim. "
+                f"Output: {_language_directive(self._output_language)}."
             )
             messages[0] = messages[0].model_copy(update={"content": content})
         return bound, messages, tool
@@ -1595,13 +1598,64 @@ class Investigator:
                 raise ValueError("invalid-closing-submission")
             args = calls[0]["args"]
             tool.args_schema.model_validate(args)
-            # Validate shape without replacing, coercing or filling the raw
-            # dict. Existing parsing and evidence/verdict checks remain final.
-            return self._parse_verdict(json.dumps(args, ensure_ascii=False))
+            # Required flat fields have been checked without coercion. The
+            # explicit none sentinel maps to null, never to a guessed verdict.
+            # Existing parsing and evidence/verdict checks remain final.
+            payload = self._closing_submission_payload(args)
+            return self._parse_verdict(json.dumps(payload, ensure_ascii=False))
         # A provider that ignores tool choice may still return the original
         # legal JSON contract. This is parsing the same response, never retrying
         # a changed request or interpreting explanatory prose as an enum.
         return self._parse_verdict(getattr(response, "content", "") or "")
+
+    @staticmethod
+    def _closing_submission_payload(args: dict[str, Any]) -> dict[str, Any]:
+        """Assemble validated primitives without silently dropping proof fields."""
+        expected, actual = args["assessment_expected"], args["assessment_actual"]
+        expected_refs, actual_refs = args["assessment_expected_evidence"], args["assessment_actual_evidence"]
+        assessment = None
+        if args["assessment_comparison"] == "none":
+            if expected or actual or expected_refs or actual_refs:
+                raise ValueError("nonempty-none-assessment")
+        else:
+            if not expected.strip() or not actual.strip() or not expected_refs or not actual_refs:
+                raise ValueError("incomplete-assessment")
+            assessment = {
+                "expected": expected,
+                "actual": actual,
+                "comparison": args["assessment_comparison"],
+                "expected_evidence": expected_refs,
+                "actual_evidence": actual_refs,
+            }
+        counter = None
+        if args["counter_premise"] == "none":
+            if args["counter_statement"] or args["counter_evidence"]:
+                raise ValueError("nonempty-none-counterevidence")
+        else:
+            if not args["counter_statement"].strip() or not args["counter_evidence"]:
+                raise ValueError("incomplete-counterevidence")
+            counter = {
+                "premise": args["counter_premise"],
+                "statement": args["counter_statement"],
+                "evidence": args["counter_evidence"],
+            }
+        sites = [
+            {"path": path, "line": line, "excerpt": excerpt}
+            for path, line, excerpt in zip(
+                args["additional_site_paths"],
+                args["additional_site_lines"],
+                args["additional_site_excerpts"],
+                strict=True,
+            )
+        ]
+        return {
+            "answer": args["answer"],
+            "severity": args["severity"],
+            "assessment": assessment,
+            "counterevidence": counter,
+            "reason": args["reason"],
+            "additional_sites": sites,
+        }
 
     async def _close(
         self,

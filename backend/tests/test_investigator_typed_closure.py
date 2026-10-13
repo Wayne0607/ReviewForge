@@ -59,8 +59,29 @@ def submission(comparison="conflict"):
     }
 
 
+def wire_submission(raw=None):
+    raw = submission() if raw is None else raw
+    assessment, counter = raw["assessment"], raw["counterevidence"]
+    return {
+        "answer": raw["answer"],
+        "severity": raw["severity"],
+        "reason": raw["reason"],
+        "assessment_comparison": assessment["comparison"] if assessment else "none",
+        "assessment_expected": assessment["expected"] if assessment else "",
+        "assessment_actual": assessment["actual"] if assessment else "",
+        "assessment_expected_evidence": assessment["expected_evidence"] if assessment else [],
+        "assessment_actual_evidence": assessment["actual_evidence"] if assessment else [],
+        "counter_premise": counter["premise"] if counter else "none",
+        "counter_statement": counter["statement"] if counter else "",
+        "counter_evidence": counter["evidence"] if counter else [],
+        "additional_site_paths": [site["path"] for site in raw["additional_sites"]],
+        "additional_site_lines": [site["line"] for site in raw["additional_sites"]],
+        "additional_site_excerpts": [site["excerpt"] for site in raw["additional_sites"]],
+    }
+
+
 def tool_response(args=None, *, name="submit_investigation"):
-    return AIMessage(content="", tool_calls=[{"id": "submit", "name": name, "args": args or submission()}])
+    return AIMessage(content="", tool_calls=[{"id": "submit", "name": name, "args": args or wire_submission()}])
 
 
 class Model(BaseChatModel):
@@ -130,16 +151,23 @@ def test_submission_schema_uses_current_exact_refs_and_literal_comparison():
     text = json.dumps(schema)
     assert all(value in text for value in ["conflict", "compatible", "unresolved", "obs_0:e1", "obs_1:e1"])
     assert "obs_2:e1" not in text
-    tool.args_schema.model_validate(submission())
+    assert all(value not in text for value in ["anyOf", "$ref", "$defs", '"null"'])
+    parameters = schema["parameters"]
+    assert set(parameters["properties"]) == set(parameters["required"])
+    for value in parameters["properties"].values():
+        assert value["type"] in {"string", "array"}
+        if value["type"] == "array":
+            assert value["items"]["type"] in {"string", "integer"}
+    tool.args_schema.model_validate(wire_submission())
     for raw in [
-        submission("The code probably intended OR"),
+        wire_submission(submission("The code probably intended OR")),
         {"assessment": None},
-        submission() | {"invented": "field"},
+        wire_submission() | {"invented": "field"},
     ]:
         with pytest.raises(ValidationError):
             tool.args_schema.model_validate(raw)
-    raw = submission()
-    raw["assessment"]["expected_evidence"] = ["obs_99:e1"]
+    raw = wire_submission()
+    raw["assessment_expected_evidence"] = ["obs_99:e1"]
     with pytest.raises(ValidationError):
         tool.args_schema.model_validate(raw)
 
@@ -161,10 +189,10 @@ def test_no_saved_source_can_only_submit_unknown_without_invalid_empty_enum():
     tool = value._closing_submission_tool()
     schema = convert_to_openai_tool(tool)
     assert '"enum": []' not in json.dumps(schema)
-    unknown = submission() | {"assessment": None}
+    unknown = wire_submission(submission() | {"assessment": None})
     tool.args_schema.model_validate(unknown)
     with pytest.raises(ValidationError):
-        tool.args_schema.model_validate(submission())
+        tool.args_schema.model_validate(wire_submission())
 
 
 @pytest.mark.asyncio
@@ -173,7 +201,7 @@ def test_no_saved_source_can_only_submit_unknown_without_invalid_empty_enum():
 )
 async def test_result_tool_uses_original_parsing_and_verdict_validation(monkeypatch, comparison, verdict):
     raw = submission(comparison)
-    model = Model(reply=tool_response(raw))
+    model = Model(reply=tool_response(wire_submission(raw)))
     value = worker(model)
     original = copy.deepcopy(value._observations)
     seen = []
@@ -191,6 +219,8 @@ async def test_result_tool_uses_original_parsing_and_verdict_validation(monkeypa
     assert model.bindings[0][1] == {"tool_choice": "any"}
     assert model.calls[0][1]["tools"][0]["function"]["name"] == "submit_investigation"
     assert "final request: no tools" not in model.calls[0][0][0].content
+    assert '"assessment":{' not in model.calls[0][0][0].content
+    assert "assessment_comparison" in model.calls[0][0][0].content
 
 
 @pytest.mark.asyncio
@@ -198,10 +228,10 @@ async def test_counterevidence_keeps_original_mutual_exclusion_validation():
     raw = submission() | {
         "counterevidence": {"premise": "mechanism", "statement": "A guard prevents access", "evidence": ["obs_0:e1"]}
     }
-    result = await close(worker(Model(reply=tool_response(raw))))
+    result = await close(worker(Model(reply=tool_response(wire_submission(raw)))))
     assert result.verdict == "unknown" and result.reason == "inconsistent-assessment"
     raw["assessment"] = None
-    result = await close(worker(Model(reply=tool_response(raw))))
+    result = await close(worker(Model(reply=tool_response(wire_submission(raw)))))
     assert result.verdict == "refuted"
 
 
@@ -210,7 +240,7 @@ async def test_counterevidence_keeps_original_mutual_exclusion_validation():
     "kind", ["unknown-tool", "multiple-tools", "bad-enum", "bad-ref", "missing-field", "invalid-tool"]
 )
 async def test_invalid_tool_result_is_unknown_even_if_content_contains_valid_json(kind):
-    raw = submission()
+    raw = wire_submission()
     response = tool_response(raw)
     response.content = json.dumps(submission())
     if kind == "unknown-tool":
@@ -218,17 +248,88 @@ async def test_invalid_tool_result_is_unknown_even_if_content_contains_valid_jso
     elif kind == "multiple-tools":
         response.tool_calls.append(copy.deepcopy(response.tool_calls[0]))
     elif kind == "bad-enum":
-        response.tool_calls[0]["args"]["assessment"]["comparison"] = "prose cannot become conflict"
+        response.tool_calls[0]["args"]["assessment_comparison"] = "prose cannot become conflict"
     elif kind == "bad-ref":
-        response.tool_calls[0]["args"]["assessment"]["actual_evidence"] = ["obs_2:e1"]
+        response.tool_calls[0]["args"]["assessment_actual_evidence"] = ["obs_2:e1"]
     elif kind == "missing-field":
-        del response.tool_calls[0]["args"]["assessment"]
+        del response.tool_calls[0]["args"]["assessment_comparison"]
     else:
         response.invalid_tool_calls = [
             {"name": "submit_investigation", "args": "broken", "id": "bad", "error": "invalid"}
         ]
     result = await close(worker(Model(reply=response)))
     assert result.verdict == "unknown" and result.outcome == "output-error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "stringified-assessment",
+        "stringified-reference-array",
+        "omitted-none-field",
+        "nonempty-none-assessment",
+        "nonempty-none-counter",
+        "missing-assessment-evidence",
+        "missing-counter-evidence",
+        "unequal-sites",
+        "string-line",
+        "boolean-line",
+    ],
+)
+async def test_flat_wire_rejects_malformed_fields_without_repair(case):
+    raw = wire_submission()
+    if case == "stringified-assessment":
+        # The exact observed transport failure: a nested proof becomes a JSON string.
+        raw = submission()
+        raw["assessment"] = json.dumps(raw["assessment"])
+    elif case == "stringified-reference-array":
+        raw["assessment_expected_evidence"] = json.dumps(raw["assessment_expected_evidence"])
+    elif case == "omitted-none-field":
+        del raw["counter_statement"]
+    elif case == "nonempty-none-assessment":
+        raw["assessment_comparison"] = "none"
+    elif case == "nonempty-none-counter":
+        raw["counter_statement"] = "Text cannot silently disappear"
+    elif case == "missing-assessment-evidence":
+        raw["assessment_expected_evidence"] = []
+    elif case == "missing-counter-evidence":
+        raw = wire_submission(submission() | {"assessment": None})
+        raw.update(counter_premise="mechanism", counter_statement="Missing source")
+    else:
+        raw.update(
+            additional_site_paths=["check.ts"],
+            additional_site_lines=[1],
+            additional_site_excerpts=["return admin && owner;"],
+        )
+        if case == "unequal-sites":
+            raw["additional_site_excerpts"] = []
+        else:
+            raw["additional_site_lines"] = ["1" if case == "string-line" else True]
+    model = Model(reply=tool_response(raw))
+    result = await close(worker(model))
+    assert result.verdict == "unknown" and result.reason == "invalid-closing-submission"
+    assert result.outcome == "output-error" and len(model.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_flat_none_is_explicit_unknown_and_sites_preserve_exact_binding(monkeypatch):
+    raw = submission() | {
+        "assessment": None,
+        "additional_sites": [{"path": "check.ts", "line": 1, "excerpt": "return admin && owner;"}],
+    }
+    value = worker(Model(reply=tool_response(wire_submission(raw))))
+    seen = []
+    finalize = value._finalize
+
+    def capture(parsed, *args, **kwargs):
+        seen.append(parsed)
+        return finalize(parsed, *args, **kwargs)
+
+    monkeypatch.setattr(value, "_finalize", capture)
+    result = await close(value)
+    assert seen == [raw]
+    assert result.verdict == "unknown" and result.outcome != "output-error"
 
 
 @pytest.mark.asyncio

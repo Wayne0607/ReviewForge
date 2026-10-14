@@ -223,6 +223,101 @@ async def test_workload_scaled_session_cap_does_not_make_more_than_32_units_nece
 
 
 @pytest.mark.asyncio
+async def test_discovery_announces_deadline_and_removes_reads_from_the_final_request():
+    review_state, changes, _, _ = fixture(1)
+    review_state.head_sha = "head"
+    executed = []
+
+    def answer(messages, options, turn):
+        data = packet(messages)
+        assert data["session"]["requests_remaining"] == 3 - turn
+        names = {tool["function"]["name"] for tool in options["tools"]}
+        if not data["session"]["last_turn"]:
+            assert "read_file" in names
+            return receipt(call("read_file", {"path": "consumer.py", "start": turn, "end": turn}))
+        assert turn == 3 and names == {"submit_hypothesis", "submit_no_issue", "defer_unit"}
+        return receipt(call("submit_no_issue", clean(data["pending_units"][0])))
+
+    model = SessionModel(handler=answer)
+    ledger = HypothesisLedger("run", "head", "digest", protocol_version=5)
+    await HypothesisGenerator(model, executor=source_executor(executed)).run(
+        review_state, ContextPack(), changes, ledger
+    )
+    assert len(model.calls) == 3 and len(executed) == 2
+    assert len(ledger.no_issue_units) == 1 and not ledger.unresolved_units
+
+
+@pytest.mark.asyncio
+async def test_global_last_request_is_terminal_and_cannot_execute_a_late_read():
+    review_state, changes, _, _ = fixture(1)
+    executed = []
+
+    def answer(messages, options, turn):
+        assert packet(messages)["session"] == {"turn": 1, "requests_remaining": 0, "last_turn": True}
+        assert "read_file" not in {tool["function"]["name"] for tool in options["tools"]}
+        return receipt(call("read_file", {"path": "consumer.py", "start": 1, "end": 1}))
+
+    model = SessionModel(handler=answer)
+    ledger = HypothesisLedger("run", "head", "digest", protocol_version=5)
+    await HypothesisGenerator(model, executor=source_executor(executed), session_request_limit=1).run(
+        review_state, ContextPack(), changes, ledger
+    )
+    assert len(model.calls) == 1 and not executed and not ledger.no_issue_units
+    assert ledger.unresolved_units
+
+
+@pytest.mark.asyncio
+async def test_discovery_preserves_a_useful_terminal_request_under_a_tight_physical_budget():
+    from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
+
+    review_state, changes, _, _ = fixture(1)
+    executed = []
+
+    def answer(messages, options, turn):
+        assert packet(messages)["session"]["last_turn"]
+        return receipt(call("submit_no_issue", clean(packet(messages)["pending_units"][0])))
+
+    model = SessionModel(handler=answer)
+    budget = RequestBudget(6000, editor_reserve=0)
+    bounded = BudgetedChatLLM(model, budget, phase="discovery")
+    ledger = HypothesisLedger("run", "head", "digest", protocol_version=5)
+    await HypothesisGenerator(bounded, executor=source_executor(executed)).run(
+        review_state, ContextPack(), changes, ledger
+    )
+    assert len(model.calls) == 1 and len(ledger.no_issue_units) == 1 and not executed
+    assert budget.reported == 120 and not budget.pending and budget.denials == 0
+
+
+@pytest.mark.asyncio
+async def test_immutable_real_read_only_receipts_do_not_execute_a_read_after_the_announced_deadline():
+    saved = json.loads((Path(__file__).parent / "fixtures/v5_discovery_read_only_receipts.json").read_text())
+    review_state, changes, _, _ = fixture(1)
+    review_state.head_sha = "head"
+    executed = []
+
+    def answer(messages, options, turn):
+        response = saved["responses"][turn - 1]["response"]
+        if turn == 3:
+            assert packet(messages)["session"]["last_turn"]
+        return AIMessage(
+            content=response["content"],
+            tool_calls=response["tool_calls"],
+            additional_kwargs={"tool_calls": response["raw_tool_calls"]},
+            response_metadata={"finish_reason": response["finish_reason"]},
+        )
+
+    model = SessionModel(handler=answer)
+    ledger = HypothesisLedger("run", "head", "digest", protocol_version=5)
+    await HypothesisGenerator(model, executor=source_executor(executed)).run(
+        review_state, ContextPack(), changes, ledger
+    )
+    record = next(iter(ledger.discovery_blocks.values()))
+    assert len(model.calls) == 3 and len(record["observations"]) == 4
+    assert not ledger.items and not ledger.no_issue_units and ledger.unresolved_units
+    assert any(event.get("errors") for event in record["session"]["events"])
+
+
+@pytest.mark.asyncio
 async def test_case_result_has_no_empty_proof_fields_and_can_refute_original_case():
     item = candidate()
     calls = []

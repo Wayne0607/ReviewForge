@@ -13,6 +13,9 @@ receiver/argument order and original input conditions.
 Respond ONLY through supplied native actions, with no XML, prose, or JSON text.
 Multiple independent result/read calls are allowed. An acknowledged unit is done;
 do not resubmit it. One invalid action does not grant a new budget or new facts.
+The session packet states remaining requests. On last_turn only result actions
+are supplied: finish each pending unit from saved evidence, or explicitly defer
+the missing boundary. Do not issue another read or invent a clean assessment.
 
 submit_hypothesis proposes a concrete PR-introduced inconsistency and an answerable
 missing-contract question. It is OPEN, never confirmed. Do not invent a requirement

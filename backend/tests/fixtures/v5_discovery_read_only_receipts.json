@@ -1,0 +1,164 @@
+{
+  "source_run": "v4-session-retest-b7b57e2-20261014-214820",
+  "source_revision": "b7b57e203a761094c395ecfbd66e622148e94e98",
+  "note": "Original provider receipts, retained unchanged; offline replay is not another paid review or a quality score.",
+  "responses": [
+    {
+      "file": "3e1295ab6be941eaad036f60c8a51446-output.json",
+      "sha256": "7c1bacaf83c440ce87a18399ef92140be935593d2fae3f63a3d47301a22037f3",
+      "response": {
+        "content": "",
+        "usage": {
+          "input_tokens": 14770,
+          "output_tokens": 57,
+          "total_tokens": 14827,
+          "input_token_details": {
+            "cache_read": 0
+          },
+          "output_token_details": {}
+        },
+        "reasoning": "",
+        "finish_reason": "tool_calls",
+        "tool_calls": [
+          {
+            "name": "read_diff",
+            "args": {
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx"
+            },
+            "id": "call_dde2b438366042e4b9002a80",
+            "type": "tool_call"
+          },
+          {
+            "name": "find_references",
+            "args": {
+              "symbol": "MultiEmail"
+            },
+            "id": "call_8211c71f70394326b7826fb9",
+            "type": "tool_call"
+          }
+        ],
+        "raw_tool_calls": [
+          {
+            "id": "call_dde2b438366042e4b9002a80",
+            "function": {
+              "arguments": "{\"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\"}",
+              "name": "read_diff"
+            },
+            "type": "function",
+            "index": 0
+          },
+          {
+            "id": "call_8211c71f70394326b7826fb9",
+            "function": {
+              "arguments": "{\"symbol\": \"MultiEmail\"}",
+              "name": "find_references"
+            },
+            "type": "function",
+            "index": 1
+          }
+        ]
+      }
+    },
+    {
+      "file": "7c6d784d0afd4f74bb6d37f6e8151a8b-output.json",
+      "sha256": "0557e1378dc2ef38137b3ef7a8f601600c26e675dde50d9ade3416e79c8a81b4",
+      "response": {
+        "content": "",
+        "usage": {
+          "input_tokens": 15737,
+          "output_tokens": 110,
+          "total_tokens": 15847,
+          "input_token_details": {
+            "cache_read": 14336
+          },
+          "output_token_details": {}
+        },
+        "reasoning": "",
+        "finish_reason": "tool_calls",
+        "tool_calls": [
+          {
+            "name": "read_file",
+            "args": {
+              "end": "107",
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+              "start": "46"
+            },
+            "id": "call_b62d72603d5947edac22b3c8",
+            "type": "tool_call"
+          },
+          {
+            "name": "read_file",
+            "args": {
+              "end": "96",
+              "path": "packages/ui/form/MultiEmail.tsx",
+              "start": "1"
+            },
+            "id": "call_4ea18b89a39c4ea6a448eb1b",
+            "type": "tool_call"
+          }
+        ],
+        "raw_tool_calls": [
+          {
+            "id": "call_b62d72603d5947edac22b3c8",
+            "function": {
+              "arguments": "{\"end\": \"107\", \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": \"46\"}",
+              "name": "read_file"
+            },
+            "type": "function",
+            "index": 0
+          },
+          {
+            "id": "call_4ea18b89a39c4ea6a448eb1b",
+            "function": {
+              "arguments": "{\"end\": \"96\", \"path\": \"packages/ui/form/MultiEmail.tsx\", \"start\": \"1\"}",
+              "name": "read_file"
+            },
+            "type": "function",
+            "index": 1
+          }
+        ]
+      }
+    },
+    {
+      "file": "55ba0c09c9d848a4947614bf5374ce2b-output.json",
+      "sha256": "3d93aa22a2496952a24debb12269a87532283638e5f328cd21f9e5a34f8857cf",
+      "response": {
+        "content": "",
+        "usage": {
+          "input_tokens": 18033,
+          "output_tokens": 52,
+          "total_tokens": 18085,
+          "input_token_details": {
+            "cache_read": 12288
+          },
+          "output_token_details": {}
+        },
+        "reasoning": "",
+        "finish_reason": "tool_calls",
+        "tool_calls": [
+          {
+            "name": "read_file",
+            "args": {
+              "end": "96",
+              "path": "packages/ui/form/MultiEmail.tsx",
+              "start": "30"
+            },
+            "id": "call_f6a10fc2d30f4e1d8f8682dd",
+            "type": "tool_call"
+          }
+        ],
+        "raw_tool_calls": [
+          {
+            "id": "call_f6a10fc2d30f4e1d8f8682dd",
+            "function": {
+              "arguments": "{\"end\": \"96\", \"path\": \"packages/ui/form/MultiEmail.tsx\", \"start\": \"30\"}",
+              "name": "read_file"
+            },
+            "type": "function",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -127,10 +127,28 @@ def result_payload(name, args, block, aliases):
     }
 
 
+def session_request(generator, block, aliases, pending, feedback, rules, broker, scope):
+    """The same packet and tools are used for closure forecasts and dispatch."""
+    active = replace(block, units=[unit for unit in block.units if unit.id in pending])
+    outputs = discovery_tools(active)
+    tools = [*outputs, *([] if scope["last_turn"] else broker._build_tools())]
+    bound = bind_discovery_submission(generator._llm, tools)
+    system = load_prompt("session_discovery_v5", output_language=generator._output_language)
+    packet = source_packet(block, aliases, pending) | {"session": scope}
+    chat = [
+        SystemMessage(content=system + ("\nApplicable review rules:\n" + rules if rules else "")),
+        HumanMessage(content=json.dumps(packet, ensure_ascii=False)),
+    ]
+    if feedback:
+        chat.append(controller_feedback(feedback, tools))
+    return bound, chat, tools, outputs
+
+
 async def run_discovery(generator, state, pack, changeset, ledger, *, overview_changeset=None):
     from reviewforge.engine.hypothesis_generator import (
         HypothesisGenerationResult,
         _discovery_available,
+        _discovery_output_floor,
         _right_lines_by_path,
     )
     from reviewforge.engine.request_budget import plan_request
@@ -199,11 +217,6 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             used_turns += 1
             delivered_aliases = dict(aliases)
             active = replace(block, units=[unit for unit in block.units if unit.id in pending])
-            outputs = discovery_tools(active)
-            reads = broker._build_tools()
-            tools = [*outputs, *reads]
-            bound = bind_discovery_submission(generator._llm, tools)
-            system = load_prompt("session_discovery_v5", output_language=generator._output_language)
             rules = "\n".join(
                 dict.fromkeys(
                     generator._responsibility_rules.get(name, "")
@@ -211,21 +224,52 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
                     for name in generator._unit_responsibilities.get(unit.id, [])
                 )
             )
-            chat = [
-                SystemMessage(content=system + ("\nApplicable review rules:\n" + rules if rules else "")),
-                HumanMessage(content=json.dumps(source_packet(block, aliases, pending), ensure_ascii=False)),
-            ]
-            if feedback:
-                chat.append(controller_feedback(feedback, tools))
+            remaining = min(session.record["max_turns"] - session.record["turns"], request_limit - used_turns)
+            scope = {"turn": session.record["turns"], "requests_remaining": remaining, "last_turn": remaining == 0}
+            close_scope = scope | {"requests_remaining": 0, "last_turn": True}
+            closing = session_request(generator, block, aliases, pending, feedback, rules, broker, close_scope)
+            available = _discovery_available(ledger)
+            allowance = min(
+                generator._discovery_max_hypotheses_per_block, max(0, generator._max_hypotheses - len(ledger.items))
+            )
+            output_floor = _discovery_output_floor(len(pending), allowance, protocol_version=5)
+            closing_plan = plan_request(closing[0], closing[1], max_output_tokens=4096, fallback_available=available)
+            closing_reserve = closing_plan.input_tokens + output_floor
+            bound, chat, tools, outputs = (
+                closing
+                if scope["last_turn"]
+                else session_request(generator, block, aliases, pending, feedback, rules, broker, scope)
+            )
+            plan = plan_request(
+                bound,
+                chat,
+                max_output_tokens=4096,
+                fallback_available=available,
+                reserve_tokens=0 if scope["last_turn"] else closing_reserve,
+            )
+            if not scope["last_turn"] and plan.max_output_tokens < 512:
+                # An additional read must not consume the last usable result
+                # request. This is a forecast; physical admission still guards
+                # growth in the next packet and concurrent/unknown spending.
+                scope = close_scope
+                bound, chat, tools, outputs = closing
+                plan = closing_plan
+            if scope["last_turn"]:
+                session.record["max_turns"] = session.record["turns"]
+            session.event("request-scope", **scope, closing_reserve=closing_reserve)
             if sum(len(message.content) for message in chat) > generator._max_input_chars:
                 session.finish("capacity-deferred: session-input-limit")
                 break
-            plan = plan_request(bound, chat, max_output_tokens=4096, fallback_available=_discovery_available(ledger))
-            record["request_plan"] = {"input_tokens": plan.input_tokens, "max_output_tokens": plan.max_output_tokens}
+            record["request_plan"] = {
+                "input_tokens": plan.input_tokens,
+                "max_output_tokens": plan.max_output_tokens,
+                "last_turn": scope["last_turn"],
+                "closing_reserve": closing_reserve,
+            }
             record["request_attempted"] = True
             if generator._on_update:
                 await generator._on_update(ledger)
-            if plan.max_output_tokens < 512:
+            if plan.max_output_tokens < (output_floor if scope["last_turn"] else 512):
                 session.finish("budget-exhausted")
                 break
             try:

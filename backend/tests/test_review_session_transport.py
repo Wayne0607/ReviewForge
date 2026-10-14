@@ -19,7 +19,8 @@ from reviewforge.engine.wire_audit import WireAudit
 
 
 @pytest.mark.asyncio
-async def test_real_sdk_dispatches_one_native_contract_and_accounts_every_feedback_receipt(tmp_path):
+@pytest.mark.parametrize("terminal_first", [False, True])
+async def test_real_sdk_dispatches_one_native_contract_and_accounts_every_feedback_receipt(tmp_path, terminal_first):
     review_state, changes, _, _ = fixture(2)
     ledger = HypothesisLedger("sdk", "head", "digest", protocol_version=5)
     requests = []
@@ -29,12 +30,15 @@ async def test_real_sdk_dispatches_one_native_contract_and_accounts_every_feedba
         payload = json.loads(request.content)
         requests.append(payload)
         names = [tool["function"]["name"] for tool in payload["tools"]]
-        assert {"submit_hypothesis", "submit_no_issue", "defer_unit", "read_file", "find_definition"} <= set(names)
+        assert {"submit_hypothesis", "submit_no_issue", "defer_unit"} <= set(names)
         assert payload["tool_choice"] == "required" and "response_format" not in payload
         data = json.loads(payload["messages"][1]["content"])
+        assert data["session"]["last_turn"] is terminal_first
+        assert ("read_file" in names) is not terminal_first
         calls = [{"id": "wrong", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}]
-        if len(requests) > 1:
-            assert "controller_receipt" in payload["messages"][-1]["content"]
+        if terminal_first or len(requests) > 1:
+            if not terminal_first:
+                assert "controller_receipt" in payload["messages"][-1]["content"]
             calls = [
                 {
                     "id": f"unit-{index}",
@@ -87,14 +91,18 @@ async def test_real_sdk_dispatches_one_native_contract_and_accounts_every_feedba
             result = await HypothesisGenerator(
                 BudgetedChatLLM(model, budget, phase="discovery"),
                 executor=source_executor([]),
+                session_request_limit=1 if terminal_first else 32,
             ).run(review_state, ContextPack(), changes, ledger)
     snapshot = budget.snapshot()
-    assert len(requests) == result.blocks == snapshot["request_count"] == 2
+    expected = 1 if terminal_first else 2
+    assert len(requests) == result.blocks == snapshot["request_count"] == expected
     assert (
-        snapshot["reported_tokens"] == 240 and not snapshot["pending"] and snapshot["unreported_reserved_tokens"] == 0
+        snapshot["reported_tokens"] == 120 * expected
+        and not snapshot["pending"]
+        and snapshot["unreported_reserved_tokens"] == 0
     )
     assert len(ledger.no_issue_units) == 2 and not ledger.unresolved_units
-    assert len(list(tmp_path.glob("*-request.json"))) == len(list(tmp_path.glob("*-response.json"))) == 2
+    assert len(list(tmp_path.glob("*-request.json"))) == len(list(tmp_path.glob("*-response.json"))) == expected
     assert "never-log-this-secret" not in "".join(path.read_text(encoding="utf-8") for path in tmp_path.glob("*.json"))
 
 

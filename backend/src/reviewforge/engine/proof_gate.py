@@ -515,11 +515,16 @@ class ProofGate:
         if self._on_update is not None:
             await self._on_update(ledger)
 
-    def _messages(self, ledger: HypothesisLedger, batch: list[Hypothesis]) -> list[Any]:
+    def _messages(self, ledger: HypothesisLedger, batch: list[Hypothesis], *, forecast: bool = False) -> list[Any]:
         packets = [_packet(item) for item in batch]
         if ledger.protocol_version >= 4:
             for item, packet in zip(batch, packets, strict=True):
-                packet["independent_source_audit"] = ledger.source_audits[item.id]["facts"]
+                audit = ledger.source_audits.get(item.id, {})
+                if forecast and not audit_current(item, ledger):
+                    # Sizing only. Unknown future facts are budgeted by the
+                    # allocator, never fabricated or sent as source evidence.
+                    continue
+                packet["independent_source_audit"] = audit["facts"]
                 packet["independent_contracts"] = contract_catalog(item, ledger)
         return [
             SystemMessage(

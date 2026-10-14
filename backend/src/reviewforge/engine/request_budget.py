@@ -35,22 +35,51 @@ class RequestBudget:
         discovery_limit: int = 80_000,
         editor_reserve: int = 16_000,
         saved: dict[str, Any] | None = None,
+        adaptive: bool = False,
     ) -> None:
         previous = saved or {}
+        # Allocation is frozen with the run. Historical checkpoints keep their
+        # original phase limits; restoring them must not grant more credit.
+        self.adaptive = previous.get("allocation_policy") == "adaptive-v1" if previous else adaptive
         self.limit = min(limit, int(previous.get("limit", limit)))
         self.discovery_limit = min(discovery_limit, int(previous.get("discovery_limit", discovery_limit)))
-        self.editor_reserve = min(max(0, editor_reserve), self.limit)
+        self.editor_reserve = min(max(0, int(previous.get("editor_reserve", editor_reserve))), self.limit)
+        self.investigation_reserve = max(0, int(previous.get("investigation_reserve", 0))) if self.adaptive else 0
+        self.allocation: dict[str, Any] = copy.deepcopy(previous.get("allocation", {})) if self.adaptive else {}
         self.reported = max(0, int(previous.get("reported_tokens", 0)))
         self.unreported = max(0, int(previous.get("unreported_reserved_tokens", 0)))
         self.by_phase = dict(previous.get("charged_by_phase", {}))
+        self.task_usage = copy.deepcopy(previous.get("charged_by_task", {}))
         self.pending: dict[str, dict[str, Any]] = {}
         self.denials = max(0, int(previous.get("denied_requests", 0)))
         self.serial = max(0, int(previous.get("request_count", 0)))
+        self.unreported_requests = copy.deepcopy(previous.get("unreported_requests", {}))
+        self.reconciliations = copy.deepcopy(previous.get("reconciliations", {}))
         # A process interrupted after dispatch has no reliable usage receipt.
-        for entry in previous.get("pending", {}).values():
+        for identity, entry in previous.get("pending", {}).items():
             amount = max(0, int(entry["reserved_tokens"]))
             self.unreported += amount
             self.by_phase[entry["phase"]] = self.by_phase.get(entry["phase"], 0) + amount
+            self.unreported_requests[identity] = copy.deepcopy(entry)
+            self._charge_task(entry, amount, known=False)
+
+    def _charge_task(self, entry: dict[str, Any], amount: int, *, known: bool) -> None:
+        if not entry.get("task_id"):
+            return
+        usage = self.task_usage.setdefault(
+            entry["task_id"], {"reported_tokens": 0, "unreported_reserved_tokens": 0, "steps": 0}
+        )
+        key = "reported_tokens" if known else "unreported_reserved_tokens"
+        usage[key] += amount
+        usage["steps"] = max(usage["steps"], entry.get("steps", 0))
+
+    def allocate(self, *, verification: int, investigation: int, basis: dict[str, Any]) -> None:
+        """Protect forecast work, without spending it or changing a hard cap."""
+        if not self.adaptive:
+            return
+        self.editor_reserve = min(self.limit, max(0, verification))
+        self.investigation_reserve = min(self.limit, max(0, investigation))
+        self.allocation = copy.deepcopy(basis)
 
     def available(self, phase: str) -> int:
         pending = sum(item["reserved_tokens"] for item in self.pending.values())
@@ -58,11 +87,14 @@ class RequestBudget:
         if phase != "editor":
             remaining -= self.editor_reserve
         if phase == "discovery":
-            phase_pending = sum(item["reserved_tokens"] for item in self.pending.values() if item["phase"] == phase)
-            remaining = min(remaining, self.discovery_limit - self.by_phase.get(phase, 0) - phase_pending)
+            if self.adaptive:
+                remaining -= self.investigation_reserve
+            else:
+                phase_pending = sum(item["reserved_tokens"] for item in self.pending.values() if item["phase"] == phase)
+                remaining = min(remaining, self.discovery_limit - self.by_phase.get(phase, 0) - phase_pending)
         return max(0, remaining)
 
-    def reserve(self, phase: str, tokens: int) -> str:
+    def reserve(self, phase: str, tokens: int, *, task_id: str = "", steps: int = 0) -> str:
         if tokens <= 0:
             raise ValueError("request reservation must be positive")
         if tokens > self.available(phase):
@@ -73,6 +105,8 @@ class RequestBudget:
         self.serial += 1
         identity = f"request_{self.serial}"
         self.pending[identity] = {"phase": phase, "reserved_tokens": tokens}
+        if task_id:
+            self.pending[identity].update(task_id=task_id, steps=steps)
         return identity
 
     def settle(self, identity: str, actual: int | None) -> None:
@@ -80,15 +114,42 @@ class RequestBudget:
         if actual is None:
             amount = reservation["reserved_tokens"]
             self.unreported += amount
+            self.unreported_requests[identity] = copy.deepcopy(reservation)
         else:
             amount = max(0, actual)
             self.reported += amount
         phase = reservation["phase"]
         self.by_phase[phase] = self.by_phase.get(phase, 0) + amount
+        self._charge_task(reservation, amount, known=actual is not None)
 
     def release(self, identity: str) -> None:
         """Release a request rejected by another budget before dispatch."""
         self.pending.pop(identity)
+
+    def reconcile_unknown(self, identity: str, actual: int, *, receipt_ref: str) -> None:
+        """Apply an externally verified receipt for this exact physical attempt.
+
+        The caller must verify the provider's request identity and receipt. A
+        timeout, local estimate, or later retry is not a receipt. Legacy aggregate
+        unknown usage has no attempt identity and cannot be refunded here.
+        """
+        if type(actual) is not int or actual < 0 or not isinstance(receipt_ref, str) or not receipt_ref.strip():
+            raise ValueError("reconciliation requires actual usage and a verified receipt reference")
+        if identity not in self.unreported_requests or receipt_ref in {
+            row["receipt_ref"] for row in self.reconciliations.values()
+        }:
+            raise ValueError("unknown attempt or reused receipt")
+        reservation = self.unreported_requests.pop(identity)
+        reserved = reservation["reserved_tokens"]
+        self.unreported -= reserved
+        self.reported += actual
+        phase = reservation["phase"]
+        self.by_phase[phase] = self.by_phase.get(phase, 0) + actual - reserved
+        if reservation.get("task_id"):
+            usage = self.task_usage[reservation["task_id"]]
+            usage["unreported_reserved_tokens"] -= reserved
+            usage["reported_tokens"] += actual
+        self.reconciliations[identity] = {"actual_tokens": actual, "receipt_ref": receipt_ref, **reservation}
 
     @property
     def over_limit(self) -> bool:
@@ -96,22 +157,36 @@ class RequestBudget:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2 if self.adaptive else 1,
             "limit": self.limit,
             "discovery_limit": self.discovery_limit,
             "editor_reserve": self.editor_reserve,
             "reported_tokens": self.reported,
             "unreported_reserved_tokens": self.unreported,
             "charged_by_phase": dict(self.by_phase),
+            "charged_by_task": copy.deepcopy(self.task_usage),
             "pending": copy.deepcopy(self.pending),
             "denied_requests": self.denials,
             "request_count": self.serial,
+            "unreported_requests": copy.deepcopy(self.unreported_requests),
+            "reconciliations": copy.deepcopy(self.reconciliations),
+            **(
+                {
+                    "allocation_policy": "adaptive-v1",
+                    "investigation_reserve": self.investigation_reserve,
+                    "allocation": copy.deepcopy(self.allocation),
+                }
+                if self.adaptive
+                else {}
+            ),
         }
 
 
 class TaskRequestBudget(RequestBudget):
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, *, task_id: str = ""):
         super().__init__(limit, discovery_limit=limit, editor_reserve=0)
+        self.task_id = task_id
+        self.progress_steps = 0
 
 
 _task_budget: contextvars.ContextVar[TaskRequestBudget | None] = contextvars.ContextVar(
@@ -120,9 +195,9 @@ _task_budget: contextvars.ContextVar[TaskRequestBudget | None] = contextvars.Con
 
 
 @contextmanager
-def investigation_request_scope(limit: int):
+def investigation_request_scope(limit: int, *, task_id: str = ""):
     """Keep every retry/closure attempt inside the original investigation cap."""
-    budget = TaskRequestBudget(limit)
+    budget = TaskRequestBudget(limit, task_id=task_id)
     token = _task_budget.set(budget)
     try:
         yield budget
@@ -235,7 +310,12 @@ class BudgetedChatLLM(BaseChatModel):
         task_budget = _task_budget.get()
         identity = task_identity = None
         try:
-            identity = self._budget.reserve(self._phase, estimate)
+            identity = self._budget.reserve(
+                self._phase,
+                estimate,
+                task_id=task_budget.task_id if task_budget is not None else "",
+                steps=task_budget.progress_steps if task_budget is not None else 0,
+            )
             if task_budget is not None:
                 task_identity = task_budget.reserve(self._phase, estimate)
         except RequestBudgetExceededError:
@@ -245,6 +325,14 @@ class BudgetedChatLLM(BaseChatModel):
             raise
         try:
             await self._changed()
+        except BaseException:
+            # A failed pre-dispatch checkpoint is known not to have contacted
+            # the provider. Only dispatched/interrupted attempts are unknown.
+            self._budget.release(identity)
+            if task_identity is not None:
+                task_budget.release(task_identity)
+            raise
+        try:
             result = await self._inner._agenerate(messages, stop, run_manager, **options)
         except BaseException:
             self._budget.settle(identity, None)

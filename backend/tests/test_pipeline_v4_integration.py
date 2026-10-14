@@ -103,7 +103,7 @@ class _ScriptedLLM(BaseChatModel):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol_version", [2, 3])
+@pytest.mark.parametrize("protocol_version", [2, 3, 4])
 async def test_specialist_rules_share_initial_discovery_only_in_new_protocol(protocol_version):
     from reviewforge.engine.pipeline_v4 import _run_llm_stages
     from reviewforge.engine.verification_guidance import localization_guidance
@@ -166,7 +166,7 @@ async def test_specialist_rules_share_initial_discovery_only_in_new_protocol(pro
     event = next(event for event in seen if event.event_type == "lens.selected")
     assert event.data["lenses"] == ["localization"]
     assert ("lens_localization" in models) is (protocol_version == 2)
-    if protocol_version == 3:
+    if protocol_version >= 3:
         prompt = "\n".join(str(message.content) for message in models["hypothesis_generator"].calls[0])
         unit_rows = [json.loads(line) for line in prompt.splitlines() if line.startswith(f'["{unit.id}",')]
         assert len(unit_rows) == 1

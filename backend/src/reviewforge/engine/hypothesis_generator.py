@@ -111,6 +111,8 @@ def _discovery_available(ledger: HypothesisLedger) -> int:
         - saved.get("editor_reserve", 16_000)
         - sum(item["reserved_tokens"] for item in pending)
     )
+    if saved.get("allocation_policy") == "adaptive-v1":
+        return max(0, remaining - saved.get("investigation_reserve", 0))
     phase = saved.get("discovery_limit", 80_000) - saved.get("charged_by_phase", {}).get("discovery", 0)
     phase -= sum(item["reserved_tokens"] for item in pending if item["phase"] == "discovery")
     return max(0, min(remaining, phase))

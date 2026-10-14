@@ -163,6 +163,7 @@ class PipelineV4Config:
     json_output_mode: str = "auto"
     investigator_closure_thinking: str = "auto"
     max_tokens_per_pr: int = 250_000
+    budget_policy: str = "adaptive"
     provider_max_attempts: int = 3
     provider_retry_404: bool = False
     provider_retry_after_max_seconds: float = 60.0
@@ -191,10 +192,11 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
             if math.isfinite(retry_after_cap) and retry_after_cap >= 0:
                 cfg.provider_retry_after_max_seconds = retry_after_cap
     for name, allowed in (
+        ("budget_policy", {"fixed", "adaptive"}),
         ("json_output_mode", {"auto", "off", "json_object"}),
         ("investigator_closure_thinking", {"auto", "default", "disabled"}),
     ):
-        if data.get(name) in allowed:
+        if isinstance(data.get(name), str) and data[name] in allowed:
             setattr(cfg, name, data[name])
     for name in (
         "workspace_max_bytes",

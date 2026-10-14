@@ -15,6 +15,7 @@ from dataclasses import asdict
 from typing import Any
 
 from reviewforge.core.state import StateStore
+from reviewforge.engine.budget_allocation import verification_forecast
 from reviewforge.engine.context_engine import ContextEngine
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.declarations_v4 import compile_changeset_v4
@@ -31,6 +32,7 @@ from reviewforge.engine.editor import (
 from reviewforge.engine.evidence_followup import run_evidence_followup
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator, build_anchor_resolver
+from reviewforge.engine.investigation_tasks import build_investigation_tasks, fair_investigation_tasks
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
 from reviewforge.engine.language import resolve_output_language
 from reviewforge.engine.lenses import build_discovery_responsibilities, run_lens, select_lenses
@@ -176,6 +178,7 @@ async def _run_llm_stages(
             config.max_tokens_per_pr,
             discovery_limit=config.discovery_max_tokens,
             saved=ledger.request_budget,
+            adaptive=ledger.protocol_version >= 4 and getattr(config, "budget_policy", "adaptive") == "adaptive",
         )
         if ledger.protocol_version >= 3
         else None
@@ -225,8 +228,85 @@ async def _run_llm_stages(
             attempt_sink=attempt_changed,
         )
 
+    active_sources: dict[str, list[Any]] = {}
+    discovery_active = not resume or bool(ledger.unresolved_units)
+    allocation_models = (
+        (routed("investigator"), routed("investigator", closing=True), routed("editor"))
+        if request_budget is not None and request_budget.adaptive
+        else None
+    )
+
+    def refresh_allocation() -> None:
+        if request_budget is None or not request_budget.adaptive:
+            return
+        from dataclasses import replace
+
+        candidates = []
+        starters = []
+        selected = fair_investigation_tasks(
+            build_investigation_tasks(ledger.open(), head_sha=ledger.head_sha, workspace_digest=ledger.workspace_digest)
+        )[: config.investigator_max_hypotheses_per_pr]
+        opens = [task.hypothesis for task in selected]
+        confirmed = [item for item in ledger.items.values() if item.status == HypothesisStatus.CONFIRMED]
+        pending = []
+        for task in selected:
+            for identity in task.members:
+                item = ledger.items[identity]
+                if task.hypothesis.identity in active_sources:
+                    item = replace(item, observations=list(active_sources[task.hypothesis.identity]))
+                pending.append(item)
+        for item in [*confirmed, *pending]:
+            if item.identity in active_sources:
+                item = replace(item, observations=list(active_sources[item.identity]))
+            if item.status == HypothesisStatus.CONFIRMED and completed(item, ledger):
+                continue
+            candidates.append(item)
+        for item in opens:
+            preview = Investigator(
+                allocation_models[0],
+                executor,
+                output_language=language,
+                changeset=changeset,
+                protocol_version=ledger.protocol_version,
+                closing_llm=allocation_models[1],
+                adaptive_budget=True,
+            )
+            _, _, starter = preview.workload_allowance(item, state, pack)
+            starters.append(starter)
+        future = (
+            discovery_active
+            and bool(changeset.units)
+            and (not ledger.discovery_blocks or bool(ledger.unresolved_units))
+        )
+        forecast = verification_forecast(
+            allocation_models[2], ledger, candidates, language=language, future_candidate=future
+        )
+        investigation = sum(starters)
+        if future and not starters:
+            investigation = 8_192  # Bootstrap allowance until an actual candidate exists.
+        request_budget.allocate(
+            verification=forecast["verification_tokens"],
+            investigation=investigation,
+            basis={
+                **forecast,
+                "investigation_starter_tokens": investigation,
+                "discovery_target_tokens": config.discovery_max_tokens,
+            },
+        )
+        ledger.request_budget = request_budget.snapshot()
+
+    def evidence_changed(item, observations) -> None:
+        active_sources[item.identity] = list(observations)
+        refresh_allocation()
+
     async def checkpoint(current: HypothesisLedger) -> None:
+        refresh_allocation()
         await _persist_ledger(orchestrator, current)
+
+    executor = build_workspace_executor(workspace, state)
+    refresh_allocation()
+    if request_budget is not None:
+        await budget_changed(request_budget.snapshot())
 
     # A frozen first review proves discovery was attempted. Retry only if
     # generation/lens failures remain; finished verdicts stay in the ledger.
@@ -300,7 +380,8 @@ async def _run_llm_stages(
                 context_max_chars=config.context_pack_max_chars,
             )
 
-    executor = build_workspace_executor(workspace, state)
+    discovery_active = False
+    refresh_allocation()
     for item in ledger.items.values():
         if item.status == HypothesisStatus.UNKNOWN and item.retryable:
             item.status = HypothesisStatus.OPEN
@@ -327,6 +408,8 @@ async def _run_llm_stages(
                 if ledger.protocol_version >= 2
                 else None
             ),
+            request_budget=request_budget,
+            on_evidence=evidence_changed if request_budget is not None and request_budget.adaptive else None,
         )
 
     if ledger.protocol_version >= 3:
@@ -341,6 +424,7 @@ async def _run_llm_stages(
                     output_language=language,
                     changeset=changeset,
                     protocol_version=ledger.protocol_version,
+                    on_evidence=evidence_changed if request_budget is not None and request_budget.adaptive else None,
                 )
 
             changed_evidence = await run_evidence_followup(collector, ledger, state, pack, on_update=checkpoint)

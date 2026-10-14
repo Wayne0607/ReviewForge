@@ -450,7 +450,11 @@ class HypothesisLedger:
                     investigation_task_id=task_id,
                 )
             self.investigation_tasks[task_id] = {
-                **{key: previous[key] for key in ("budget_steps_limit", "token_limit") if key in previous},
+                **{
+                    key: previous[key]
+                    for key in ("budget_steps_limit", "token_limit", "budget_policy", "request_usage_synced")
+                    if key in previous
+                },
                 **(
                     {"total_steps": int(previous["total_steps"]) + int(verdict.get("investigation_steps", 0))}
                     if "total_steps" in previous

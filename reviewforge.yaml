@@ -175,6 +175,9 @@ coverage_gap:
 # Hypothesis pipeline remains opt-in through the holdout gate (T11).
 pipeline_v4:
   mode: "legacy"
+  # New protocol-4 runs share the PR pool and forecast downstream work.
+  # "fixed" keeps the historical 80k discovery / 16k verification allocation.
+  budget_policy: "adaptive"
   output_language: "auto"
   workspace_max_bytes: 200000000
   context_pack_max_slices: 12

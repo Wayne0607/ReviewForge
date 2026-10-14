@@ -6,6 +6,7 @@
 - 用户已授权统一使用 `dev`，替代旧任务卡的 `hp/<卡号>` 分支约定。
 - 新流水线事实源：[hypothesis-pipeline-spec.md](docs/hypothesis-pipeline-spec.md)。进度与待验收项：[v4-development.md](docs/v4-development.md)。
 - 默认仍是 `legacy`；`shadow` 与 `hypothesis` 是尚待真实基准验收的 v4 路径。下述 Planner/Reviewer/Verifier/Commenter 描述适用于 legacy。
+- 新 v4 运行使用内部协议 5 的受控原生动作循环；发现可以只读取证，证据和工作状态可恢复。旧协议 1–4 的快照与账本保留原语义；发布仍经原独立核验，工作循环跑通不等于质量验收。
 
 ## Agent 架构
 

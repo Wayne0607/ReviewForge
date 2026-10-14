@@ -145,7 +145,7 @@ class PipelineV4Config:
     """
 
     mode: str = "legacy"
-    protocol_version: int = 4
+    protocol_version: int = 5
     output_language: str = "auto"
     workspace_max_bytes: int = 200_000_000
     context_pack_max_slices: int = 12
@@ -154,6 +154,7 @@ class PipelineV4Config:
     generator_max_hypotheses: int = 12
     discovery_target_input_chars: int = 32_000
     discovery_max_blocks: int = 8
+    session_max_requests: int = 32
     discovery_max_tokens: int = 80_000
     max_lenses: int = 3
     investigator_concurrency: int = 4
@@ -177,7 +178,7 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         cfg.mode = _normalize_pipeline_mode(data["mode"], cfg.mode)
     if "output_language" in data:
         cfg.output_language = _normalize_output_language(data["output_language"], cfg.output_language)
-    if type(data.get("protocol_version")) is int and data["protocol_version"] in {1, 2, 3, 4}:
+    if type(data.get("protocol_version")) is int and data["protocol_version"] in {1, 2, 3, 4, 5}:
         cfg.protocol_version = data["protocol_version"]
     if type(data.get("provider_max_attempts")) is int and data["provider_max_attempts"] in {1, 2, 3}:
         cfg.provider_max_attempts = data["provider_max_attempts"]
@@ -206,6 +207,7 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         "generator_max_hypotheses",
         "discovery_target_input_chars",
         "discovery_max_blocks",
+        "session_max_requests",
         "discovery_max_tokens",
         "max_lenses",
         "investigator_concurrency",

@@ -278,6 +278,14 @@ async def _run_llm_stages(
             and bool(changeset.units)
             and (not ledger.discovery_blocks or bool(ledger.unresolved_units))
         )
+        if ledger.protocol_version >= 5:
+            assessed = {
+                unit_id
+                for block in ledger.discovery_blocks.values()
+                for unit_id, row in block.get("units", {}).items()
+                if row.get("status") in {"assessed", "recovered"}
+            }
+            future = discovery_active and any(unit.id not in assessed for unit in changeset.units)
         forecast = verification_forecast(
             allocation_models[2], ledger, candidates, language=language, future_candidate=future
         )
@@ -330,6 +338,9 @@ async def _run_llm_stages(
                 "unit_responsibilities": responsibilities,
                 "responsibility_rules": rules,
             }
+            if ledger.protocol_version >= 5:
+                discovery_options["executor"] = executor
+                discovery_options["session_request_limit"] = config.session_max_requests
         generator = HypothesisGenerator(
             routed("hypothesis_generator"),
             max_input_chars=config.generator_max_input_chars,
@@ -386,6 +397,8 @@ async def _run_llm_stages(
         if item.status == HypothesisStatus.UNKNOWN and item.retryable:
             item.status = HypothesisStatus.OPEN
     if ledger.open():
+        from reviewforge.engine.review_session import EvidenceStore
+
         investigator = Investigator(
             routed("investigator"),
             executor,
@@ -393,6 +406,7 @@ async def _run_llm_stages(
             changeset=changeset,
             protocol_version=ledger.protocol_version,
             closing_llm=routed("investigator", closing=True) if ledger.protocol_version >= 2 else None,
+            evidence_store=EvidenceStore(ledger) if ledger.protocol_version >= 5 else None,
         )
         await investigator.run(
             ledger,

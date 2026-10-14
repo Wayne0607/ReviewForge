@@ -308,6 +308,8 @@ class Investigator:
         on_evidence: Callable[[Hypothesis, list[Observation]], None] | None = None,
         task_id: str = "",
         starting_steps: int = 0,
+        evidence_store: Any = None,
+        on_progress: Any = None,
     ) -> None:
         self._llm = llm
         self._executor = executor
@@ -335,6 +337,8 @@ class Investigator:
         self._task_id = task_id
         self._starting_steps = starting_steps
         self._tool_schemas: dict[str, Any] | None = None
+        self._evidence_store = evidence_store
+        self._on_progress = on_progress
 
     def workload_allowance(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> tuple[int, int, int]:
         """Size bounded work from real request inputs, independently of severity.
@@ -343,10 +347,17 @@ class Investigator:
         Every physical attempt is still admitted by the shared PR/task budgets.
         """
         self._prepare_investigation(hypothesis, state, pack)
-        explorer = self._llm.bind_tools(self._build_tools())
-        first = plan_request(explorer, self._exploration_chat(hypothesis, pack), fallback_available=32_000)
-        closer = self._closing_llm if self._closing_llm is not None else self._llm
-        closer, chat, _ = self._typed_closing_request(closer, self._closing_chat([], 32_000, hypothesis=hypothesis))
+        if self._protocol_version >= 5:
+            from reviewforge.engine.investigation_session import request
+
+            explorer, first_chat, _ = request(self, hypothesis, pack)
+            closer, chat, _ = request(self, hypothesis, pack, final=True, turn=4)
+        else:
+            explorer = self._llm.bind_tools(self._build_tools())
+            first_chat = self._exploration_chat(hypothesis, pack)
+            closer = self._closing_llm if self._closing_llm is not None else self._llm
+            closer, chat, _ = self._typed_closing_request(closer, self._closing_chat([], 32_000, hypothesis=hypothesis))
+        first = plan_request(explorer, first_chat, fallback_available=32_000)
         final = plan_request(closer, chat, fallback_available=32_000)
         paths = len({site.path for site in hypothesis.sites})
         steps = self._max_steps or min(_MAX_STEPS, 4 + max(0, paths - 1) + min(2, first.input_tokens // 6_000))
@@ -601,6 +612,8 @@ class Investigator:
         )
         self._obs_counter += 1
         self._observations.append(observation)
+        if self._evidence_store is not None:
+            self._evidence_store.observation(observation)
         if self._protocol_version >= 3:
             self._progress.append(
                 {
@@ -643,6 +656,8 @@ class Investigator:
                         "next_action": "Use a narrower read_file/read_diff range or more specific search.",
                     }
                 )
+        if self._on_progress is not None:
+            await self._on_progress(self._observations, self._progress)
         return self._observation_reply(observation, text=text)
 
     def _observation_reply(self, observation: Observation, *, text: str | None = None) -> str:
@@ -1290,6 +1305,11 @@ class Investigator:
         changed_paths: set[str] | None = None,
     ) -> InvestigationResult:
         """Answer one hypothesis's open_question within its budget_steps."""
+
+        if self._protocol_version >= 5:
+            from reviewforge.engine.investigation_session import investigate
+
+            return await investigate(self, hypothesis, state, pack, changed_paths=changed_paths)
 
         self._prepare_investigation(hypothesis, state, pack)
         if hypothesis.change_anchor is not None and (
@@ -2466,6 +2486,15 @@ class Investigator:
 
         async def _investigate(index: int, hypothesis: Hypothesis, allowance: dict[str, Any]) -> InvestigationResult:
             nonlocal available_tokens
+
+            async def save_progress(observations, progress):
+                for identity in allowance.get("members", [hypothesis.identity]):
+                    member = ledger.items[identity]
+                    member.observations = list(observations)
+                    member.investigation_progress = list(progress)
+                if on_update is not None:
+                    await on_update(ledger)
+
             if index >= max(0, max_hypotheses_per_pr):
                 return self._result(
                     verdict="unknown",
@@ -2507,6 +2536,8 @@ class Investigator:
                     on_evidence=on_evidence,
                     task_id=hypothesis.investigation_task_id if adaptive else "",
                     starting_steps=allowance.get("total_steps", 0) if adaptive else 0,
+                    evidence_store=self._evidence_store,
+                    on_progress=save_progress if ledger.protocol_version >= 5 else None,
                 )
                 if adaptive:
                     worker._max_steps = max(0, allowance["budget_steps_limit"] - allowance.get("total_steps", 0))

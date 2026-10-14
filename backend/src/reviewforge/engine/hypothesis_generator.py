@@ -357,6 +357,9 @@ class HypothesisGenerator:
         discovery_max_hypotheses_per_block: int = 6,
         unit_responsibilities: dict[str, list[str]] | None = None,
         responsibility_rules: dict[str, str] | None = None,
+        executor: Any = None,
+        evidence_cache: Any = None,
+        session_request_limit: int = 32,
     ) -> None:
         self._llm = llm
         self._max_input_chars = max(1, int(max_input_chars))
@@ -383,6 +386,9 @@ class HypothesisGenerator:
         self._discovery_max_hypotheses_per_block = max(1, int(discovery_max_hypotheses_per_block))
         self._unit_responsibilities = copy.deepcopy(unit_responsibilities or {})
         self._responsibility_rules = dict(responsibility_rules or {})
+        self._executor = executor
+        self._evidence_cache = evidence_cache
+        self._session_request_limit = max(1, int(session_request_limit))
 
     def _system_prompt(self) -> str:
         lens_name = self._source[len("lens:") :] if self._source.startswith("lens:") else self._source
@@ -406,6 +412,10 @@ class HypothesisGenerator:
         resume: bool = False,
         overview_changeset: SemanticChangeSet | None = None,
     ) -> HypothesisGenerationResult:
+        if ledger.protocol_version >= 5:
+            from reviewforge.engine.discovery_session import run_discovery
+
+            return await run_discovery(self, state, pack, changeset, ledger, overview_changeset=overview_changeset)
         if ledger.protocol_version >= 3:
             return await self._run_discovery(
                 state, pack, changeset, ledger, resume=resume, overview_changeset=overview_changeset
@@ -886,9 +896,13 @@ class HypothesisGenerator:
         protocol_version: int = 3,
     ) -> bool:
         behavior = item.get("behavior")
-        if not isinstance(behavior, dict) or any(
-            not isinstance(behavior.get(field), str) or not behavior[field].strip() or len(behavior[field]) > 600
-            for field in ("before", "after", "observable")
+        if (
+            not isinstance(behavior, dict)
+            or protocol_version < 5
+            and any(
+                not isinstance(behavior.get(field), str) or not behavior[field].strip() or len(behavior[field]) > 600
+                for field in ("before", "after", "observable")
+            )
         ):
             return False
         facts = behavior.get("source_facts")

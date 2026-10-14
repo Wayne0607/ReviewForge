@@ -18,6 +18,7 @@ from langchain_core.language_models import BaseChatModel
 from reviewforge.core.config import ROLE_NAMES, LLMConfig, RoleOverride
 from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
 from reviewforge.engine.openai_compat import ReasoningContentChatOpenAI as ChatOpenAI
+from reviewforge.engine.wire_audit import client_options
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ def _build_llm(
         api_key=api_key,
         streaming=False,
         timeout=120,
+        **client_options(),
         **common,
     )
 

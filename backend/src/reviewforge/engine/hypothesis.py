@@ -289,10 +289,11 @@ class HypothesisLedger:
     source_audits: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_audit_batches: int = 0
     structural_checks: dict[str, Any] = field(default_factory=dict)
+    evidence_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.protocol_version not in {1, 2, 3, 4}:
+        if self.protocol_version not in {1, 2, 3, 4, 5}:
             raise ValueError("unsupported investigation protocol")
         if type(self.source_audit_batches) is not int or self.source_audit_batches < 0:
             raise ValueError("source audit batch count must be a nonnegative integer")
@@ -496,6 +497,7 @@ class HypothesisLedger:
                 "no_issue_units": dict(sorted(self.no_issue_units.items())),
                 "unresolved_units": dict(sorted(self.unresolved_units.items())),
                 "protocol_version": self.protocol_version,
+                **({"evidence_records": copy.deepcopy(self.evidence_records)} if self.protocol_version >= 5 else {}),
                 "investigation_tasks": copy.deepcopy(self.investigation_tasks),
                 **(
                     {
@@ -541,4 +543,5 @@ class HypothesisLedger:
                 )
             ),
             structural_checks=copy.deepcopy(data.get("structural_checks", {})),
+            evidence_records=copy.deepcopy(data.get("evidence_records", {})),
         )

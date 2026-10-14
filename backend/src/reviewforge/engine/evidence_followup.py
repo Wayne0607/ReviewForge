@@ -175,7 +175,7 @@ async def run_evidence_followup(
     or reopened here, and the worker retains its physical PR budget.
     """
     if (
-        ledger.protocol_version != 4
+        ledger.protocol_version < 4
         or getattr(state, "head_sha", None) != ledger.head_sha
         or getattr(pack, "workspace_digest", None) != ledger.workspace_digest
     ):

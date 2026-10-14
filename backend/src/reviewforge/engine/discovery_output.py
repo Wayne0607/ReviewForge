@@ -33,6 +33,7 @@ class DiscoveryOutput:
     payload: dict[str, Any]
     complete: bool
     recovery: str = "none"
+    rejected_sites: tuple[dict[str, str], ...] = ()
 
 
 def frame_discovery_output(content: object) -> DiscoveryOutput | None:

@@ -26,7 +26,7 @@ class RoutedModel(ScriptedLLM):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protocol,count", [(4, 1), (4, 2), (3, 1), (3, 2)])
 async def test_singleton_native_and_multiunit_json_are_selected_before_request(protocol, count):
-    state, changes, block, aliases = fixture(count)
+    state, changes, block, aliases = fixture(count, scoped=protocol >= 4)
     native = protocol == 4 and count == 1
     body = {"hypotheses": [candidate(block.units[0])], "no_issue_units": [clean(item) for item in block.units[1:]]}
     response = (

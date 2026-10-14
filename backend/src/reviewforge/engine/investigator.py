@@ -334,6 +334,7 @@ class Investigator:
         self._on_evidence = on_evidence
         self._task_id = task_id
         self._starting_steps = starting_steps
+        self._tool_schemas: dict[str, Any] | None = None
 
     def workload_allowance(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> tuple[int, int, int]:
         """Size bounded work from real request inputs, independently of severity.
@@ -476,12 +477,60 @@ class Investigator:
             )
         return tools
 
-    async def _run_tool(self, name: str, args: dict[str, Any]) -> str:
+    def _normalize_tool_args(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._protocol_version < 4:
+            return dict(args)
+        if self._tool_schemas is None:
+            self._tool_schemas = {tool.name: tool.args_schema for tool in self._build_tools()}
+        schema = self._tool_schemas.get(name)
+        if schema is None or not isinstance(args, dict) or set(args) - set(schema.model_fields):
+            raise ValueError("invalid-evidence-tool-arguments")
+        # Tool integer inputs accept exact integer strings, not boolean or
+        # fractional coordinates/limits. Validate before identity, cache or I/O.
+        for argument in ("start", "end", "max_hits"):
+            value = args.get(argument)
+            if (
+                isinstance(value, bool)
+                or isinstance(value, float)
+                or isinstance(value, str)
+                and not re.fullmatch(r"[+-]?[0-9]+", value)
+            ):
+                raise ValueError("invalid-evidence-tool-integer")
+        return schema.model_validate(args).model_dump(exclude_none=True)
+
+    def _prepared_tool_args(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        args = self._normalize_tool_args(name, args)
         if name == "read_file":
             args = self._focus_read_args(args)
+        return args
+
+    def _query_observation(self, name: str, args: dict[str, Any]) -> Observation | None:
+        query = _query_string(name, args)
+        for observation in self._observations:
+            if observation.query == query:
+                return observation
+            if self._protocol_version < 4:
+                continue
+            saved_name, _, saved_args = observation.query.partition(" ")
+            if saved_name != name:
+                continue
+            try:
+                previous = self._normalize_tool_args(name, json.loads(saved_args))
+            except (ValueError, TypeError):
+                continue
+            if previous == args:
+                # Compare old checkpoints without rewriting their audit trail.
+                return observation
+        return None
+
+    async def _run_tool(self, name: str, args: dict[str, Any]) -> str:
+        try:
+            args = self._prepared_tool_args(name, args)
+        except (ValueError, TypeError):
+            return "Invalid tool arguments; use the supplied tool schema. No source read was performed."
         query = _query_string(name, args)
         if self._protocol_version >= 3:
-            existing = next((obs for obs in self._observations if obs.query == query), None)
+            existing = self._query_observation(name, args)
             if existing is not None:
                 return self._observation_reply(existing) + "\nAlready recorded; choose a different missing fact."
         if self._tool_counts.get(query, 0) >= 2:
@@ -1182,10 +1231,13 @@ class Investigator:
                     name, args = call.get("name"), call.get("args")
                     if name not in known_tools or not isinstance(args, dict):
                         raise ValueError("unknown tool or invalid arguments")
-                    # Execute only schema fields, retaining omitted optional fields.
-                    args = known_tools[name].args_schema.model_validate(args).model_dump(exclude_unset=True)
-                    if name == "read_file":
-                        args = self._focus_read_args(args)
+                    if self._protocol_version >= 4:
+                        args = self._prepared_tool_args(name, args)
+                    else:
+                        # Preserve historical collection argument shapes.
+                        args = known_tools[name].args_schema.model_validate(args).model_dump(exclude_unset=True)
+                        if name == "read_file":
+                            args = self._focus_read_args(args)
                     if self._collection_query_exists(name, args, known_tools[name]):
                         self._collection_state["reason"] = "repeated-evidence"
                         return
@@ -1197,6 +1249,8 @@ class Investigator:
     def _collection_query_exists(self, name: str, args: dict[str, Any], tool: StructuredTool) -> bool:
         # Omitted defaults and explicit defaults describe the same read. Do not
         # spend another collection round on that representational difference.
+        if self._protocol_version >= 4:
+            return self._query_observation(name, self._prepared_tool_args(name, args)) is not None
         normalized = tool.args_schema.model_validate(args).model_dump()
         for observation in self._observations:
             saved_name, _, saved_args = observation.query.partition(" ")
@@ -1212,6 +1266,7 @@ class Investigator:
 
     def _prepare_investigation(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> None:
         self._state = state
+        self._tool_schemas = None
         self._observations = [
             obs for obs in hypothesis.observations if self._protocol_version < 3 or obs.sha == state.head_sha
         ]
@@ -1393,12 +1448,11 @@ class Investigator:
                     return self._invalid_output("invalid-progress", hypothesis, step + 1)
                 if not tool_calls and progress is not None:
                     navigation = progress["next_evidence"]
-                    args = (
-                        self._focus_read_args(navigation["args"])
-                        if navigation["tool"] == "read_file"
-                        else navigation["args"]
-                    )
-                    if any(obs.query == _query_string(navigation["tool"], args) for obs in self._observations):
+                    try:
+                        args = self._prepared_tool_args(navigation["tool"], navigation["args"])
+                    except (ValueError, TypeError):
+                        return self._invalid_output("invalid-progress", hypothesis, step + 1)
+                    if self._query_observation(navigation["tool"], args) is not None:
                         self._progress.append({"phase": "budget", "event": "close-after-repeated-evidence"})
                         return await self._close(
                             self._closing_chat(initial, token_limit, hypothesis=hypothesis),

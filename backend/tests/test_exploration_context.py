@@ -297,7 +297,11 @@ async def test_compact_packets_preserve_recorded_truncation_without_unsaved_evid
 
     worker = Investigator(None, long_result, protocol_version=4)
     worker._state = state()
-    args = {"path": "source.ts", "start": 1, "end": 601} if tool == "read_file" else {"symbol": "source"}
+    args = {
+        "read_file": {"path": "source.ts", "start": 1, "end": 601},
+        "grep": {"pattern": "source"},
+        "find_definition": {"symbol": "source"},
+    }[tool]
     await worker._run_tool(tool, args)
     source = worker._observations[0]
     snapshot = asdict(source)

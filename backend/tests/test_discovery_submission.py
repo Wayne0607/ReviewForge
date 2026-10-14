@@ -43,12 +43,12 @@ from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
 from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
 
 
-def fixture(count=2):
+def fixture(count=2, *, scoped=False):
     units = [unit(f"file{index}.py") for index in range(count)]
     state = StateStore(file_diffs={item.path: diff() for item in units})
     changes = changeset(*units)
     block = plan_discovery(changes, ContextPack(), state.file_diffs, limits=DiscoveryLimits())[0]
-    return state, changes, block, source_aliases(block.source_refs)
+    return state, changes, block, source_aliases(block.source_refs, scoped=scoped)
 
 
 def assessment(block, aliases, item=None):
@@ -416,8 +416,12 @@ async def test_structural_records_require_explicit_fields_and_real_consumer(sele
     block = plan_discovery(changes, pack, state.file_diffs, limits=DiscoveryLimits(), file_changes=state.file_changes)[
         0
     ]
-    aliases = source_aliases(block.source_refs)
-    consumer = next(alias for alias, ref in aliases.items() if block.source_refs[ref].kind == "reference")
+    aliases = source_aliases(block.source_refs, scoped=True)
+    consumer = next(
+        alias
+        for alias, ref in aliases.items()
+        if block.source_refs[ref].kind == "reference" and "resources/new.json" in block.source_refs[ref].text
+    )
     args = {
         "unit_id": item.id,
         "checked": "Compared the consumer literal lookup against both verified paths.",
@@ -539,7 +543,7 @@ async def test_final_batch_request_drives_budget_split_without_lowering_floor_or
     "response_kind", ["complete", "text", "400", "truncated", "duplicate", "invented-path", "old-empty-change"]
 )
 async def test_real_adapter_serializes_tools_and_budget_includes_schema_without_400_fallback(response_kind):
-    state, changes, block, aliases = fixture(1)
+    state, changes, block, aliases = fixture(1, scoped=True)
     requests, snapshots = [], []
     args = hypothesis(block, aliases)
     if response_kind in {"invented-path", "old-empty-change"}:

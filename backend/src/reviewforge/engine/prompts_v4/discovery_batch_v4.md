@@ -27,10 +27,12 @@ tests or browse advisories. Questions must fit these capabilities.
   Copy unit_id exactly. Its path/LEFT/RIGHT ranges are the target, not the entire
   shared hunk. A class header does not cover changed operations. Parent/child
   scopes may share a line but each needs assessment.
-- `- LEFT [rN]` is before, `+ RIGHT [rN]` is after. Unchanged rows have distinct
-  before/RIGHT refs; Context refs stay context even when their body is shared
-  with RIGHT. Copy {"source_ref":"rN"} or a supplied sr_ID, WITHOUT column suffixes
-  or coordinate/quote overrides. References are valid only in this block.
+- References encode file, side and line: f0.B46 is file f0 before line 46,
+  f0.R47 its RIGHT/head line 47, f1.C287 file f1 Context line 287. Use the
+  Source reference files legend and EACH target's allowed lists. Context stays
+  context even when its body is shared with RIGHT. Copy the entire supplied alias
+  as source_ref, including any .sN excerpt segment, WITHOUT :column suffixes or
+  coordinate/quote overrides. A plausible alias is invalid unless delivered.
 - behavior.source_facts: 1–12 refs including the target's changed after operation
   AND its removed/replaced before operation. This applies equally to hypotheses
   and clean assessments. For pure additions omit the unchanged before ref.
@@ -39,12 +41,13 @@ tests or browse advisories. Questions must fit these capabilities.
   relevant operations from both nonempty lists, using more refs only for distinct
   changes or necessary context; do not copy every eligible ref to fill the limit.
   These lists do not select facts for you or establish that a unit is clean.
-  Use one rN per source_ref, never a
-  joined label such as "r3:1-120 r8:121-240".
+  Use one supplied alias per source_ref; never join several labels in one string.
 - Describe only supplied local changes. absent-new-declaration proves that
   visible added declaration; absent-before-in-delivered-source or unresolved
   correspondence does not prove global prior absence. Never invent before code.
-- sites: own-target RIGHT ref with excerpt >=12 characters. trigger_basis: a
+- sites: choose ONE primary own-target allowed RIGHT ref with excerpt >=12
+  characters. Put supporting sources in behavior.source_facts, not extra sites.
+  trigger_basis: a
   real ref for the observed input/discrepancy; it does not prove the contract.
 - Respond to every unit, including tests. Missing/invalid output is unresolved,
   never clean. A candidate may coexist with deferred boundaries, but clean may

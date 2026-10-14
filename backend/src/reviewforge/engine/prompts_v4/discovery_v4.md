@@ -27,10 +27,12 @@ tests or browse advisories. Questions must fit these capabilities.
   Copy unit_id exactly. Its path/LEFT/RIGHT ranges are the target, not the entire
   shared hunk. A class header does not cover changed operations. Parent/child
   scopes may share a line but each needs assessment.
-- `- LEFT [rN]` is before, `+ RIGHT [rN]` is after. Unchanged rows have distinct
-  before/RIGHT refs; Context refs stay context even when their body is shared
-  with RIGHT. Copy supplied rN strings WITHOUT column suffixes or coordinate/quote
-  overrides. The wire pattern is syntax only: only actual refs in this block are valid.
+- References encode their file, side and line: f0.B46 is file f0 before line 46,
+  f0.R47 its RIGHT/head line 47, f1.C287 file f1 Context line 287. Use the
+  Source reference files legend and the target's allowed lists. Context stays
+  context even when its body is shared with RIGHT. Copy the entire supplied
+  alias, including any .sN excerpt segment, WITHOUT :column suffixes or
+  coordinate/quote overrides. A plausible alias is invalid unless delivered.
 - Behavior sources: 1–12 refs including the target's changed after operation
   AND its removed/replaced before operation. This applies equally to hypotheses
   and clean assessments. For pure additions omit the unchanged before ref.
@@ -39,12 +41,13 @@ tests or browse advisories. Questions must fit these capabilities.
   relevant operations from both nonempty lists, using more refs only for distinct
   changes or necessary context; do not copy every eligible ref to fill the limit.
   These lists do not select facts for you or establish that a unit is clean.
-  Use one rN per source_ref, never a
-  joined label such as "r3:1-120 r8:121-240".
+  Use one supplied alias per source_ref; never join several labels in one string.
 - Describe only supplied local changes. absent-new-declaration proves that
   visible added declaration; absent-before-in-delivered-source or unresolved
   correspondence does not prove global prior absence. Never invent before code.
-- site_refs: own-target allowed_site_refs, RIGHT with excerpt >=12 characters.
+- site_refs: select exactly ONE primary location from own-target allowed_site_refs,
+  RIGHT with excerpt >=12 characters. Other supporting locations belong in
+  behavior/trigger source_refs, not extra sites. Structural changes use [].
   A trigger-role ref identifies the observed input/discrepancy, not its contract.
 - Respond to every unit, including tests. Missing/invalid output is unresolved,
   never clean. A candidate may coexist with deferred boundaries, but clean may
@@ -66,7 +69,7 @@ Prose: one concise nonempty sentence, <=600 characters. The ceiling is not a tar
   before/after/observable describe local behavior. source_refs and source_roles
   are equally sized arrays matched by position: 1–12 behavior roles and exactly
   one trigger role. A ref may support both by repeating it with the other role.
-  site_refs select the unit's real RIGHT locations. Choose supplied mechanism/severity.
+  site_refs selects the unit's single primary RIGHT location. Choose supplied mechanism/severity.
 - submit_no_issue: checked names the changed operation and concrete checked
   boundary; before/after/observable and source_refs supply its actual behavior
   sources. Every source_ref here is a behavior source. No candidate fields.

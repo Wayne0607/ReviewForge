@@ -13,8 +13,28 @@ _REFERENCE = re.compile(r"\bsr_[0-9a-f]{12,64}\b")
 _CONTEXT_ALIAS = re.compile(r"^\s*\d+ \[[^\]]+\] = (?:RIGHT \[[^\]]+\]|earlier Context)$")
 
 
-def source_aliases(refs: dict[str, Any]) -> dict[str, str]:
-    return {f"r{index}": reference for index, reference in enumerate(sorted(refs))}
+def source_aliases(refs: dict[str, Any], *, scoped: bool = False) -> dict[str, str]:
+    if not scoped:
+        # Historical blocks must retain their original wire-to-source mapping.
+        return {f"r{index}": reference for index, reference in enumerate(sorted(refs))}
+    paths = {path: index for index, path in enumerate(sorted({source.path for source in refs.values()}))}
+    groups: dict[tuple[str, str, int], list[str]] = {}
+    for reference, source in refs.items():
+        groups.setdefault((source.path, source.side, source.line), []).append(reference)
+    result = {}
+    for (path, side, line), references in sorted(groups.items()):
+        side_label = {"before": "B", "after": "R", "context": "C"}[side]
+        prefix = f"f{paths[path]}.{side_label}{line}"
+        for segment, reference in enumerate(sorted(references), 1):
+            # Segments remain distinct canonical excerpts, not guessed columns.
+            alias = f"{prefix}.s{segment}" if len(references) > 1 else prefix
+            result[alias] = reference
+    return result
+
+
+def source_alias_legend(refs: dict[str, Any]) -> str:
+    paths = sorted({source.path for source in refs.values()})
+    return "\n".join(f"f{index} = {path}" for index, path in enumerate(paths))
 
 
 def target_source_choices(block: DiscoveryBlock, unit_id: str, aliases: dict[str, str]) -> list[list[str]]:

@@ -53,7 +53,7 @@ def contracted_input():
 async def test_v4_discovers_a_source_grounded_lead_without_pretending_to_prove_the_contract():
     u, state, pack, block, raw = contracted_input()
     raw.pop("violation")
-    aliases = source_aliases(block.source_refs)
+    aliases = source_aliases(block.source_refs, scoped=True)
     reverse = {reference: alias for alias, reference in aliases.items()}
 
     def source_alias(fact):

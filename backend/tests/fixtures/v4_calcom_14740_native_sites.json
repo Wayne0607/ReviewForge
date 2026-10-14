@@ -1,0 +1,242 @@
+{
+  "origin": {
+    "source_revision": "3a5dc445145dc6495322f52896158005a27ad428",
+    "repo": "calcom/cal.com",
+    "pr_number": 14740,
+    "head_sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+    "block_id": "db_3bb4d52d0cbafaf6",
+    "input_sha256": "a52ed888aa26f91b85ddd712453f487a54b34450af82335201b0011c5440ab40",
+    "output_sha256": "7c2ff0ac05732ab432b27bc7d2e9a75c075509e7e4ae7bd17a170075b53c65e3",
+    "scope": "unchanged complete native calls; only their delivered source subset, not a full PR rerun or quality score"
+  },
+  "unit": {
+    "id": "su_4f55d1b4d6edc1dc",
+    "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+    "symbol": "addGuestsHandler",
+    "before_state": "absent-before-in-delivered-source",
+    "start_line": 22,
+    "end_line": 174
+  },
+  "response": {
+    "content": "",
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "name": "submit_hypothesis",
+        "args": {
+          "unit_id": "su_4f55d1b4d6edc1dc",
+          "before": "No addGuestsHandler existed in the delivered source; the whole authorization block is newly added.",
+          "after": "Lines 46-48 compute `const isTeamAdminOrOwner = (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) && (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));`, then line 54 gates with `if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) throw FORBIDDEN`.",
+          "observable": "A team membership with role ADMIN satisfies isTeamAdmin but not isTeamOwner, so the conjunctive variable named \"isTeamAdminOrOwner\" is false for exactly the admins it claims to permit.",
+          "source_refs": [
+            "r69",
+            "r5",
+            "r4",
+            "r54",
+            "r25",
+            "r21",
+            "r118"
+          ],
+          "source_roles": [
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "trigger"
+          ],
+          "site_refs": [
+            "r69",
+            "r5",
+            "r4",
+            "r54",
+            "r25"
+          ],
+          "mechanism": "wrong-operator",
+          "severity": "error",
+          "claim": "The new permission check combines isTeamAdmin and isTeamOwner with `&&` while naming/using the result as \"admin OR owner\", so team ADMIN members are denied on bookings whose eventType belongs to a team.",
+          "trigger": "A logged-in user who is an accepted ADMIN (not OWNER) membership of booking.eventType.teamId calls bookings.addGuests on that team event's booking and is not the organizer or an attendee.",
+          "impact": "Legitimate team admins receive TRPCError FORBIDDEN (\"you_do_not_have_permission\") and cannot add guests, contradicting the handler's own identifier and the intended admin-or-owner bypass.",
+          "discrepancy": "The identifier and gate intend admin-or-owner authorization, but the boolean operator requires both predicates simultaneously; isTeamOwner already implies ADMIN-level rights, so the conjunction collapses the admin path.",
+          "open_question": "Does the product contract for bookings.addGuests grant team ADMINs (non-owners) permission for team-event bookings, i.e., should line 48 be `||` rather than `&&`?",
+          "refutation": "If the schema/handler contract or tests state that only team OWNERS may add guests to team bookings, then requiring both checks is redundant but correct and the name is merely misleading."
+        },
+        "id": "call_c7b88751cc004e7a9dd425bf",
+        "type": "tool_call"
+      },
+      {
+        "name": "submit_hypothesis",
+        "args": {
+          "unit_id": "su_4f55d1b4d6edc1dc",
+          "before": "Not applicable: this filtering logic is newly introduced in the delivered source.",
+          "after": "Lines 74-78 build `uniqueGuests = guests.filter((guest) => !booking.attendees.some((attendee) => guest === attendee.email) && !blacklistedGuestEmails.includes(guest))`; line 80 throws BAD_REQUEST when the filtered list is empty; lines 83-90 map survivors into attendees and line 92 persists them via `createMany`.",
+          "observable": "Input rows that are exact duplicates of each other (e.g. [\"a@x.com\",\"a@x.com\"]) both survive the filter because it only compares against existing booking attendees, and both are inserted by createMany.",
+          "source_refs": [
+            "r149",
+            "r135",
+            "r164",
+            "r120",
+            "r190",
+            "r179",
+            "r132",
+            "r168"
+          ],
+          "source_roles": [
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "behavior",
+            "trigger"
+          ],
+          "site_refs": [
+            "r149",
+            "r135",
+            "r164",
+            "r120",
+            "r190",
+            "r179",
+            "r132",
+            "r168"
+          ],
+          "mechanism": "missing-await",
+          "severity": "warning",
+          "claim": "The dedupe step named \"uniqueGuests\" never de-duplicates within the submitted `guests` array, so repeated emails are persisted as repeated attendees and emailed repeatedly.",
+          "trigger": "Client submits the same email address twice (or more) in input.guests for a booking where that email is not yet an attendee.",
+          "impact": "Duplicate BookingAttendee rows are created for one person and duplicate add-guest invitations/video links are sent, despite the BAD_REQUEST message \"emails_must_be_unique_valid\" asserting uniqueness.",
+          "discrepancy": "The error text and variable name promise unique guest emails, but the predicate only excludes emails matching existing attendees and blacklisted emails, leaving intra-request duplicates untouched.",
+          "open_question": "Does addGuests.schema.ts guarantee de-duplicated input (e.g. transform/zod unique enforcement), or is per-request uniqueness expected to be enforced here?",
+          "refutation": "If the schema normalizes `guests` into a Set/unique list before the handler runs, the filter's scope over existing attendees alone is sufficient."
+        },
+        "id": "call_4c2dddacbed34f5d9caf2cdd",
+        "type": "tool_call"
+      }
+    ]
+  },
+  "source_refs": {
+    "r118": {
+      "canonical": "sr_a8eef742ae28",
+      "side": "context",
+      "path": "packages/lib/server/queries/teams/index.ts",
+      "line": 286,
+      "text": "export async function isTeamOwner(userId: number, teamId: number) {",
+      "changed": false
+    },
+    "r120": {
+      "canonical": "sr_aad43bd59b14",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 81,
+      "text": "    throw new TRPCError({ code: \"BAD_REQUEST\", message: \"emails_must_be_unique_valid\" });",
+      "changed": true
+    },
+    "r132": {
+      "canonical": "sr_b8a5a853a16d",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 102,
+      "text": "          data: guestsFullDetails,",
+      "changed": true
+    },
+    "r135": {
+      "canonical": "sr_bd7484c50715",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 76,
+      "text": "      !booking.attendees.some((attendee) => guest === attendee.email) &&",
+      "changed": true
+    },
+    "r149": {
+      "canonical": "sr_caab67166556",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 74,
+      "text": "  const uniqueGuests = guests.filter(",
+      "changed": true
+    },
+    "r164": {
+      "canonical": "sr_e14df0cf4e91",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 77,
+      "text": "      !blacklistedGuestEmails.includes(guest)",
+      "changed": true
+    },
+    "r168": {
+      "canonical": "sr_e6505ccc2d8a",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 117,
+      "text": "    };",
+      "changed": true
+    },
+    "r179": {
+      "canonical": "sr_f390826f3006",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 101,
+      "text": "        createMany: {",
+      "changed": true
+    },
+    "r190": {
+      "canonical": "sr_faa263e481ab",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 84,
+      "text": "    return {",
+      "changed": true
+    },
+    "r21": {
+      "canonical": "sr_1fa26af0fff1",
+      "side": "context",
+      "path": "packages/lib/server/queries/teams/index.ts",
+      "line": 263,
+      "text": "// also returns team",
+      "changed": false
+    },
+    "r25": {
+      "canonical": "sr_22193ae61f44",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 55,
+      "text": "    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });",
+      "changed": true
+    },
+    "r4": {
+      "canonical": "sr_08bdb3844d9f",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 46,
+      "text": "  const isTeamAdminOrOwner =",
+      "changed": true
+    },
+    "r5": {
+      "canonical": "sr_093c2d68f24b",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 48,
+      "text": "    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));",
+      "changed": true
+    },
+    "r54": {
+      "canonical": "sr_56f27a55f936",
+      "side": "context",
+      "path": "packages/lib/server/queries/teams/index.ts",
+      "line": 287,
+      "text": "  return !!(await prisma.membership.findFirst({",
+      "changed": false
+    },
+    "r69": {
+      "canonical": "sr_6fece4228cac",
+      "side": "after",
+      "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+      "line": 47,
+      "text": "    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&",
+      "changed": true
+    }
+  },
+  "patch": "@@ -0,0 +1,174 @@\n+import EventManager from \"@calcom/core/EventManager\";\n+import dayjs from \"@calcom/dayjs\";\n+import { sendAddGuestsEmails } from \"@calcom/emails\";\n+import { parseRecurringEvent } from \"@calcom/lib\";\n+import { getTranslation } from \"@calcom/lib/server\";\n+import { getUsersCredentials } from \"@calcom/lib/server/getUsersCredentials\";\n+import { isTeamAdmin, isTeamOwner } from \"@calcom/lib/server/queries/teams\";\n+import { prisma } from \"@calcom/prisma\";\n+import type { CalendarEvent } from \"@calcom/types/Calendar\";\n+\n+import { TRPCError } from \"@trpc/server\";\n+\n+import type { TrpcSessionUser } from \"../../../trpc\";\n+import type { TAddGuestsInputSchema } from \"./addGuests.schema\";\n+\n+type AddGuestsOptions = {\n+  ctx: {\n+    user: NonNullable<TrpcSessionUser>;\n+  };\n+  input: TAddGuestsInputSchema;\n+};\n+export const addGuestsHandler = async ({ ctx, input }: AddGuestsOptions) => {\n+  const { user } = ctx;\n+  const { bookingId, guests } = input;\n+\n+  const booking = await prisma.booking.findFirst({\n+    where: {\n+      id: bookingId,\n+    },\n+    include: {\n+      attendees: true,\n+      eventType: true,\n+      destinationCalendar: true,\n+      references: true,\n+      user: {\n+        include: {\n+          destinationCalendar: true,\n+          credentials: true,\n+        },\n+      },\n+    },\n+  });\n+\n+  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });\n+\n+  const isTeamAdminOrOwner =\n+    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n+    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n+\n+  const isOrganizer = booking.userId === user.id;\n+\n+  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n+\n+  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n+    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n+  }\n+\n+  const organizer = await prisma.user.findFirstOrThrow({\n+    where: {\n+      id: booking.userId || 0,\n+    },\n+    select: {\n+      name: true,\n+      email: true,\n+      timeZone: true,\n+      locale: true,\n+    },\n+  });\n+\n+  const blacklistedGuestEmails = process.env.BLACKLISTED_GUEST_EMAILS\n+    ? process.env.BLACKLISTED_GUEST_EMAILS.split(\",\").map((email) => email.toLowerCase())\n+    : [];\n+\n+  const uniqueGuests = guests.filter(\n+    (guest) =>\n+      !booking.attendees.some((attendee) => guest === attendee.email) &&\n+      !blacklistedGuestEmails.includes(guest)\n+  );\n+\n+  if (uniqueGuests.length === 0)\n+    throw new TRPCError({ code: \"BAD_REQUEST\", message: \"emails_must_be_unique_valid\" });\n+\n+  const guestsFullDetails = uniqueGuests.map((guest) => {\n+    return {\n+      name: \"\",\n+      email: guest,\n+      timeZone: organizer.timeZone,\n+      locale: organizer.locale,\n+    };\n+  });\n+\n+  const bookingAttendees = await prisma.booking.update({\n+    where: {\n+      id: bookingId,\n+    },\n+    include: {\n+      attendees: true,\n+    },\n+    data: {\n+      attendees: {\n+        createMany: {\n+          data: guestsFullDetails,\n+        },\n+      },\n+    },\n+  });\n+\n+  const attendeesListPromises = bookingAttendees.attendees.map(async (attendee) => {\n+    return {\n+      name: attendee.name,\n+      email: attendee.email,\n+      timeZone: attendee.timeZone,\n+      language: {\n+        translate: await getTranslation(attendee.locale ?? \"en\", \"common\"),\n+        locale: attendee.locale ?? \"en\",\n+      },\n+    };\n+  });\n+\n+  const attendeesList = await Promise.all(attendeesListPromises);\n+  const tOrganizer = await getTranslation(organizer.locale ?? \"en\", \"common\");\n+  const videoCallReference = booking.references.find((reference) => reference.type.includes(\"_video\"));\n+\n+  const evt: CalendarEvent = {\n+    title: booking.title || \"\",\n+    type: (booking.eventType?.title as string) || booking?.title || \"\",\n+    description: booking.description || \"\",\n+    startTime: booking.startTime ? dayjs(booking.startTime).format() : \"\",\n+    endTime: booking.endTime ? dayjs(booking.endTime).format() : \"\",\n+    organizer: {\n+      email: booking?.userPrimaryEmail ?? organizer.email,\n+      name: organizer.name ?? \"Nameless\",\n+      timeZone: organizer.timeZone,\n+      language: { translate: tOrganizer, locale: organizer.locale ?? \"en\" },\n+    },\n+    attendees: attendeesList,\n+    uid: booking.uid,\n+    recurringEvent: parseRecurringEvent(booking.eventType?.recurringEvent),\n+    location: booking.location,\n+    destinationCalendar: booking?.destinationCalendar\n+      ? [booking?.destinationCalendar]\n+      : booking?.user?.destinationCalendar\n+      ? [booking?.user?.destinationCalendar]\n+      : [],\n+    seatsPerTimeSlot: booking.eventType?.seatsPerTimeSlot,\n+    seatsShowAttendees: booking.eventType?.seatsShowAttendees,\n+  };\n+\n+  if (videoCallReference) {\n+    evt.videoCallData = {\n+      type: videoCallReference.type,\n+      id: videoCallReference.meetingId,\n+      password: videoCallReference?.meetingPassword,\n+      url: videoCallReference.meetingUrl,\n+    };\n+  }\n+\n+  const credentials = await getUsersCredentials(ctx.user);\n+\n+  const eventManager = new EventManager({\n+    ...user,\n+    credentials: [...credentials],\n+  });\n+\n+  await eventManager.updateCalendarAttendees(evt, booking);\n+\n+  try {\n+    await sendAddGuestsEmails(evt, guests);\n+  } catch (err) {\n+    console.log(\"Error sending AddGuestsEmails\");\n+  }\n+\n+  return { message: \"Guests added\" };\n+};"
+}

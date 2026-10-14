@@ -53,6 +53,7 @@ from reviewforge.engine.discovery import (
 from reviewforge.engine.discovery_aliases import (
     expand_response_refs,
     render_source_aliases,
+    source_alias_legend,
     source_aliases,
     target_site_choices,
     target_source_choices,
@@ -515,7 +516,7 @@ class HypothesisGenerator:
         self, block: DiscoveryBlock, ledger: HypothesisLedger, allowance: int, guidance: str = ""
     ) -> str:
         shown = present_discovery_block(block) if ledger.protocol_version >= 4 else None
-        aliases = source_aliases(block.source_refs) if shown else {}
+        aliases = source_aliases(block.source_refs, scoped=True) if shown else {}
         anchors = []
         for unit in block.units:
             target = block.unit_facts.get(unit.id, [])
@@ -599,6 +600,13 @@ class HypothesisGenerator:
         if block.change_text:
             sections.insert(
                 3, "## Structural changes (typed facts; not source lines or Observations)\n" + block.change_text
+            )
+        if shown:
+            sections.append(
+                "## Source reference files\n"
+                "fN.Bline = before; fN.Rline = RIGHT/head; fN.Cline = Context. "
+                "A .sN suffix identifies a separate excerpt segment; copy it exactly.\n"
+                + source_alias_legend(block.source_refs)
             )
         if block.oversize:
             sections.append(
@@ -713,7 +721,7 @@ class HypothesisGenerator:
                 },
             }
             ledger.discovery_blocks[key] = record
-            aliases = source_aliases(block.source_refs) if ledger.protocol_version >= 4 else {}
+            aliases = source_aliases(block.source_refs, scoped=True) if ledger.protocol_version >= 4 else {}
             if aliases:
                 record["source_ref_aliases"] = aliases
             used = sum(item.source == "generator" or item.source.startswith("lens:") for item in ledger.items.values())
@@ -824,6 +832,8 @@ class HypothesisGenerator:
                 parsed = framed.payload if framed is not None else None
                 if framed is not None:
                     record["output_framing"] = {"complete": framed.complete, "recovery": framed.recovery}
+                    if framed.rejected_sites:
+                        record["rejected_sites"] = list(framed.rejected_sites)
                 if parsed is None and ledger.protocol_version < 4 and isinstance(original, str) and original.strip():
                     parsed = await self._invoke_repair(original, ledger=ledger, request_floor=floor, record=record)
                 if parsed is None:

@@ -24,10 +24,10 @@ from reviewforge.engine.native_submission import inspect_tool_calls
 def discovery_submission_tools(block: DiscoveryBlock, aliases: dict[str, str]) -> list[StructuredTool]:
     """Build provider shapes before budget planning; membership stays local.
 
-    Unit IDs are a small literal vocabulary. Source/site aliases already appear
-    beside delivered source: repeating their large enums costs the same budget
-    again. A provider sees the rN pattern, while decoding must check the actual
-    block alias registry and per-unit site set before the original source checks.
+    Unit IDs are a small literal vocabulary. Behavior/trigger references use a
+    syntax pattern, with membership and ownership checked locally. New scoped
+    blocks select one primary site from the actual RIGHT vocabulary. Historical
+    rN blocks retain their original list schema for deterministic replay.
     """
     unit_type = Literal[tuple(unit.id for unit in block.units)]
     config = ConfigDict(extra="forbid", strict=True)
@@ -52,7 +52,9 @@ def discovery_submission_tools(block: DiscoveryBlock, aliases: dict[str, str]) -
     if not aliases:
         # No empty enum, invented source or clean fallback when material is absent.
         return [defer]
-    reference_type = Annotated[str, Field(pattern=r"^r[0-9]+$")]
+    scoped = all(alias.startswith("f") for alias in aliases)
+    pattern = r"^f[0-9]+\.[BRC][0-9]+(?:\.s[0-9]+)?$" if scoped else r"^r[0-9]+$"
+    reference_type = Annotated[str, Field(pattern=pattern)]
     sites = tuple(
         dict.fromkeys(alias for unit in block.units for alias in target_site_choices(block, unit.id, aliases))
     )
@@ -74,7 +76,13 @@ def discovery_submission_tools(block: DiscoveryBlock, aliases: dict[str, str]) -
         "severity": (Literal["error", "warning", "info"], ...),
         "source_refs": (list[reference_type], Field(min_length=2, max_length=13)),
         "source_roles": (list[Literal["behavior", "trigger"]], Field(min_length=2, max_length=13)),
-        "site_refs": (list[reference_type], Field(max_length=len(sites))),
+        "site_refs": (
+            list[Literal[sites]] if scoped and sites else list[reference_type],
+            Field(
+                min_length=1 if scoped and sites and not block.structural_changes else 0,
+                max_length=min(1, len(sites)) if scoped else len(sites),
+            ),
+        ),
         **{field: prose() for field in ("claim", "trigger", "impact", "open_question", "refutation", "discrepancy")},
     }
     return [tool("submit_hypothesis", hypothesis), tool("submit_no_issue", {**common, "checked": prose()}), defer]
@@ -110,8 +118,14 @@ def bind_discovery_submission(llm: Any, tools: list[StructuredTool]) -> Any:
 
 
 def _record_payload(
-    name: str, args: dict[str, Any], block: DiscoveryBlock, aliases: dict[str, str]
+    name: str,
+    args: dict[str, Any],
+    block: DiscoveryBlock,
+    aliases: dict[str, str],
+    rejected_sites: list[dict[str, str]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    if rejected_sites is None:
+        rejected_sites = []
     if any(isinstance(value, str) and not value.strip() for value in args.values()):
         raise ValueError("empty-discovery-prose")
     unit_id = args["unit_id"]
@@ -132,15 +146,25 @@ def _record_payload(
         raise ValueError("invalid-discovery-change-selection")
     references = args["source_refs"]
     trigger = None
+    site_refs = []
     if name == "submit_hypothesis":
         allowed_sites = set(target_site_choices(block, unit_id, aliases))
-        if any(reference not in allowed_sites for reference in args["site_refs"]):
+        site_refs = [reference for reference in args["site_refs"] if reference in allowed_sites]
+        invalid_sites = [reference for reference in args["site_refs"] if reference not in allowed_sites]
+        if invalid_sites and not site_refs:
             raise ValueError("invalid-discovery-site-alias")
         roles = args["source_roles"]
         if len(roles) != len(references) or roles.count("trigger") != 1 or not 1 <= roles.count("behavior") <= 12:
             raise ValueError("invalid-discovery-source-roles")
         trigger = references[roles.index("trigger")]
         references = [reference for reference, role in zip(references, roles, strict=True) if role == "behavior"]
+        # Keep a complete lead with an independently valid target location, but
+        # never mark this receipt complete. Mandatory behavior/trigger sources
+        # still pass the unchanged consumer; no source is invented or remapped.
+        rejected_sites.extend(
+            {"unit_id": unit_id, "source_ref": reference, "reason": "not-target-right-site"}
+            for reference in invalid_sites
+        )
     behavior = {field: args[field] for field in ("before", "after", "observable")} | {
         "source_facts": [{"source_ref": reference} for reference in references]
     }
@@ -169,14 +193,14 @@ def _record_payload(
             )
         },
         "trigger_basis": {"source_ref": trigger},
-        "sites": [{"source_ref": reference} for reference in args["site_refs"]],
+        "sites": [{"source_ref": reference} for reference in site_refs],
     }
 
 
 def parse_discovery_submission(
     response: Any, tools: list[StructuredTool], block: DiscoveryBlock, aliases: dict[str, str]
 ) -> tuple[DiscoveryOutput | None, list[str]]:
-    """Decode native calls without coercion, repair, or a second model request.
+    """Decode native calls without inventing evidence or another model request.
 
     None means there is no native response: the caller may strictly parse the
     original text in that same receipt, including its complete-record framing.
@@ -200,6 +224,7 @@ def parse_discovery_submission(
         errors.append("truncated-native-discovery")
     schemas = {tool.name: tool.args_schema for tool in tools}
     payload: dict[str, Any] = {name: [] for name in ("hypotheses", "no_issue_units", "deferred_units")}
+    rejected_sites: list[dict[str, str]] = []
     if not calls and not errors:
         errors.append("empty-native-discovery")
     content = getattr(response, "content", "")
@@ -212,9 +237,16 @@ def parse_discovery_submission(
             continue
         try:
             args = schemas[name].model_validate(call["args"]).model_dump()
-            collection, item = _record_payload(name, args, block, aliases)
+            collection, item = _record_payload(name, args, block, aliases, rejected_sites)
         except (ValidationError, ValueError, TypeError):
             errors.append("invalid-native-discovery-record")
             continue
         payload[collection].append(item)
-    return DiscoveryOutput(payload, not errors, "partial-native-tool-calls" if errors else "native-tool-calls"), errors
+    if rejected_sites:
+        errors.append("rejected-auxiliary-discovery-sites")
+    return DiscoveryOutput(
+        payload,
+        not errors,
+        "partial-native-tool-calls" if errors else "native-tool-calls",
+        tuple(rejected_sites),
+    ), errors

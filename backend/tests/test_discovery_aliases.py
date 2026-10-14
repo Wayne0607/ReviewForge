@@ -128,7 +128,7 @@ async def test_v4_generator_decodes_aliases_before_exact_site_validation(case):
     u = unit("app.py")
     pack = ContextPack()
     block = plan_discovery(changeset(u), pack, {u.path: diff()}, limits=DiscoveryLimits())[0]
-    aliases = source_aliases(block.source_refs)
+    aliases = source_aliases(block.source_refs, scoped=True)
     before = next(alias for alias, ref in aliases.items() if block.source_refs[ref].side == "before")
     after = next(alias for alias, ref in aliases.items() if block.source_refs[ref].side == "after")
     raw = candidate(u)

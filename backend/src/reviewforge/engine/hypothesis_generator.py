@@ -412,6 +412,10 @@ class HypothesisGenerator:
         resume: bool = False,
         overview_changeset: SemanticChangeSet | None = None,
     ) -> HypothesisGenerationResult:
+        if ledger.protocol_version >= 6:
+            from reviewforge.engine.discovery_workflow import run_discovery
+
+            return await run_discovery(self, state, pack, changeset, ledger, overview_changeset=overview_changeset)
         if ledger.protocol_version >= 5:
             from reviewforge.engine.discovery_session import run_discovery
 

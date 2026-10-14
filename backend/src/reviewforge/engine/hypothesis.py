@@ -293,7 +293,7 @@ class HypothesisLedger:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.protocol_version not in {1, 2, 3, 4, 5}:
+        if self.protocol_version not in {1, 2, 3, 4, 5, 6}:
             raise ValueError("unsupported investigation protocol")
         if type(self.source_audit_batches) is not int or self.source_audit_batches < 0:
             raise ValueError("source audit batch count must be a nonnegative integer")

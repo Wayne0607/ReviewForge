@@ -17,7 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from reviewforge.core.json_output import strip_reasoning_blocks
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus
 from reviewforge.engine.prompts_v4 import load_prompt
-from reviewforge.engine.request_budget import plan_request
+from reviewforge.engine.request_budget import plan_request, snapshot_available
 
 _KINDS = {"caller", "test", "schema", "configuration", "format", "language"}
 
@@ -180,17 +180,15 @@ async def run_source_audit(llm, ledger, on_update=None):
             if sum(len(message.content) for message in trial) > 32_000:
                 break
             budget = ledger.request_budget
-            available = max(
-                0,
-                budget.get("limit", 16_000)
-                - budget.get("reported_tokens", 0)
-                - budget.get("unreported_reserved_tokens", 0)
-                - sum(p.get("reserved_tokens", 0) for p in budget.get("pending", {}).values())
-                - (spent if not budget else 0),
+            available = snapshot_available(
+                budget, fallback=None if ledger.protocol_version >= 8 else max(0, 16_000 - spent)
             )
             # Leave useful room for comparing the claim to the reconstruction.
             trial_plan = plan_request(llm, trial, max_output_tokens=4096, fallback_available=available)
-            if trial_plan.available_tokens - trial_plan.input_tokens < 2048 + 512 * (len(batch) + 1):
+            if (
+                trial_plan.available_tokens is not None
+                and trial_plan.available_tokens - trial_plan.input_tokens < 2048 + 512 * (len(batch) + 1)
+            ):
                 break
             batch.append(item)
             request, plan = trial, trial_plan
@@ -233,7 +231,9 @@ async def run_source_audit(llm, ledger, on_update=None):
         spent += tokens if tokens is not None else plan.input_tokens + plan.max_output_tokens
         ledger.source_audits[batch[0].id]["tokens"] += tokens or 0
         try:
-            if _over_budget(ledger) or tokens is not None and tokens > plan.available_tokens:
+            if _over_budget(ledger) or (
+                tokens is not None and plan.available_tokens is not None and tokens > plan.available_tokens
+            ):
                 raise OverflowError
             text = strip_reasoning_blocks(response.content)
             if text.startswith("```json\n") and text.endswith("\n```"):

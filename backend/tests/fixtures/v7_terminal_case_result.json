@@ -1,0 +1,36 @@
+{
+  "source_commit": "e3521d797bb4103c869a3f2cdb1485b79287f3ae",
+  "trace_sha256": "4ae4f7d3c2bf990eb2f90e9500256a5ef991672372f15da3b9892601ed16fda4",
+  "head_sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+  "workspace_digest": "fa7ce3bdc1b04f2f5a5258cd4a9873298d3ba0d81d304076d1fa02cca44b3ff4",
+  "case": {
+    "id": "h_ddcac275",
+    "claim": "handleAdd's empty-input guard uses multiEmailValue.length === 0, but the state is initialized to [\"\"] and MultiEmail feeds it, so a single blank input passes the length check and reaches the zod array parse instead of being silently returned.",
+    "trigger": "User opens dialog, types nothing (value stays [\"\"]), clicks Add.",
+    "impact": "Instead of an early return, validation fails on the invalid empty string and isInvalidEmail flips the 'emails must be unique/valid' error; mutation is not sent, so behavior depends on whether MultiEmail ever emits [] or strips \"\"."
+  },
+  "tool_call": {
+    "name": "submit_confirmed",
+    "args": {
+      "case_id": "case_fd5cfc4e2c608e829d0bd71c",
+      "reason": "The guard contract is the PR's own early-return for \"no emails entered\", but its length===0 predicate can never be satisfied in this dialog: state is initialized to [\"\"] (obs_3:e3, obs_4:e1) and MultiEmail's setValue path preserves array length instead of dropping empty entries (obs_9:e4). So the single blank input [\"\"] passes the guard and reaches z.array(z.string().email()).safeParse, which rejects \"\" and flips isInvalidEmail, surfacing a validation error for an action where no guest was entered. The refutation condition (MultiEmail normalizing empty input to [] or filtering \"\") is contradicted by the actual onChange handler shown in obs_9:e4; the remaining unread tail only adds more rows, it cannot turn [\"\"] into []. Expected vs actual are established for the same witness (open dialog, type nothing, click Add).",
+      "expected": "With no email entered (state still [\\\"\\\"]), clicking Add should hit the empty-input guard and return silently with no validation error and no mutation.",
+      "actual": "[\\\"\\\"] has length 1, so the guard is skipped; ZAddGuestsInputSchema.safeParse([\\\"\\\"]) fails on z.string().email(), setIsInvalidEmail(true) shows the invalid/unique-emails error even though the user typed nothing.",
+      "expected_evidence": [
+        "obs_5:e1",
+        "obs_4:e2",
+        "obs_9:e4"
+      ],
+      "actual_evidence": [
+        "obs_3:e3",
+        "obs_4:e1",
+        "obs_4:e2",
+        "obs_5:e1",
+        "obs_9:e4"
+      ]
+    },
+    "id": "call_0c9db80e7b604fe284bca028",
+    "type": "tool_call"
+  },
+  "note": "Transport failure regression only; no semantic truth or quality label."
+}

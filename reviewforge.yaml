@@ -175,10 +175,11 @@ coverage_gap:
 # Hypothesis pipeline remains opt-in through the holdout gate (T11).
 pipeline_v4:
   mode: "legacy"
-  protocol_version: 7
-  # New runs use bounded native action sessions and the shared PR pool.
-  # "fixed" keeps the historical 80k discovery / 16k verification allocation.
-  budget_policy: "adaptive"
+  protocol_version: 8
+  # New runs record usage without phase, PR or investigation token caps.
+  # Historical protocols 1–7 retain their frozen fixed/adaptive limits.
+  # Explicit benchmark grants remain enforced outside the product policy.
+  budget_policy: "metered"
   output_language: "auto"
   workspace_max_bytes: 200000000
   context_pack_max_slices: 12

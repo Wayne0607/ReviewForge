@@ -651,7 +651,16 @@ async def _main_async(args: argparse.Namespace) -> None:
                 "version": getattr(orchestrator._pipeline_v4_config, "protocol_version", 2),
                 "json_output_mode": orchestrator._pipeline_v4_config.json_output_mode,
                 "investigator_closure_thinking": orchestrator._pipeline_v4_config.investigator_closure_thinking,
-                "max_tokens_per_pr": orchestrator._pipeline_v4_config.max_tokens_per_pr,
+                "max_tokens_per_pr": (
+                    None
+                    if getattr(orchestrator._pipeline_v4_config, "protocol_version", 2) >= 8
+                    else orchestrator._pipeline_v4_config.max_tokens_per_pr
+                ),
+                **(
+                    {"token_policy": "usage-only-v1"}
+                    if getattr(orchestrator._pipeline_v4_config, "protocol_version", 2) >= 8
+                    else {}
+                ),
             }
         validate_resume_metadata(
             read_metadata(root / "metadata.json"),

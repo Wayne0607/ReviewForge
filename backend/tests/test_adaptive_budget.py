@@ -396,9 +396,10 @@ async def test_forecast_follows_actual_task_priority_and_excludes_unselected_wor
 
 
 @pytest.mark.parametrize(
-    "configured,expected", [("adaptive", "adaptive"), ("fixed", "fixed"), ("bad", "adaptive"), ("[]", "adaptive")]
+    "configured,expected",
+    [("adaptive", "adaptive"), ("fixed", "fixed"), ("metered", "metered"), ("bad", "metered"), ("[]", "metered")],
 )
-def test_budget_policy_is_explicit_config_and_invalid_values_do_not_disable_limits(tmp_path, configured, expected):
+def test_budget_policy_is_explicit_config_and_invalid_values_use_the_current_default(tmp_path, configured, expected):
     path = tmp_path / "reviewforge.yaml"
     path.write_text(f"pipeline_v4:\n  budget_policy: {configured}\n", encoding="utf-8")
     assert ReviewForgeConfig.load(path).pipeline_v4.budget_policy == expected

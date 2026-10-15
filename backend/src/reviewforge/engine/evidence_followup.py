@@ -46,7 +46,13 @@ def _original_task(item: Hypothesis, ledger: HypothesisLedger) -> dict[str, Any]
         return None
     # A historical task without frozen limits/counters cannot be upgraded into
     # a fresh allowance. Bool is deliberately not accepted as a numeric limit.
-    if any(type(task.get(key)) is not int or task[key] < 0 for key in (*_COUNTERS, *_LIMITS)):
+    metered = (
+        ledger.protocol_version >= 8
+        and task.get("budget_policy") == "usage-only-v1"
+        and task.get("token_limit") is None
+    )
+    limits = ("budget_steps_limit",) if metered else _LIMITS
+    if any(type(task.get(key)) is not int or task[key] < 0 for key in (*_COUNTERS, *limits)):
         return None
     members = task.get("members")
     if (
@@ -64,9 +70,8 @@ def _original_task(item: Hypothesis, ledger: HypothesisLedger) -> dict[str, Any]
         }
     ):
         return None
-    if (
-        task["budget_steps_limit"] <= task["total_steps"]
-        or task["token_limit"] <= task["total_tokens"] + task["total_unreported_tokens"]
+    if task["budget_steps_limit"] <= task["total_steps"] or (
+        not metered and task["token_limit"] <= task["total_tokens"] + task["total_unreported_tokens"]
     ):
         return None
     # Equal task members share sources. Never invalidate a completed semantic
@@ -204,7 +209,9 @@ async def run_evidence_followup(
             "workspace_digest": ledger.workspace_digest,
             "charged_to": task["charged_to"],
             "allocated": {
-                "tokens": task["token_limit"] - task["total_tokens"] - task["total_unreported_tokens"],
+                "tokens": None
+                if task["token_limit"] is None
+                else task["token_limit"] - task["total_tokens"] - task["total_unreported_tokens"],
                 "steps": task["budget_steps_limit"] - task["total_steps"],
             },
             "original_audit": copy.deepcopy(ledger.source_audits[item.id]),
@@ -236,9 +243,9 @@ async def run_evidence_followup(
             if not valid_usage:
                 raise ValueError("invalid-segment-accounting")
             if (
-                record["tokens"] + record["unreported_tokens"] > record["allocated"]["tokens"]
-                or record["steps"] > record["allocated"]["steps"]
-            ):
+                record["allocated"]["tokens"] is not None
+                and record["tokens"] + record["unreported_tokens"] > record["allocated"]["tokens"]
+            ) or record["steps"] > record["allocated"]["steps"]:
                 record["rejection_reason"] = "segment-exceeded-allocated-budget"
                 raise ValueError(record["rejection_reason"])
             count = _new_facts(returned, original, ledger.head_sha)

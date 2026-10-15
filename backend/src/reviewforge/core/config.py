@@ -145,7 +145,7 @@ class PipelineV4Config:
     """
 
     mode: str = "legacy"
-    protocol_version: int = 7
+    protocol_version: int = 8
     output_language: str = "auto"
     workspace_max_bytes: int = 200_000_000
     context_pack_max_slices: int = 12
@@ -155,7 +155,7 @@ class PipelineV4Config:
     discovery_target_input_chars: int = 32_000
     discovery_max_blocks: int = 8
     session_max_requests: int = 32
-    discovery_max_tokens: int = 80_000
+    discovery_max_tokens: int = 80_000  # Historical protocols 1–7 only.
     max_lenses: int = 3
     investigator_concurrency: int = 4
     investigator_max_hypotheses_per_pr: int = 12
@@ -163,8 +163,8 @@ class PipelineV4Config:
     publish_max_inline_overflow: int = 8
     json_output_mode: str = "auto"
     investigator_closure_thinking: str = "auto"
-    max_tokens_per_pr: int = 250_000
-    budget_policy: str = "adaptive"
+    max_tokens_per_pr: int = 250_000  # Historical protocols 1–7 only.
+    budget_policy: str = "metered"  # Protocol 8 always meters without product token caps.
     provider_max_attempts: int = 3
     provider_retry_404: bool = False
     provider_retry_after_max_seconds: float = 60.0
@@ -178,7 +178,7 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         cfg.mode = _normalize_pipeline_mode(data["mode"], cfg.mode)
     if "output_language" in data:
         cfg.output_language = _normalize_output_language(data["output_language"], cfg.output_language)
-    if type(data.get("protocol_version")) is int and data["protocol_version"] in {1, 2, 3, 4, 5, 6, 7}:
+    if type(data.get("protocol_version")) is int and data["protocol_version"] in {1, 2, 3, 4, 5, 6, 7, 8}:
         cfg.protocol_version = data["protocol_version"]
     if type(data.get("provider_max_attempts")) is int and data["provider_max_attempts"] in {1, 2, 3}:
         cfg.provider_max_attempts = data["provider_max_attempts"]
@@ -193,7 +193,7 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
             if math.isfinite(retry_after_cap) and retry_after_cap >= 0:
                 cfg.provider_retry_after_max_seconds = retry_after_cap
     for name, allowed in (
-        ("budget_policy", {"fixed", "adaptive"}),
+        ("budget_policy", {"fixed", "adaptive", "metered"}),
         ("json_output_mode", {"auto", "off", "json_object"}),
         ("investigator_closure_thinking", {"auto", "default", "disabled"}),
     ):

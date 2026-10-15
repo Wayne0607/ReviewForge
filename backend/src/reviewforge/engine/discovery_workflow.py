@@ -466,7 +466,11 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             work.flow["mode"] = "result"
             # Protect one useful result for each other pending group when the
             # forecast fits; impossible aggregate forecasts must not deadlock.
-            reserve = min(other_reserve, max(0, plan.available_tokens - plan.input_tokens - floor))
+            reserve = (
+                0
+                if plan.available_tokens is None
+                else min(other_reserve, max(0, plan.available_tokens - plan.input_tokens - floor))
+            )
             plan = plan_request(
                 current[0], current[1], max_output_tokens=4096, fallback_available=available, reserve_tokens=reserve
             )

@@ -332,6 +332,7 @@ class Investigator:
         self._closure_constraints: list[str] = []
         self._collection_state: dict[str, Any] | None = None
         self._adaptive_budget = adaptive_budget
+        self._metered = protocol_version >= 8
         self._token_limit = token_limit
         self._on_evidence = on_evidence
         self._task_id = task_id
@@ -1083,11 +1084,11 @@ class Investigator:
             return await self._investigate(hypothesis, state, pack, changed_paths=changed_paths)
         from reviewforge.engine.request_budget import investigation_request_scope
 
-        if self._adaptive_budget and self._token_limit is None:
+        if self._adaptive_budget and not self._metered and self._token_limit is None:
             self._max_steps, self._token_limit, _ = self.workload_allowance(hypothesis, state, pack)
         steps = self._max_steps if self._max_steps is not None else budget_steps(hypothesis)
         self._unreported_tokens = 0
-        allowance = self._token_limit if self._token_limit is not None else steps * 4_000
+        allowance = None if self._metered else self._token_limit if self._token_limit is not None else steps * 4_000
         with investigation_request_scope(allowance, task_id=self._task_id) as task_budget:
             self._task_request_budget = task_budget
             try:
@@ -1120,7 +1121,7 @@ class Investigator:
         state: StateStore,
         pack: ContextPack,
         *,
-        token_limit: int,
+        token_limit: int | None,
         max_steps: int,
         gaps: list[str],
     ) -> InvestigationResult:
@@ -1145,11 +1146,18 @@ class Investigator:
         self._progress = []
         if self._protocol_version < 4:
             raise ValueError("evidence collection requires protocol 4")
-        if type(token_limit) is not int or type(max_steps) is not int or token_limit < 0 or max_steps < 0:
+        if (
+            (token_limit is None and not self._metered)
+            or (token_limit is not None and (type(token_limit) is not int or token_limit < 0))
+            or type(max_steps) is not int
+            or max_steps < 0
+        ):
             raise ValueError("evidence collection requires nonnegative integer limits")
         if not isinstance(gaps, list) or any(not isinstance(gap, str) or not gap.strip() for gap in gaps):
             raise ValueError("evidence collection requires explicit source gaps")
         self._prepare_investigation(hypothesis, state, pack)
+        if self._metered:
+            token_limit = None
         with investigation_request_scope(token_limit) as task_budget:
             self._task_request_budget = task_budget
             try:
@@ -1183,7 +1191,7 @@ class Investigator:
         return self.evidence_followup_snapshot()
 
     async def _collect_evidence_rounds(
-        self, hypothesis: Hypothesis, pack: ContextPack, token_limit: int, max_steps: int, gaps: list[str]
+        self, hypothesis: Hypothesis, pack: ContextPack, token_limit: int | None, max_steps: int, gaps: list[str]
     ) -> None:
         tools = self._build_tools()
         known_tools = {tool.name: tool for tool in tools}
@@ -1208,7 +1216,10 @@ class Investigator:
             packet["gaps"] = gaps
             chat = [system, HumanMessage(content=json.dumps(packet, ensure_ascii=False, separators=(",", ":")))]
             plan = plan_request(
-                bound, chat, max_output_tokens=1_000, fallback_available=token_limit - self._accounted_tokens()
+                bound,
+                chat,
+                max_output_tokens=1_000,
+                fallback_available=None if token_limit is None else token_limit - self._accounted_tokens(),
             )
             self._progress.append(
                 {
@@ -1230,7 +1241,7 @@ class Investigator:
             snapshot = self._task_request_budget.snapshot()
             if snapshot["request_count"]:
                 self._tokens = int(snapshot["reported_tokens"])
-            if self._accounted_tokens() > token_limit:
+            if token_limit is not None and self._accounted_tokens() > token_limit:
                 self._collection_state.update(reason="token-exhausted", outcome="budget-exhausted")
                 break
             calls = getattr(response, "tool_calls", None) or []
@@ -2483,6 +2494,8 @@ class Investigator:
         semaphore = asyncio.Semaphore(max(1, concurrency))
         available_tokens = None if token_budget is None else max(0, token_budget)
         adaptive = request_budget is not None and request_budget.adaptive
+        metered = ledger.protocol_version >= 8
+        managed = adaptive or metered
 
         async def _investigate(index: int, hypothesis: Hypothesis, allowance: dict[str, Any]) -> InvestigationResult:
             nonlocal available_tokens
@@ -2498,13 +2511,13 @@ class Investigator:
             if index >= max(0, max_hypotheses_per_pr):
                 return self._result(
                     verdict="unknown",
-                    reason="investigation-task-cap" if adaptive else "budget-exhausted",
+                    reason="investigation-task-cap" if managed else "budget-exhausted",
                     severity=hypothesis.severity,
                     outcome="policy-deferred" if ledger.protocol_version >= 2 else "budget-exhausted",
                 )
             async with semaphore:
                 reserve = (self._max_steps if self._max_steps is not None else budget_steps(hypothesis)) * 4_000
-                if available_tokens is not None and not adaptive:
+                if available_tokens is not None and not managed:
                     if available_tokens < reserve:
                         return self._result(
                             verdict="unknown",
@@ -2534,19 +2547,23 @@ class Investigator:
                         else None
                     ),
                     on_evidence=on_evidence,
-                    task_id=hypothesis.investigation_task_id if adaptive else "",
-                    starting_steps=allowance.get("total_steps", 0) if adaptive else 0,
+                    task_id=hypothesis.investigation_task_id if managed else "",
+                    starting_steps=allowance.get("total_steps", 0) if managed else 0,
                     evidence_store=self._evidence_store,
                     on_progress=save_progress if ledger.protocol_version >= 5 else None,
                 )
-                if adaptive:
+                if managed:
                     worker._max_steps = max(0, allowance["budget_steps_limit"] - allowance.get("total_steps", 0))
-                    if not worker._max_steps or not worker._token_limit:
+                    from reviewforge.engine.investigation_repair import has_saved_result
+
+                    if (not worker._max_steps and not (metered and has_saved_result(hypothesis))) or (
+                        adaptive and not worker._token_limit
+                    ):
                         return worker._result(
                             verdict="unknown",
-                            reason="original-task-budget-exhausted",
+                            reason="investigation-step-limit" if metered else "original-task-budget-exhausted",
                             severity=hypothesis.severity,
-                            outcome="budget-exhausted",
+                            outcome="output-error" if metered else "budget-exhausted",
                         )
                 try:
                     result = await worker.investigate(hypothesis, state, pack, changed_paths=changed)
@@ -2559,7 +2576,7 @@ class Investigator:
                         retryable=True,
                         outcome="output-error",
                     )
-                if available_tokens is not None and not adaptive:
+                if available_tokens is not None and not managed:
                     available_tokens += reserve - result.tokens - result.unreported_tokens
                 return result
 
@@ -2586,18 +2603,18 @@ class Investigator:
                     "members": list(task.members),
                     "charged_to": hypothesis.identity,
                     "budget_steps_limit": limit,
-                    "token_limit": token_limit,
-                    **({"budget_policy": "adaptive-v1"} if adaptive else {}),
+                    "token_limit": None if metered else token_limit,
+                    **({"budget_policy": "usage-only-v1" if metered else "adaptive-v1"} if managed else {}),
                     "total_steps": 0,
                     "total_unreported_tokens": 0,
                 }
                 if on_update is not None:
                     await on_update(ledger)
             allowance = ledger.investigation_tasks.get(task.id, {})
-            if adaptive:
+            if managed:
                 # A checkpoint may stop before the final verdict writes task
                 # counters. Physical receipts/pending costs survive separately.
-                usage = request_budget.task_usage.get(task.id, {})
+                usage = request_budget.task_usage.get(task.id, {}) if request_budget is not None else {}
                 synced = allowance.get("request_usage_synced", {})
                 for counter, field in (
                     ("total_tokens", "reported_tokens"),
@@ -2630,9 +2647,9 @@ class Investigator:
             )
             if ledger.protocol_version >= 2:
                 ledger.apply_task_verdict(task.id, task.members, hypothesis.identity, **verdict)
-                if adaptive:
+                if managed:
                     record = ledger.investigation_tasks[task.id]
-                    usage = request_budget.task_usage.get(task.id, {})
+                    usage = request_budget.task_usage.get(task.id, {}) if request_budget is not None else {}
                     record["request_usage_synced"] = dict(usage)
                     record["total_steps"] = max(record.get("total_steps", 0), usage.get("steps", 0))
             else:

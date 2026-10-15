@@ -6,7 +6,7 @@
 - 用户已授权统一使用 `dev`，替代旧任务卡的 `hp/<卡号>` 分支约定。
 - 新流水线事实源：[hypothesis-pipeline-spec.md](docs/hypothesis-pipeline-spec.md)。进度与待验收项：[v4-development.md](docs/v4-development.md)。
 - 默认仍是 `legacy`；`shadow` 与 `hypothesis` 是尚待真实基准验收的 v4 路径。下述 Planner/Reviewer/Verifier/Commenter 描述适用于 legacy。
-- 新 v4 运行使用内部协议 7：保留轮转发现与批量结果，格式错误可在固定草稿上局部修复；预算先取 PR/外层授权交集再保护下游工作。旧协议 1–6 保留原语义与冻结计数；发布仍经原独立核验，工作循环跑通不等于质量验收。付费基准用原生 `external_request_budget_scope` / `authorized_budget` 或 runner 的 `--token-budget`，不得用先扣阶段预留再取外层最小值的旧补丁。
+- 新 v4 运行使用内部协议 8：token 只计量，不以阶段、PR、调查额度中止；保留有限请求/步骤、超时、重试与机器资源保护。末轮调查可对固定草稿的超长字段做至多两次独立格式修复，计数和原文可恢复。旧协议 1–7 保留原语义与冻结计数；发布仍经原独立核验，工作循环跑通不等于质量验收。用户明确批准的付费评测额度是独立外层边界，用原生 `external_request_budget_scope` / `authorized_budget` 或 runner 的 `--token-budget` 保持，不因产品取消 token 上限而自动扩额。历史冻结脚本与原始实录不修改。
 
 ## Agent 架构
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import ValidationError
 
 from reviewforge.core.change_manifest import is_verified_rename
 from reviewforge.engine.discovery_submission import bind_discovery_submission
@@ -49,7 +50,13 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
         )
     changed = changed_paths if changed_paths is not None else _changed_paths(state)
     steps = worker._max_steps if worker._max_steps is not None else budget_steps(hypothesis)
-    token_limit = worker._token_limit if worker._token_limit is not None else steps * 4000
+    token_limit = None if worker._metered else worker._token_limit if worker._token_limit is not None else steps * 4000
+    if worker._metered:
+        from reviewforge.engine.investigation_repair import repair, restore
+
+        saved = restore(worker, hypothesis, pack)
+        if saved is not None:
+            return await repair(worker, hypothesis, pack, changed, saved, steps=0)
     bootstrap = int(await worker._bootstrap(hypothesis, pack))
     terminal = decision_tools(hypothesis, state.head_sha)
     schemas = {tool.name: tool.args_schema for tool in terminal}
@@ -75,7 +82,7 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
             bound,
             chat,
             max_output_tokens=worker._closing_output(hypothesis) if final else 2048,
-            fallback_available=token_limit - worker._accounted_tokens(),
+            fallback_available=None if token_limit is None else token_limit - worker._accounted_tokens(),
         )
         worker._progress.append(
             {
@@ -112,7 +119,7 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
                 outcome="budget-exhausted" if exhausted else "provider-error",
                 retryable=not exhausted,
             )
-        if worker._accounted_tokens() > token_limit:
+        if token_limit is not None and worker._accounted_tokens() > token_limit:
             return worker._result(
                 verdict="unknown",
                 reason="token-exhausted",
@@ -131,7 +138,13 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
                 try:
                     args = schemas[call["name"]].model_validate(call["args"]).model_dump()
                     payload = decision_payload(call["name"], args, hypothesis)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as exc:
+                    if worker._metered and isinstance(exc, ValidationError):
+                        from reviewforge.engine.investigation_repair import remember, repair
+
+                        draft = remember(worker, hypothesis, pack, call, schemas[call["name"]], exc)
+                        if draft is not None:
+                            return await repair(worker, hypothesis, pack, changed, draft, steps=turn)
                     feedback.append({"error": "invalid-case-result-schema-or-identity"})
                 else:
                     result = worker._finalize(payload, hypothesis, changed, steps=turn)

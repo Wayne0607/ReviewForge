@@ -101,9 +101,15 @@ def _discovery_output_floor(unit_count: int, allowance: int, *, protocol_version
     return min(8192, 256 + 256 * unit_count + 640 * min(allowance, unit_count))
 
 
-def _discovery_available(ledger: HypothesisLedger) -> int:
+def _discovery_available(ledger: HypothesisLedger) -> int | None:
     """Fallback snapshot only; a live physical budget view remains authoritative."""
     saved = ledger.request_budget
+    if ledger.protocol_version >= 8 and not saved:
+        return None
+    if saved.get("allocation_policy") == "usage-only-v1":
+        from reviewforge.engine.request_budget import snapshot_available
+
+        return snapshot_available(saved, fallback=250_000)
     pending = list(saved.get("pending", {}).values())
     remaining = (
         saved.get("limit", 250_000)

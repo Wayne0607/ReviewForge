@@ -30,7 +30,7 @@ class RequestBudgetExceededError(ValueError):
 class RequestBudget:
     def __init__(
         self,
-        limit: int,
+        limit: int | None,
         *,
         discovery_limit: int = 80_000,
         editor_reserve: int = 16_000,
@@ -40,10 +40,20 @@ class RequestBudget:
         previous = saved or {}
         # Allocation is frozen with the run. Historical checkpoints keep their
         # original phase limits; restoring them must not grant more credit.
-        self.adaptive = previous.get("allocation_policy") == "adaptive-v1" if previous else adaptive
-        self.limit = min(limit, int(previous.get("limit", limit)))
-        self.discovery_limit = min(discovery_limit, int(previous.get("discovery_limit", discovery_limit)))
-        self.editor_reserve = min(max(0, int(previous.get("editor_reserve", editor_reserve))), self.limit)
+        self.metered = previous.get("allocation_policy") == "usage-only-v1" if previous else limit is None
+        self.adaptive = (
+            previous.get("allocation_policy") == "adaptive-v1" if previous else adaptive
+        ) and not self.metered
+        old_limit = previous.get("limit", limit)
+        self.limit = None if self.metered else minimum_limit(limit, old_limit)
+        if not self.metered and self.limit is None:
+            raise ValueError("a capped budget requires its frozen limit")
+        self.discovery_limit = (
+            None if self.metered else min(discovery_limit, int(previous.get("discovery_limit", discovery_limit)))
+        )
+        self.editor_reserve = (
+            0 if self.metered else min(max(0, int(previous.get("editor_reserve", editor_reserve))), self.limit)
+        )
         self.investigation_reserve = max(0, int(previous.get("investigation_reserve", 0))) if self.adaptive else 0
         self.allocation: dict[str, Any] = copy.deepcopy(previous.get("allocation", {})) if self.adaptive else {}
         self.reported = max(0, int(previous.get("reported_tokens", 0)))
@@ -104,9 +114,14 @@ class RequestBudget:
             raise ValueError("budget is already bound to another live scope")
         self.external_binding, self.external = binding, scope
 
-    def available(self, phase: str) -> int:
+    def bind_current_external(self) -> None:
+        """Persist authorization identity even before the first model is built."""
+        self.bind_external(_external_budget.get())
+
+    def available(self, phase: str) -> int | None:
+        """None means metering without a token ceiling, never infinite credit."""
         pending = sum(item["reserved_tokens"] for item in self.pending.values())
-        remaining = self.limit - self.reported - self.unreported - pending
+        remaining = None if self.metered else self.limit - self.reported - self.unreported - pending
         if self.external_binding and self.external is None:
             return 0  # A recovered run cannot spend before its grant is restored.
         if self.external is not None:
@@ -114,7 +129,9 @@ class RequestBudget:
                 return 0
             # Intersect raw balances FIRST. min(PR - reserve, grant) would let
             # discovery consume money needed for investigation and verification.
-            remaining = min(remaining, self.external.budget.available("editor"))
+            remaining = minimum_limit(remaining, self.external.budget.available("editor"))
+        if self.metered:
+            return None if remaining is None else max(0, remaining)
         if phase != "editor":
             remaining -= self.editor_reserve
         if phase == "discovery":
@@ -128,7 +145,8 @@ class RequestBudget:
     def reserve(self, phase: str, tokens: int, *, task_id: str = "", steps: int = 0) -> str:
         if tokens <= 0:
             raise ValueError("request reservation must be positive")
-        if tokens > self.available(phase):
+        available = self.available(phase)
+        if available is not None and tokens > available:
             self.denials += 1
             raise RequestBudgetExceededError(
                 f"{phase} request needs {tokens} tokens; available {self.available(phase)}"
@@ -184,7 +202,7 @@ class RequestBudget:
 
     @property
     def over_limit(self) -> bool:
-        return self.reported + self.unreported > self.limit or (
+        return (self.limit is not None and self.reported + self.unreported > self.limit) or (
             self.external is not None and self.external.budget.over_limit
         )
 
@@ -198,7 +216,7 @@ class RequestBudget:
                 pending_reserved_tokens=sum(row["reserved_tokens"] for row in grant.pending.values()),
             )
         return {
-            "version": 2 if self.adaptive else 1,
+            "version": 3 if self.metered else 2 if self.adaptive else 1,
             "limit": self.limit,
             "discovery_limit": self.discovery_limit,
             "editor_reserve": self.editor_reserve,
@@ -211,6 +229,7 @@ class RequestBudget:
             "request_count": self.serial,
             "unreported_requests": copy.deepcopy(self.unreported_requests),
             "reconciliations": copy.deepcopy(self.reconciliations),
+            **({"allocation_policy": "usage-only-v1"} if self.metered else {}),
             **({"external_budget": external_receipt} if external_receipt else {}),
             **(
                 {
@@ -227,14 +246,49 @@ class RequestBudget:
 def budget_snapshot_over_limit(snapshot: dict[str, Any]) -> bool:
     """Publication/completeness must honor the same limits as admission."""
     return any(
-        "limit" in row and row.get("reported_tokens", 0) + row.get("unreported_reserved_tokens", 0) > row["limit"]
+        row.get("limit") is not None
+        and row.get("reported_tokens", 0) + row.get("unreported_reserved_tokens", 0) > row["limit"]
         for row in (snapshot, snapshot.get("external_budget", {}))
     )
 
 
+def minimum_limit(*limits: int | None) -> int | None:
+    """Intersect actual ceilings; absence of a ceiling is represented by None."""
+    finite = [value for value in limits if value is not None]
+    return min(finite) if finite else None
+
+
+def snapshot_available(snapshot: dict[str, Any], *, fallback: int | None) -> int | None:
+    limit = snapshot.get("limit", fallback)
+    available = (
+        None
+        if limit is None
+        else max(
+            0,
+            limit
+            - snapshot.get("reported_tokens", 0)
+            - snapshot.get("unreported_reserved_tokens", 0)
+            - sum(row["reserved_tokens"] for row in snapshot.get("pending", {}).values()),
+        )
+    )
+    grant = snapshot.get("external_budget")
+    if grant:
+        available = minimum_limit(
+            available,
+            max(
+                0,
+                grant["limit"]
+                - grant.get("reported_tokens", 0)
+                - grant.get("unreported_reserved_tokens", 0)
+                - grant.get("pending_reserved_tokens", 0),
+            ),
+        )
+    return available
+
+
 class TaskRequestBudget(RequestBudget):
-    def __init__(self, limit: int, *, task_id: str = ""):
-        super().__init__(limit, discovery_limit=limit, editor_reserve=0)
+    def __init__(self, limit: int | None, *, task_id: str = ""):
+        super().__init__(limit, discovery_limit=limit if limit is not None else 0, editor_reserve=0)
         self.task_id = task_id
         self.progress_steps = 0
 
@@ -260,7 +314,7 @@ def external_request_budget_scope(budget: RequestBudget, *, identity: str, on_ch
     dispatch. Provider attempts are charged to both ledgers exactly once; these
     are two views of the same cost and must not be added together.
     """
-    if not identity.strip() or not callable(on_change) or _external_budget.get() is not None:
+    if budget.limit is None or not identity.strip() or not callable(on_change) or _external_budget.get() is not None:
         raise ValueError("a named, persistent, non-nested external budget is required")
     scope = ExternalBudgetScope(budget, identity, on_change)
     token = _external_budget.set(scope)
@@ -277,8 +331,8 @@ _task_budget: contextvars.ContextVar[TaskRequestBudget | None] = contextvars.Con
 
 
 @contextmanager
-def investigation_request_scope(limit: int, *, task_id: str = ""):
-    """Keep every retry/closure attempt inside the original investigation cap."""
+def investigation_request_scope(limit: int | None, *, task_id: str = ""):
+    """Meter every retry/closure; historical tasks retain their finite cap."""
     budget = TaskRequestBudget(limit, task_id=task_id)
     token = _task_budget.set(budget)
     try:
@@ -322,13 +376,13 @@ def estimate_request(messages: list[BaseMessage], kwargs: dict[str, Any]) -> int
 @dataclass(frozen=True)
 class RequestBudgetView:
     input_tokens: int
-    available_tokens: int
+    available_tokens: int | None
 
 
 @dataclass(frozen=True)
 class RequestPlan:
     input_tokens: int
-    available_tokens: int
+    available_tokens: int | None
     max_output_tokens: int
 
 
@@ -337,7 +391,7 @@ def plan_request(
     messages: list[BaseMessage],
     *,
     max_output_tokens: int = 4_000,
-    fallback_available: int,
+    fallback_available: int | None,
     reserve_tokens: int = 0,
 ) -> RequestPlan:
     """Forecast once before retries, using the same input as physical admission.
@@ -348,6 +402,7 @@ def plan_request(
     """
     if max_output_tokens <= 0 or reserve_tokens < 0:
         raise ValueError("planning requires a positive output cap and nonnegative reserve")
+    fallback_available = None if fallback_available is None else max(0, fallback_available)
     options = {"max_tokens": max_output_tokens}
     while isinstance(llm, RunnableBindingBase):
         options = llm.kwargs | options
@@ -355,9 +410,13 @@ def plan_request(
     planner = getattr(llm, "request_budget_view", None)
     view = planner(messages, options) if callable(planner) else None
     if view is None:
-        view = RequestBudgetView(estimate_request(messages, options), max(0, fallback_available))
-    available = min(view.available_tokens, max(0, fallback_available))
-    output = max(0, min(max_output_tokens, available - view.input_tokens - reserve_tokens))
+        view = RequestBudgetView(estimate_request(messages, options), fallback_available)
+    available = minimum_limit(view.available_tokens, fallback_available)
+    output = (
+        max_output_tokens
+        if available is None
+        else max(0, min(max_output_tokens, available - view.input_tokens - reserve_tokens))
+    )
     return RequestPlan(view.input_tokens, available, output)
 
 
@@ -369,7 +428,7 @@ class BudgetedChatLLM(BaseChatModel):
 
     def __init__(self, inner, budget, *, phase, on_change=None):
         super().__init__()
-        budget.bind_external(_external_budget.get())
+        budget.bind_current_external()
         self._inner, self._budget, self._phase, self._on_change = inner, budget, phase, on_change
 
     async def _changed(self):
@@ -383,7 +442,7 @@ class BudgetedChatLLM(BaseChatModel):
         available = self._budget.available(self._phase)
         task_budget = _task_budget.get()
         if task_budget is not None:
-            available = min(available, task_budget.available(self._phase))
+            available = minimum_limit(available, task_budget.available(self._phase))
         return RequestBudgetView(estimate_request(messages, options), available)
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):

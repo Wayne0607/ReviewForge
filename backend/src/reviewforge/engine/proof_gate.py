@@ -24,7 +24,7 @@ from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Hypothes
 from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.publication_contracts import contract_catalog
-from reviewforge.engine.request_budget import budget_snapshot_over_limit, plan_request
+from reviewforge.engine.request_budget import budget_snapshot_over_limit, plan_request, snapshot_available
 from reviewforge.engine.source_audit import audit_hash, run_source_audit
 from reviewforge.engine.source_audit import current as audit_current
 from reviewforge.engine.verification_guidance import (
@@ -595,13 +595,7 @@ class ProofGate:
             pending.append(item)
         await self._changed(ledger)
         budget = ledger.request_budget or {}
-        available = max(
-            0,
-            budget.get("limit", _DEFAULT_AVAILABLE)
-            - budget.get("reported_tokens", 0)
-            - budget.get("unreported_reserved_tokens", 0)
-            - sum(record.get("reserved_tokens", 0) for record in budget.get("pending", {}).values()),
-        )
+        available = snapshot_available(budget, fallback=None if ledger.protocol_version >= 8 else _DEFAULT_AVAILABLE)
         spent = calls = 0
         while pending:
             batch = []
@@ -612,9 +606,13 @@ class ProofGate:
                 if sum(len(message.content) for message in trial_messages) > _INPUT_CHARS:
                     break
                 live_available = _live_available(self._llm, trial_messages)
-                fallback = live_available if not budget and live_available is not None else available - spent
+                fallback = (
+                    live_available
+                    if not budget and live_available is not None
+                    else (None if available is None else max(0, available - spent))
+                )
                 trial_plan = plan_request(
-                    self._llm, trial_messages, max_output_tokens=_MAX_OUTPUT, fallback_available=max(0, fallback)
+                    self._llm, trial_messages, max_output_tokens=_MAX_OUTPUT, fallback_available=fallback
                 )
                 # A policy floor gives a useful response room; it is no guarantee
                 # that a model can finish an arbitrary proof in this many tokens.
@@ -669,7 +667,9 @@ class ProofGate:
             spent += tokens if tokens is not None else planned.input_tokens + planned.max_output_tokens
             # The batch has one actual bill. Attribute it once, never per candidate.
             ledger.publication_reviews[batch[0].id]["tokens"] += tokens or 0
-            if (tokens is not None and tokens > planned.available_tokens) or _over_budget(ledger):
+            if (
+                tokens is not None and planned.available_tokens is not None and tokens > planned.available_tokens
+            ) or _over_budget(ledger):
                 for item in batch:
                     ledger.publication_reviews[item.id].update(
                         outcome="budget-exhausted", reason="publication-actual-budget-overrun"

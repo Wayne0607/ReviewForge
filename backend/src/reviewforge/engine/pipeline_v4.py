@@ -175,14 +175,16 @@ async def _run_llm_stages(
     ctx.set(ledger.run_id, getattr(orchestrator, "_db", None))
     request_budget = (
         RequestBudget(
-            config.max_tokens_per_pr,
+            None if ledger.protocol_version >= 8 else config.max_tokens_per_pr,
             discovery_limit=config.discovery_max_tokens,
             saved=ledger.request_budget,
-            adaptive=ledger.protocol_version >= 4 and getattr(config, "budget_policy", "adaptive") == "adaptive",
+            adaptive=ledger.protocol_version >= 4 and getattr(config, "budget_policy", "adaptive") != "fixed",
         )
         if ledger.protocol_version >= 3
         else None
     )
+    if request_budget is not None:
+        request_budget.bind_current_external()
 
     async def budget_changed(snapshot: dict[str, Any]) -> None:
         ledger.request_budget = snapshot
@@ -964,9 +966,12 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
         investigation_deferred=sum(item.investigation_outcome == "policy-deferred" for item in hypotheses),
         budget_failures=int(
             (
-                ledger.request_budget.get("reported_tokens", 0)
-                + ledger.request_budget.get("unreported_reserved_tokens", 0)
-                > config.max_tokens_per_pr
+                (
+                    ledger.protocol_version < 8
+                    and ledger.request_budget.get("reported_tokens", 0)
+                    + ledger.request_budget.get("unreported_reserved_tokens", 0)
+                    > config.max_tokens_per_pr
+                )
                 or budget_snapshot_over_limit(ledger.request_budget)
                 or ledger.request_budget.get("denied_requests", 0) > 0
             )

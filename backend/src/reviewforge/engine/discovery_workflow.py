@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from reviewforge.core.change_manifest import FileChange, is_verified_rename
 from reviewforge.engine.discovery import SourceLine, plan_discovery
 from reviewforge.engine.discovery_aliases import expand_response_refs, source_aliases
+from reviewforge.engine.discovery_repair import apply_repairs, pending_repairs, remember, repair_request
 from reviewforge.engine.discovery_session import extend_sources, restore_observation, result_payload, source_packet
 from reviewforge.engine.discovery_submission import bind_discovery_submission
 from reviewforge.engine.discovery_workflow_tools import KINDS, assessment_tools
@@ -27,6 +28,7 @@ from reviewforge.engine.request_budget import plan_request
 from reviewforge.engine.review_session import EvidenceStore, ReviewSession, actions
 
 POLICY = "fair-assessments-v1"
+REPAIR_POLICY = "fair-assessments-v2"
 READ_REQUESTS = 2
 REPAIR_REQUESTS = 2
 
@@ -64,6 +66,7 @@ class Work:
     aliases: dict
     session: ReviewSession
     order: int
+    protocol_version: int = 6
     stopped: str = ""
 
     @property
@@ -78,10 +81,10 @@ class Work:
 def request(generator, work, *, read=False, global_remaining=0):
     pending = work.pending
     active = replace(work.block, units=[unit for unit in work.block.units if unit.id in pending])
-    result_tool, schemas = assessment_tools(active)
+    result_tool, schemas = assessment_tools(active, protocol_version=work.protocol_version)
     tools = [result_tool, *(work.broker._build_tools() if read else [])]
     scope = {
-        "policy": POLICY,
+        "policy": work.flow["policy"],
         "phase": "acquire" if read else "repair" if work.flow["invalid_receipts"] else "submit",
         "turn": work.session.record["turns"] + 1,
         "requests_remaining": max(
@@ -90,6 +93,10 @@ def request(generator, work, *, read=False, global_remaining=0):
         "read_requests_remaining": max(0, READ_REQUESTS - work.flow["read_requests"] - int(read)),
         "last_turn": min(work.session.record["max_turns"] - work.session.record["turns"], global_remaining) <= 1,
     }
+    if work.protocol_version >= 7 and not read and pending_repairs(work):
+        scope.update(phase="field-repair", repair_record_count=len(pending_repairs(work)))
+        repair_tool, chat = repair_request(work, schemas, scope)
+        return bind_discovery_submission(generator._llm, [repair_tool]), chat, [repair_tool], schemas, scope
     packet = compact_packet(work.block, work.aliases, pending, work.broker._observations) | {"session": scope}
     rules = "\n".join(
         dict.fromkeys(
@@ -99,6 +106,8 @@ def request(generator, work, *, read=False, global_remaining=0):
         )
     )
     prompt = load_prompt("discovery_workflow_v6", output_language=generator._output_language)
+    if work.protocol_version >= 7:
+        prompt += "\nThe duplicate discrepancy description is optional. Do not repeat claim/trigger/impact to fill it."
     chat = [
         SystemMessage(content=prompt + ("\nApplicable review rules:\n" + rules if rules else "")),
         HumanMessage(content=json.dumps(packet, ensure_ascii=False)),
@@ -141,9 +150,12 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
     groups = {}
     reads = 0
     had_result = False
+    invalid_units = set()
+    touched = set()
+    carried = work.flow.setdefault("accepted_records", {}) if work.protocol_version >= 7 else {}
     for call in calls:
         name, args = call["name"], call["args"]
-        if name != "submit_assessments":
+        if name not in {"submit_assessments", "repair_assessments"}:
             before = len(work.broker._observations)
             try:
                 prepared = work.broker._prepared_tool_args(name, args)
@@ -161,7 +173,13 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
             continue
         had_result = True
         work.flow["mode"] = "result"
-        records = args.get("records")
+        if name == "repair_assessments":
+            records, repair_errors = apply_repairs(work, args)
+            feedback.extend(repair_errors)
+            errors.extend({"reason": entry["error"], "unit_id": entry.get("unit_id", "")} for entry in repair_errors)
+            args = {"records": records}
+        else:
+            records = args.get("records")
         if (
             set(args) != {"records"}
             or not isinstance(records, list)
@@ -173,31 +191,63 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
             if not isinstance(raw, dict):
                 feedback.append({"error": "assessment-record-must-be-object"})
                 continue
-            schema = schemas.get(raw.get("kind"))
+            unit_id = raw.get("unit_id")
+            if isinstance(unit_id, str):
+                touched.add(unit_id)
+            schema = schemas.get(raw.get("kind")) if isinstance(raw.get("kind"), str) else None
             if schema is None:
                 feedback.append(rejected(name, raw, "unknown-assessment-kind"))
+                if isinstance(unit_id, str):
+                    invalid_units.add(unit_id)
                 continue
             try:
-                args = schema.model_validate(raw).model_dump()
+                args = schema.model_validate(raw).model_dump(exclude_none=True)
             except ValidationError as exc:
                 fields = [
                     {"field": list(error["loc"]), "type": error["type"]} for error in exc.errors(include_input=False)
                 ]
                 feedback.append(rejected(name, raw, "invalid-assessment-schema", fields))
+                if isinstance(unit_id, str):
+                    invalid_units.add(unit_id)
+                if work.protocol_version >= 7:
+                    remember(work, raw, fields, schemas)
                 continue
             try:
                 collection, item = result_payload(KINDS[args["kind"]], args, work.block, delivered)
             except (ValueError, TypeError):
                 feedback.append(rejected(name, raw, "invalid-assessment-reference"))
+                invalid_units.add(args["unit_id"])
                 continue
             groups.setdefault(args["unit_id"], []).append((collection, item))
+            if work.protocol_version >= 7:
+                prior = carried.setdefault(args["unit_id"], [])
+                if args not in prior:
+                    prior.append(copy.deepcopy(args))
+    if work.protocol_version >= 7:
+        invalid_units.update(value["raw"]["unit_id"] for value in pending_repairs(work).values())
+        for unit_id in touched & work.pending:
+            if unit_id in carried:
+                groups[unit_id] = [
+                    result_payload(KINDS[args["kind"]], args, work.block, delivered) for args in carried[unit_id]
+                ]
+    counted_error = work.protocol_version >= 7 and (bool(errors) or any("error" in entry for entry in feedback))
+    if counted_error:
+        # Freeze a rejected receipt before an independent sibling checkpoint
+        # can be interrupted. Recovery must not grant a fresh repair allowance.
+        work.flow["invalid_receipts"] += 1
     committed = 0
     for unit_id, entries in groups.items():
         unit = next(unit for unit in work.block.units if unit.id == unit_id)
         payload = {name: [] for name in ("hypotheses", "no_issue_units", "deferred_units")}
         for collection, item in entries:
             payload[collection].append(item)
-        local = {"units": {}, "output_framing": {"complete": not any(e["unit_id"] in {"", unit_id} for e in errors)}}
+        local = {
+            "units": {},
+            "output_framing": {
+                "complete": (work.protocol_version < 7 or unit_id not in invalid_units)
+                and not any(e["unit_id"] in {"", unit_id} for e in errors)
+            },
+        }
         allowance = min(
             generator._discovery_max_hypotheses_per_block, max(0, generator._max_hypotheses - len(ledger.items))
         )
@@ -210,10 +260,22 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
             allowance,
             local,
         )
+        if work.protocol_version >= 7:
+            validated = local.get("validated_assessments", [])
+            keep = []
+            for raw in carried.get(unit_id, []):
+                collection, item = result_payload(KINDS[raw["kind"]], raw, work.block, delivered)
+                expanded = expand_response_refs({collection: [item]}, delivered)[collection][0]
+                normalized = generator._resolve_discovery_sources(expanded, work.block)
+                if (raw["kind"], normalized) in validated:
+                    keep.append(raw)
+            carried[unit_id] = keep
         row = local["units"][unit_id]
-        finished = row["status"] in {"assessed", "capacity-deferred"} or any(
-            kind == "deferred_units" for kind, _ in entries
+        finished = (work.protocol_version < 7 or unit_id not in invalid_units) and (
+            row["status"] in {"assessed", "capacity-deferred"} or any(kind == "deferred_units" for kind, _ in entries)
         )
+        if finished:
+            carried.pop(unit_id, None)
         work.record["units"][unit_id] = row | {"finished": finished}
         committed += int(finished)
         feedback.append({"unit_id": unit_id, "result": row["status"], "reason": row.get("reason", "")})
@@ -225,7 +287,8 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         if item.unit_id in {unit.id for unit in work.block.units} and item.attempts == 0 and not item.observations:
             item.observations = copy.deepcopy(work.broker._observations)
     if errors or any("error" in entry for entry in feedback) or not (reads or committed):
-        work.flow["invalid_receipts"] += 1
+        if not counted_error:
+            work.flow["invalid_receipts"] += 1
         if not reads:
             work.flow["mode"] = "result"
     if had_result and work.pending:
@@ -257,6 +320,7 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
 
     if generator._executor is None:
         raise ValueError("protocol-6 discovery requires the pinned read-only executor")
+    policy = REPAIR_POLICY if ledger.protocol_version >= 7 else POLICY
     blocks = plan_discovery(
         changeset,
         pack,
@@ -298,14 +362,14 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
                 "source": generator._source,
                 "unit_ids": [u.id for u in block.units],
                 "units": {},
-                "submission_mode": POLICY,
+                "submission_mode": policy,
                 "status": "pending",
                 "head_sha": ledger.head_sha,
                 "workspace_digest": ledger.workspace_digest,
                 "observations": [],
                 "request_limit": request_limit,
                 "workflow": {
-                    "policy": POLICY,
+                    "policy": policy,
                     "mode": "acquire",
                     "read_requests": 0,
                     "result_requests": 0,
@@ -317,7 +381,7 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
         if (
             record.get("head_sha") != ledger.head_sha
             or record.get("workspace_digest") != ledger.workspace_digest
-            or record.get("workflow", {}).get("policy") != POLICY
+            or record.get("workflow", {}).get("policy") != policy
         ):
             raise ValueError("discovery-workflow-binding-mismatch")
         for unit in block.units:
@@ -327,7 +391,12 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             block.source_refs.update({ref: SourceLine(**source) for ref, source in record["source_registry"].items()})
             block.facts.extend(block.source_refs.values())
         aliases = record.setdefault("source_ref_aliases", source_aliases(block.source_refs, scoped=True))
-        broker = Investigator(None, generator._executor, protocol_version=6, evidence_cache=generator._evidence_cache)
+        broker = Investigator(
+            None,
+            generator._executor,
+            protocol_version=ledger.protocol_version,
+            evidence_cache=generator._evidence_cache,
+        )
         broker._state = state
         broker._observations = [restore_observation(raw) for raw in record["observations"]]
         broker._obs_counter = len(broker._observations)
@@ -344,7 +413,7 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             or flow["read_requests"] > READ_REQUESTS
         ):
             raise ValueError("invalid-discovery-workflow-counters")
-        worklist.append(Work(block, record, broker, aliases, session, order))
+        worklist.append(Work(block, record, broker, aliases, session, order, ledger.protocol_version))
     await checkpoint(generator, ledger)
     used = sum(record.get("session", {}).get("turns", 0) for record in ledger.discovery_blocks.values())
     while used < request_limit:
@@ -372,6 +441,8 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
                 generator._discovery_max_hypotheses_per_block, max(0, generator._max_hypotheses - len(ledger.items))
             )
             floor = _discovery_output_floor(len(other.pending), allowance, protocol_version=6)
+            if closing[4]["phase"] == "field-repair":
+                floor = min(4096, 512 + 256 * closing[4]["repair_record_count"])
             plan = plan_request(closing[0], closing[1], max_output_tokens=4096, fallback_available=available)
             costs[other.order] = plan.input_tokens + floor
             closings[other.order] = (closing, plan, floor)

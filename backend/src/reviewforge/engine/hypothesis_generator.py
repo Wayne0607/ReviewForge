@@ -1006,6 +1006,7 @@ class HypothesisGenerator:
                     continue
                 answers[unit_id].append((kind, raw))
         candidates = []
+        validated = []
         for unit_id, entries in answers.items():
             unit = units[unit_id]
             if not entries:
@@ -1023,6 +1024,7 @@ class HypothesisGenerator:
                         failed[unit_id] = "invalid deferred assessment"
                     else:
                         failed[unit_id] = "deferred: " + raw["reason"].strip()
+                        validated.append((kind, raw))
                     continue
                 raw = self._resolve_discovery_sources(raw, block)
                 if not self._valid_behavior(
@@ -1038,6 +1040,8 @@ class HypothesisGenerator:
                         or len(raw["checked"]) > 600
                     ):
                         failed[unit_id] = "missing concrete checked boundary"
+                    else:
+                        validated.append((kind, raw))
                     continue
                 if ledger.protocol_version < 4 and not self._valid_violation(raw, block):
                     failed[unit_id] = "invalid source-backed violation obligations"
@@ -1045,6 +1049,10 @@ class HypothesisGenerator:
                     continue
                 payload, sites = self._validate_hypothesis(raw, right_lines)
                 required = ("claim", "trigger", "impact", "open_question", "refutation", "discrepancy")
+                if ledger.protocol_version >= 7:
+                    # A lead already states the alleged violation in claim,
+                    # trigger and impact. Duplicate prose is not new evidence.
+                    required = required[:-1]
                 if (
                     payload is None
                     or any(
@@ -1091,8 +1099,27 @@ class HypothesisGenerator:
                     continue
                 candidates.append(raw)
         candidates.sort(key=lambda raw: (-_SEVERITY_PRIORITY[raw["severity"]], raw["unit_id"], raw["claim"]))
-        kept = candidates[:allowance]
-        for raw in candidates[allowance:]:
+        repeated = []
+        if ledger.protocol_version >= 7:
+            for raw in candidates:
+                # A saved valid sibling remains part of the unit transaction.
+                # Rechecking it cannot consume another candidate slot, or a
+                # repair at the PR cap could never finish that unit.
+                if any(
+                    item.unit_id == raw["unit_id"]
+                    and item.mechanism == raw["mechanism"]
+                    and all(
+                        getattr(item, field) == raw[field].strip()
+                        for field in ("claim", "trigger", "impact", "open_question", "refutation")
+                    )
+                    and [(site.path, site.line, site.excerpt) for site in item.sites]
+                    == [(site["path"], site["line"], site["excerpt"]) for site in raw["sites"]]
+                    for item in ledger.items.values()
+                ):
+                    repeated.append(raw)
+        fresh = [raw for raw in candidates if raw not in repeated]
+        kept = [*repeated, *fresh[:allowance]]
+        for raw in fresh[allowance:]:
             result.dropped_overflow += 1
             failed[raw["unit_id"]] = "capacity-deferred: PR candidate limit"
         if kept:
@@ -1104,6 +1131,8 @@ class HypothesisGenerator:
                 units,
                 structural_changes=block.structural_changes,
             )
+        if ledger.protocol_version >= 7:
+            record["validated_assessments"] = [*validated, *(("hypothesis", raw) for raw in kept)]
         for unit_id, entries in answers.items():
             if record.get("output_framing", {}).get("complete") is False:
                 # Complete prefix candidates are still useful leads; a damaged

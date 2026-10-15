@@ -44,7 +44,7 @@ from reviewforge.engine.proof_gate import _scope_matches as proof_scope_matches
 from reviewforge.engine.proof_gate import retryable as proof_retryable
 from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy
 from reviewforge.engine.publication_delivery import DeliveryOutcome, deliver_saved_publication
-from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
+from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget, budget_snapshot_over_limit
 from reviewforge.engine.run_health import RunHealth
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
@@ -967,6 +967,7 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
                 ledger.request_budget.get("reported_tokens", 0)
                 + ledger.request_budget.get("unreported_reserved_tokens", 0)
                 > config.max_tokens_per_pr
+                or budget_snapshot_over_limit(ledger.request_budget)
                 or ledger.request_budget.get("denied_requests", 0) > 0
             )
             if ledger.protocol_version >= 3

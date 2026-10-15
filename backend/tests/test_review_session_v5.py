@@ -501,9 +501,9 @@ def test_wire_receipts_observe_real_http_tools_without_headers_messages_or_respo
     assert "submit_unknown" in saved and "find_definition" in saved
 
 
-def test_new_default_is_frozen_protocol5_and_old_explicit_versions_remain_available():
-    assert PipelineV4Config().protocol_version == 6 and PipelineV4Config().mode == "legacy"
-    for version in range(1, 7):
+def test_new_default_and_old_explicit_versions_remain_available():
+    assert PipelineV4Config().protocol_version == 7 and PipelineV4Config().mode == "legacy"
+    for version in range(1, 8):
         assert _pipeline_v4_from_dict({"protocol_version": version}).protocol_version == version
 
 

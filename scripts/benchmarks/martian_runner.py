@@ -557,6 +557,24 @@ async def _run_one(
 
 
 async def main_async(args: argparse.Namespace) -> None:
+    from authorized_budget import authorized_budget
+
+    limit = getattr(args, "token_budget", 0)
+    path = Path(args.output).resolve().parent / "authorized-budget.json"
+    if limit < 0 or limit and args.pipeline != "hypothesis":
+        raise ValueError("--token-budget requires a positive limit and the hypothesis pipeline")
+    if not limit:
+        if path.exists():
+            raise ValueError("resume requires the original --token-budget")
+        return await _main_async(args)
+    if not path.exists() and (Path(args.output).exists() or path.with_name("metadata.json").exists()):
+        raise ValueError("cannot attach a fresh grant to an existing run; use a new output directory")
+    identity = "benchmark:" + hashlib.sha256(str(path).encode()).hexdigest()[:24]
+    with authorized_budget(path, limit=limit, identity=identity):
+        await _main_async(args)
+
+
+async def _main_async(args: argparse.Namespace) -> None:
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
     try:
@@ -606,6 +624,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "limit": args.limit,
         "generator_max_input_chars_override": args.generator_max_input_chars,
         "require_complete_workspace": args.require_complete_workspace,
+        "authorized_token_budget": getattr(args, "token_budget", 0),
     }
 
     orchestrator, db, raw_github = await _build_runtime(
@@ -691,6 +710,12 @@ def main() -> None:
     parser.add_argument("--workload", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=0,
+        help="Already authorized shared token ceiling for hypothesis PRs; persisted across resume, including retries",
+    )
     parser.add_argument("--reviewer-concurrency", type=int, default=4)
     parser.add_argument("--publication-gate-concurrency", type=int, default=1)
     parser.add_argument("--capture-invalid-outputs", action="store_true")

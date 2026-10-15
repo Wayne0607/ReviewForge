@@ -24,7 +24,7 @@ from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, Hypothes
 from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.publication_contracts import contract_catalog
-from reviewforge.engine.request_budget import plan_request
+from reviewforge.engine.request_budget import budget_snapshot_over_limit, plan_request
 from reviewforge.engine.source_audit import audit_hash, run_source_audit
 from reviewforge.engine.source_audit import current as audit_current
 from reviewforge.engine.verification_guidance import (
@@ -493,11 +493,7 @@ def _live_available(llm: Any, messages: list[Any]) -> int | None:
 
 
 def _over_budget(ledger: HypothesisLedger) -> bool:
-    budget = ledger.request_budget or {}
-    return (
-        "limit" in budget
-        and budget.get("reported_tokens", 0) + budget.get("unreported_reserved_tokens", 0) > budget["limit"]
-    )
+    return budget_snapshot_over_limit(ledger.request_budget or {})
 
 
 class ProofGate:

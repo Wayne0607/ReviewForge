@@ -55,6 +55,8 @@ class RequestBudget:
         self.serial = max(0, int(previous.get("request_count", 0)))
         self.unreported_requests = copy.deepcopy(previous.get("unreported_requests", {}))
         self.reconciliations = copy.deepcopy(previous.get("reconciliations", {}))
+        self.external_binding = copy.deepcopy(previous.get("external_budget", {}))
+        self.external = None
         # A process interrupted after dispatch has no reliable usage receipt.
         for identity, entry in previous.get("pending", {}).items():
             amount = max(0, int(entry["reserved_tokens"]))
@@ -81,9 +83,38 @@ class RequestBudget:
         self.investigation_reserve = min(self.limit, max(0, investigation))
         self.allocation = copy.deepcopy(basis)
 
+    def bind_external(self, scope) -> None:
+        """Bind an authorization envelope before allocating any stage credit.
+
+        The grant is a ceiling on the same currency, not another phase budget.
+        A saved grant cannot disappear or be replaced on checkpoint recovery.
+        """
+        if scope is None:
+            if self.external_binding:
+                raise ValueError("saved external budget scope is required")
+            return
+        binding = {"id": scope.identity, "limit": scope.budget.limit}
+        if scope.budget is self or scope.budget.external is not None:
+            raise ValueError("external budget must be an independent root envelope")
+        if self.external_binding and (
+            self.external_binding["id"] != scope.identity or scope.budget.limit > self.external_binding["limit"]
+        ):
+            raise ValueError("external budget identity or frozen limit changed")
+        if self.external is not None and self.external is not scope:
+            raise ValueError("budget is already bound to another live scope")
+        self.external_binding, self.external = binding, scope
+
     def available(self, phase: str) -> int:
         pending = sum(item["reserved_tokens"] for item in self.pending.values())
         remaining = self.limit - self.reported - self.unreported - pending
+        if self.external_binding and self.external is None:
+            return 0  # A recovered run cannot spend before its grant is restored.
+        if self.external is not None:
+            if not self.external.active:
+                return 0
+            # Intersect raw balances FIRST. min(PR - reserve, grant) would let
+            # discovery consume money needed for investigation and verification.
+            remaining = min(remaining, self.external.budget.available("editor"))
         if phase != "editor":
             remaining -= self.editor_reserve
         if phase == "discovery":
@@ -153,9 +184,19 @@ class RequestBudget:
 
     @property
     def over_limit(self) -> bool:
-        return self.reported + self.unreported > self.limit
+        return self.reported + self.unreported > self.limit or (
+            self.external is not None and self.external.budget.over_limit
+        )
 
     def snapshot(self) -> dict[str, Any]:
+        external_receipt = copy.deepcopy(self.external_binding)
+        if self.external is not None:
+            grant = self.external.budget
+            external_receipt.update(
+                reported_tokens=grant.reported,
+                unreported_reserved_tokens=grant.unreported,
+                pending_reserved_tokens=sum(row["reserved_tokens"] for row in grant.pending.values()),
+            )
         return {
             "version": 2 if self.adaptive else 1,
             "limit": self.limit,
@@ -170,6 +211,7 @@ class RequestBudget:
             "request_count": self.serial,
             "unreported_requests": copy.deepcopy(self.unreported_requests),
             "reconciliations": copy.deepcopy(self.reconciliations),
+            **({"external_budget": external_receipt} if external_receipt else {}),
             **(
                 {
                     "allocation_policy": "adaptive-v1",
@@ -182,11 +224,51 @@ class RequestBudget:
         }
 
 
+def budget_snapshot_over_limit(snapshot: dict[str, Any]) -> bool:
+    """Publication/completeness must honor the same limits as admission."""
+    return any(
+        "limit" in row and row.get("reported_tokens", 0) + row.get("unreported_reserved_tokens", 0) > row["limit"]
+        for row in (snapshot, snapshot.get("external_budget", {}))
+    )
+
+
 class TaskRequestBudget(RequestBudget):
     def __init__(self, limit: int, *, task_id: str = ""):
         super().__init__(limit, discovery_limit=limit, editor_reserve=0)
         self.task_id = task_id
         self.progress_steps = 0
+
+
+@dataclass
+class ExternalBudgetScope:
+    budget: RequestBudget
+    identity: str
+    on_change: Callable[[dict[str, Any]], Awaitable[None]]
+    active: bool = True
+
+
+_external_budget: contextvars.ContextVar[ExternalBudgetScope | None] = contextvars.ContextVar(
+    "v4_external_request_budget", default=None
+)
+
+
+@contextmanager
+def external_request_budget_scope(budget: RequestBudget, *, identity: str, on_change):
+    """Share one durable grant across sequential PRs and an optional judge.
+
+    The caller restores the grant snapshot and persists every callback before
+    dispatch. Provider attempts are charged to both ledgers exactly once; these
+    are two views of the same cost and must not be added together.
+    """
+    if not identity.strip() or not callable(on_change) or _external_budget.get() is not None:
+        raise ValueError("a named, persistent, non-nested external budget is required")
+    scope = ExternalBudgetScope(budget, identity, on_change)
+    token = _external_budget.set(scope)
+    try:
+        yield budget
+    finally:
+        scope.active = False
+        _external_budget.reset(token)
 
 
 _task_budget: contextvars.ContextVar[TaskRequestBudget | None] = contextvars.ContextVar(
@@ -287,9 +369,13 @@ class BudgetedChatLLM(BaseChatModel):
 
     def __init__(self, inner, budget, *, phase, on_change=None):
         super().__init__()
+        budget.bind_external(_external_budget.get())
         self._inner, self._budget, self._phase, self._on_change = inner, budget, phase, on_change
 
     async def _changed(self):
+        if self._budget.external is not None and self._budget.external.active:
+            scope = self._budget.external
+            await scope.on_change(scope.budget.snapshot())
         if self._on_change is not None:
             await self._on_change(self._budget.snapshot())
 
@@ -308,7 +394,8 @@ class BudgetedChatLLM(BaseChatModel):
             raise ValueError("a finite positive output budget is required")
         estimate = estimate_request(messages, options) + maximum
         task_budget = _task_budget.get()
-        identity = task_identity = None
+        external = self._budget.external
+        identity = task_identity = external_identity = None
         try:
             identity = self._budget.reserve(
                 self._phase,
@@ -318,9 +405,15 @@ class BudgetedChatLLM(BaseChatModel):
             )
             if task_budget is not None:
                 task_identity = task_budget.reserve(self._phase, estimate)
+            if external is not None:
+                external_identity = external.budget.reserve("editor", estimate)
+                self._budget.pending[identity]["external_request_id"] = external_identity
+                external.budget.pending[external_identity].update(review_request_id=identity, review_phase=self._phase)
         except RequestBudgetExceededError:
             if identity is not None:
                 self._budget.release(identity)
+            if task_identity is not None:
+                task_budget.release(task_identity)
             await self._changed()
             raise
         try:
@@ -331,6 +424,8 @@ class BudgetedChatLLM(BaseChatModel):
             self._budget.release(identity)
             if task_identity is not None:
                 task_budget.release(task_identity)
+            if external_identity is not None:
+                external.budget.release(external_identity)
             raise
         try:
             result = await self._inner._agenerate(messages, stop, run_manager, **options)
@@ -338,12 +433,16 @@ class BudgetedChatLLM(BaseChatModel):
             self._budget.settle(identity, None)
             if task_identity is not None:
                 task_budget.settle(task_identity, None)
+            if external_identity is not None:
+                external.budget.settle(external_identity, None)
             await self._changed()
             raise
         actual = _actual_usage(result)
         self._budget.settle(identity, actual)
         if task_identity is not None:
             task_budget.settle(task_identity, actual)
+        if external_identity is not None:
+            external.budget.settle(external_identity, actual)
         await self._changed()
         return result
 

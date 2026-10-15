@@ -65,6 +65,44 @@ async def test_benchmark_runtime_loads_config_and_blocks_all_real_github_writes(
 
 
 @pytest.mark.asyncio
+async def test_runner_native_grant_persists_calls_and_rejects_missing_scope_on_resume(runner, monkeypatch, tmp_path):
+    from test_request_budget import _Model
+
+    from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
+
+    invocations = []
+
+    async def exercise(_args):
+        invocations.append(True)
+        await BudgetedChatLLM(_Model(), RequestBudget(250_000), phase="editor").ainvoke([])
+
+    monkeypatch.setattr(runner, "_main_async", exercise)
+    args = SimpleNamespace(output=str(tmp_path / "results.json"), token_budget=10_000, pipeline="hypothesis")
+    await runner.main_async(args)
+    await runner.main_async(args)
+    saved = json.loads((tmp_path / "authorized-budget.json").read_text())
+    assert saved["budget"]["reported_tokens"] == 24 and saved["budget"]["request_count"] == 2
+    args.token_budget = 0
+    with pytest.raises(ValueError, match="original"):
+        await runner.main_async(args)
+    args.token_budget = 20_000
+    with pytest.raises(ValueError, match="changed"):
+        await runner.main_async(args)
+    args.pipeline = "legacy"
+    with pytest.raises(ValueError, match="hypothesis"):
+        await runner.main_async(args)
+    assert len(invocations) == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_refuses_fresh_credit_for_existing_results(runner, tmp_path):
+    output = tmp_path / "results.json"
+    output.write_text("[]")
+    with pytest.raises(ValueError, match="fresh grant"):
+        await runner.main_async(SimpleNamespace(output=str(output), token_budget=10_000, pipeline="hypothesis"))
+
+
+@pytest.mark.asyncio
 async def test_benchmark_actual_sdk_sends_one_http_attempt_on_429(runner, monkeypatch, tmp_path):
     from langchain_core.messages import HumanMessage
     from openai import RateLimitError

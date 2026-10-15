@@ -1,0 +1,3302 @@
+{
+  "source_revision": "965f4830519b60510646d157cc429e633d157f86",
+  "cases": [
+    {
+      "input_file": "0eaeace72e0b4986851e466305045e50-input.json",
+      "input_sha256": "ae7e1676cf2293830784cc4c6d547f99ca908370ccaade4c3cb5c2c221de6370",
+      "output_file": "0eaeace72e0b4986851e466305045e50-output.json",
+      "output_sha256": "8d5bd2115163a39fcd4aad9c22d9d8c7c10a016e7998542a6ea6a951a570ef3d",
+      "original_record": {
+        "unit_id": "su_e88cc243923359cd",
+        "source_refs": [
+          "f10.R12",
+          "f10.R19",
+          "f10.R26",
+          "f10.R31",
+          "f10.R32",
+          "f10.R33",
+          "f10.R34",
+          "f10.R39",
+          "f10.R40",
+          "f10.R41",
+          "f10.R42",
+          "f10.R46",
+          "f10.R47",
+          "f10.R57",
+          "f10.R58",
+          "f10.R64",
+          "f10.R65",
+          "f10.R66",
+          "f10.R67",
+          "f10.R77",
+          "f10.R83",
+          "f10.R84",
+          "f10.R85",
+          "f10.R86"
+        ],
+        "checked": "",
+        "kind": "deferred",
+        "reason": "MultiEmail.tsx is new (f10.R1-R96 delivered), but its consumers/contract are not in the delivered source: MultiEmailLazy.tsx (su_dde0ee33daa48ac3) and AddGuestsDialog.tsx (su_48/su_24 units) were not supplied, so I cannot verify how `value`/`setValue` are wired (field-array vs controlled state) or whether index-keyed list mutation causes a user-visible regression. Without that boundary the discrepancy is unverifiable."
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "extra_forbidden"
+        },
+        {
+          "field": [
+            "checked"
+          ],
+          "type": "extra_forbidden"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_e88cc243923359cd",
+        "path": "packages/ui/form/MultiEmail.tsx",
+        "symbol": "MultiEmail",
+        "before_state": "absent-before-in-delivered-source",
+        "required_source_sides": [
+          [],
+          [
+            "f10.R12",
+            "f10.R13",
+            "f10.R14",
+            "f10.R15",
+            "f10.R16.s1",
+            "f10.R16.s2",
+            "f10.R17",
+            "f10.R18",
+            "f10.R19",
+            "f10.R20",
+            "f10.R21",
+            "f10.R22",
+            "f10.R23",
+            "f10.R24",
+            "f10.R25",
+            "f10.R26",
+            "f10.R27",
+            "f10.R28",
+            "f10.R29",
+            "f10.R30",
+            "f10.R31",
+            "f10.R32",
+            "f10.R33",
+            "f10.R34",
+            "f10.R35",
+            "f10.R36",
+            "f10.R37",
+            "f10.R38",
+            "f10.R39",
+            "f10.R40",
+            "f10.R41",
+            "f10.R42",
+            "f10.R43",
+            "f10.R44",
+            "f10.R45",
+            "f10.R46",
+            "f10.R47",
+            "f10.R48",
+            "f10.R49",
+            "f10.R50",
+            "f10.R51",
+            "f10.R52",
+            "f10.R53",
+            "f10.R54",
+            "f10.R55",
+            "f10.R56",
+            "f10.R57",
+            "f10.R58",
+            "f10.R59",
+            "f10.R60",
+            "f10.R61",
+            "f10.R62",
+            "f10.R63",
+            "f10.R64",
+            "f10.R65",
+            "f10.R66",
+            "f10.R67",
+            "f10.R68",
+            "f10.R69",
+            "f10.R70",
+            "f10.R71",
+            "f10.R72",
+            "f10.R73",
+            "f10.R74",
+            "f10.R75",
+            "f10.R77",
+            "f10.R78",
+            "f10.R79",
+            "f10.R80",
+            "f10.R81",
+            "f10.R82",
+            "f10.R83",
+            "f10.R84",
+            "f10.R85",
+            "f10.R86",
+            "f10.R87",
+            "f10.R88",
+            "f10.R89",
+            "f10.R90",
+            "f10.R91",
+            "f10.R92",
+            "f10.R93",
+            "f10.R94"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f10.R12",
+          "f10.R13",
+          "f10.R14",
+          "f10.R15",
+          "f10.R16.s1",
+          "f10.R16.s2",
+          "f10.R19",
+          "f10.R20",
+          "f10.R21",
+          "f10.R22",
+          "f10.R23",
+          "f10.R24",
+          "f10.R25",
+          "f10.R26",
+          "f10.R27",
+          "f10.R28",
+          "f10.R29",
+          "f10.R30",
+          "f10.R31",
+          "f10.R32",
+          "f10.R33",
+          "f10.R34",
+          "f10.R35",
+          "f10.R36",
+          "f10.R37",
+          "f10.R38",
+          "f10.R39",
+          "f10.R40",
+          "f10.R41",
+          "f10.R42",
+          "f10.R43",
+          "f10.R44",
+          "f10.R45",
+          "f10.R46",
+          "f10.R47",
+          "f10.R48",
+          "f10.R49",
+          "f10.R50",
+          "f10.R51",
+          "f10.R52",
+          "f10.R53",
+          "f10.R54",
+          "f10.R55",
+          "f10.R56",
+          "f10.R57",
+          "f10.R58",
+          "f10.R59",
+          "f10.R60",
+          "f10.R61",
+          "f10.R62",
+          "f10.R63",
+          "f10.R64",
+          "f10.R65",
+          "f10.R66",
+          "f10.R67",
+          "f10.R68",
+          "f10.R69",
+          "f10.R70",
+          "f10.R71",
+          "f10.R72",
+          "f10.R74",
+          "f10.R77",
+          "f10.R78",
+          "f10.R79",
+          "f10.R80",
+          "f10.R81",
+          "f10.R82",
+          "f10.R83",
+          "f10.R84",
+          "f10.R85",
+          "f10.R86",
+          "f10.R87",
+          "f10.R88",
+          "f10.R89",
+          "f10.R90"
+        ]
+      },
+      "files": {
+        "f3": "packages/emails/src/templates/index.ts",
+        "f6": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f10": "packages/ui/form/MultiEmail.tsx",
+        "f11": "packages/ui/index.tsx",
+        "f4": "packages/lib/hooks/useLocale.ts",
+        "f8": "packages/ui/components/form/inputs/Input.tsx",
+        "f9": "packages/ui/components/form/inputs/InputFieldWithSelect.tsx",
+        "f0": "apps/api/package.json",
+        "f1": "apps/api/v1/package.json",
+        "f2": "apps/api/v2/tsconfig.json",
+        "f7": "packages/trpc/server/routers/viewer/teams/inviteMember/inviteMember.handler.test.ts",
+        "f5": "packages/lib/server/queries/teams/index.ts"
+      },
+      "rows": [
+        [
+          "f10.R12",
+          "function MultiEmail({ value, readOnly, label, setValue, placeholder }: MultiEmailProps) {"
+        ],
+        [
+          "f10.R13",
+          "  const { t } = useLocale();"
+        ],
+        [
+          "f10.R14",
+          "  value = value || [];"
+        ],
+        [
+          "f10.R15",
+          "  const inputClassName ="
+        ],
+        [
+          "f10.R16.s2",
+          "    \"dark:placeholder:text-muted focus:border-emphasis border-subtle block w-full rounded-md border-default text-sm focus:ring-"
+        ],
+        [
+          "f10.R16.s1",
+          "black disabled:bg-emphasis disabled:hover:cursor-not-allowed dark:selection:bg-green-500 disabled:dark:text-subtle bg-default\";"
+        ],
+        [
+          "f10.R17",
+          "  return ("
+        ],
+        [
+          "f10.R18",
+          "    <>"
+        ],
+        [
+          "f10.R19",
+          "      {value.length ? ("
+        ],
+        [
+          "f10.R20",
+          "        <div>"
+        ],
+        [
+          "f10.R21",
+          "          <label htmlFor=\"emails\" className=\"text-default my-2 block text-sm font-medium\">"
+        ],
+        [
+          "f10.R22",
+          "            {label}"
+        ],
+        [
+          "f10.R23",
+          "          </label>"
+        ],
+        [
+          "f10.R24",
+          "          <ul>"
+        ],
+        [
+          "f10.R25",
+          "            {value.map((field, index) => ("
+        ],
+        [
+          "f10.R26",
+          "              <li key={index}>"
+        ],
+        [
+          "f10.R27",
+          "                <EmailField"
+        ],
+        [
+          "f10.R28",
+          "                  disabled={readOnly}"
+        ],
+        [
+          "f10.R29",
+          "                  value={field}"
+        ],
+        [
+          "f10.R30",
+          "                  className={inputClassName}"
+        ],
+        [
+          "f10.R31",
+          "                  onChange={(e) => {"
+        ],
+        [
+          "f10.R32",
+          "                    const updatedValue = [...value];"
+        ],
+        [
+          "f10.R33",
+          "                    updatedValue[index] = e.target.value;"
+        ],
+        [
+          "f10.R34",
+          "                    setValue(updatedValue);"
+        ],
+        [
+          "f10.R35",
+          "                  }}"
+        ],
+        [
+          "f10.R36",
+          "                  placeholder={placeholder}"
+        ],
+        [
+          "f10.R37",
+          "                  label={<></>}"
+        ],
+        [
+          "f10.R38",
+          "                  required"
+        ],
+        [
+          "f10.R39",
+          "                  onClickAddon={() => {"
+        ],
+        [
+          "f10.R40",
+          "                    const updatedValue = [...value];"
+        ],
+        [
+          "f10.R41",
+          "                    updatedValue.splice(index, 1);"
+        ],
+        [
+          "f10.R42",
+          "                    setValue(updatedValue);"
+        ],
+        [
+          "f10.R43",
+          "                  }}"
+        ],
+        [
+          "f10.R44",
+          "                  addOnSuffix={"
+        ],
+        [
+          "f10.R45",
+          "                    !readOnly ? ("
+        ],
+        [
+          "f10.R46",
+          "                      <Tooltip content=\"Remove email\">"
+        ],
+        [
+          "f10.R47",
+          "                        <button className=\"m-1\" type=\"button\">"
+        ],
+        [
+          "f10.R48",
+          "                          <Icon name=\"x\" width={12} className=\"text-default\" />"
+        ],
+        [
+          "f10.R49",
+          "                        </button>"
+        ],
+        [
+          "f10.R50",
+          "                      </Tooltip>"
+        ],
+        [
+          "f10.R51",
+          "                    ) : null"
+        ],
+        [
+          "f10.R52",
+          "                  }"
+        ],
+        [
+          "f10.R53",
+          "                />"
+        ],
+        [
+          "f10.R54",
+          "              </li>"
+        ],
+        [
+          "f10.R55",
+          "            ))}"
+        ],
+        [
+          "f10.R56",
+          "          </ul>"
+        ],
+        [
+          "f10.R57",
+          "          {!readOnly && ("
+        ],
+        [
+          "f10.R58",
+          "            <Button"
+        ],
+        [
+          "f10.R59",
+          "              data-testid=\"add-another-email\""
+        ],
+        [
+          "f10.R60",
+          "              type=\"button\""
+        ],
+        [
+          "f10.R61",
+          "              color=\"minimal\""
+        ],
+        [
+          "f10.R62",
+          "              StartIcon=\"user-plus\""
+        ],
+        [
+          "f10.R63",
+          "              className=\"my-2.5\""
+        ],
+        [
+          "f10.R64",
+          "              onClick={() => {"
+        ],
+        [
+          "f10.R65",
+          "                const updatedValue = [...value];"
+        ],
+        [
+          "f10.R66",
+          "                updatedValue.push(\"\");"
+        ],
+        [
+          "f10.R67",
+          "                setValue(updatedValue);"
+        ],
+        [
+          "f10.R68",
+          "              }}>"
+        ],
+        [
+          "f10.R69",
+          "              {t(\"add_another\")}"
+        ],
+        [
+          "f10.R70",
+          "            </Button>"
+        ],
+        [
+          "f10.R71",
+          "          )}"
+        ],
+        [
+          "f10.R72",
+          "        </div>"
+        ],
+        [
+          "f10.R73",
+          "      ) : ("
+        ],
+        [
+          "f10.R74",
+          "        <></>"
+        ],
+        [
+          "f10.R75",
+          "      )}"
+        ],
+        [
+          "f10.R77",
+          "      {!value.length && !readOnly && ("
+        ],
+        [
+          "f10.R78",
+          "        <Button"
+        ],
+        [
+          "f10.R79",
+          "          data-testid=\"add-emails\""
+        ],
+        [
+          "f10.R80",
+          "          color=\"minimal\""
+        ],
+        [
+          "f10.R81",
+          "          variant=\"button\""
+        ],
+        [
+          "f10.R82",
+          "          StartIcon=\"user-plus\""
+        ],
+        [
+          "f10.R83",
+          "          onClick={() => {"
+        ],
+        [
+          "f10.R84",
+          "            const updatedValue = [...value];"
+        ],
+        [
+          "f10.R85",
+          "            updatedValue.push(\"\");"
+        ],
+        [
+          "f10.R86",
+          "            setValue(updatedValue);"
+        ],
+        [
+          "f10.R87",
+          "          }}"
+        ],
+        [
+          "f10.R88",
+          "          className=\"mr-auto\">"
+        ],
+        [
+          "f10.R89",
+          "          {label}"
+        ],
+        [
+          "f10.R90",
+          "        </Button>"
+        ],
+        [
+          "f10.R91",
+          "      )}"
+        ],
+        [
+          "f10.R92",
+          "    </>"
+        ],
+        [
+          "f10.R93",
+          "  );"
+        ],
+        [
+          "f10.R94",
+          "}"
+        ]
+      ]
+    },
+    {
+      "input_file": "0eaeace72e0b4986851e466305045e50-input.json",
+      "input_sha256": "ae7e1676cf2293830784cc4c6d547f99ca908370ccaade4c3cb5c2c221de6370",
+      "output_file": "0eaeace72e0b4986851e466305045e50-output.json",
+      "output_sha256": "8d5bd2115163a39fcd4aad9c22d9d8c7c10a016e7998542a6ea6a951a570ef3d",
+      "original_record": {
+        "unit_id": "su_01b6b37bcb346117",
+        "source_refs": [
+          "f3.R38",
+          "f3.R39",
+          "f3.B35",
+          "f3.B36",
+          "f3.B37",
+          "f3.R40"
+        ],
+        "checked": "Compared head RIGHT lines f3.R38/f3.R39 against base context f3.B35-B37 and head f3.R40: the change is purely additive, inserting two named re-exports (OrganizerAddGuestsEmail, AttendeeAddGuestsEmail) between existing ones with no line removed or reordered semantics. Verified each added export uses the same `export { X } from \"./X\"` barrel pattern as surrounding lines; no duplicate identifier among delivered lines, no changed specifier for an existing template, and the prior exports (BookingRedirectEmailNotification, VerifyEmailChangeEmail, OrganizationCreationEmail, OrganizationAdminNoSlotsEmail) are byte-identical before/after.",
+        "kind": "no_issue"
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "checked"
+          ],
+          "type": "string_too_long"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_01b6b37bcb346117",
+        "path": "packages/emails/src/templates/index.ts",
+        "symbol": "",
+        "before_state": "unresolved-declaration-correspondence",
+        "required_source_sides": [
+          [],
+          [
+            "f3.R38",
+            "f3.R39"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f3.R35",
+          "f3.R36",
+          "f3.R37",
+          "f3.R38",
+          "f3.R39",
+          "f3.R40"
+        ]
+      },
+      "files": {
+        "f3": "packages/emails/src/templates/index.ts",
+        "f6": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f10": "packages/ui/form/MultiEmail.tsx",
+        "f11": "packages/ui/index.tsx",
+        "f4": "packages/lib/hooks/useLocale.ts",
+        "f8": "packages/ui/components/form/inputs/Input.tsx",
+        "f9": "packages/ui/components/form/inputs/InputFieldWithSelect.tsx",
+        "f0": "apps/api/package.json",
+        "f1": "apps/api/v1/package.json",
+        "f2": "apps/api/v2/tsconfig.json",
+        "f7": "packages/trpc/server/routers/viewer/teams/inviteMember/inviteMember.handler.test.ts",
+        "f5": "packages/lib/server/queries/teams/index.ts"
+      },
+      "rows": [
+        [
+          "f3.B35",
+          "export { BookingRedirectEmailNotification } from \"./BookingRedirectEmailNotification\";"
+        ],
+        [
+          "f3.R35",
+          "export { BookingRedirectEmailNotification } from \"./BookingRedirectEmailNotification\";"
+        ],
+        [
+          "f3.B36",
+          "export { VerifyEmailChangeEmail } from \"./VerifyEmailChangeEmail\";"
+        ],
+        [
+          "f3.R36",
+          "export { VerifyEmailChangeEmail } from \"./VerifyEmailChangeEmail\";"
+        ],
+        [
+          "f3.B37",
+          "export { OrganizationCreationEmail } from \"./OrganizationCreationEmail\";"
+        ],
+        [
+          "f3.R37",
+          "export { OrganizationCreationEmail } from \"./OrganizationCreationEmail\";"
+        ],
+        [
+          "f3.R38",
+          "export { OrganizerAddGuestsEmail } from \"./OrganizerAddGuestsEmail\";"
+        ],
+        [
+          "f3.R39",
+          "export { AttendeeAddGuestsEmail } from \"./AttendeeAddGuestsEmail\";"
+        ],
+        [
+          "f3.R40",
+          "export { OrganizationAdminNoSlotsEmail } from \"./OrganizationAdminNoSlots\";"
+        ]
+      ]
+    },
+    {
+      "input_file": "0eaeace72e0b4986851e466305045e50-input.json",
+      "input_sha256": "ae7e1676cf2293830784cc4c6d547f99ca908370ccaade4c3cb5c2c221de6370",
+      "output_file": "0eaeace72e0b4986851e466305045e50-output.json",
+      "output_sha256": "8d5bd2115163a39fcd4aad9c22d9d8c7c10a016e7998542a6ea6a951a570ef3d",
+      "original_record": {
+        "unit_id": "su_d587a9f1b82290cb",
+        "source_refs": [
+          "f11.R150",
+          "f11.R151",
+          "f11.R152",
+          "f11.R153",
+          "f11.R154",
+          "f11.B150",
+          "f11.B151",
+          "f11.B152",
+          "f11.B153"
+        ],
+        "checked": "Traced the changed public surface: head adds `export { default as MultiEmail } from \"./form/MultiEmailLazy\";` (f11.R153) between PhoneInput (f11.R152) and UnstyledSelect (f11.R154); base lines f11.B150-B152 are unchanged and f11.B153 UnstyledSelect is preserved at f11.R154, so no existing alias was renamed, dropped or shadowed. The new alias follows the identical lazy-re-export convention used by AddressInput/PhoneInput, and the package's own consumer packages/ui/form/MultiEmail.tsx imports only Button/EmailField/Icon/Tooltip from \"@calcom/ui\" (f10.R2), i.e. it does not self-import MultiEmail, so no circular-name collision is introduced by this line.",
+        "kind": "no_issue"
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "checked"
+          ],
+          "type": "string_too_long"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_d587a9f1b82290cb",
+        "path": "packages/ui/index.tsx",
+        "symbol": "",
+        "before_state": "unresolved-declaration-correspondence",
+        "required_source_sides": [
+          [],
+          [
+            "f11.R153"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f11.R150",
+          "f11.R151",
+          "f11.R152",
+          "f11.R153",
+          "f11.R154"
+        ]
+      },
+      "files": {
+        "f3": "packages/emails/src/templates/index.ts",
+        "f6": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f10": "packages/ui/form/MultiEmail.tsx",
+        "f11": "packages/ui/index.tsx",
+        "f4": "packages/lib/hooks/useLocale.ts",
+        "f8": "packages/ui/components/form/inputs/Input.tsx",
+        "f9": "packages/ui/components/form/inputs/InputFieldWithSelect.tsx",
+        "f0": "apps/api/package.json",
+        "f1": "apps/api/v1/package.json",
+        "f2": "apps/api/v2/tsconfig.json",
+        "f7": "packages/trpc/server/routers/viewer/teams/inviteMember/inviteMember.handler.test.ts",
+        "f5": "packages/lib/server/queries/teams/index.ts"
+      },
+      "rows": [
+        [
+          "f11.B150",
+          "/** ⬇️ TODO - Move these to components */"
+        ],
+        [
+          "f11.R150",
+          "/** ⬇️ TODO - Move these to components */"
+        ],
+        [
+          "f11.B151",
+          "export { default as AddressInput } from \"./form/AddressInputLazy\";"
+        ],
+        [
+          "f11.R151",
+          "export { default as AddressInput } from \"./form/AddressInputLazy\";"
+        ],
+        [
+          "f11.B152",
+          "export { default as PhoneInput } from \"./form/PhoneInputLazy\";"
+        ],
+        [
+          "f11.R152",
+          "export { default as PhoneInput } from \"./form/PhoneInputLazy\";"
+        ],
+        [
+          "f11.R153",
+          "export { default as MultiEmail } from \"./form/MultiEmailLazy\";"
+        ],
+        [
+          "f11.B153",
+          "export { UnstyledSelect } from \"./form/Select\";"
+        ],
+        [
+          "f11.R154",
+          "export { UnstyledSelect } from \"./form/Select\";"
+        ]
+      ]
+    },
+    {
+      "input_file": "0eaeace72e0b4986851e466305045e50-input.json",
+      "input_sha256": "ae7e1676cf2293830784cc4c6d547f99ca908370ccaade4c3cb5c2c221de6370",
+      "output_file": "0eaeace72e0b4986851e466305045e50-output.json",
+      "output_sha256": "8d5bd2115163a39fcd4aad9c22d9d8c7c10a016e7998542a6ea6a951a570ef3d",
+      "original_record": {
+        "unit_id": "su_4f55d1b4d6edc1dc",
+        "source_refs": [
+          "f6.R46",
+          "f6.R47",
+          "f6.R48",
+          "f6.R50",
+          "f6.R52",
+          "f6.R54",
+          "f6.R55",
+          "f6.C-none",
+          "f5.C264",
+          "f5.C270",
+          "f5.C286",
+          "f5.C292"
+        ],
+        "site_refs": [
+          "f6.R48"
+        ],
+        "trigger_ref": "f6.R54",
+        "mechanism": "wrong-operator",
+        "severity": "error",
+        "kind": "hypothesis",
+        "claim": "The team-admin/owner permission check is ANDed instead of ORed, so the intended \"team admin or owner\" escape hatch can never be true and authorization silently degrades to organizer-or-attendee only.",
+        "trigger": "A bookings/eventType membership row with role ADMIN (isTeamAdmin true, isTeamOwner false) calls addGuestsHandler for a booking belonging to another organizer on that team.",
+        "impact": "Legitimate team admins/owners cannot add guests to teammates' bookings: isTeamAdminOrOwner is always false whenever either predicate is true only singly, and both are false when teamId is 0/undefined, so the handler throws FORBIDDEN (f6.R55) for a caller the feature is meant to allow; conversely nothing over-grants, so the effect is a hard functional failure of the new permission path.",
+        "open_question": "What is the intended authorization contract for addGuests — should any single team ADMIN or OWNER membership satisfy isTeamAdminOrOwner (i.e. `||`), and is `booking.eventType?.teamId ?? 0` a valid teamId input for these helpers, or is ANDing the two helpers deliberate here?",
+        "refutation": "Would be refuted if the delivered contract (addGuests.schema / caller in AddGuestsDialog, or tests) requires the caller to hold BOTH ADMIN and OWNER simultaneously, or if isTeamAdmin/isTeamOwner are documented as non-overlapping checks where `&&` is intentional; also refuted if eventType.teamId is always null for these bookings so the branch is dead code by design. Neither is shown in the delivered source.",
+        "discrepancy": "isTeamAdmin's query accepts OR:[{role:\"ADMIN\"},{role:\"OWNER\"}] (f5.C270) while isTeamOwner accepts only role:\"OWNER\" (f5.C292), so isTeamAdmin ⊇ isTeamOwner; `isTeamAdmin(...) && isTeamOwner(...)` (f6.R47-R48) therefore collapses to isTeamOwner and excludes pure admins, contradicting the variable name `isTeamAdminOrOwner` and the `!isTeamAdminOrOwner && ...` gate at f6.R54. Before-state: file absent, so no prior operator to compare.",
+        "source_refs_note": ""
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs",
+            7
+          ],
+          "type": "string_pattern_mismatch"
+        },
+        {
+          "field": [
+            "source_refs_note"
+          ],
+          "type": "extra_forbidden"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_4f55d1b4d6edc1dc",
+        "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "symbol": "addGuestsHandler",
+        "before_state": "absent-before-in-delivered-source",
+        "required_source_sides": [
+          [],
+          [
+            "f6.R22",
+            "f6.R23",
+            "f6.R24",
+            "f6.R26",
+            "f6.R27",
+            "f6.R28",
+            "f6.R29",
+            "f6.R30",
+            "f6.R31",
+            "f6.R32",
+            "f6.R33",
+            "f6.R34",
+            "f6.R35",
+            "f6.R36",
+            "f6.R37",
+            "f6.R38",
+            "f6.R39",
+            "f6.R40",
+            "f6.R41",
+            "f6.R42",
+            "f6.R44",
+            "f6.R46",
+            "f6.R47",
+            "f6.R48",
+            "f6.R50",
+            "f6.R52",
+            "f6.R54",
+            "f6.R55",
+            "f6.R56",
+            "f6.R58",
+            "f6.R59",
+            "f6.R60",
+            "f6.R61",
+            "f6.R62",
+            "f6.R63",
+            "f6.R64",
+            "f6.R65",
+            "f6.R66",
+            "f6.R67",
+            "f6.R68",
+            "f6.R70",
+            "f6.R71",
+            "f6.R72",
+            "f6.R74",
+            "f6.R75",
+            "f6.R76",
+            "f6.R77",
+            "f6.R78",
+            "f6.R80",
+            "f6.R81",
+            "f6.R83",
+            "f6.R84",
+            "f6.R85",
+            "f6.R86",
+            "f6.R87",
+            "f6.R88",
+            "f6.R89",
+            "f6.R90",
+            "f6.R92",
+            "f6.R93",
+            "f6.R94",
+            "f6.R95",
+            "f6.R96",
+            "f6.R97",
+            "f6.R98",
+            "f6.R99",
+            "f6.R100",
+            "f6.R101",
+            "f6.R102",
+            "f6.R103",
+            "f6.R104",
+            "f6.R105",
+            "f6.R106",
+            "f6.R108",
+            "f6.R109",
+            "f6.R110",
+            "f6.R111",
+            "f6.R112",
+            "f6.R113",
+            "f6.R114",
+            "f6.R115",
+            "f6.R116",
+            "f6.R117",
+            "f6.R118",
+            "f6.R120",
+            "f6.R121",
+            "f6.R122",
+            "f6.R124",
+            "f6.R125",
+            "f6.R126",
+            "f6.R127",
+            "f6.R128",
+            "f6.R129",
+            "f6.R130",
+            "f6.R131",
+            "f6.R132",
+            "f6.R133",
+            "f6.R134",
+            "f6.R135",
+            "f6.R136",
+            "f6.R137",
+            "f6.R138",
+            "f6.R139",
+            "f6.R140",
+            "f6.R141",
+            "f6.R142",
+            "f6.R143",
+            "f6.R144",
+            "f6.R145",
+            "f6.R146",
+            "f6.R147",
+            "f6.R149",
+            "f6.R150",
+            "f6.R151",
+            "f6.R152",
+            "f6.R153",
+            "f6.R154",
+            "f6.R155",
+            "f6.R156",
+            "f6.R158",
+            "f6.R160",
+            "f6.R161",
+            "f6.R162",
+            "f6.R163",
+            "f6.R165",
+            "f6.R167",
+            "f6.R168",
+            "f6.R169",
+            "f6.R170",
+            "f6.R171",
+            "f6.R173",
+            "f6.R174"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f6.R22",
+          "f6.R23",
+          "f6.R24",
+          "f6.R26",
+          "f6.R27",
+          "f6.R28",
+          "f6.R30",
+          "f6.R31",
+          "f6.R32",
+          "f6.R33",
+          "f6.R34",
+          "f6.R35",
+          "f6.R36",
+          "f6.R37",
+          "f6.R38",
+          "f6.R44",
+          "f6.R46",
+          "f6.R47",
+          "f6.R48",
+          "f6.R50",
+          "f6.R52",
+          "f6.R54",
+          "f6.R55",
+          "f6.R58",
+          "f6.R59",
+          "f6.R60",
+          "f6.R62",
+          "f6.R63",
+          "f6.R64",
+          "f6.R65",
+          "f6.R66",
+          "f6.R70",
+          "f6.R71",
+          "f6.R74",
+          "f6.R75",
+          "f6.R76",
+          "f6.R77",
+          "f6.R80",
+          "f6.R81",
+          "f6.R83",
+          "f6.R84",
+          "f6.R85",
+          "f6.R86",
+          "f6.R87",
+          "f6.R88",
+          "f6.R92",
+          "f6.R93",
+          "f6.R94",
+          "f6.R96",
+          "f6.R97",
+          "f6.R100",
+          "f6.R101",
+          "f6.R102",
+          "f6.R108",
+          "f6.R109",
+          "f6.R110",
+          "f6.R111",
+          "f6.R112",
+          "f6.R113",
+          "f6.R114",
+          "f6.R115",
+          "f6.R120",
+          "f6.R121",
+          "f6.R122",
+          "f6.R124",
+          "f6.R125",
+          "f6.R126",
+          "f6.R127",
+          "f6.R128",
+          "f6.R129",
+          "f6.R130",
+          "f6.R131",
+          "f6.R132",
+          "f6.R133",
+          "f6.R134",
+          "f6.R136",
+          "f6.R137",
+          "f6.R138",
+          "f6.R139",
+          "f6.R140",
+          "f6.R141",
+          "f6.R142",
+          "f6.R143",
+          "f6.R145",
+          "f6.R146",
+          "f6.R149",
+          "f6.R150",
+          "f6.R151",
+          "f6.R152",
+          "f6.R153",
+          "f6.R154",
+          "f6.R158",
+          "f6.R160",
+          "f6.R161",
+          "f6.R162",
+          "f6.R165",
+          "f6.R168",
+          "f6.R169",
+          "f6.R170",
+          "f6.R173"
+        ]
+      },
+      "files": {
+        "f3": "packages/emails/src/templates/index.ts",
+        "f6": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f10": "packages/ui/form/MultiEmail.tsx",
+        "f11": "packages/ui/index.tsx",
+        "f4": "packages/lib/hooks/useLocale.ts",
+        "f8": "packages/ui/components/form/inputs/Input.tsx",
+        "f9": "packages/ui/components/form/inputs/InputFieldWithSelect.tsx",
+        "f0": "apps/api/package.json",
+        "f1": "apps/api/v1/package.json",
+        "f2": "apps/api/v2/tsconfig.json",
+        "f7": "packages/trpc/server/routers/viewer/teams/inviteMember/inviteMember.handler.test.ts",
+        "f5": "packages/lib/server/queries/teams/index.ts"
+      },
+      "rows": [
+        [
+          "f6.R22",
+          "export const addGuestsHandler = async ({ ctx, input }: AddGuestsOptions) => {"
+        ],
+        [
+          "f6.R23",
+          "  const { user } = ctx;"
+        ],
+        [
+          "f6.R24",
+          "  const { bookingId, guests } = input;"
+        ],
+        [
+          "f6.R26",
+          "  const booking = await prisma.booking.findFirst({"
+        ],
+        [
+          "f6.R27",
+          "    where: {"
+        ],
+        [
+          "f6.R28",
+          "      id: bookingId,"
+        ],
+        [
+          "f6.R29",
+          "    },"
+        ],
+        [
+          "f6.R30",
+          "    include: {"
+        ],
+        [
+          "f6.R31",
+          "      attendees: true,"
+        ],
+        [
+          "f6.R32",
+          "      eventType: true,"
+        ],
+        [
+          "f6.R33",
+          "      destinationCalendar: true,"
+        ],
+        [
+          "f6.R34",
+          "      references: true,"
+        ],
+        [
+          "f6.R35",
+          "      user: {"
+        ],
+        [
+          "f6.R36",
+          "        include: {"
+        ],
+        [
+          "f6.R37",
+          "          destinationCalendar: true,"
+        ],
+        [
+          "f6.R38",
+          "          credentials: true,"
+        ],
+        [
+          "f6.R39",
+          "        },"
+        ],
+        [
+          "f6.R40",
+          "      },"
+        ],
+        [
+          "f6.R41",
+          "    },"
+        ],
+        [
+          "f6.R42",
+          "  });"
+        ],
+        [
+          "f6.R44",
+          "  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });"
+        ],
+        [
+          "f6.R46",
+          "  const isTeamAdminOrOwner ="
+        ],
+        [
+          "f6.R47",
+          "    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&"
+        ],
+        [
+          "f6.R48",
+          "    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));"
+        ],
+        [
+          "f6.R50",
+          "  const isOrganizer = booking.userId === user.id;"
+        ],
+        [
+          "f6.R52",
+          "  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);"
+        ],
+        [
+          "f6.R54",
+          "  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {"
+        ],
+        [
+          "f6.R55",
+          "    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });"
+        ],
+        [
+          "f6.R56",
+          "  }"
+        ],
+        [
+          "f6.R58",
+          "  const organizer = await prisma.user.findFirstOrThrow({"
+        ],
+        [
+          "f6.R59",
+          "    where: {"
+        ],
+        [
+          "f6.R60",
+          "      id: booking.userId || 0,"
+        ],
+        [
+          "f6.R61",
+          "    },"
+        ],
+        [
+          "f6.R62",
+          "    select: {"
+        ],
+        [
+          "f6.R63",
+          "      name: true,"
+        ],
+        [
+          "f6.R64",
+          "      email: true,"
+        ],
+        [
+          "f6.R65",
+          "      timeZone: true,"
+        ],
+        [
+          "f6.R66",
+          "      locale: true,"
+        ],
+        [
+          "f6.R67",
+          "    },"
+        ],
+        [
+          "f6.R68",
+          "  });"
+        ],
+        [
+          "f6.R70",
+          "  const blacklistedGuestEmails = process.env.BLACKLISTED_GUEST_EMAILS"
+        ],
+        [
+          "f6.R71",
+          "    ? process.env.BLACKLISTED_GUEST_EMAILS.split(\",\").map((email) => email.toLowerCase())"
+        ],
+        [
+          "f6.R72",
+          "    : [];"
+        ],
+        [
+          "f6.R74",
+          "  const uniqueGuests = guests.filter("
+        ],
+        [
+          "f6.R75",
+          "    (guest) =>"
+        ],
+        [
+          "f6.R76",
+          "      !booking.attendees.some((attendee) => guest === attendee.email) &&"
+        ],
+        [
+          "f6.R77",
+          "      !blacklistedGuestEmails.includes(guest)"
+        ],
+        [
+          "f6.R78",
+          "  );"
+        ],
+        [
+          "f6.R80",
+          "  if (uniqueGuests.length === 0)"
+        ],
+        [
+          "f6.R81",
+          "    throw new TRPCError({ code: \"BAD_REQUEST\", message: \"emails_must_be_unique_valid\" });"
+        ],
+        [
+          "f6.R83",
+          "  const guestsFullDetails = uniqueGuests.map((guest) => {"
+        ],
+        [
+          "f6.R84",
+          "    return {"
+        ],
+        [
+          "f6.R85",
+          "      name: \"\","
+        ],
+        [
+          "f6.R86",
+          "      email: guest,"
+        ],
+        [
+          "f6.R87",
+          "      timeZone: organizer.timeZone,"
+        ],
+        [
+          "f6.R88",
+          "      locale: organizer.locale,"
+        ],
+        [
+          "f6.R89",
+          "    };"
+        ],
+        [
+          "f6.R90",
+          "  });"
+        ],
+        [
+          "f6.R92",
+          "  const bookingAttendees = await prisma.booking.update({"
+        ],
+        [
+          "f6.R93",
+          "    where: {"
+        ],
+        [
+          "f6.R94",
+          "      id: bookingId,"
+        ],
+        [
+          "f6.R95",
+          "    },"
+        ],
+        [
+          "f6.R96",
+          "    include: {"
+        ],
+        [
+          "f6.R97",
+          "      attendees: true,"
+        ],
+        [
+          "f6.R98",
+          "    },"
+        ],
+        [
+          "f6.R99",
+          "    data: {"
+        ],
+        [
+          "f6.R100",
+          "      attendees: {"
+        ],
+        [
+          "f6.R101",
+          "        createMany: {"
+        ],
+        [
+          "f6.R102",
+          "          data: guestsFullDetails,"
+        ],
+        [
+          "f6.R103",
+          "        },"
+        ],
+        [
+          "f6.R104",
+          "      },"
+        ],
+        [
+          "f6.R105",
+          "    },"
+        ],
+        [
+          "f6.R106",
+          "  });"
+        ],
+        [
+          "f6.R108",
+          "  const attendeesListPromises = bookingAttendees.attendees.map(async (attendee) => {"
+        ],
+        [
+          "f6.R109",
+          "    return {"
+        ],
+        [
+          "f6.R110",
+          "      name: attendee.name,"
+        ],
+        [
+          "f6.R111",
+          "      email: attendee.email,"
+        ],
+        [
+          "f6.R112",
+          "      timeZone: attendee.timeZone,"
+        ],
+        [
+          "f6.R113",
+          "      language: {"
+        ],
+        [
+          "f6.R114",
+          "        translate: await getTranslation(attendee.locale ?? \"en\", \"common\"),"
+        ],
+        [
+          "f6.R115",
+          "        locale: attendee.locale ?? \"en\","
+        ],
+        [
+          "f6.R116",
+          "      },"
+        ],
+        [
+          "f6.R117",
+          "    };"
+        ],
+        [
+          "f6.R118",
+          "  });"
+        ],
+        [
+          "f6.R120",
+          "  const attendeesList = await Promise.all(attendeesListPromises);"
+        ],
+        [
+          "f6.R121",
+          "  const tOrganizer = await getTranslation(organizer.locale ?? \"en\", \"common\");"
+        ],
+        [
+          "f6.R122",
+          "  const videoCallReference = booking.references.find((reference) => reference.type.includes(\"_video\"));"
+        ],
+        [
+          "f6.R124",
+          "  const evt: CalendarEvent = {"
+        ],
+        [
+          "f6.R125",
+          "    title: booking.title || \"\","
+        ],
+        [
+          "f6.R126",
+          "    type: (booking.eventType?.title as string) || booking?.title || \"\","
+        ],
+        [
+          "f6.R127",
+          "    description: booking.description || \"\","
+        ],
+        [
+          "f6.R128",
+          "    startTime: booking.startTime ? dayjs(booking.startTime).format() : \"\","
+        ],
+        [
+          "f6.R129",
+          "    endTime: booking.endTime ? dayjs(booking.endTime).format() : \"\","
+        ],
+        [
+          "f6.R130",
+          "    organizer: {"
+        ],
+        [
+          "f6.R131",
+          "      email: booking?.userPrimaryEmail ?? organizer.email,"
+        ],
+        [
+          "f6.R132",
+          "      name: organizer.name ?? \"Nameless\","
+        ],
+        [
+          "f6.R133",
+          "      timeZone: organizer.timeZone,"
+        ],
+        [
+          "f6.R134",
+          "      language: { translate: tOrganizer, locale: organizer.locale ?? \"en\" },"
+        ],
+        [
+          "f6.R135",
+          "    },"
+        ],
+        [
+          "f6.R136",
+          "    attendees: attendeesList,"
+        ],
+        [
+          "f6.R137",
+          "    uid: booking.uid,"
+        ],
+        [
+          "f6.R138",
+          "    recurringEvent: parseRecurringEvent(booking.eventType?.recurringEvent),"
+        ],
+        [
+          "f6.R139",
+          "    location: booking.location,"
+        ],
+        [
+          "f6.R140",
+          "    destinationCalendar: booking?.destinationCalendar"
+        ],
+        [
+          "f6.R141",
+          "      ? [booking?.destinationCalendar]"
+        ],
+        [
+          "f6.R142",
+          "      : booking?.user?.destinationCalendar"
+        ],
+        [
+          "f6.R143",
+          "      ? [booking?.user?.destinationCalendar]"
+        ],
+        [
+          "f6.R144",
+          "      : [],"
+        ],
+        [
+          "f6.R145",
+          "    seatsPerTimeSlot: booking.eventType?.seatsPerTimeSlot,"
+        ],
+        [
+          "f6.R146",
+          "    seatsShowAttendees: booking.eventType?.seatsShowAttendees,"
+        ],
+        [
+          "f6.R147",
+          "  };"
+        ],
+        [
+          "f6.R149",
+          "  if (videoCallReference) {"
+        ],
+        [
+          "f6.R150",
+          "    evt.videoCallData = {"
+        ],
+        [
+          "f6.R151",
+          "      type: videoCallReference.type,"
+        ],
+        [
+          "f6.R152",
+          "      id: videoCallReference.meetingId,"
+        ],
+        [
+          "f6.R153",
+          "      password: videoCallReference?.meetingPassword,"
+        ],
+        [
+          "f6.R154",
+          "      url: videoCallReference.meetingUrl,"
+        ],
+        [
+          "f6.R155",
+          "    };"
+        ],
+        [
+          "f6.R156",
+          "  }"
+        ],
+        [
+          "f6.R158",
+          "  const credentials = await getUsersCredentials(ctx.user);"
+        ],
+        [
+          "f6.R160",
+          "  const eventManager = new EventManager({"
+        ],
+        [
+          "f6.R161",
+          "    ...user,"
+        ],
+        [
+          "f6.R162",
+          "    credentials: [...credentials],"
+        ],
+        [
+          "f6.R163",
+          "  });"
+        ],
+        [
+          "f6.R165",
+          "  await eventManager.updateCalendarAttendees(evt, booking);"
+        ],
+        [
+          "f6.R167",
+          "  try {"
+        ],
+        [
+          "f6.R168",
+          "    await sendAddGuestsEmails(evt, guests);"
+        ],
+        [
+          "f6.R169",
+          "  } catch (err) {"
+        ],
+        [
+          "f6.R170",
+          "    console.log(\"Error sending AddGuestsEmails\");"
+        ],
+        [
+          "f6.R171",
+          "  }"
+        ],
+        [
+          "f6.R173",
+          "  return { message: \"Guests added\" };"
+        ],
+        [
+          "f6.R174",
+          "};"
+        ],
+        [
+          "f5.C264",
+          "export async function isTeamAdmin(userId: number, teamId: number) {"
+        ],
+        [
+          "f5.C270",
+          "      OR: [{ role: \"ADMIN\" }, { role: \"OWNER\" }],"
+        ],
+        [
+          "f5.C286",
+          "export async function isTeamOwner(userId: number, teamId: number) {"
+        ],
+        [
+          "f5.C292",
+          "      role: \"OWNER\","
+        ]
+      ]
+    },
+    {
+      "input_file": "4ac7f30999dd4a08a0afb747936abf6c-input.json",
+      "input_sha256": "75c14277b9af310bae803d48273cef780314b3ae696df852611897b245873aca",
+      "output_file": "4ac7f30999dd4a08a0afb747936abf6c-output.json",
+      "output_sha256": "0bf7c495cdc2a075299421ceda0eec62f7965d9b3bd1d5651ba0c3dbc21ee19d",
+      "original_record": {
+        "unit_id": "su_b585cc49bed7df04",
+        "source_refs": [
+          "f0.R193",
+          "f0.R194",
+          "f0.R195",
+          "f0.R196",
+          "f0.R197",
+          "f0.R198",
+          "f0.R199",
+          "f0.R200",
+          "f0.R268",
+          "f0.R357",
+          "f0.R358",
+          "f0.R359",
+          "f0.R360",
+          "f0.R361"
+        ],
+        "site_refs": [
+          "f0.R194"
+        ],
+        "trigger_ref": "f0.R194",
+        "mechanism": "missing-await",
+        "severity": "warning",
+        "claim": "The added \"add_members\" dropdown entry is appended unconditionally to the actions array and its onClick only flips isOpenAddGuestsDialog; unlike neighbouring entries there is no invalidation/refetch hook on the mutation, so the row's guest list UI is not refreshed by this component after the dialog commits.",
+        "trigger": "User opens app.cal.com/bookings, clicks \"Additional guests\", submits the dialog and closes it without remounting the list.",
+        "impact": "The bookings table can keep showing stale attendee counts/emails until a manual reload, since BookingListItem never observes the addGuests mutation result.",
+        "open_question": "Does AddGuestsDialog itself invalidate trpc.viewer.bookings queries (or receive an onSuccess/callback from this component), given BookingListItem passes only isOpenDialog/setIsOpenDialog/bookingId?",
+        "refutation": "Refuted if AddGuestsDialog performs the cache invalidation internally, in which case no local onSuccess is needed.",
+        "discrepancy": "State setter and dialog props are wired here, but no data-refresh contract is visible on the changed lines; the closing side of the loop lives in an undelivered file.",
+        "kind": "hypothesis"
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "too_long"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_b585cc49bed7df04",
+        "path": "apps/web/components/booking/BookingListItem.tsx",
+        "symbol": "BookingListItem",
+        "before_state": "unresolved-declaration-correspondence",
+        "required_source_sides": [
+          [],
+          [
+            "f0.R193",
+            "f0.R194",
+            "f0.R195",
+            "f0.R196",
+            "f0.R197",
+            "f0.R198",
+            "f0.R199",
+            "f0.R200",
+            "f0.R268",
+            "f0.R357",
+            "f0.R358",
+            "f0.R359",
+            "f0.R360",
+            "f0.R361"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f0.R191",
+          "f0.R194",
+          "f0.R195",
+          "f0.R196",
+          "f0.R197",
+          "f0.R199",
+          "f0.R203",
+          "f0.R265",
+          "f0.R266",
+          "f0.R267",
+          "f0.R268",
+          "f0.R269",
+          "f0.R270",
+          "f0.R271",
+          "f0.R354",
+          "f0.R355",
+          "f0.R357",
+          "f0.R358",
+          "f0.R359",
+          "f0.R360",
+          "f0.R362",
+          "f0.R363",
+          "f0.R364"
+        ]
+      },
+      "files": {
+        "f0": "apps/web/components/booking/BookingListItem.tsx",
+        "f1": "packages/trpc/server/routers/viewer/bookings/_router.tsx",
+        "f2": "packages/trpc/server/routers/viewer/bookings/addGuests.schema.ts",
+        "f3": "packages/ui/form/MultiEmailLazy.tsx"
+      },
+      "rows": [
+        [
+          "f0.R191",
+          "      icon: \"map-pin\" as const,"
+        ],
+        [
+          "f0.R193",
+          "    {"
+        ],
+        [
+          "f0.R194",
+          "      id: \"add_members\","
+        ],
+        [
+          "f0.R195",
+          "      label: t(\"additional_guests\"),"
+        ],
+        [
+          "f0.R196",
+          "      onClick: () => {"
+        ],
+        [
+          "f0.R197",
+          "        setIsOpenAddGuestsDialog(true);"
+        ],
+        [
+          "f0.R198",
+          "      },"
+        ],
+        [
+          "f0.R199",
+          "      icon: \"user-plus\" as const,"
+        ],
+        [
+          "f0.R200",
+          "    },"
+        ],
+        [
+          "f0.R203",
+          "  if (booking.eventType.schedulingType === SchedulingType.ROUND_ROBIN) {"
+        ],
+        [
+          "f0.R265",
+          "  const [isOpenRescheduleDialog, setIsOpenRescheduleDialog] = useState(false);"
+        ],
+        [
+          "f0.R266",
+          "  const [isOpenReassignDialog, setIsOpenReassignDialog] = useState(false);"
+        ],
+        [
+          "f0.R267",
+          "  const [isOpenSetLocationDialog, setIsOpenLocationDialog] = useState(false);"
+        ],
+        [
+          "f0.R268",
+          "  const [isOpenAddGuestsDialog, setIsOpenAddGuestsDialog] = useState(false);"
+        ],
+        [
+          "f0.R269",
+          "  const setLocationMutation = trpc.viewer.bookings.editLocation.useMutation({"
+        ],
+        [
+          "f0.R270",
+          "    onSuccess: () => {"
+        ],
+        [
+          "f0.R271",
+          "      showToast(t(\"location_updated\"), \"success\");"
+        ],
+        [
+          "f0.R354",
+          "        setShowLocationModal={setIsOpenLocationDialog}"
+        ],
+        [
+          "f0.R355",
+          "        teamId={booking.eventType?.team?.id}"
+        ],
+        [
+          "f0.R357",
+          "      <AddGuestsDialog"
+        ],
+        [
+          "f0.R358",
+          "        isOpenDialog={isOpenAddGuestsDialog}"
+        ],
+        [
+          "f0.R359",
+          "        setIsOpenDialog={setIsOpenAddGuestsDialog}"
+        ],
+        [
+          "f0.R360",
+          "        bookingId={booking.id}"
+        ],
+        [
+          "f0.R361",
+          "      />"
+        ],
+        [
+          "f0.R362",
+          "      {booking.paid && booking.payment[0] && ("
+        ],
+        [
+          "f0.R363",
+          "        <ChargeCardDialog"
+        ],
+        [
+          "f0.R364",
+          "          isOpenDialog={chargeCardDialogIsOpen}"
+        ]
+      ]
+    },
+    {
+      "input_file": "4ac7f30999dd4a08a0afb747936abf6c-input.json",
+      "input_sha256": "75c14277b9af310bae803d48273cef780314b3ae696df852611897b245873aca",
+      "output_file": "4ac7f30999dd4a08a0afb747936abf6c-output.json",
+      "output_sha256": "0bf7c495cdc2a075299421ceda0eec62f7965d9b3bd1d5651ba0c3dbc21ee19d",
+      "original_record": {
+        "unit_id": "su_dfc47e46f893d70a",
+        "source_refs": [
+          "f1.R4",
+          "f1.R18",
+          "f1.R79",
+          "f1.R80",
+          "f1.R81",
+          "f1.R82",
+          "f1.R83",
+          "f1.R84",
+          "f1.R86",
+          "f1.R87",
+          "f1.R88",
+          "f1.R89",
+          "f1.R91",
+          "f1.R92",
+          "f1.R93",
+          "f1.R94",
+          "f1.R95"
+        ],
+        "site_refs": [
+          "f1.R91"
+        ],
+        "trigger_ref": "f1.R79",
+        "mechanism": "error-path",
+        "severity": "warning",
+        "claim": "The cached-handler indirection stores the resolved module member in UNSTABLE_HANDLER_CACHE.addGuests and then invokes it directly as a function, so the handler loses its tRPC procedure context: it receives only ({ ctx, input }) rather than the full tRPC options object, and any handler written against the tRPC resolver signature would see missing fields.",
+        "trigger": "First request to viewer.bookings.addGuests populates the cache; subsequent requests read it and call UNSTABLE_HANDLER_CACHE.addGuests({ ctx, input }).",
+        "impact": "If addGuests.handler is not authored as a plain ({ ctx, input }) => ... function, the mutation throws at runtime or silently ignores additional resolver metadata, and the error surface is limited to the generic \"Failed to load handler\" throw.",
+        "open_question": "What is the exact exported signature of addGuestsHandler in ./addGuests.handler (not delivered in this source set) - does it accept ({ ctx, input }) and return a value usable as the mutation result?",
+        "refutation": "Refuted if addGuests.handler is declared as an async function taking exactly { ctx, input }, matching the existing editLocation/confirm pattern in this router.",
+        "discrepancy": "Router wiring, cache key naming and null-guard match the surrounding procedures, but the callee contract cannot be confirmed from the delivered files.",
+        "kind": "hypothesis"
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "too_long"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_dfc47e46f893d70a",
+        "path": "packages/trpc/server/routers/viewer/bookings/_router.tsx",
+        "symbol": "",
+        "before_state": "unresolved-declaration-correspondence",
+        "required_source_sides": [
+          [],
+          [
+            "f1.R4",
+            "f1.R18",
+            "f1.R79",
+            "f1.R80",
+            "f1.R81",
+            "f1.R82",
+            "f1.R83",
+            "f1.R84",
+            "f1.R86",
+            "f1.R87",
+            "f1.R88",
+            "f1.R89",
+            "f1.R91",
+            "f1.R92",
+            "f1.R93",
+            "f1.R94",
+            "f1.R95"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f1.R1",
+          "f1.R2",
+          "f1.R3",
+          "f1.R4",
+          "f1.R5",
+          "f1.R6",
+          "f1.R7",
+          "f1.R15",
+          "f1.R16",
+          "f1.R17",
+          "f1.R18",
+          "f1.R19",
+          "f1.R20",
+          "f1.R21",
+          "f1.R76",
+          "f1.R79",
+          "f1.R80",
+          "f1.R81",
+          "f1.R82",
+          "f1.R86",
+          "f1.R87",
+          "f1.R88",
+          "f1.R91",
+          "f1.R93",
+          "f1.R97",
+          "f1.R98"
+        ]
+      },
+      "files": {
+        "f0": "apps/web/components/booking/BookingListItem.tsx",
+        "f1": "packages/trpc/server/routers/viewer/bookings/_router.tsx",
+        "f2": "packages/trpc/server/routers/viewer/bookings/addGuests.schema.ts",
+        "f3": "packages/ui/form/MultiEmailLazy.tsx"
+      },
+      "rows": [
+        [
+          "f1.R1",
+          "import authedProcedure from \"../../../procedures/authedProcedure\";"
+        ],
+        [
+          "f1.R2",
+          "import publicProcedure from \"../../../procedures/publicProcedure\";"
+        ],
+        [
+          "f1.R3",
+          "import { router } from \"../../../trpc\";"
+        ],
+        [
+          "f1.R4",
+          "import { ZAddGuestsInputSchema } from \"./addGuests.schema\";"
+        ],
+        [
+          "f1.R5",
+          "import { ZConfirmInputSchema } from \"./confirm.schema\";"
+        ],
+        [
+          "f1.R6",
+          "import { ZEditLocationInputSchema } from \"./editLocation.schema\";"
+        ],
+        [
+          "f1.R7",
+          "import { ZFindInputSchema } from \"./find.schema\";"
+        ],
+        [
+          "f1.R15",
+          "  get?: typeof import(\"./get.handler\").getHandler;"
+        ],
+        [
+          "f1.R16",
+          "  requestReschedule?: typeof import(\"./requestReschedule.handler\").requestRescheduleHandler;"
+        ],
+        [
+          "f1.R17",
+          "  editLocation?: typeof import(\"./editLocation.handler\").editLocationHandler;"
+        ],
+        [
+          "f1.R18",
+          "  addGuests?: typeof import(\"./addGuests.handler\").addGuestsHandler;"
+        ],
+        [
+          "f1.R19",
+          "  confirm?: typeof import(\"./confirm.handler\").confirmHandler;"
+        ],
+        [
+          "f1.R20",
+          "  getBookingAttendees?: typeof import(\"./getBookingAttendees.handler\").getBookingAttendeesHandler;"
+        ],
+        [
+          "f1.R21",
+          "  find?: typeof import(\"./find.handler\").getHandler;"
+        ],
+        [
+          "f1.R76",
+          "      input,"
+        ],
+        [
+          "f1.R79",
+          "  addGuests: authedProcedure.input(ZAddGuestsInputSchema).mutation(async ({ input, ctx }) => {"
+        ],
+        [
+          "f1.R80",
+          "    if (!UNSTABLE_HANDLER_CACHE.addGuests) {"
+        ],
+        [
+          "f1.R81",
+          "      UNSTABLE_HANDLER_CACHE.addGuests = await import(\"./addGuests.handler\").then("
+        ],
+        [
+          "f1.R82",
+          "        (mod) => mod.addGuestsHandler"
+        ],
+        [
+          "f1.R83",
+          "      );"
+        ],
+        [
+          "f1.R84",
+          "    }"
+        ],
+        [
+          "f1.R86",
+          "    // Unreachable code but required for type safety"
+        ],
+        [
+          "f1.R87",
+          "    if (!UNSTABLE_HANDLER_CACHE.addGuests) {"
+        ],
+        [
+          "f1.R88",
+          "      throw new Error(\"Failed to load handler\");"
+        ],
+        [
+          "f1.R89",
+          "    }"
+        ],
+        [
+          "f1.R91",
+          "    return UNSTABLE_HANDLER_CACHE.addGuests({"
+        ],
+        [
+          "f1.R92",
+          "      ctx,"
+        ],
+        [
+          "f1.R93",
+          "      input,"
+        ],
+        [
+          "f1.R94",
+          "    });"
+        ],
+        [
+          "f1.R95",
+          "  }),"
+        ],
+        [
+          "f1.R97",
+          "  confirm: authedProcedure.input(ZConfirmInputSchema).mutation(async ({ input, ctx }) => {"
+        ],
+        [
+          "f1.R98",
+          "    if (!UNSTABLE_HANDLER_CACHE.confirm) {"
+        ]
+      ]
+    },
+    {
+      "input_file": "8de055892be348b085cdca9d909c7b62-input.json",
+      "input_sha256": "403d051d6612aaf9a6f138a7e5f0bcde20f1f45a512ebb0c208c25c6eb948558",
+      "output_file": "8de055892be348b085cdca9d909c7b62-output.json",
+      "output_sha256": "7ea4cfb1cf809ee227e7b82f1289b8a8558bee7fab5b0cb75292d8212a459b20",
+      "original_record": {
+        "unit_id": "su_493054b14c6d75d7",
+        "kind": "hypothesis",
+        "source_refs": [
+          "f2.R1",
+          "f2.R3",
+          "f2.R4",
+          "f2.R5",
+          "f2.R6",
+          "f2.R7",
+          "f2.R8",
+          "f2.R9",
+          "f2.R10",
+          "f10.C9"
+        ],
+        "site_refs": [
+          "f2.R3"
+        ],
+        "trigger_ref": "f2.R3",
+        "mechanism": "contract-mismatch",
+        "severity": "warning",
+        "claim": "The new React AttendeeAddGuestsEmail is exported only as a named const (f2.R3) and no delivered line of packages/emails/src/templates/index.ts re-exports it, while the sibling AttendeeScheduledEmail is re-exported (f10.C9). renderEmail(\"AttendeeAddGuestsEmail\", ...) in f6.R31 needs this name reachable from the templates barrel.",
+        "trigger": "If the omitted tail of index.ts (f10.C18 is truncated at 'export { ') lacks an AttendeeAddGuestsEmail entry, any caller resolving the template by string name fails to find the component.",
+        "impact": "Organizer add-guests HTML body cannot be rendered; the email either throws or degrades to text-only for every organizer/team member notified by sendAddGuestsEmails.",
+        "open_question": "Does the undelivered portion of packages/emails/src/templates/index.ts contain `export { AttendeeAddGuestsEmail } from \"./AttendeeAddGuestsEmail\";` (and the OrganizerAddGuestsEmail equivalent), and does renderEmail resolve names through that barrel?",
+        "refutation": "Confirmed counterevidence would be an explicit re-export line for AttendeeAddGuestsEmail in the delivered index.ts range; f10.C1-C17 do not include it and C18 is cut off, so absence is not yet proven."
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "discrepancy"
+          ],
+          "type": "missing"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_493054b14c6d75d7",
+        "path": "packages/emails/src/templates/AttendeeAddGuestsEmail.tsx",
+        "symbol": "AttendeeAddGuestsEmail",
+        "before_state": "absent-before-in-delivered-source",
+        "required_source_sides": [
+          [],
+          [
+            "f2.R3",
+            "f2.R4",
+            "f2.R5",
+            "f2.R6",
+            "f2.R7",
+            "f2.R8",
+            "f2.R9",
+            "f2.R10"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f2.R3",
+          "f2.R4",
+          "f2.R5",
+          "f2.R6",
+          "f2.R7",
+          "f2.R8"
+        ]
+      },
+      "files": {
+        "f0": "packages/emails/email-manager.ts",
+        "f2": "packages/emails/src/templates/AttendeeAddGuestsEmail.tsx",
+        "f6": "packages/emails/templates/organizer-add-guests-email.ts",
+        "f3": "packages/emails/src/templates/AttendeeScheduledEmail.tsx",
+        "f8": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f7": "packages/lib/formatCalendarEvent.ts",
+        "f4": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "f5": "packages/emails/templates/_base-email.ts",
+        "f1": "packages/emails/lib/generateIcsString.ts",
+        "f9": "packages/emails/templates/organizer-scheduled-email.ts",
+        "f10": "packages/emails/src/templates/index.ts"
+      },
+      "rows": [
+        [
+          "f2.R1",
+          "import { AttendeeScheduledEmail } from \"./AttendeeScheduledEmail\";"
+        ],
+        [
+          "f2.R3",
+          "export const AttendeeAddGuestsEmail = (props: React.ComponentProps<typeof AttendeeScheduledEmail>) => ("
+        ],
+        [
+          "f2.R4",
+          "  <AttendeeScheduledEmail"
+        ],
+        [
+          "f2.R5",
+          "    title=\"new_guests_added\""
+        ],
+        [
+          "f2.R6",
+          "    headerType=\"calendarCircle\""
+        ],
+        [
+          "f2.R7",
+          "    subject=\"guests_added_event_type_subject\""
+        ],
+        [
+          "f2.R8",
+          "    {...props}"
+        ],
+        [
+          "f2.R9",
+          "  />"
+        ],
+        [
+          "f2.R10",
+          ");"
+        ],
+        [
+          "f10.C9",
+          "export { AttendeeScheduledEmail } from \"./AttendeeScheduledEmail\";"
+        ]
+      ]
+    },
+    {
+      "input_file": "8de055892be348b085cdca9d909c7b62-input.json",
+      "input_sha256": "403d051d6612aaf9a6f138a7e5f0bcde20f1f45a512ebb0c208c25c6eb948558",
+      "output_file": "8de055892be348b085cdca9d909c7b62-output.json",
+      "output_sha256": "7ea4cfb1cf809ee227e7b82f1289b8a8558bee7fab5b0cb75292d8212a459b20",
+      "original_record": {
+        "unit_id": "su_e1416ad1b3fded56",
+        "kind": "hypothesis",
+        "source_refs": [
+          "f0.R525",
+          "f0.R526",
+          "f0.R528",
+          "f0.R529",
+          "f0.R531",
+          "f0.R532",
+          "f0.R533",
+          "f0.R534",
+          "f0.R535",
+          "f0.R536",
+          "f0.R537",
+          "f0.R539",
+          "f0.R540",
+          "f0.R541",
+          "f0.R542",
+          "f0.R543",
+          "f0.R544",
+          "f0.R545",
+          "f0.R546",
+          "f0.R547",
+          "f0.R549",
+          "f0.R550"
+        ],
+        "site_refs": [
+          "f0.R541"
+        ],
+        "trigger_ref": "f0.R541",
+        "mechanism": "wrong-operator",
+        "severity": "error",
+        "claim": "sendAddGuestsEmails branches on `if (newGuests.includes(attendee.email))` (f0.R541) and sends the plain AttendeeScheduledEmail for those guests (f0.R542), i.e. the full booking-confirmation template, instead of a dedicated newly-added-guest notification.",
+        "trigger": "addGuests handler calls sendAddGuestsEmails(evt, guests) with exactly the newly added guest addresses (f8.C168), so every intended recipient matches the includes() check.",
+        "impact": "New guests receive a generic 'event confirmed' email (title/subject/ICS from AttendeeScheduledEmail) rather than a 'guests were added' notice, while all pre-existing attendees get AttendeeAddGuestsEmail — the message semantics are inverted for the people the feature targets.",
+        "open_question": "Is the contract for the new-guest branch a full booking confirmation (correct) or a distinct 'you were added' template, and should the condition be inverted relative to the attendee loop?",
+        "refutation": "Would be refuted if callers pass newGuests as non-recipients/existing guests, or if a separate send path exists for new guests; f8.C168 passes the just-added `guests` list and no other new-guest send appears in f0.R525-R550."
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "too_long"
+        },
+        {
+          "field": [
+            "discrepancy"
+          ],
+          "type": "missing"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_e1416ad1b3fded56",
+        "path": "packages/emails/email-manager.ts",
+        "symbol": "sendAddGuestsEmails",
+        "before_state": "absent-new-declaration",
+        "required_source_sides": [
+          [],
+          [
+            "f0.R525",
+            "f0.R526",
+            "f0.R528",
+            "f0.R529",
+            "f0.R531",
+            "f0.R532",
+            "f0.R533",
+            "f0.R534",
+            "f0.R535",
+            "f0.R536",
+            "f0.R537",
+            "f0.R539",
+            "f0.R540",
+            "f0.R541",
+            "f0.R542",
+            "f0.R543",
+            "f0.R544",
+            "f0.R545",
+            "f0.R546",
+            "f0.R547",
+            "f0.R549",
+            "f0.R550"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f0.R525",
+          "f0.R526",
+          "f0.R528",
+          "f0.R529",
+          "f0.R531",
+          "f0.R532",
+          "f0.R533",
+          "f0.R534",
+          "f0.R539",
+          "f0.R540",
+          "f0.R541",
+          "f0.R542",
+          "f0.R543",
+          "f0.R544",
+          "f0.R549"
+        ]
+      },
+      "files": {
+        "f0": "packages/emails/email-manager.ts",
+        "f2": "packages/emails/src/templates/AttendeeAddGuestsEmail.tsx",
+        "f6": "packages/emails/templates/organizer-add-guests-email.ts",
+        "f3": "packages/emails/src/templates/AttendeeScheduledEmail.tsx",
+        "f8": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f7": "packages/lib/formatCalendarEvent.ts",
+        "f4": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "f5": "packages/emails/templates/_base-email.ts",
+        "f1": "packages/emails/lib/generateIcsString.ts",
+        "f9": "packages/emails/templates/organizer-scheduled-email.ts",
+        "f10": "packages/emails/src/templates/index.ts"
+      },
+      "rows": [
+        [
+          "f0.R525",
+          "export const sendAddGuestsEmails = async (calEvent: CalendarEvent, newGuests: string[]) => {"
+        ],
+        [
+          "f0.R526",
+          "  const calendarEvent = formatCalEvent(calEvent);"
+        ],
+        [
+          "f0.R528",
+          "  const emailsToSend: Promise<unknown>[] = [];"
+        ],
+        [
+          "f0.R529",
+          "  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));"
+        ],
+        [
+          "f0.R531",
+          "  if (calendarEvent.team?.members) {"
+        ],
+        [
+          "f0.R532",
+          "    for (const teamMember of calendarEvent.team.members) {"
+        ],
+        [
+          "f0.R533",
+          "      emailsToSend.push("
+        ],
+        [
+          "f0.R534",
+          "        sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent, teamMember }))"
+        ],
+        [
+          "f0.R535",
+          "      );"
+        ],
+        [
+          "f0.R536",
+          "    }"
+        ],
+        [
+          "f0.R537",
+          "  }"
+        ],
+        [
+          "f0.R539",
+          "  emailsToSend.push("
+        ],
+        [
+          "f0.R540",
+          "    ...calendarEvent.attendees.map((attendee) => {"
+        ],
+        [
+          "f0.R541",
+          "      if (newGuests.includes(attendee.email)) {"
+        ],
+        [
+          "f0.R542",
+          "        return sendEmail(() => new AttendeeScheduledEmail(calendarEvent, attendee));"
+        ],
+        [
+          "f0.R543",
+          "      } else {"
+        ],
+        [
+          "f0.R544",
+          "        return sendEmail(() => new AttendeeAddGuestsEmail(calendarEvent, attendee));"
+        ],
+        [
+          "f0.R545",
+          "      }"
+        ],
+        [
+          "f0.R546",
+          "    })"
+        ],
+        [
+          "f0.R547",
+          "  );"
+        ],
+        [
+          "f0.R549",
+          "  await Promise.all(emailsToSend);"
+        ],
+        [
+          "f0.R550",
+          "};"
+        ]
+      ]
+    },
+    {
+      "input_file": "8de055892be348b085cdca9d909c7b62-input.json",
+      "input_sha256": "403d051d6612aaf9a6f138a7e5f0bcde20f1f45a512ebb0c208c25c6eb948558",
+      "output_file": "8de055892be348b085cdca9d909c7b62-output.json",
+      "output_sha256": "7ea4cfb1cf809ee227e7b82f1289b8a8558bee7fab5b0cb75292d8212a459b20",
+      "original_record": {
+        "unit_id": "su_2bcf26f1a8d03c72",
+        "kind": "hypothesis",
+        "source_refs": [
+          "f6.R8",
+          "f6.R9",
+          "f6.R11",
+          "f6.R12",
+          "f6.R13",
+          "f6.R14",
+          "f6.R15",
+          "f6.R16",
+          "f6.R17",
+          "f6.R18",
+          "f6.R19",
+          "f6.R20",
+          "f6.R21",
+          "f6.R23",
+          "f6.R24",
+          "f6.R25",
+          "f6.R26",
+          "f6.R27",
+          "f6.R28",
+          "f6.R29",
+          "f6.R30",
+          "f6.R31",
+          "f6.R32",
+          "f6.R33",
+          "f6.R34",
+          "f6.R35",
+          "f6.R36",
+          "f6.R37"
+        ],
+        "site_refs": [
+          "f6.R28"
+        ],
+        "trigger_ref": "f6.R28",
+        "mechanism": "null-path",
+        "severity": "error",
+        "claim": "getNodeMailerPayload dereferences this.calEvent.attendees[0].name unguarded (f6.R28) and builds replyTo from every attendee email (f6.R25); neither is validated for a non-empty attendees array before the subject string is composed.",
+        "trigger": "Reached for each OrganizerAddGuestsEmail instance created in sendAddGuestsEmails (f0.R529, f0.R534) whenever calEvent.attendees is empty or an attendee record lacks `name`.",
+        "impact": "A TypeError inside payload construction rejects the promise pushed into emailsToSend, so `await Promise.all(emailsToSend)` (f0.R549) throws and the whole addGuests flow reports failure after the calendar/attendee update already succeeded.",
+        "open_question": "Can the addGuests path deliver a CalendarEvent whose attendees array is empty (e.g. zero-attendee/team bookings), and is there a contract guaranteeing attendees[0].name exists for organizer confirmation emails?",
+        "refutation": "Refuted if the handler/schema guarantees at least one named attendee before sendAddGuestsEmails is called; addGuests.schema.ts and the pre-call validation in f8 were not delivered, so this guard has not been traced."
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "too_long"
+        },
+        {
+          "field": [
+            "discrepancy"
+          ],
+          "type": "missing"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_2bcf26f1a8d03c72",
+        "path": "packages/emails/templates/organizer-add-guests-email.ts",
+        "symbol": "getNodeMailerPayload",
+        "before_state": "absent-before-in-delivered-source",
+        "required_source_sides": [
+          [],
+          [
+            "f6.R8",
+            "f6.R9",
+            "f6.R11",
+            "f6.R12",
+            "f6.R13",
+            "f6.R14",
+            "f6.R15",
+            "f6.R16",
+            "f6.R17",
+            "f6.R18",
+            "f6.R19",
+            "f6.R20",
+            "f6.R21",
+            "f6.R22",
+            "f6.R23",
+            "f6.R24",
+            "f6.R25",
+            "f6.R26",
+            "f6.R27",
+            "f6.R28",
+            "f6.R29",
+            "f6.R30",
+            "f6.R31",
+            "f6.R32",
+            "f6.R33",
+            "f6.R34",
+            "f6.R35",
+            "f6.R36",
+            "f6.R37"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f6.R8",
+          "f6.R9",
+          "f6.R11",
+          "f6.R12",
+          "f6.R13",
+          "f6.R14",
+          "f6.R15",
+          "f6.R16",
+          "f6.R17",
+          "f6.R18",
+          "f6.R19",
+          "f6.R21",
+          "f6.R23",
+          "f6.R24",
+          "f6.R25",
+          "f6.R26",
+          "f6.R27",
+          "f6.R28",
+          "f6.R29",
+          "f6.R31",
+          "f6.R32",
+          "f6.R33",
+          "f6.R35"
+        ]
+      },
+      "files": {
+        "f0": "packages/emails/email-manager.ts",
+        "f2": "packages/emails/src/templates/AttendeeAddGuestsEmail.tsx",
+        "f6": "packages/emails/templates/organizer-add-guests-email.ts",
+        "f3": "packages/emails/src/templates/AttendeeScheduledEmail.tsx",
+        "f8": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f7": "packages/lib/formatCalendarEvent.ts",
+        "f4": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "f5": "packages/emails/templates/_base-email.ts",
+        "f1": "packages/emails/lib/generateIcsString.ts",
+        "f9": "packages/emails/templates/organizer-scheduled-email.ts",
+        "f10": "packages/emails/src/templates/index.ts"
+      },
+      "rows": [
+        [
+          "f6.R8",
+          "  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {"
+        ],
+        [
+          "f6.R9",
+          "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+        ],
+        [
+          "f6.R11",
+          "    return {"
+        ],
+        [
+          "f6.R12",
+          "      icalEvent: {"
+        ],
+        [
+          "f6.R13",
+          "        filename: \"event.ics\","
+        ],
+        [
+          "f6.R14",
+          "        content: generateIcsString({"
+        ],
+        [
+          "f6.R15",
+          "          event: this.calEvent,"
+        ],
+        [
+          "f6.R16",
+          "          title: this.t(\"new_guests_added\"),"
+        ],
+        [
+          "f6.R17",
+          "          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),"
+        ],
+        [
+          "f6.R18",
+          "          role: \"organizer\","
+        ],
+        [
+          "f6.R19",
+          "          status: \"CONFIRMED\","
+        ],
+        [
+          "f6.R20",
+          "        }),"
+        ],
+        [
+          "f6.R21",
+          "        method: \"REQUEST\","
+        ],
+        [
+          "f6.R22",
+          "      },"
+        ],
+        [
+          "f6.R23",
+          "      from: `${APP_NAME} <${this.getMailerOptions().from}>`,"
+        ],
+        [
+          "f6.R24",
+          "      to: toAddresses.join(\",\"),"
+        ],
+        [
+          "f6.R25",
+          "      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],"
+        ],
+        [
+          "f6.R26",
+          "      subject: `${this.t(\"guests_added_event_type_subject\", {"
+        ],
+        [
+          "f6.R27",
+          "        eventType: this.calEvent.type,"
+        ],
+        [
+          "f6.R28",
+          "        name: this.calEvent.attendees[0].name,"
+        ],
+        [
+          "f6.R29",
+          "        date: this.getFormattedDate(),"
+        ],
+        [
+          "f6.R30",
+          "      })}`,"
+        ],
+        [
+          "f6.R31",
+          "      html: await renderEmail(\"OrganizerAddGuestsEmail\", {"
+        ],
+        [
+          "f6.R32",
+          "        attendee: this.calEvent.organizer,"
+        ],
+        [
+          "f6.R33",
+          "        calEvent: this.calEvent,"
+        ],
+        [
+          "f6.R34",
+          "      }),"
+        ],
+        [
+          "f6.R35",
+          "      text: this.getTextBody(\"new_guests_added\"),"
+        ],
+        [
+          "f6.R36",
+          "    };"
+        ],
+        [
+          "f6.R37",
+          "  }"
+        ]
+      ]
+    },
+    {
+      "input_file": "8de055892be348b085cdca9d909c7b62-input.json",
+      "input_sha256": "403d051d6612aaf9a6f138a7e5f0bcde20f1f45a512ebb0c208c25c6eb948558",
+      "output_file": "8de055892be348b085cdca9d909c7b62-output.json",
+      "output_sha256": "7ea4cfb1cf809ee227e7b82f1289b8a8558bee7fab5b0cb75292d8212a459b20",
+      "original_record": {
+        "unit_id": "su_70b48ed0e8d69762",
+        "kind": "hypothesis",
+        "source_refs": [
+          "f6.R7",
+          "f6.R8",
+          "f6.R9",
+          "f6.R11",
+          "f6.R12",
+          "f6.R13",
+          "f6.R14",
+          "f6.R15",
+          "f6.R16",
+          "f6.R17",
+          "f6.R18",
+          "f6.R19",
+          "f6.R20",
+          "f6.R21",
+          "f6.R22",
+          "f6.R23",
+          "f6.R24",
+          "f6.R25",
+          "f6.R26",
+          "f6.R27",
+          "f6.R28",
+          "f6.R29",
+          "f6.R30",
+          "f6.R31",
+          "f6.R32",
+          "f6.R33",
+          "f6.R34",
+          "f6.R35",
+          "f6.R36",
+          "f6.R37",
+          "f6.R38"
+        ],
+        "site_refs": [
+          "f6.R8"
+        ],
+        "trigger_ref": "f6.R8",
+        "mechanism": "doc",
+        "severity": "info",
+        "claim": "OrganizerAddGuestsEmail (f6.R7) overrides the inherited getNodeMailerPayload but declares it `protected` (f6.R8) whereas the base-class member it replaces is also `protected async` (f9.C29); the override never delegates to OrganizerScheduledEmail's payload logic, duplicating icalEvent/from/to assembly.",
+        "trigger": "Any consumer outside the class hierarchy reaching for the payload (e.g. tests or a future sender helper) still cannot call it, and the duplicated block can drift from the organizer-scheduled version.",
+        "impact": "No runtime change today because BaseEmail.sendEmail invokes this.getNodeMailerPayload() internally (f5.C50); the risk is maintenance divergence between the two near-identical payloads rather than a broken call.",
+        "open_question": "Is the intent to reuse OrganizerScheduledEmail's payload with a different subject/text (calling super and spreading overrides), or a fully independent payload that must stay in sync manually?",
+        "refutation": "Refuted if the duplicated fields intentionally differ from the organizer-scheduled email in ways super() could not express; the omitted tail of f9 (lines beyond 31 saved) was not available for a field-by-field comparison."
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "too_long"
+        },
+        {
+          "field": [
+            "discrepancy"
+          ],
+          "type": "missing"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_70b48ed0e8d69762",
+        "path": "packages/emails/templates/organizer-add-guests-email.ts",
+        "symbol": "OrganizerAddGuestsEmail",
+        "before_state": "absent-before-in-delivered-source",
+        "required_source_sides": [
+          [],
+          [
+            "f6.R7",
+            "f6.R8",
+            "f6.R9",
+            "f6.R11",
+            "f6.R12",
+            "f6.R13",
+            "f6.R14",
+            "f6.R15",
+            "f6.R16",
+            "f6.R17",
+            "f6.R18",
+            "f6.R19",
+            "f6.R20",
+            "f6.R21",
+            "f6.R22",
+            "f6.R23",
+            "f6.R24",
+            "f6.R25",
+            "f6.R26",
+            "f6.R27",
+            "f6.R28",
+            "f6.R29",
+            "f6.R30",
+            "f6.R31",
+            "f6.R32",
+            "f6.R33",
+            "f6.R34",
+            "f6.R35",
+            "f6.R36",
+            "f6.R37",
+            "f6.R38"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f6.R7",
+          "f6.R8",
+          "f6.R9",
+          "f6.R11",
+          "f6.R12",
+          "f6.R13",
+          "f6.R14",
+          "f6.R15",
+          "f6.R16",
+          "f6.R17",
+          "f6.R18",
+          "f6.R19",
+          "f6.R21",
+          "f6.R23",
+          "f6.R24",
+          "f6.R25",
+          "f6.R26",
+          "f6.R27",
+          "f6.R28",
+          "f6.R29",
+          "f6.R31",
+          "f6.R32",
+          "f6.R33",
+          "f6.R35"
+        ]
+      },
+      "files": {
+        "f0": "packages/emails/email-manager.ts",
+        "f2": "packages/emails/src/templates/AttendeeAddGuestsEmail.tsx",
+        "f6": "packages/emails/templates/organizer-add-guests-email.ts",
+        "f3": "packages/emails/src/templates/AttendeeScheduledEmail.tsx",
+        "f8": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+        "f7": "packages/lib/formatCalendarEvent.ts",
+        "f4": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "f5": "packages/emails/templates/_base-email.ts",
+        "f1": "packages/emails/lib/generateIcsString.ts",
+        "f9": "packages/emails/templates/organizer-scheduled-email.ts",
+        "f10": "packages/emails/src/templates/index.ts"
+      },
+      "rows": [
+        [
+          "f6.R7",
+          "export default class OrganizerAddGuestsEmail extends OrganizerScheduledEmail {"
+        ],
+        [
+          "f6.R8",
+          "  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {"
+        ],
+        [
+          "f6.R9",
+          "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+        ],
+        [
+          "f6.R11",
+          "    return {"
+        ],
+        [
+          "f6.R12",
+          "      icalEvent: {"
+        ],
+        [
+          "f6.R13",
+          "        filename: \"event.ics\","
+        ],
+        [
+          "f6.R14",
+          "        content: generateIcsString({"
+        ],
+        [
+          "f6.R15",
+          "          event: this.calEvent,"
+        ],
+        [
+          "f6.R16",
+          "          title: this.t(\"new_guests_added\"),"
+        ],
+        [
+          "f6.R17",
+          "          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),"
+        ],
+        [
+          "f6.R18",
+          "          role: \"organizer\","
+        ],
+        [
+          "f6.R19",
+          "          status: \"CONFIRMED\","
+        ],
+        [
+          "f6.R20",
+          "        }),"
+        ],
+        [
+          "f6.R21",
+          "        method: \"REQUEST\","
+        ],
+        [
+          "f6.R22",
+          "      },"
+        ],
+        [
+          "f6.R23",
+          "      from: `${APP_NAME} <${this.getMailerOptions().from}>`,"
+        ],
+        [
+          "f6.R24",
+          "      to: toAddresses.join(\",\"),"
+        ],
+        [
+          "f6.R25",
+          "      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],"
+        ],
+        [
+          "f6.R26",
+          "      subject: `${this.t(\"guests_added_event_type_subject\", {"
+        ],
+        [
+          "f6.R27",
+          "        eventType: this.calEvent.type,"
+        ],
+        [
+          "f6.R28",
+          "        name: this.calEvent.attendees[0].name,"
+        ],
+        [
+          "f6.R29",
+          "        date: this.getFormattedDate(),"
+        ],
+        [
+          "f6.R30",
+          "      })}`,"
+        ],
+        [
+          "f6.R31",
+          "      html: await renderEmail(\"OrganizerAddGuestsEmail\", {"
+        ],
+        [
+          "f6.R32",
+          "        attendee: this.calEvent.organizer,"
+        ],
+        [
+          "f6.R33",
+          "        calEvent: this.calEvent,"
+        ],
+        [
+          "f6.R34",
+          "      }),"
+        ],
+        [
+          "f6.R35",
+          "      text: this.getTextBody(\"new_guests_added\"),"
+        ],
+        [
+          "f6.R36",
+          "    };"
+        ],
+        [
+          "f6.R37",
+          "  }"
+        ],
+        [
+          "f6.R38",
+          "}"
+        ]
+      ]
+    },
+    {
+      "input_file": "d0847e0dde7043e795c621fe8a24dccc-input.json",
+      "input_sha256": "70c38a1ccc1d27b3d3c19c722fc49d344156a8a5eed9bd2c6f27bf4f15d9ecd3",
+      "output_file": "d0847e0dde7043e795c621fe8a24dccc-output.json",
+      "output_sha256": "75c38ad6e06fd2a348e6d074f62a2d7f1cf3c0982376b34dea69c33180767e8f",
+      "original_record": {
+        "unit_id": "su_58f16ee1606800c0",
+        "source_refs": [
+          "f0.R1122",
+          "f0.R1124",
+          "f0.R1136",
+          "f0.R1137",
+          "f0.R1139",
+          "f0.R2434",
+          "f2.R5",
+          "f2.R7"
+        ],
+        "site_refs": [
+          "f2.R7"
+        ],
+        "trigger_ref": "f2.R7",
+        "checked": "Verified each key the delivered changed lines introduce is present exactly once in en/common.json with the placeholders its consumer needs: new_guests_added (f0.R1122) matches the literal title=\"new_guests_added\" at f2.R5; guests_added_event_type_subject (f0.R1124) supplies {{eventType}}, {{name}}, {{date}} for subject=\"guests_added_event_type_subject\" at f2.R7; guests_added / unable_to_add_guests (f0.R1136-f0.R1137) and emails_must_be_unique_valid (f0.R1139) are plain strings needing no interpolation; add_emails (f0.R2434) differs from the pre-existing add_email (f0.R2433) so no key was overwritten. Only en was required by this unit's refs, so other locales were not asserted about.",
+        "kind": "no_issue"
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "checked"
+          ],
+          "type": "string_too_long"
+        },
+        {
+          "field": [
+            "site_refs"
+          ],
+          "type": "extra_forbidden"
+        },
+        {
+          "field": [
+            "trigger_ref"
+          ],
+          "type": "extra_forbidden"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_58f16ee1606800c0",
+        "path": "apps/web/public/static/locales/en/common.json",
+        "symbol": "",
+        "before_state": "unresolved-declaration-correspondence",
+        "required_source_sides": [
+          [],
+          [
+            "f0.R1122",
+            "f0.R1124",
+            "f0.R1136",
+            "f0.R1137",
+            "f0.R1139",
+            "f0.R2434"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f0.R1119",
+          "f0.R1120",
+          "f0.R1121",
+          "f0.R1122",
+          "f0.R1123",
+          "f0.R1124",
+          "f0.R1125",
+          "f0.R1126",
+          "f0.R1127",
+          "f0.R1133",
+          "f0.R1134",
+          "f0.R1135",
+          "f0.R1136",
+          "f0.R1137",
+          "f0.R1138",
+          "f0.R1139",
+          "f0.R1140",
+          "f0.R1141",
+          "f0.R1142",
+          "f0.R2431",
+          "f0.R2432",
+          "f0.R2433",
+          "f0.R2434",
+          "f0.R2435",
+          "f0.R2436",
+          "f0.R2437"
+        ]
+      },
+      "files": {
+        "f0": "apps/web/public/static/locales/en/common.json",
+        "f2": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "f1": "packages/emails/email-manager.ts",
+        "f3": "packages/emails/src/templates/OrganizerScheduledEmail.tsx"
+      },
+      "rows": [
+        [
+          "f0.R1119",
+          "  \"impersonating_user_warning\": \"Impersonating username \\\"{{user}}\\\".\","
+        ],
+        [
+          "f0.R1120",
+          "  \"impersonating_stop_instructions\": \"Click here to stop\","
+        ],
+        [
+          "f0.R1121",
+          "  \"event_location_changed\": \"Updated - Your event changed the location\","
+        ],
+        [
+          "f0.R1122",
+          "  \"new_guests_added\": \"Added - New guests added to your event\","
+        ],
+        [
+          "f0.R1123",
+          "  \"location_changed_event_type_subject\": \"Location Changed: {{eventType}} with {{name}} at {{date}}\","
+        ],
+        [
+          "f0.R1124",
+          "  \"guests_added_event_type_subject\": \"Guests Added: {{eventType}} with {{name}} at {{date}}\","
+        ],
+        [
+          "f0.R1125",
+          "  \"current_location\": \"Current Location\","
+        ],
+        [
+          "f0.R1126",
+          "  \"new_location\": \"New Location\","
+        ],
+        [
+          "f0.R1127",
+          "  \"session\": \"Session\","
+        ],
+        [
+          "f0.R1133",
+          "  \"set_location\": \"Set Location\","
+        ],
+        [
+          "f0.R1134",
+          "  \"update_location\": \"Update Location\","
+        ],
+        [
+          "f0.R1135",
+          "  \"location_updated\": \"Location updated\","
+        ],
+        [
+          "f0.R1136",
+          "  \"guests_added\": \"Guests added\","
+        ],
+        [
+          "f0.R1137",
+          "  \"unable_to_add_guests\": \"Unable to add guests\","
+        ],
+        [
+          "f0.R1138",
+          "  \"email_validation_error\": \"That doesn't look like an email address\","
+        ],
+        [
+          "f0.R1139",
+          "  \"emails_must_be_unique_valid\": \"Emails must be unique and valid\","
+        ],
+        [
+          "f0.R1140",
+          "  \"url_validation_error\": \"That doesn't look like a URL\","
+        ],
+        [
+          "f0.R1141",
+          "  \"place_where_cal_widget_appear\": \"Place this code in your HTML where you want your {{appName}} widget to appear.\","
+        ],
+        [
+          "f0.R1142",
+          "  \"create_update_react_component\": \"Create or update an existing React component as shown below.\","
+        ],
+        [
+          "f0.R2431",
+          "  \"primary\": \"Primary\","
+        ],
+        [
+          "f0.R2432",
+          "  \"make_primary\": \"Make primary\","
+        ],
+        [
+          "f0.R2433",
+          "  \"add_email\": \"Add Email\","
+        ],
+        [
+          "f0.R2434",
+          "  \"add_emails\": \"Add Emails\","
+        ],
+        [
+          "f0.R2435",
+          "  \"add_email_description\": \"Add an email address to replace your primary or to use as an alternative email on your event types.\","
+        ],
+        [
+          "f0.R2436",
+          "  \"confirm_email\": \"Confirm your email\","
+        ],
+        [
+          "f0.R2437",
+          "  \"scheduler_first_name\": \"The first name of the person booking\","
+        ],
+        [
+          "f2.R5",
+          "    title=\"new_guests_added\""
+        ],
+        [
+          "f2.R7",
+          "    subject=\"guests_added_event_type_subject\""
+        ]
+      ]
+    },
+    {
+      "input_file": "d0847e0dde7043e795c621fe8a24dccc-input.json",
+      "input_sha256": "70c38a1ccc1d27b3d3c19c722fc49d344156a8a5eed9bd2c6f27bf4f15d9ecd3",
+      "output_file": "d0847e0dde7043e795c621fe8a24dccc-output.json",
+      "output_sha256": "75c38ad6e06fd2a348e6d074f62a2d7f1cf3c0982376b34dea69c33180767e8f",
+      "original_record": {
+        "unit_id": "su_e866fc18018c6e13",
+        "source_refs": [
+          "f2.R3",
+          "f2.R4",
+          "f2.R5",
+          "f2.R6",
+          "f2.R7",
+          "f2.R8",
+          "f2.R9",
+          "f2.R10",
+          "f2.R11",
+          "f3.C5",
+          "f3.C12",
+          "f1.C529",
+          "f1.C534"
+        ],
+        "site_refs": [
+          "f2.R9"
+        ],
+        "trigger_ref": "f1.C534",
+        "mechanism": "contract-mismatch",
+        "severity": "warning",
+        "claim": "OrganizerAddGuestsEmail reuses OrganizerScheduledEmail's props type, which requires attendee: Person, but neither the wrapper nor the delivered email-manager call sites supply attendee, so the result for the supported inputs (calEvent only, or calEvent + teamMember) diverges from the wrapped component's expectation.",
+        "trigger": "sendAddGuestsEmails renders new OrganizerAddGuestsEmail({ calEvent }) and ({ calEvent, teamMember }); React/TSX props spread {...props} forwards no attendee value.",
+        "impact": "The organizer/team-member 'new guests added' notification can render with an undefined attendee wherever OrganizerScheduledEmail reads it (subject/personalization), producing a blank or broken message instead of the intended guest-added notice; the wrapper also hides this gap because its prop type claims attendee is required yet nothing enforces passing it.",
+        "open_question": "Does OrganizerScheduledEmail derive every displayed name/subject field from calEvent.organizer or teamMember when props.attendee is absent, or does it read props.attendee directly?",
+        "refutation": "It would be refuted by source showing OrganizerScheduledEmail defaults attendee to calEvent.organizer/teamMember before use, or by a delivered call site that passes attendee; the supplied excerpt stops at the signature (f3.C5-f3.C12) and does not contain the body, so neither is established here.",
+        "discrepancy": "Declared contract f3.C8 makes attendee non-optional, while the only delivered producers f1.C529/f1.C534 omit it and the wrapper adds no default (f2.R4-f2.R9).",
+        "kind": "hypothesis"
+      },
+      "v6_errors": [
+        {
+          "field": [
+            "source_refs"
+          ],
+          "type": "too_long"
+        }
+      ],
+      "unit": {
+        "unit_id": "su_e866fc18018c6e13",
+        "path": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "symbol": "OrganizerAddGuestsEmail",
+        "before_state": "absent-before-in-delivered-source",
+        "required_source_sides": [
+          [],
+          [
+            "f2.R3",
+            "f2.R4",
+            "f2.R5",
+            "f2.R6",
+            "f2.R7",
+            "f2.R8",
+            "f2.R9",
+            "f2.R10",
+            "f2.R11"
+          ]
+        ],
+        "allowed_site_refs": [
+          "f2.R3",
+          "f2.R4",
+          "f2.R5",
+          "f2.R6",
+          "f2.R7",
+          "f2.R8",
+          "f2.R9"
+        ]
+      },
+      "files": {
+        "f0": "apps/web/public/static/locales/en/common.json",
+        "f2": "packages/emails/src/templates/OrganizerAddGuestsEmail.tsx",
+        "f1": "packages/emails/email-manager.ts",
+        "f3": "packages/emails/src/templates/OrganizerScheduledEmail.tsx"
+      },
+      "rows": [
+        [
+          "f2.R3",
+          "export const OrganizerAddGuestsEmail = (props: React.ComponentProps<typeof OrganizerScheduledEmail>) => ("
+        ],
+        [
+          "f2.R4",
+          "  <OrganizerScheduledEmail"
+        ],
+        [
+          "f2.R5",
+          "    title=\"new_guests_added\""
+        ],
+        [
+          "f2.R6",
+          "    headerType=\"calendarCircle\""
+        ],
+        [
+          "f2.R7",
+          "    subject=\"guests_added_event_type_subject\""
+        ],
+        [
+          "f2.R8",
+          "    callToAction={null}"
+        ],
+        [
+          "f2.R9",
+          "    {...props}"
+        ],
+        [
+          "f2.R10",
+          "  />"
+        ],
+        [
+          "f2.R11",
+          ");"
+        ],
+        [
+          "f1.C529",
+          "  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));"
+        ],
+        [
+          "f1.C534",
+          "        sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent, teamMember }))"
+        ],
+        [
+          "f3.C5",
+          "export const OrganizerScheduledEmail = ("
+        ],
+        [
+          "f3.C12",
+          "  } & Partial<React.ComponentProps<typeof BaseScheduledEmail>>"
+        ]
+      ]
+    }
+  ]
+}

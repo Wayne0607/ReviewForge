@@ -121,6 +121,7 @@ def result_payload(name, args, block, aliases):
                 "mechanism",
                 "severity",
             )
+            if key in args
         },
         "sites": [{"source_ref": ref} for ref in sites],
         "trigger_basis": {"source_ref": args["trigger_ref"]},

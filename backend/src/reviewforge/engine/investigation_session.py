@@ -18,13 +18,19 @@ from reviewforge.engine.session_tools import case_identity, decision_payload, de
 def request(worker, hypothesis, pack, *, final=False, turn=1, feedback=None, status="pending"):
     """Use the actual same tools/messages for allocation forecasts and dispatch."""
     state = worker._state
-    tools = [*decision_tools(hypothesis, state.head_sha), *([] if final else worker._build_tools())]
+    tools = [
+        *decision_tools(hypothesis, state.head_sha, protocol_version=worker._protocol_version),
+        *([] if final else worker._build_tools()),
+    ]
     model = worker._closing_llm if final and worker._closing_llm is not None else worker._llm
     bound = bind_discovery_submission(model, tools)
     packet = json.loads(worker._exploration_chat(hypothesis, pack)[-1].content)
     packet["case_id"] = case_identity(hypothesis, state.head_sha)
     packet["session"] = {"state": status, "turn": turn, "last_turn": final}
-    prompt = load_prompt("session_investigation_v5", output_language=worker._output_language)
+    prompt = load_prompt(
+        "session_investigation_v9" if worker._protocol_version >= 9 else "session_investigation_v5",
+        output_language=worker._output_language,
+    )
     if worker._closure_constraints:
         prompt += "\nApplicable contract constraints:\n" + "\n".join(worker._closure_constraints)
     chat = [SystemMessage(content=prompt), HumanMessage(content=json.dumps(packet, ensure_ascii=False))]

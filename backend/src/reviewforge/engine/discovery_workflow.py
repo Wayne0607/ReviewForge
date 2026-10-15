@@ -105,7 +105,10 @@ def request(generator, work, *, read=False, global_remaining=0):
             for name in generator._unit_responsibilities.get(unit.id, [])
         )
     )
-    prompt = load_prompt("discovery_workflow_v6", output_language=generator._output_language)
+    prompt = load_prompt(
+        "discovery_workflow_v9" if work.protocol_version >= 9 else "discovery_workflow_v6",
+        output_language=generator._output_language,
+    )
     if work.protocol_version >= 7:
         prompt += "\nThe duplicate discrepancy description is optional. Do not repeat claim/trigger/impact to fill it."
     chat = [

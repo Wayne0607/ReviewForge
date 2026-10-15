@@ -50,6 +50,7 @@ from reviewforge.engine.native_submission import strict_tool_calls
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import RequestBudget, plan_request
 from reviewforge.engine.semantic_diff import SemanticChangeSet, UnitKind
+from reviewforge.engine.source_navigation import AFTER_LINES, BEFORE_LINES, SOURCE_CHARS, TOOL_CHARS
 from reviewforge.engine.verification_guidance import (
     defect_scope_guidance,
     has_python_concurrency,
@@ -544,6 +545,13 @@ class Investigator:
         if self._protocol_version >= 3:
             existing = self._query_observation(name, args)
             if existing is not None:
+                if self._protocol_version >= 9:
+                    return (
+                        "\n\n".join(
+                            self._observation_reply(item) for item in self._observations if item.query == existing.query
+                        )[:TOOL_CHARS]
+                        + "\nAlready recorded; choose a different missing fact."
+                    )
                 return self._observation_reply(existing) + "\nAlready recorded; choose a different missing fact."
         if self._tool_counts.get(query, 0) >= 2:
             return "Repeated tool call limit reached; use existing observations or investigate a different fact."
@@ -588,13 +596,19 @@ class Investigator:
             text = ""
             failed = True
         original_chars = len(text)
-        text = text[:_TOOL_RESULT_CHARS]
+        text = text[: TOOL_CHARS if self._protocol_version >= 9 else _TOOL_RESULT_CHARS]
         if failed:
             status = "error"
         elif _is_not_found(text):
             status = "not_found"
         else:
             status = "success"
+        if self._protocol_version >= 9:
+            from reviewforge.engine.source_navigation import save_window
+
+            return await save_window(
+                self, name, args, query, text, status, original_chars, shared_result_id, reused, diff_navigation
+            )
         excerpt, excerpt_range = text[:_OBS_EXCERPT_CHARS], None
         if name == "read_file" and status == "success":
             excerpt, excerpt_range = self._saved_read_excerpt(text, args)
@@ -689,7 +703,7 @@ class Investigator:
         if observation.excerpt_line_range:
             start, saved_end = observation.excerpt_line_range
             reply += f"\nSaved source lines {start}-{saved_end}; the last line may be incomplete."
-        if len(text) > _OBS_EXCERPT_CHARS:
+        if len(text) > (SOURCE_CHARS if self._protocol_version >= 9 else _OBS_EXCERPT_CHARS):
             reply += (
                 "\n[End saved evidence excerpt]\nResult exceeds the saved excerpt; omitted source is not shown. "
                 "Use read_file/read_diff with a narrower line range or a more specific search "
@@ -704,26 +718,28 @@ class Investigator:
                         f"\nNavigation only: Saved search location {observation.path}:{focus} is outside this excerpt; "
                         f"read_file start={max(1, requested_start, focus - 3)} end={min(end, focus + 8)} to record it."
                     )
-        return reply[:_TOOL_RESULT_CHARS]
+        return reply[: TOOL_CHARS if self._protocol_version >= 9 else _TOOL_RESULT_CHARS]
 
     def _saved_read_excerpt(self, text: str, args: dict[str, Any]) -> tuple[str, tuple[int, int]]:
-        # Read arguments, digest and the 6000-character tool cap stay intact.
-        # Within that returned source, prefer an already saved positive hit
-        # when the first 1200 characters would omit it. Never fetch extra text.
+        # Prefer the saved positive location within the actual returned source.
+        # Protocol 9 saves a wider window as several original-sized immutable
+        # Observations; protocols 1–8 retain their historical window and caps.
+        # Never fetch extra text or promote an omitted byte into evidence.
         first = max(1, int(args.get("start") or 1))
         lines = text.splitlines(keepends=True)
-        excerpt = text[:_OBS_EXCERPT_CHARS]
+        limit = SOURCE_CHARS if self._protocol_version >= 9 else _OBS_EXCERPT_CHARS
+        excerpt = text[:limit]
         path = str(args.get("path") or "")
         focus = self._saved_read_focus(path)
         if self._protocol_version >= 3:
             focus = focus or self._read_focus.get(path)
         offset = focus - first if focus is not None else -1
-        if 0 <= offset < len(lines) and len("".join(lines[: offset + 1])) > _OBS_EXCERPT_CHARS:
+        if 0 <= offset < len(lines) and len("".join(lines[: offset + 1])) > limit:
             begin = max(0, offset - 3)
             # A very long preceding line must not displace the known hit again.
-            if len("".join(lines[begin:offset])) >= _OBS_EXCERPT_CHARS:
+            if len("".join(lines[begin:offset])) >= limit:
                 begin = offset
-            excerpt = "".join(lines[begin : offset + 9])[:_OBS_EXCERPT_CHARS]
+            excerpt = "".join(lines[begin : offset + 9])[:limit]
             first += begin
         return excerpt, (first, first + len(excerpt.splitlines()) - 1)
 
@@ -751,9 +767,14 @@ class Investigator:
         focus = self._saved_read_focus(path) or self._read_focus.get(path)
         if focus is None:
             return args
-        return {**args, "start": max(1, focus - 3), "end": focus + 8}
+        before, after = (BEFORE_LINES, AFTER_LINES) if self._protocol_version >= 9 else (3, 8)
+        return {**args, "start": max(1, focus - before), "end": focus + after}
 
     def _saved_read_focus(self, path: str) -> int | None:
+        if self._protocol_version >= 9:
+            from reviewforge.engine.source_navigation import focus
+
+            return focus(self._observations, path)
         # Search scopes are not files. Use concrete locations in saved positive
         # hits, never an absent result or model-authored filename/line guess.
         for observation in reversed(self._observations):
@@ -1317,6 +1338,10 @@ class Investigator:
     ) -> InvestigationResult:
         """Answer one hypothesis's open_question within its budget_steps."""
 
+        if self._protocol_version >= 9:
+            from reviewforge.engine.investigation_transaction import investigate
+
+            return await investigate(self, hypothesis, state, pack, changed_paths=changed_paths)
         if self._protocol_version >= 5:
             from reviewforge.engine.investigation_session import investigate
 
@@ -1732,6 +1757,10 @@ class Investigator:
         packet["proof_duty"] = next(
             (entry for entry in reversed(self._progress) if entry.get("phase") == "proof-duty"), None
         )
+        if self._protocol_version >= 9:
+            from reviewforge.engine.source_navigation import packet as navigation_packet
+
+            packet["source_navigation"] = navigation_packet(self._observations)
         return [
             SystemMessage(content=self._system_prompt()),
             HumanMessage(content=json.dumps(packet, ensure_ascii=False, separators=(",", ":"))),
@@ -2556,9 +2585,11 @@ class Investigator:
                     worker._max_steps = max(0, allowance["budget_steps_limit"] - allowance.get("total_steps", 0))
                     from reviewforge.engine.investigation_repair import has_saved_result
 
-                    if (not worker._max_steps and not (metered and has_saved_result(hypothesis))) or (
-                        adaptive and not worker._token_limit
-                    ):
+                    if (
+                        not worker._max_steps
+                        and ledger.protocol_version < 9
+                        and not (metered and has_saved_result(hypothesis))
+                    ) or (adaptive and not worker._token_limit):
                         return worker._result(
                             verdict="unknown",
                             reason="investigation-step-limit" if metered else "original-task-budget-exhausted",

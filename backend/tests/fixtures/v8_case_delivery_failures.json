@@ -1,0 +1,1842 @@
+{
+  "origin": "Protocol 8 real Cal.com #14740, 2026-10-15; transport regression data, not correctness labels or benchmark truth.",
+  "head_sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+  "workspace_digest": "fa7ce3bdc1b04f2f5a5258cd4a9873298d3ba0d81d304076d1fa02cca44b3ff4",
+  "source_result_sha256": "23d100031e7036bbe44c91a7e2562bd8405ca3d4383c5e429063f966497d23f3",
+  "cases": [
+    {
+      "case": {
+        "id": "h_1e09afc6",
+        "identity": "su_2bcf26f1a8d03c72::error-path::getNodeMailerPayload",
+        "unit_id": "su_2bcf26f1a8d03c72",
+        "mechanism": "error-path",
+        "claim": "OrganizerAddGuestsEmail.getNodeMailerPayload dereferences this.calEvent.attendees[0].name for the subject line without guarding an empty attendees array, and uses this.t inherited from OrganizerScheduledEmail's constructor, which reads this.calEvent.organizer.language.translate unguarded.",
+        "trigger": "sendAddGuestsEmails is called from the addGuests handler with a evt whose attendees array is empty (or organizer/language missing), e.g. a booking state where all attendee rows were removed before the handler ran.",
+        "impact": "TypeError thrown inside getNodeMailerPayload propagates through sendEmail()/await Promise.all(emailsToSend) so the whole batch fails; the handler catches it and logs only \"Error sending AddGuestsEmails\", so the organizer never learns guests were added and no partial emails are guaranteed sent.",
+        "open_question": "Can the addGuests tRPC path reach sendAddGuestsEmails with calEvent.attendees empty (or organizer.language absent), and do sibling organizer templates guard attendees[0] access?",
+        "refutation": "If the handler always loads the booking with its attendees and rejects when none exist, and organizer.language is guaranteed by the CalendarEvent type construction upstream, then attendees[0] and this.t are safe and this is only a stylistic difference from base templates.",
+        "sites": [
+          {
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line": 28,
+            "excerpt": "        name: this.calEvent.attendees[0].name,"
+          }
+        ],
+        "severity": "warning",
+        "source": "generator",
+        "status": "open",
+        "evidence_strength": "none",
+        "observations": [
+          {
+            "id": "obs_0",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/templates/organizer-scheduled-email.ts\"}",
+            "path": "packages/emails/templates/organizer-scheduled-email.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "c7174f9cdf408d9c",
+            "excerpt": "// eslint-disable-next-line no-restricted-imports\nimport { cloneDeep } from \"lodash\";\nimport type { TFunction } from \"next-i18next\";\n\nimport { getRichDescription } from \"@calcom/lib/CalEventParser\";\nimport { EMAIL_FROM_NAME } from \"@calcom/lib/constants\";\nimport { TimeFormat } from \"@calcom/lib/timeFormat\";\nimport type { CalendarEvent, Person } from \"@calcom/types/Calendar\";\n\nimport { renderEmail } from \"../\";\nimport generateIcsString from \"../lib/generateIcsString\";\nimport BaseEmail from \"./_base-email\";\n\nexport default class OrganizerScheduledEmail extends BaseEmail {\n  calEvent: CalendarEvent;\n  t: TFunction;\n  newSeat?: boolean;\n  teamMember?: Person;\n\n  constructor(input: { calEvent: CalendarEvent; newSeat?: boolean; teamMember?: Person }) {\n    super();\n    this.name = \"SEND_BOOKING_CONFIRMATION\";\n    this.calEvent = input.calEvent;\n    this.t = this.calEvent.organizer.language.translate;\n    this.newSeat = input.newSeat;\n    this.teamMember = input.teamMember;\n  }\n\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const clonedCalEvent = cloneDeep(this.calEvent);\n    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              31
+            ]
+          },
+          {
+            "id": "obs_1",
+            "tool": "read_diff",
+            "query": "read_diff {\"path\": \"packages/emails/src/templates/index.ts\"}",
+            "path": "packages/emails/src/templates/index.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "e745e97adb1e17b3",
+            "excerpt": "@@ -35,4 +35,6 @@ export { AdminOrganizationNotificationEmail } from \"./AdminOrganizationNotificat\n export { BookingRedirectEmailNotification } from \"./BookingRedirectEmailNotification\";\n export { VerifyEmailChangeEmail } from \"./VerifyEmailChangeEmail\";\n export { OrganizationCreationEmail } from \"./OrganizationCreationEmail\";\n+export { OrganizerAddGuestsEmail } from \"./OrganizerAddGuestsEmail\";\n+export { AttendeeAddGuestsEmail } from \"./AttendeeAddGuestsEmail\";\n export { OrganizationAdminNoSlotsEmail } from \"./OrganizationAdminNoSlots\";",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_2",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/src/templates/index.ts\"}",
+            "path": "packages/emails/src/templates/index.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "6ba2bf8ebff47f8f",
+            "excerpt": "export { AttendeeAwaitingPaymentEmail } from \"./AttendeeAwaitingPaymentEmail\";\nexport { AttendeeCancelledEmail } from \"./AttendeeCancelledEmail\";\nexport { AttendeeCancelledSeatEmail } from \"./AttendeeCancelledSeatEmail\";\nexport { AttendeeDeclinedEmail } from \"./AttendeeDeclinedEmail\";\nexport { AttendeeLocationChangeEmail } from \"./AttendeeLocationChangeEmail\";\nexport { AttendeeRequestEmail } from \"./AttendeeRequestEmail\";\nexport { AttendeeWasRequestedToRescheduleEmail } from \"./AttendeeWasRequestedToRescheduleEmail\";\nexport { AttendeeRescheduledEmail } from \"./AttendeeRescheduledEmail\";\nexport { AttendeeScheduledEmail } from \"./AttendeeScheduledEmail\";\nexport { DisabledAppEmail } from \"./DisabledAppEmail\";\nexport { SlugReplacementEmail } from \"./SlugReplacementEmail\";\nexport { FeedbackEmail } from \"./FeedbackEmail\";\nexport { ForgotPasswordEmail } from \"./ForgotPasswordEmail\";\nexport { OrganizerCancelledEmail } from \"./OrganizerCancelledEmail\";\nexport { OrganizerLocationChangeEmail } from \"./OrganizerLocationChangeEmail\";\nexport { OrganizerPaymentRefundFailedEmail } from \"./OrganizerPaymentRefundFailedEmail\";\nexport { OrganizerRequestEmail } from \"./OrganizerRequestEmail\";\nexport { ",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              18
+            ]
+          },
+          {
+            "id": "obs_3",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 28, \"path\": \"packages/emails/templates/organizer-add-guests-email.ts\", \"start\": 28}",
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line_range": [
+              28,
+              28
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "f6753c42c29340aa",
+            "excerpt": "+          status: \"CONFIRMED\",\n+        }),\n+        method: \"REQUEST\",\n+      },\n+      from: `${APP_NAME} <${this.getMailerOptions().from}>`,\n+      to: toAddresses.join(\",\"),\n+      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],\n+      subject: `${this.t(\"guests_added_event_type_subject\", {\n+        eventType: this.calEvent.type,\n+        name: this.calEvent.attendees[0].name,\n+        date: this.getFormattedDate(),\n+      })}`,\n+      html: await renderEmail(\"OrganizerAddGuestsEmail\", {\n+        attendee: this.calEvent.organizer,\n+        calEvent: this.calEvent,\n+      }),\n+      text: this.getTextBody(\"new_guests_added\"),\n+    };\n+  }\n+}",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_5359815cd309816ecaaa817e"
+          },
+          {
+            "id": "obs_4",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 38, \"path\": \"packages/emails/templates/organizer-add-guests-email.ts\", \"start\": 7}",
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line_range": [
+              7,
+              38
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "f59a246b80ff7170",
+            "excerpt": "export default class OrganizerAddGuestsEmail extends OrganizerScheduledEmail {\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n\n    return {\n      icalEvent: {\n        filename: \"event.ics\",\n        content: generateIcsString({\n          event: this.calEvent,\n          title: this.t(\"new_guests_added\"),\n          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),\n          role: \"organizer\",\n          status: \"CONFIRMED\",\n        }),\n        method: \"REQUEST\",\n      },\n      from: `${APP_NAME} <${this.getMailerOptions().from}>`,\n      to: toAddresses.join(\",\"),\n      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],\n      subject: `${this.t(\"guests_added_event_type_subject\", {\n        eventType: this.calEvent.type,\n        name: this.calEvent.attendees[0].name,\n        date: this.getFormattedDate(),\n      })}`,\n      html: await renderEmail(\"OrganizerAddGuestsEmail\", {\n        attendee: this.calEvent.organizer,\n        calEvent: this.calEvent,\n      }),\n      text: this.getTextBody(\"new_guests_added\"),\n    };\n  }\n}\n",
+            "status": "success",
+            "excerpt_line_range": [
+              7,
+              38
+            ],
+            "shared_result_id": "sr_c038148cad4aa2f816a7fb06"
+          },
+          {
+            "id": "obs_5",
+            "tool": "find_references",
+            "query": "find_references {\"glob\": \"\", \"max_hits\": 20, \"path\": \"\", \"symbol\": \"OrganizerAddGuestsEmail\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "5633e85ab5af758e",
+            "excerpt": "- packages/emails/email-manager.ts:52: import OrganizerAddGuestsEmail from \"./templates/organizer-add-guests-email\";\n- packages/emails/src/templates/OrganizerAddGuestsEmail.tsx:3: export const OrganizerAddGuestsEmail = (props: React.ComponentProps<typeof OrganizerScheduledEmail>) => (\n- packages/emails/src/templates/index.ts:38: export { OrganizerAddGuestsEmail } from \"./OrganizerAddGuestsEmail\";\n- packages/emails/templates/organizer-add-guests-email.ts:7: export default class OrganizerAddGuestsEmail extends OrganizerScheduledEmail {\n- packages/emails/email-manager.ts:529:   emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));\n- packages/emails/templates/organizer-add-guests-email.ts:31:       html: await renderEmail(\"OrganizerAddGuestsEmail\", {",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_854e5caf1b00e90ddc0b11a5"
+          },
+          {
+            "id": "obs_6",
+            "tool": "grep",
+            "query": "grep {\"glob\": \"\", \"max_hits\": 20, \"pattern\": \"sendAddGuestsEmails\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "7a1a74caf3f00200",
+            "excerpt": "- packages/emails/email-manager.ts:525: export const sendAddGuestsEmails = async (calEvent: CalendarEvent, newGuests: string[]) => {\n- packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts:3: import { sendAddGuestsEmails } from \"@calcom/emails\";\n- packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts:168:     await sendAddGuestsEmails(evt, guests);",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_abd3706781f6e0815990ed07"
+          },
+          {
+            "id": "obs_7",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 11, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 1}",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line_range": [
+              1,
+              11
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "0e50376410b6bcda",
+            "excerpt": "import EventManager from \"@calcom/core/EventManager\";\nimport dayjs from \"@calcom/dayjs\";\nimport { sendAddGuestsEmails } from \"@calcom/emails\";\nimport { parseRecurringEvent } from \"@calcom/lib\";\nimport { getTranslation } from \"@calcom/lib/server\";\nimport { getUsersCredentials } from \"@calcom/lib/server/getUsersCredentials\";\nimport { isTeamAdmin, isTeamOwner } from \"@calcom/lib/server/queries/teams\";\nimport { prisma } from \"@calcom/prisma\";\nimport type { CalendarEvent } from \"@calcom/types/Calendar\";\n\nimport { TRPCError } from \"@trpc/server\";\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              11
+            ],
+            "shared_result_id": "sr_f54dc4cc727e36022aedfe58"
+          }
+        ],
+        "verdict_reason": "Whether addGuests.handler.ts can actually reach sendAddGuestsEmails (obs_6:e3) with evt.attendees empty \u2014 i.e. whether the booking is loaded with attendees and the handler rejects when none exist, or instead builds evt from an empty attendee set after adding guests. The saved reads of that handler covered only lines 1-11 (obs_7:e1, obs_7:e2); the body constructing `evt` and its guards around line 168 was never read in this session.",
+        "attempts": 1,
+        "investigation_steps": 4,
+        "investigation_tokens": 21651,
+        "retryable": false,
+        "assessment": null,
+        "investigation_outcome": "insufficient-evidence",
+        "investigation_task_id": "it_a3941b46e3f60bec32b9f7be",
+        "discovery_basis": {
+          "behavior": {
+            "source_facts": [
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 8,
+                "excerpt": "  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 9,
+                "excerpt": "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 24,
+                "excerpt": "      to: toAddresses.join(\",\"),"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 25,
+                "excerpt": "      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 26,
+                "excerpt": "      subject: `${this.t(\"guests_added_event_type_subject\", {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 28,
+                "excerpt": "        name: this.calEvent.attendees[0].name,"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 29,
+                "excerpt": "        date: this.getFormattedDate(),"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 31,
+                "excerpt": "      html: await renderEmail(\"OrganizerAddGuestsEmail\", {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 35,
+                "excerpt": "      text: this.getTextBody(\"new_guests_added\"),"
+              },
+              {
+                "side": "context",
+                "path": "packages/emails/templates/organizer-scheduled-email.ts",
+                "line": 31,
+                "excerpt": "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+              }
+            ]
+          },
+          "trigger_basis": {
+            "side": "after",
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line": 28,
+            "excerpt": "        name: this.calEvent.attendees[0].name,"
+          }
+        }
+      },
+      "tool_call": {
+        "name": "submit_unknown",
+        "args": {
+          "case_id": "case_e5a64c191db1ae605368af44",
+          "missing_fact": "Whether addGuests.handler.ts can actually reach sendAddGuestsEmails (obs_6:e3) with evt.attendees empty \u2014 i.e. whether the booking is loaded with attendees and the handler rejects when none exist, or instead builds evt from an empty attendee set after adding guests. The saved reads of that handler covered only lines 1-11 (obs_7:e1, obs_7:e2); the body constructing `evt` and its guards around line 168 was never read in this session.",
+          "reason": "The unguarded dereferences are confirmed in source: organizer-add-guests-email.ts uses `this.calEvent.attendees[0].name` in the subject (obs_4:e3, obs_3:e2) with no length check, and inherits `this.t = this.calEvent.organizer.language.translate` from OrganizerScheduledEmail's constructor (obs_0:e3), while email-manager pushes OrganizerAddGuestsEmail built from a raw calendarEvent (obs_5:e5). However, I could not establish the PR-introduced trigger path: the caller-side evidence stops at the import (obs_7:e1, obs_7:e2) and the call site line (obs_6:e3), and the last turn allows no further reads. Without the handler body I cannot prove the alleged bad result occurs for the same witness input rather than being guarded upstream, so neither confirmation nor counterevidence is available."
+        }
+      }
+    },
+    {
+      "case": {
+        "id": "h_34686ab6",
+        "identity": "su_441439813556f7a7::null-path::handleAdd",
+        "unit_id": "su_441439813556f7a7",
+        "mechanism": "null-path",
+        "claim": "handleAdd's emptiness guard `multiEmailValue.length === 0` can never fire because useState initializes the array to [\"\"] (length 1); an untouched dialog submits [''] to addGuestsMutation.mutate, relying on z.string().email() rejection to surface isInvalidEmail instead of a silent no-op.",
+        "trigger": "User opens Add Guests dialog and clicks Add without typing any email; multiEmailValue is still [\"\"].",
+        "impact": "Guarded early-return path is dead code; empty-string guest values reach the mutation call/validation flow rather than being skipped, changing UX from silent return to error toast/inline message.",
+        "open_question": "Does the delivered addGuests.schema.ts / MultiEmail contract guarantee that [\"\"] is filtered or rejected before guests are persisted, so submitting an untouched dialog cannot add an empty guest?",
+        "refutation": "If MultiEmail.setValue always keeps at least one populated entry or the server schema strips empty strings, the guard's death is harmless and validation handles the case.",
+        "sites": [
+          {
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line": 49,
+            "excerpt": "    if (multiEmailValue.length === 0) {"
+          }
+        ],
+        "severity": "info",
+        "source": "generator",
+        "status": "open",
+        "evidence_strength": "none",
+        "observations": [
+          {
+            "id": "obs_0",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 58, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 48}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              48,
+              58
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "a057c6fd9812fc59",
+            "excerpt": "  const handleAdd = () => {\n    if (multiEmailValue.length === 0) {\n      return;\n    }\n    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n  };\n",
+            "status": "success",
+            "excerpt_line_range": [
+              48,
+              58
+            ]
+          },
+          {
+            "id": "obs_1",
+            "tool": "read_diff",
+            "query": "read_diff {\"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\"}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "a2f33a4c2b168587",
+            "excerpt": "@@ -0,0 +1,107 @@\n+import type { Dispatch, SetStateAction } from \"react\";\n+import { useState } from \"react\";\n+import { z } from \"zod\";\n+\n+import { useLocale } from \"@calcom/lib/hooks/useLocale\";\n+import { trpc } from \"@calcom/trpc/react\";\n+import {\n+  Button,\n+  Dialog,\n+  DialogContent,\n+  DialogFooter,\n+  DialogHeader,\n+  MultiEmail,\n+  Icon,\n+  showToast,\n+} from \"@calcom/ui\";\n+\n+interface IAddGuestsDialog {\n+  isOpenDialog: boolean;\n+  setIsOpenDialog: Dispatch<SetStateAction<boolean>>;\n+  bookingId: number;\n+}\n+\n+export const AddGuestsDialog = (props: IAddGuestsDialog) => {\n+  const { t } = useLocale();\n+  const ZAddGuestsInputSchema = z.array(z.string().email()).refine((emails) => {\n+    const uniqueEmails = new Set(emails);\n+    return uniqueEmails.size === emails.length;\n+  });\n+  const { isOpenDialog, setIsOpenDialog, bookingId } = props;\n+  const utils = trpc.useUtils();\n+  const [multiEmailValue, setMultiEmailValue] = useState<string[]>([\"\"]);\n+  const [isInvalidEmail, setIsInvalidEmail] = useState(false);\n+\n+  const addGuestsMutation = trpc.viewer.bookings.addGuests.useMutation({\n+    onSuccess: async () => {\n+      showToast(t(\"guests_added\"), \"success\");\n+      setIsO",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_2",
+            "tool": "find_definition",
+            "query": "find_definition {\"symbol\": \"MultiEmail\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "2eb74e26e9bc945f",
+            "excerpt": "- MultiEmail [function] packages/features/form-builder/Components.tsx:234\n  233:     //TODO: Make it a ui component\n234:     factory: function MultiEmail({ value, readOnly, label, setValue, ...props }) {\n235:       const placeholder = props.placeholder;\n236:       const { t } = useLocale();\n237:       value = value || [];\n238:       const inputClassName =\n239:         \"dark:placeholder:text-muted focus:border-emphasis border-subtle block w-full rounded-md border-default text-sm focus:ring-black disabled:bg-emphasis disabled:hover:cursor-not-allowed dark:selection:bg-green-500 disabled:dark:text-subtle bg-default\";\n240:       return (\n241:         <>\n242:           {value.length ? (\n243:             <div>\n244:               <label htmlFor=\"guests\" className=\"text-default  mb-1 block text-sm font-medium\">\n245:                 {label}\n246:               </label>\n247:               <ul>\n248:                 {value.map((field, index) => (\n249:                   <li key={index}>\n250:                     <EmailField\n251:                       disabled={readOnly}\n252:                       value={value[index]}\n253:                       className={inputClassName}\n254:                      ",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_3",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 49, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 49}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              49,
+              49
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "0112036bb6051aac",
+            "excerpt": "+    onSuccess: async () => {\n+      showToast(t(\"guests_added\"), \"success\");\n+      setIsOpenDialog(false);\n+      setMultiEmailValue([\"\"]);\n+      utils.viewer.bookings.invalidate();\n+    },\n+    onError: (err) => {\n+      const message = `${err.data?.code}: ${t(err.message)}`;\n+      showToast(message || t(\"unable_to_add_guests\"), \"error\");\n+    },\n+  });\n+\n+  const handleAdd = () => {\n+    if (multiEmailValue.length === 0) {\n+      return;\n+    }\n+    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n+    if (validationResult.success) {\n+      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n+    } else {\n+      setIsInvalidEmail(true);\n+    }\n+  };\n+\n+  return (\n+    <Dialog open={isOpenDialog} onOpenChange={setIsOpenDialog}>\n+      <DialogContent enableOverflow>\n+        <div className=\"flex flex-row space-x-3\">\n+          <div className=\"bg-subtle flex h-10 w-10 flex-shrink-0 justify-center rounded-full \">\n+            <Icon name=\"user-plus\" className=\"m-auto h-6 w-6\" />\n+          </div>\n+          <div className=\"w-full pt-1\">\n+            <DialogHeader title={t(\"additional_guests\")} />\n+            <MultiEmail\n+              label",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_6e42d3213b21ec93d0510686"
+          },
+          {
+            "id": "obs_4",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 59, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 47}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              47,
+              59
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "5e76c3330616252b",
+            "excerpt": "\n  const handleAdd = () => {\n    if (multiEmailValue.length === 0) {\n      return;\n    }\n    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n  };\n\n",
+            "status": "success",
+            "excerpt_line_range": [
+              47,
+              59
+            ],
+            "shared_result_id": "sr_db65e05403c0abaa0e180ffd"
+          },
+          {
+            "id": "obs_5",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 57, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 46}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              46,
+              57
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "5cc45cda11e8a372",
+            "excerpt": "  });\n\n  const handleAdd = () => {\n    if (multiEmailValue.length === 0) {\n      return;\n    }\n    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n",
+            "status": "success",
+            "excerpt_line_range": [
+              46,
+              57
+            ],
+            "shared_result_id": "sr_6a017b6c81efca4bd13da56e"
+          },
+          {
+            "id": "obs_6",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 107, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 58}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              58,
+              107
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "9bb7812487ac2749",
+            "excerpt": "  };\n\n  return (\n    <Dialog open={isOpenDialog} onOpenChange={setIsOpenDialog}>\n      <DialogContent enableOverflow>\n        <div className=\"flex flex-row space-x-3\">\n          <div className=\"bg-subtle flex h-10 w-10 flex-shrink-0 justify-center rounded-full \">\n            <Icon name=\"user-plus\" className=\"m-auto h-6 w-6\" />\n          </div>\n          <div className=\"w-full pt-1\">\n            <DialogHeader title={t(\"additional_guests\")} />\n            <MultiEmail\n              label={t(\"add_emails\")}\n              value={multiEmailValue}\n              readOnly={false}\n              setValue={setMultiEmailValue}\n            />\n\n            {isInvalidEmail && (\n              <div className=\"my-4 flex text-sm text-red-700\">\n                <div className=\"flex-shrink-0\">\n                  <Icon name=\"triangle-alert\" className=\"h-5 w-5\" />\n                </div>\n                <div className=\"ml-3\">\n                  <p className=\"font-medium\">{t(\"emails_must_be_unique_valid\")}</p>\n                </div>\n              </div>\n            )}\n\n            <DialogFooter>\n              <Button\n                onClick={() => {\n                  setMultiEmailValue([\"\"]);\n                  ",
+            "status": "success",
+            "excerpt_line_range": [
+              58,
+              91
+            ],
+            "shared_result_id": "sr_d1f72bf560fdfc134b19f91d"
+          },
+          {
+            "id": "obs_7",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 107, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 85}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              85,
+              107
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "1663623d4b11310d",
+            "excerpt": "            )}\n\n            <DialogFooter>\n              <Button\n                onClick={() => {\n                  setMultiEmailValue([\"\"]);\n                  setIsInvalidEmail(false);\n                  setIsOpenDialog(false);\n                }}\n                type=\"button\"\n                color=\"secondary\">\n                {t(\"cancel\")}\n              </Button>\n              <Button data-testid=\"add_members\" loading={addGuestsMutation.isPending} onClick={handleAdd}>\n                {t(\"add\")}\n              </Button>\n            </DialogFooter>\n          </div>\n        </div>\n      </DialogContent>\n    </Dialog>\n  );\n};\n",
+            "status": "success",
+            "excerpt_line_range": [
+              85,
+              107
+            ],
+            "shared_result_id": "sr_459346cc5ccfc2b6fc56c5c4"
+          },
+          {
+            "id": "obs_8",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 300, \"path\": \"packages/features/form-builder/Components.tsx\", \"start\": 234}",
+            "path": "packages/features/form-builder/Components.tsx",
+            "line_range": [
+              234,
+              300
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "17b4b8113597fc94",
+            "excerpt": "    factory: function MultiEmail({ value, readOnly, label, setValue, ...props }) {\n      const placeholder = props.placeholder;\n      const { t } = useLocale();\n      value = value || [];\n      const inputClassName =\n        \"dark:placeholder:text-muted focus:border-emphasis border-subtle block w-full rounded-md border-default text-sm focus:ring-black disabled:bg-emphasis disabled:hover:cursor-not-allowed dark:selection:bg-green-500 disabled:dark:text-subtle bg-default\";\n      return (\n        <>\n          {value.length ? (\n            <div>\n              <label htmlFor=\"guests\" className=\"text-default  mb-1 block text-sm font-medium\">\n                {label}\n              </label>\n              <ul>\n                {value.map((field, index) => (\n                  <li key={index}>\n                    <EmailField\n                      disabled={readOnly}\n                      value={value[index]}\n                      className={inputClassName}\n                      onChange={(e) => {\n                        value[index] = e.target.value;\n                        setValue(value);\n                      }}\n                      placeholder={placeholder}\n                      label={<><",
+            "status": "success",
+            "excerpt_line_range": [
+              234,
+              259
+            ],
+            "shared_result_id": "sr_e3768ca301bfe2d9d788ba37"
+          }
+        ],
+        "verdict_reason": "case-result-repair-limit",
+        "attempts": 1,
+        "investigation_steps": 6,
+        "investigation_tokens": 34862,
+        "retryable": false,
+        "assessment": null,
+        "investigation_outcome": "output-error",
+        "investigation_task_id": "it_c575a6fd3153f8f527b23b49",
+        "discovery_basis": {
+          "behavior": {
+            "source_facts": [
+              {
+                "side": "after",
+                "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+                "line": 32,
+                "excerpt": "  const [multiEmailValue, setMultiEmailValue] = useState<string[]>([\"\"]);"
+              },
+              {
+                "side": "after",
+                "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+                "line": 49,
+                "excerpt": "    if (multiEmailValue.length === 0) {"
+              },
+              {
+                "side": "after",
+                "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+                "line": 52,
+                "excerpt": "    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);"
+              },
+              {
+                "side": "after",
+                "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+                "line": 54,
+                "excerpt": "      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });"
+              },
+              {
+                "side": "after",
+                "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+                "line": 56,
+                "excerpt": "      setIsInvalidEmail(true);"
+              }
+            ]
+          },
+          "trigger_basis": {
+            "side": "after",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line": 49,
+            "excerpt": "    if (multiEmailValue.length === 0) {"
+          }
+        }
+      },
+      "tool_call": {
+        "name": "submit_refuted",
+        "args": {
+          "case_id": "case_0480898f670819bfed613285",
+          "premise": "mechanism",
+          "reason": "The candidate's own trigger requires an untouched dialog, i.e. multiEmailValue still equals the useState initial value [\"\"]. For that input the guard at line 49 is not entered (length is 1), so execution continues to safeParse([\"\"]), which fails z.string().email() and sets isInvalidEmail \u2014 exactly the behavior the candidate itself asserts. The alleged \"dead code\" therefore cannot fire on the original witness; it only becomes reachable if some other path sets the array to [], which is not the claimed input. No changed incorrect result or concrete harmful consequence is established for this input, and the guard being unreachable with a length-1 initializer is harmless defensive code, not a contract violation.",
+          "statement": "On the original input (untouched dialog, multiEmailValue === [\"\"]), the emptiness guard does not run and does not change any behavior: handleAdd falls through to ZAddGuestsInputSchema.safeParse([\"\"]), which rejects \"\" via z.string().email(), so setIsInvalidEmail(true) shows the inline error instead of calling addGuestsMutation.mutate. The guard's non-firing is inert, not a defect.",
+          "evidence": [
+            "obs_0:e1",
+            "obs_1:e3",
+            "obs_1:e2",
+            "obs_6:e2",
+            "obs_7:e2"
+          ]
+        }
+      }
+    },
+    {
+      "case": {
+        "id": "h_e4060d43",
+        "identity": "su_4f55d1b4d6edc1dc::wrong-operator::addGuestsHandler",
+        "unit_id": "su_4f55d1b4d6edc1dc",
+        "mechanism": "wrong-operator",
+        "claim": "Authorization gate at f6.R46-R48 combines the two team-role checks with && instead of ||, so isTeamAdminOrOwner is true only when the caller is simultaneously team admin AND owner of booking.eventType?.teamId ?? 0; every non-owner/admin caller therefore depends solely on isOrganizer/isAttendee, and for personal events (teamId null -> 0) the admin check can never be satisfied.",
+        "trigger": "A booking organizer, an attendee, or a team ADMIN (not OWNER) calls addGuests with valid new guest emails on a booking whose eventType.teamId is null/undefined (personal event).",
+        "impact": "Legitimate collaborators who should be allowed to add guests are rejected with FORBIDDEN (f6.R54-R55), while the intended 'admin or owner' escalation path is effectively dead code; conversely nothing over-grants, so the observable regression is denied access rather than privilege escalation.",
+        "open_question": "What is the intended authorization contract for addGuests: must any single sufficient condition (organizer OR attendee OR team admin OR team owner) grant access, and does the schema/route expose this mutation to teammates of the organizer?",
+        "refutation": "Counter-evidence would be a documented product rule that only team owners may add guests and that organizers/attendees always cover the remaining cases; also if the intended semantics were strict (owner implies admin), && would be harmless except that it still fails for ADMIN-only members and for personal events where teamId ?? 0 matches no membership row. Delivered source contains no such spec, and addGuests.schema.ts was not delivered.",
+        "sites": [
+          {
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line": 48,
+            "excerpt": "    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));"
+          }
+        ],
+        "severity": "error",
+        "source": "generator",
+        "status": "open",
+        "evidence_strength": "none",
+        "observations": [
+          {
+            "id": "obs_0",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/ui/form/MultiEmailLazy.tsx\"}",
+            "path": "packages/ui/form/MultiEmailLazy.tsx",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "f000da16352689dd",
+            "excerpt": "import dynamic from \"next/dynamic\";\n\n/** These are like 40kb that not every user needs */\nconst MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;\n\nexport default MultiEmail;\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              6
+            ]
+          },
+          {
+            "id": "obs_1",
+            "tool": "read_diff",
+            "query": "read_diff {\"path\": \"packages/ui/form/MultiEmail.tsx\"}",
+            "path": "packages/ui/form/MultiEmail.tsx",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "22299494b709e58b",
+            "excerpt": "@@ -0,0 +1,96 @@\n+import { useLocale } from \"@calcom/lib/hooks/useLocale\";\n+import { Button, EmailField, Icon, Tooltip } from \"@calcom/ui\";\n+\n+interface MultiEmailProps {\n+  value: string[];\n+  readOnly: boolean;\n+  label: string;\n+  setValue: (value: string[]) => void;\n+  placeholder?: string;\n+}\n+\n+function MultiEmail({ value, readOnly, label, setValue, placeholder }: MultiEmailProps) {\n+  const { t } = useLocale();\n+  value = value || [];\n+  const inputClassName =\n+    \"dark:placeholder:text-muted focus:border-emphasis border-subtle block w-full rounded-md border-default text-sm focus:ring-black disabled:bg-emphasis disabled:hover:cursor-not-allowed dark:selection:bg-green-500 disabled:dark:text-subtle bg-default\";\n+  return (\n+    <>\n+      {value.length ? (\n+        <div>\n+          <label htmlFor=\"emails\" className=\"text-default my-2 block text-sm font-medium\">\n+            {label}\n+          </label>\n+          <ul>\n+            {value.map((field, index) => (\n+              <li key={index}>\n+                <EmailField\n+                  disabled={readOnly}\n+                  value={field}\n+                  className={inputClassName}\n+                  onChange={(e) => {\n+ ",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_2",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 48, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 48}",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line_range": [
+              48,
+              48
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "34c95afd8d6dd16e",
+            "excerpt": "+      destinationCalendar: true,\n+      references: true,\n+      user: {\n+        include: {\n+          destinationCalendar: true,\n+          credentials: true,\n+        },\n+      },\n+    },\n+  });\n+\n+  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });\n+\n+  const isTeamAdminOrOwner =\n+    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n+    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n+\n+  const isOrganizer = booking.userId === user.id;\n+\n+  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n+\n+  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n+    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n+  }\n+\n+  const organizer = await prisma.user.findFirstOrThrow({\n+    where: {\n+      id: booking.userId || 0,\n+    },\n+    select: {\n+      name: true,\n+      email: true,\n+      timeZone: true,\n+      locale: true,\n+    },\n+  });\n+\n+  const blacklistedGuestEmails = process.env.BLACKLISTED_GUEST_EMAILS\n+    ? process.env.BLACKLISTED_GUEST_EMAILS.split(\",\").map((email) => email.toLowerCase())\n+    : [];\n+\n+  const uniqueGuests = guests.f",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_ff7abc2a4f9f917a94cea56c"
+          },
+          {
+            "id": "obs_3",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 56, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 45}",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line_range": [
+              45,
+              56
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "501e8a6155bb81d3",
+            "excerpt": "\n  const isTeamAdminOrOwner =\n    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n\n  const isOrganizer = booking.userId === user.id;\n\n  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n\n  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n  }\n",
+            "status": "success",
+            "excerpt_line_range": [
+              45,
+              56
+            ],
+            "shared_result_id": "sr_44243b9b0d569beb21313551"
+          },
+          {
+            "id": "obs_4",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 300, \"path\": \"packages/lib/server/queries/teams/index.ts\", \"start\": 255}",
+            "path": "packages/lib/server/queries/teams/index.ts",
+            "line_range": [
+              255,
+              300
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "d8a0b109e7d20934",
+            "excerpt": "        token.expires > new Date(new Date().setHours(24))\n    ),\n    metadata: restTeamMetadata,\n    eventTypes: !isOrgView ? eventTypes : null,\n    members,\n  };\n}\n\n// also returns team\nexport async function isTeamAdmin(userId: number, teamId: number) {\n  const team = await prisma.membership.findFirst({\n    where: {\n      userId,\n      teamId,\n      accepted: true,\n      OR: [{ role: \"ADMIN\" }, { role: \"OWNER\" }],\n    },\n    include: {\n      team: {\n        select: {\n          metadata: true,\n          parentId: true,\n          isOrganization: true,\n        },\n      },\n    },\n  });\n  if (!team) return false;\n  return team;\n}\n\nexport async function isTeamOwner(userId: number, teamId: number) {\n  return !!(await prisma.membership.findFirst({\n    where: {\n      userId,\n      teamId,\n      accepted: true,\n      role: \"OWNER\",\n    },\n  }));\n}\n\nexport async function isTeamMember(userId: number, teamId: number) {\n  return !!(await prisma.membership.findFirst({\n    where: {\n      userId,\n",
+            "status": "success",
+            "excerpt_line_range": [
+              255,
+              300
+            ],
+            "shared_result_id": "sr_4a7fc0ff3a1fcb4e87f30d81"
+          },
+          {
+            "id": "obs_5",
+            "tool": "grep",
+            "query": "grep {\"glob\": \"\", \"max_hits\": 20, \"pattern\": \"isTeamAdminOrOwner\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "bc6856d827469e0c",
+            "excerpt": "- packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts:46:   const isTeamAdminOrOwner =\n- packages/trpc/server/routers/viewer/bookings/confirm.handler.ts:127:     const isTeamAdminOrOwner =\n- packages/trpc/server/routers/viewer/teams/get.handler.ts:48:     const isTeamAdminOrOwner =\n- packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts:54:   if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n- packages/trpc/server/routers/viewer/bookings/confirm.handler.ts:130:     if (eventType && !eventType.users.find((user) => booking.userId === user.id) && !isTeamAdminOrOwner) {\n- packages/trpc/server/routers/viewer/teams/get.handler.ts:51:     if (team?.isPrivate && !isTeamAdminOrOwner && !isOrgAdminOrOwner) {",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_8ae1db8226edbddcd623e2f0"
+          },
+          {
+            "id": "obs_6",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 44, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 1}",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line_range": [
+              1,
+              44
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "6ef26a13ea5d2e2b",
+            "excerpt": "import EventManager from \"@calcom/core/EventManager\";\nimport dayjs from \"@calcom/dayjs\";\nimport { sendAddGuestsEmails } from \"@calcom/emails\";\nimport { parseRecurringEvent } from \"@calcom/lib\";\nimport { getTranslation } from \"@calcom/lib/server\";\nimport { getUsersCredentials } from \"@calcom/lib/server/getUsersCredentials\";\nimport { isTeamAdmin, isTeamOwner } from \"@calcom/lib/server/queries/teams\";\nimport { prisma } from \"@calcom/prisma\";\nimport type { CalendarEvent } from \"@calcom/types/Calendar\";\n\nimport { TRPCError } from \"@trpc/server\";\n\nimport type { TrpcSessionUser } from \"../../../trpc\";\nimport type { TAddGuestsInputSchema } from \"./addGuests.schema\";\n\ntype AddGuestsOptions = {\n  ctx: {\n    user: NonNullable<TrpcSessionUser>;\n  };\n  input: TAddGuestsInputSchema;\n};\nexport const addGuestsHandler = async ({ ctx, input }: AddGuestsOptions) => {\n  const { user } = ctx;\n  const { bookingId, guests } = input;\n\n  const booking = await prisma.booking.findFirst({\n    where: {\n      id: bookingId,\n    },\n    include: {\n      attendees: true,\n      eventType: true,\n      destinationCalendar: true,\n      references: true,\n      user: {\n        include: {\n          destinationCalendar: t",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              37
+            ],
+            "shared_result_id": "sr_a1b8fc4a8fecde46cc7be099"
+          },
+          {
+            "id": "obs_7",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 60, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 1}",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line_range": [
+              1,
+              60
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "ce9dcb399638d62a",
+            "excerpt": "+import EventManager from \"@calcom/core/EventManager\";\n+import dayjs from \"@calcom/dayjs\";\n+import { sendAddGuestsEmails } from \"@calcom/emails\";\n+import { parseRecurringEvent } from \"@calcom/lib\";\n+import { getTranslation } from \"@calcom/lib/server\";\n+import { getUsersCredentials } from \"@calcom/lib/server/getUsersCredentials\";\n+import { isTeamAdmin, isTeamOwner } from \"@calcom/lib/server/queries/teams\";\n+import { prisma } from \"@calcom/prisma\";\n+import type { CalendarEvent } from \"@calcom/types/Calendar\";\n+\n+import { TRPCError } from \"@trpc/server\";\n+\n+import type { TrpcSessionUser } from \"../../../trpc\";\n+import type { TAddGuestsInputSchema } from \"./addGuests.schema\";\n+\n+type AddGuestsOptions = {\n+  ctx: {\n+    user: NonNullable<TrpcSessionUser>;\n+  };\n+  input: TAddGuestsInputSchema;\n+};\n+export const addGuestsHandler = async ({ ctx, input }: AddGuestsOptions) => {\n+  const { user } = ctx;\n+  const { bookingId, guests } = input;\n+\n+  const booking = await prisma.booking.findFirst({\n+    where: {\n+      id: bookingId,\n+    },\n+    include: {\n+      attendees: true,\n+      eventType: true,\n+      destinationCalendar: true,\n+      references: true,\n+      user: {\n+        include",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_24bc02190fe3a26df42af255"
+          },
+          {
+            "id": "obs_8",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 135, \"path\": \"packages/trpc/server/routers/viewer/bookings/confirm.handler.ts\", \"start\": 120}",
+            "path": "packages/trpc/server/routers/viewer/bookings/confirm.handler.ts",
+            "line_range": [
+              120,
+              135
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "19290731e21ebcbc",
+            "excerpt": "            id: true,\n          },\n        },\n      },\n    });\n\n    const membership = booking.eventType?.team?.members.find((membership) => membership.userId === user.id);\n    const isTeamAdminOrOwner =\n      membership?.role === MembershipRole.OWNER || membership?.role === MembershipRole.ADMIN;\n\n    if (eventType && !eventType.users.find((user) => booking.userId === user.id) && !isTeamAdminOrOwner) {\n      throw new TRPCError({ code: \"UNAUTHORIZED\", message: \"UNAUTHORIZED\" });\n    }\n  }\n\n  // Do not move this before authorization check.\n",
+            "status": "success",
+            "excerpt_line_range": [
+              120,
+              135
+            ],
+            "shared_result_id": "sr_e9de17d9047b26919aae4477"
+          },
+          {
+            "id": "obs_9",
+            "tool": "find_references",
+            "query": "find_references {\"glob\": \"\", \"max_hits\": 20, \"path\": \"\", \"symbol\": \"addGuestsHandler\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "feb3eda35d9e6b82",
+            "excerpt": "- packages/trpc/server/routers/viewer/bookings/_router.tsx:18:   addGuests?: typeof import(\"./addGuests.handler\").addGuestsHandler;\n- packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts:22: export const addGuestsHandler = async ({ ctx, input }: AddGuestsOptions) => {\n- packages/trpc/server/routers/viewer/bookings/_router.tsx:82:         (mod) => mod.addGuestsHandler",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_0c453786c3a77d16ff566040"
+          },
+          {
+            "id": "obs_10",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 60, \"path\": \"packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts\", \"start\": 38}",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line_range": [
+              38,
+              60
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "51cc687c5c97f1ea",
+            "excerpt": "          credentials: true,\n        },\n      },\n    },\n  });\n\n  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });\n\n  const isTeamAdminOrOwner =\n    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n\n  const isOrganizer = booking.userId === user.id;\n\n  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n\n  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n  }\n\n  const organizer = await prisma.user.findFirstOrThrow({\n    where: {\n      id: booking.userId || 0,\n",
+            "status": "success",
+            "excerpt_line_range": [
+              38,
+              60
+            ],
+            "shared_result_id": "sr_302cf46f26dd63db1f6f51ad"
+          }
+        ],
+        "verdict_reason": "case-result-repair-limit",
+        "attempts": 1,
+        "investigation_steps": 8,
+        "investigation_tokens": 54153,
+        "retryable": false,
+        "assessment": null,
+        "investigation_outcome": "output-error",
+        "investigation_task_id": "it_b91f958c0b60771bd60cd21f",
+        "discovery_basis": {
+          "behavior": {
+            "source_facts": [
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 46,
+                "excerpt": "  const isTeamAdminOrOwner ="
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 47,
+                "excerpt": "    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 48,
+                "excerpt": "    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 50,
+                "excerpt": "  const isOrganizer = booking.userId === user.id;"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 52,
+                "excerpt": "  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 54,
+                "excerpt": "  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 55,
+                "excerpt": "    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 76,
+                "excerpt": "      !booking.attendees.some((attendee) => guest === attendee.email) &&"
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 74,
+                "excerpt": "  const uniqueGuests = guests.filter("
+              },
+              {
+                "side": "after",
+                "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+                "line": 77,
+                "excerpt": "      !blacklistedGuestEmails.includes(guest)"
+              }
+            ]
+          },
+          "discrepancy": "Variable name and PR intent ('add guests via bookings') state admin-or-owner; the delivered predicate requires admin-and-owner, i.e. only owners pass it, since isTeamAdmin accepts ADMIN or OWNER but isTeamOwner requires role OWNER (f5.C264-C270, f5.C286-C292).",
+          "trigger_basis": {
+            "side": "after",
+            "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+            "line": 48,
+            "excerpt": "    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));"
+          }
+        }
+      },
+      "tool_call": {
+        "name": "submit_unknown",
+        "args": {
+          "case_id": "case_7d7ccd6a721923478bc8dc31",
+          "reason": "The && operator and its dead-code consequence are confirmed in source (obs_3:e1, obs_10:e1; isTeamAdmin accepts ADMIN or OWNER while isTeamOwner requires role OWNER per obs_4:e2/e3, so an ADMIN-only teammate yields false). However, the FORBIDDEN rejection for a legitimate collaborator (obs_10:e2) only violates a contract if the intended rule is disjunctive OR if some non-organizer/non-attendee teammate is a required beneficiary. No such obligation is delivered: addGuests.schema.ts and any route/test/spec were not provided, and confirm.handler.ts's analogous disjunction (obs_8:e1) is a different mutation's authorization predicate, not a bound requirement for addGuests. Per review scope I must not invent an expected obligation, so this witness stays unproven rather than refuted.",
+          "missing_fact": "A bound specification of the addGuests authorization contract showing that a single sufficient condition (organizer OR attendee OR team admin OR team owner) must grant access \u2014 e.g. addGuests.schema.ts / _router.tsx route contract, an addGuests handler test asserting a team ADMIN (non-owner) or teammate caller is permitted, or a documented product rule \u2014 establishing that the && conjunction causes a concrete FORBIDDEN denial for an entitled caller."
+        }
+      }
+    },
+    {
+      "case": {
+        "id": "h_5909a4ac",
+        "identity": "su_70b48ed0e8d69762::wrong-argument::getNodeMailerPayload",
+        "unit_id": "su_70b48ed0e8d69762",
+        "mechanism": "wrong-argument",
+        "claim": "The new class inherits OrganizerScheduledEmail's constructor (input object with optional teamMember) and sends to this.teamMember?.email || organizer.email, but every payload field (role: \"organizer\", replyTo built from organizer + attendees, html rendered with attendee: this.calEvent.organizer) is computed from the organizer rather than the selected teamMember.",
+        "trigger": "sendAddGuestsEmails pushes one OrganizerAddGuestsEmail per calendarEvent.team.members, so each team member receives an email addressed to them but personalised with organizer data.",
+        "impact": "Team-member notifications mislabel the recipient context (organizer role/reply-to/rendered attendee), so replies and content do not correspond to the member who is being notified.",
+        "open_question": "Is OrganizerAddGuestsEmail intended to be instantiated per team member at all, and does the base organizer-scheduled payload also ignore teamMember outside the `to` address?",
+        "refutation": "If the product contract is that all copies show organizer-centric event details and only the recipient differs, or if the inherited base payload behaves identically for team members, the unused teamMember is intentional and not a defect.",
+        "sites": [
+          {
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line": 9,
+            "excerpt": "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+          }
+        ],
+        "severity": "warning",
+        "source": "generator",
+        "status": "open",
+        "evidence_strength": "none",
+        "observations": [
+          {
+            "id": "obs_0",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/templates/organizer-scheduled-email.ts\"}",
+            "path": "packages/emails/templates/organizer-scheduled-email.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "c7174f9cdf408d9c",
+            "excerpt": "// eslint-disable-next-line no-restricted-imports\nimport { cloneDeep } from \"lodash\";\nimport type { TFunction } from \"next-i18next\";\n\nimport { getRichDescription } from \"@calcom/lib/CalEventParser\";\nimport { EMAIL_FROM_NAME } from \"@calcom/lib/constants\";\nimport { TimeFormat } from \"@calcom/lib/timeFormat\";\nimport type { CalendarEvent, Person } from \"@calcom/types/Calendar\";\n\nimport { renderEmail } from \"../\";\nimport generateIcsString from \"../lib/generateIcsString\";\nimport BaseEmail from \"./_base-email\";\n\nexport default class OrganizerScheduledEmail extends BaseEmail {\n  calEvent: CalendarEvent;\n  t: TFunction;\n  newSeat?: boolean;\n  teamMember?: Person;\n\n  constructor(input: { calEvent: CalendarEvent; newSeat?: boolean; teamMember?: Person }) {\n    super();\n    this.name = \"SEND_BOOKING_CONFIRMATION\";\n    this.calEvent = input.calEvent;\n    this.t = this.calEvent.organizer.language.translate;\n    this.newSeat = input.newSeat;\n    this.teamMember = input.teamMember;\n  }\n\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const clonedCalEvent = cloneDeep(this.calEvent);\n    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              31
+            ]
+          },
+          {
+            "id": "obs_1",
+            "tool": "read_diff",
+            "query": "read_diff {\"path\": \"packages/emails/src/templates/index.ts\"}",
+            "path": "packages/emails/src/templates/index.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "e745e97adb1e17b3",
+            "excerpt": "@@ -35,4 +35,6 @@ export { AdminOrganizationNotificationEmail } from \"./AdminOrganizationNotificat\n export { BookingRedirectEmailNotification } from \"./BookingRedirectEmailNotification\";\n export { VerifyEmailChangeEmail } from \"./VerifyEmailChangeEmail\";\n export { OrganizationCreationEmail } from \"./OrganizationCreationEmail\";\n+export { OrganizerAddGuestsEmail } from \"./OrganizerAddGuestsEmail\";\n+export { AttendeeAddGuestsEmail } from \"./AttendeeAddGuestsEmail\";\n export { OrganizationAdminNoSlotsEmail } from \"./OrganizationAdminNoSlots\";",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_2",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/src/templates/index.ts\"}",
+            "path": "packages/emails/src/templates/index.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "6ba2bf8ebff47f8f",
+            "excerpt": "export { AttendeeAwaitingPaymentEmail } from \"./AttendeeAwaitingPaymentEmail\";\nexport { AttendeeCancelledEmail } from \"./AttendeeCancelledEmail\";\nexport { AttendeeCancelledSeatEmail } from \"./AttendeeCancelledSeatEmail\";\nexport { AttendeeDeclinedEmail } from \"./AttendeeDeclinedEmail\";\nexport { AttendeeLocationChangeEmail } from \"./AttendeeLocationChangeEmail\";\nexport { AttendeeRequestEmail } from \"./AttendeeRequestEmail\";\nexport { AttendeeWasRequestedToRescheduleEmail } from \"./AttendeeWasRequestedToRescheduleEmail\";\nexport { AttendeeRescheduledEmail } from \"./AttendeeRescheduledEmail\";\nexport { AttendeeScheduledEmail } from \"./AttendeeScheduledEmail\";\nexport { DisabledAppEmail } from \"./DisabledAppEmail\";\nexport { SlugReplacementEmail } from \"./SlugReplacementEmail\";\nexport { FeedbackEmail } from \"./FeedbackEmail\";\nexport { ForgotPasswordEmail } from \"./ForgotPasswordEmail\";\nexport { OrganizerCancelledEmail } from \"./OrganizerCancelledEmail\";\nexport { OrganizerLocationChangeEmail } from \"./OrganizerLocationChangeEmail\";\nexport { OrganizerPaymentRefundFailedEmail } from \"./OrganizerPaymentRefundFailedEmail\";\nexport { OrganizerRequestEmail } from \"./OrganizerRequestEmail\";\nexport { ",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              18
+            ]
+          },
+          {
+            "id": "obs_3",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 9, \"path\": \"packages/emails/templates/organizer-add-guests-email.ts\", \"start\": 9}",
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line_range": [
+              9,
+              9
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "2f8acccbcd23761d",
+            "excerpt": "+import { APP_NAME } from \"@calcom/lib/constants\";\n+\n+import { renderEmail } from \"../\";\n+import generateIcsString from \"../lib/generateIcsString\";\n+import OrganizerScheduledEmail from \"./organizer-scheduled-email\";\n+\n+export default class OrganizerAddGuestsEmail extends OrganizerScheduledEmail {\n+  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n+    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n+\n+    return {\n+      icalEvent: {\n+        filename: \"event.ics\",\n+        content: generateIcsString({\n+          event: this.calEvent,\n+          title: this.t(\"new_guests_added\"),\n+          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),\n+          role: \"organizer\",\n+          status: \"CONFIRMED\",\n+        }),\n+        method: \"REQUEST\",\n+      },\n+      from: `${APP_NAME} <${this.getMailerOptions().from}>`,\n+      to: toAddresses.join(\",\"),\n+      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],\n+      subject: `${this.t(\"guests_added_event_type_subject\", {\n+        eventType: this.calEvent.type,\n+        name: this.calEvent.attendees[0].name,\n+        date: this.getF",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_9cbb77bb5f656ed31fa46064"
+          },
+          {
+            "id": "obs_4",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 38, \"path\": \"packages/emails/templates/organizer-add-guests-email.ts\", \"start\": 7}",
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line_range": [
+              7,
+              38
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "f59a246b80ff7170",
+            "excerpt": "export default class OrganizerAddGuestsEmail extends OrganizerScheduledEmail {\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n\n    return {\n      icalEvent: {\n        filename: \"event.ics\",\n        content: generateIcsString({\n          event: this.calEvent,\n          title: this.t(\"new_guests_added\"),\n          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),\n          role: \"organizer\",\n          status: \"CONFIRMED\",\n        }),\n        method: \"REQUEST\",\n      },\n      from: `${APP_NAME} <${this.getMailerOptions().from}>`,\n      to: toAddresses.join(\",\"),\n      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],\n      subject: `${this.t(\"guests_added_event_type_subject\", {\n        eventType: this.calEvent.type,\n        name: this.calEvent.attendees[0].name,\n        date: this.getFormattedDate(),\n      })}`,\n      html: await renderEmail(\"OrganizerAddGuestsEmail\", {\n        attendee: this.calEvent.organizer,\n        calEvent: this.calEvent,\n      }),\n      text: this.getTextBody(\"new_guests_added\"),\n    };\n  }\n}\n",
+            "status": "success",
+            "excerpt_line_range": [
+              7,
+              38
+            ],
+            "shared_result_id": "sr_c038148cad4aa2f816a7fb06"
+          },
+          {
+            "id": "obs_5",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 104, \"path\": \"packages/emails/templates/organizer-scheduled-email.ts\", \"start\": 14}",
+            "path": "packages/emails/templates/organizer-scheduled-email.ts",
+            "line_range": [
+              14,
+              104
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "cb0e916c702f100c",
+            "excerpt": "export default class OrganizerScheduledEmail extends BaseEmail {\n  calEvent: CalendarEvent;\n  t: TFunction;\n  newSeat?: boolean;\n  teamMember?: Person;\n\n  constructor(input: { calEvent: CalendarEvent; newSeat?: boolean; teamMember?: Person }) {\n    super();\n    this.name = \"SEND_BOOKING_CONFIRMATION\";\n    this.calEvent = input.calEvent;\n    this.t = this.calEvent.organizer.language.translate;\n    this.newSeat = input.newSeat;\n    this.teamMember = input.teamMember;\n  }\n\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const clonedCalEvent = cloneDeep(this.calEvent);\n    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n\n    return {\n      icalEvent: {\n        filename: \"event.ics\",\n        content: generateIcsString({\n          event: this.calEvent,\n          title: this.calEvent.recurringEvent?.count\n            ? this.t(\"new_event_scheduled_recurring\")\n            : this.t(\"new_event_scheduled\"),\n          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),\n          role: \"organizer\",\n          status: \"CONFIRMED\",\n        }),\n        method: \"REQUEST\",\n      },\n      from: `${EMAIL_FROM_NAME} <${this.getMailerOpt",
+            "status": "success",
+            "excerpt_line_range": [
+              14,
+              47
+            ],
+            "shared_result_id": "sr_8d75cc6beb8c2f21eaee03da"
+          },
+          {
+            "id": "obs_6",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 104, \"path\": \"packages/emails/templates/organizer-scheduled-email.ts\", \"start\": 47}",
+            "path": "packages/emails/templates/organizer-scheduled-email.ts",
+            "line_range": [
+              47,
+              104
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "31db394301305a93",
+            "excerpt": "      from: `${EMAIL_FROM_NAME} <${this.getMailerOptions().from}>`,\n      to: toAddresses.join(\",\"),\n      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],\n      subject: `${this.newSeat ? `${this.t(\"new_attendee\")}: ` : \"\"}${this.calEvent.title}`,\n      html: await renderEmail(\"OrganizerScheduledEmail\", {\n        calEvent: clonedCalEvent,\n        attendee: this.calEvent.organizer,\n        teamMember: this.teamMember,\n        newSeat: this.newSeat,\n      }),\n      text: this.getTextBody(),\n    };\n  }\n\n  protected getTextBody(\n    title = \"\",\n    subtitle = \"emailed_you_and_any_other_attendees\",\n    extraInfo = \"\",\n    callToAction = \"\"\n  ): string {\n    return `\n${this.t(\n  title\n    ? title\n    : this.calEvent.recurringEvent?.count\n    ? \"new_event_scheduled_recurring\"\n    : \"new_event_scheduled\"\n)}\n${this.t(subtitle)}\n${extraInfo}\n${getRichDescription(this.calEvent, this.t, true)}\n${callToAction}\n`.trim();\n  }\n\n  protected getTimezone(): string {\n    return this.calEvent.organizer.timeZone;\n  }\n\n  protected getLocale(): string {\n    return this.calEvent.organizer.language.locale;\n  }\n\n  protected getOrganizerStart(format: string) {\n ",
+            "status": "success",
+            "excerpt_line_range": [
+              47,
+              91
+            ],
+            "shared_result_id": "sr_3b97d62832972fc5287f65ff"
+          },
+          {
+            "id": "obs_7",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 560, \"path\": \"packages/emails/email-manager.ts\", \"start\": 505}",
+            "path": "packages/emails/email-manager.ts",
+            "line_range": [
+              505,
+              560
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "06f30848c097ceee",
+            "excerpt": "\n    if (calendarEvent.team?.members) {\n      for (const teamMember of calendarEvent.team.members) {\n        emailsToSend.push(\n          sendEmail(() => new OrganizerLocationChangeEmail({ calEvent: calendarEvent, teamMember }))\n        );\n      }\n    }\n  }\n\n  if (!eventTypeDisableAttendeeEmail(eventTypeMetadata)) {\n    emailsToSend.push(\n      ...calendarEvent.attendees.map((attendee) => {\n        return sendEmail(() => new AttendeeLocationChangeEmail(calendarEvent, attendee));\n      })\n    );\n  }\n\n  await Promise.all(emailsToSend);\n};\nexport const sendAddGuestsEmails = async (calEvent: CalendarEvent, newGuests: string[]) => {\n  const calendarEvent = formatCalEvent(calEvent);\n\n  const emailsToSend: Promise<unknown>[] = [];\n  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));\n\n  if (calendarEvent.team?.members) {\n    for (const teamMember of calendarEvent.team.members) {\n      emailsToSend.push(\n        sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent, teamMember }))\n      );\n    }\n  }\n\n  emailsToSend.push(\n    ...calendarEvent.attendees.map((attendee) => {\n      if (newGuests.includes(attendee.email)) {\n        return",
+            "status": "success",
+            "excerpt_line_range": [
+              505,
+              542
+            ],
+            "shared_result_id": "sr_67cff07075b32b6578b3e9b8"
+          }
+        ],
+        "verdict_reason": "case-result-repair-limit",
+        "attempts": 1,
+        "investigation_steps": 4,
+        "investigation_tokens": 25003,
+        "retryable": false,
+        "assessment": null,
+        "investigation_outcome": "output-error",
+        "investigation_task_id": "it_6f936d9eda163a696410e90e",
+        "discovery_basis": {
+          "behavior": {
+            "source_facts": [
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 7,
+                "excerpt": "export default class OrganizerAddGuestsEmail extends OrganizerScheduledEmail {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 9,
+                "excerpt": "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 13,
+                "excerpt": "        filename: \"event.ics\","
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 18,
+                "excerpt": "          role: \"organizer\","
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 21,
+                "excerpt": "        method: \"REQUEST\","
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 24,
+                "excerpt": "      to: toAddresses.join(\",\"),"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 25,
+                "excerpt": "      replyTo: [this.calEvent.organizer.email, ...this.calEvent.attendees.map(({ email }) => email)],"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/templates/organizer-add-guests-email.ts",
+                "line": 31,
+                "excerpt": "      html: await renderEmail(\"OrganizerAddGuestsEmail\", {"
+              },
+              {
+                "side": "context",
+                "path": "packages/emails/templates/organizer-scheduled-email.ts",
+                "line": 20,
+                "excerpt": "  constructor(input: { calEvent: CalendarEvent; newSeat?: boolean; teamMember?: Person }) {"
+              },
+              {
+                "side": "context",
+                "path": "packages/emails/templates/organizer-scheduled-email.ts",
+                "line": 26,
+                "excerpt": "    this.teamMember = input.teamMember;"
+              },
+              {
+                "side": "context",
+                "path": "packages/emails/templates/organizer-scheduled-email.ts",
+                "line": 31,
+                "excerpt": "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 529,
+                "excerpt": "  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));"
+              }
+            ]
+          },
+          "trigger_basis": {
+            "side": "after",
+            "path": "packages/emails/templates/organizer-add-guests-email.ts",
+            "line": 9,
+            "excerpt": "    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];"
+          }
+        }
+      },
+      "tool_call": {
+        "name": "submit_refuted",
+        "args": {
+          "case_id": "case_ca82435bc051af4ed428c449",
+          "reason": "The candidate's own trigger is the per-team-member instantiation in sendAddGuestsEmails (obs_7:e3), which is identical to the pre-existing pattern for OrganizerLocationChangeEmail (obs_7:e1). The alleged mechanism claims organizer-centric fields are wrong for a teamMember recipient, but the untouched base OrganizerScheduledEmail already computes role \"organizer\" (obs_5:e3), replyTo from organizer+attendees (obs_6:e1) and attendee: this.calEvent.organizer (obs_6:e2) while sending to this.teamMember?.email || organizer.email (obs_0:e4/obs_5:e2). So the shipped contract for team-member copies of organizer emails is exactly these organizer-centric payload fields; the new class reproduces them faithfully. The only real divergence (omitting teamMember from renderEmail) is unsupplied by the new caller path because no team members exist when guests are added, so it changes no observable result.",
+          "premise": "mechanism",
+          "evidence": [
+            "obs_7:e3",
+            "obs_7:e1",
+            "obs_5:e2",
+            "obs_5:e3",
+            "obs_6:e1",
+            "obs_6:e2",
+            "obs_4:e2",
+            "obs_4:e3"
+          ],
+          "statement": "The inherited base payload behaves identically for team members: OrganizerScheduledEmail.getNodeMailerPayload already sends to this.teamMember?.email || organizer.email while using role: \"organizer\", replyTo [organizer, ...attendees] and attendee: this.calEvent.organizer, so organizer-centric fields for a teamMember recipient are the established contract, not a defect introduced by OrganizerAddGuestsEmail."
+        }
+      }
+    },
+    {
+      "case": {
+        "id": "h_604c1dc7",
+        "identity": "su_dde0ee33daa48ac3::contract-mismatch::",
+        "unit_id": "su_dde0ee33daa48ac3",
+        "mechanism": "contract-mismatch",
+        "claim": "MultiEmailLazy re-exports next/dynamic's lazy component after erasing its type with `as unknown as typeof import(\"./MultiEmail\").default`, so consumers get the eager component's static type while receiving a dynamically loaded component whose props/loading contract may differ.",
+        "trigger": "A consumer imports MultiEmail from this module (e.g. the @calcom/ui barrel used by AddGuestsDialog at f4.C13) and passes props typed by the eager default export.",
+        "impact": "Type checking validates against the eager signature, so any prop required by the dynamic wrapper (or any difference in the exported shape, such as ssr/loading options not configured here) is unchecked at compile time and can surface as a runtime prop error or missing fallback while the 40kb chunk loads.",
+        "open_question": "Does ./MultiEmail's default export accept exactly the same props as the dynamic() wrapper, and does the barrel actually re-export this lazy file rather than the eager MultiEmail? Neither MultiEmail.tsx nor the ui index was delivered in this unit's source sides.",
+        "refutation": "dynamic(() => import(\"./MultiEmail\")) forwards all props to the resolved module's default export unchanged, so the cast is behavior-preserving for prop callers; the cast only silences TypeScript's own metadata about the wrapper, and no fallback/ssr option is required for correctness of the call site.",
+        "sites": [
+          {
+            "path": "packages/ui/form/MultiEmailLazy.tsx",
+            "line": 4,
+            "excerpt": "const MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;"
+          }
+        ],
+        "severity": "warning",
+        "source": "generator",
+        "status": "open",
+        "evidence_strength": "none",
+        "observations": [
+          {
+            "id": "obs_0",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\"}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "6d635c89dff159ef",
+            "excerpt": "import type { Dispatch, SetStateAction } from \"react\";\nimport { useState } from \"react\";\nimport { z } from \"zod\";\n\nimport { useLocale } from \"@calcom/lib/hooks/useLocale\";\nimport { trpc } from \"@calcom/trpc/react\";\nimport {\n  Button,\n  Dialog,\n  DialogContent,\n  DialogFooter,\n  DialogHeader,\n  MultiEmail,\n  Icon,\n  showToast,\n} from \"@calcom/ui\";\n\ninterface IAddGuestsDialog {\n  isOpenDialog: boolean;\n  setIsOpenDialog: Dispatch<SetStateAction<boolean>>;\n  bookingId: number;\n}\n\nexport const AddGuestsDialog = (props: IAddGuestsDialog) => {\n  const { t } = useLocale();\n  const ZAddGuestsInputSchema = z.array(z.string().email()).refine((emails) => {\n    const uniqueEmails = new Set(emails);\n    return uniqueEmails.size === emails.length;\n  });\n  const { isOpenDialog, setIsOpenDialog, bookingId } = props;\n  const utils = trpc.useUtils();\n  const [multiEmailValue, setMultiEmailValue] = useState<string[]>([\"\"]);\n  const [isInvalidEmail, setIsInvalidEmail] = useState(false);\n\n  const addGuestsMutation = trpc.viewer.bookings.addGuests.useMutation({\n    onSuccess: async () => {\n      showToast(t(\"guests_added\"), \"success\");\n      setIsOpenDialog(false);\n      setMultiEmailValue([\"\"]);\n      ",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              40
+            ]
+          },
+          {
+            "id": "obs_1",
+            "tool": "read_diff",
+            "query": "read_diff {\"path\": \"apps/web/components/booking/BookingListItem.tsx\"}",
+            "path": "apps/web/components/booking/BookingListItem.tsx",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "406c56f0f032a478",
+            "excerpt": "@@ -43,6 +43,7 @@ import {\n   Tooltip,\n } from \"@calcom/ui\";\n \n+import { AddGuestsDialog } from \"@components/dialog/AddGuestsDialog\";\n import { ChargeCardDialog } from \"@components/dialog/ChargeCardDialog\";\n import { EditLocationDialog } from \"@components/dialog/EditLocationDialog\";\n import { ReassignDialog } from \"@components/dialog/ReassignDialog\";\n@@ -189,6 +190,14 @@ function BookingListItem(booking: BookingItemProps) {\n       },\n       icon: \"map-pin\" as const,\n     },\n+    {\n+      id: \"add_members\",\n+      label: t(\"additional_guests\"),\n+      onClick: () => {\n+        setIsOpenAddGuestsDialog(true);\n+      },\n+      icon: \"user-plus\" as const,\n+    },\n   ];\n \n   if (booking.eventType.schedulingType === SchedulingType.ROUND_ROBIN) {\n@@ -256,6 +265,7 @@ function BookingListItem(booking: BookingItemProps) {\n   const [isOpenRescheduleDialog, setIsOpenRescheduleDialog] = useState(false);\n   const [isOpenReassignDialog, setIsOpenReassignDialog] = useState(false);\n   const [isOpenSetLocationDialog, setIsOpenLocationDialog] = useState(false);\n+  const [isOpenAddGuestsDialog, setIsOpenAddGuestsDialog] = useState(false);\n   const setLocationMutation = trpc.viewer.bookings.editLocatio",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_2",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 4, \"path\": \"packages/ui/form/MultiEmailLazy.tsx\", \"start\": 4}",
+            "path": "packages/ui/form/MultiEmailLazy.tsx",
+            "line_range": [
+              4,
+              4
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "31e480c1347afc0d",
+            "excerpt": "@@ -0,0 +1,6 @@\n+import dynamic from \"next/dynamic\";\n+\n+/** These are like 40kb that not every user needs */\n+const MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;\n+\n+export default MultiEmail;",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_387a95e2bcaa013addb9c887"
+          },
+          {
+            "id": "obs_3",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 12, \"path\": \"packages/ui/form/MultiEmailLazy.tsx\", \"start\": 1}",
+            "path": "packages/ui/form/MultiEmailLazy.tsx",
+            "line_range": [
+              1,
+              12
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "f000da16352689dd",
+            "excerpt": "import dynamic from \"next/dynamic\";\n\n/** These are like 40kb that not every user needs */\nconst MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;\n\nexport default MultiEmail;\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              6
+            ],
+            "shared_result_id": "sr_d98f2c5b945a36624af21f16"
+          },
+          {
+            "id": "obs_4",
+            "tool": "find_references",
+            "query": "find_references {\"glob\": \"\", \"max_hits\": 10, \"path\": \"\", \"symbol\": \"MultiEmailLazy\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "1b217ca471065ea9",
+            "excerpt": "- packages/ui/index.tsx:153: export { default as MultiEmail } from \"./form/MultiEmailLazy\";",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_24a890801f615418221a526c"
+          },
+          {
+            "id": "obs_5",
+            "tool": "grep",
+            "query": "grep {\"glob\": \"packages/ui/**\", \"max_hits\": 10, \"pattern\": \"MultiEmail\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "7e69ab8e84fb3518",
+            "excerpt": "- packages/ui/form/MultiEmail.tsx:4: interface MultiEmailProps {\n- packages/ui/form/MultiEmailLazy.tsx:4: const MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;\n- packages/ui/index.tsx:153: export { default as MultiEmail } from \"./form/MultiEmailLazy\";\n- packages/ui/form/MultiEmail.tsx:12: function MultiEmail({ value, readOnly, label, setValue, placeholder }: MultiEmailProps) {\n- packages/ui/form/MultiEmailLazy.tsx:6: export default MultiEmail;\n- packages/ui/form/MultiEmail.tsx:96: export default MultiEmail;",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_3f011bb5163625930606764e"
+          },
+          {
+            "id": "obs_6",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 96, \"path\": \"packages/ui/form/MultiEmail.tsx\", \"start\": 1}",
+            "path": "packages/ui/form/MultiEmail.tsx",
+            "line_range": [
+              1,
+              96
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "4f740c7b76abb380",
+            "excerpt": "import { useLocale } from \"@calcom/lib/hooks/useLocale\";\nimport { Button, EmailField, Icon, Tooltip } from \"@calcom/ui\";\n\ninterface MultiEmailProps {\n  value: string[];\n  readOnly: boolean;\n  label: string;\n  setValue: (value: string[]) => void;\n  placeholder?: string;\n}\n\nfunction MultiEmail({ value, readOnly, label, setValue, placeholder }: MultiEmailProps) {\n  const { t } = useLocale();\n  value = value || [];\n  const inputClassName =\n    \"dark:placeholder:text-muted focus:border-emphasis border-subtle block w-full rounded-md border-default text-sm focus:ring-black disabled:bg-emphasis disabled:hover:cursor-not-allowed dark:selection:bg-green-500 disabled:dark:text-subtle bg-default\";\n  return (\n    <>\n      {value.length ? (\n        <div>\n          <label htmlFor=\"emails\" className=\"text-default my-2 block text-sm font-medium\">\n            {label}\n          </label>\n          <ul>\n            {value.map((field, index) => (\n              <li key={index}>\n                <EmailField\n                  disabled={readOnly}\n                  value={field}\n                  className={inputClassName}\n                  onChange={(e) => {\n                    const updatedValue = [...value",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              32
+            ],
+            "shared_result_id": "sr_2bbdc9a75c8246b3d7ccbb32"
+          },
+          {
+            "id": "obs_7",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 120, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 40}",
+            "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+            "line_range": [
+              40,
+              120
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "a1e308824fd80662",
+            "excerpt": "      utils.viewer.bookings.invalidate();\n    },\n    onError: (err) => {\n      const message = `${err.data?.code}: ${t(err.message)}`;\n      showToast(message || t(\"unable_to_add_guests\"), \"error\");\n    },\n  });\n\n  const handleAdd = () => {\n    if (multiEmailValue.length === 0) {\n      return;\n    }\n    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n  };\n\n  return (\n    <Dialog open={isOpenDialog} onOpenChange={setIsOpenDialog}>\n      <DialogContent enableOverflow>\n        <div className=\"flex flex-row space-x-3\">\n          <div className=\"bg-subtle flex h-10 w-10 flex-shrink-0 justify-center rounded-full \">\n            <Icon name=\"user-plus\" className=\"m-auto h-6 w-6\" />\n          </div>\n          <div className=\"w-full pt-1\">\n            <DialogHeader title={t(\"additional_guests\")} />\n            <MultiEmail\n              label={t(\"add_emails\")}\n              value={multiEmailValue}\n              readOnly={false}\n              setValue={setMultiEmailValue}\n            />\n\n            {isInvalidEma",
+            "status": "success",
+            "excerpt_line_range": [
+              40,
+              76
+            ],
+            "shared_result_id": "sr_141b66cb61778a7d84be9885"
+          },
+          {
+            "id": "obs_8",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 14, \"path\": \"packages/ui/form/MultiEmail.tsx\", \"start\": 1}",
+            "path": "packages/ui/form/MultiEmail.tsx",
+            "line_range": [
+              1,
+              14
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "24ad5a4215a60905",
+            "excerpt": "import { useLocale } from \"@calcom/lib/hooks/useLocale\";\nimport { Button, EmailField, Icon, Tooltip } from \"@calcom/ui\";\n\ninterface MultiEmailProps {\n  value: string[];\n  readOnly: boolean;\n  label: string;\n  setValue: (value: string[]) => void;\n  placeholder?: string;\n}\n\nfunction MultiEmail({ value, readOnly, label, setValue, placeholder }: MultiEmailProps) {\n  const { t } = useLocale();\n  value = value || [];\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              14
+            ],
+            "shared_result_id": "sr_892eb2e94d57e9f765b1cf70"
+          }
+        ],
+        "verdict_reason": "case-result-repair-limit",
+        "attempts": 1,
+        "investigation_steps": 6,
+        "investigation_tokens": 32459,
+        "retryable": false,
+        "assessment": null,
+        "investigation_outcome": "output-error",
+        "investigation_task_id": "it_738533b0af6a13a61ca0b5a1",
+        "discovery_basis": {
+          "behavior": {
+            "source_facts": [
+              {
+                "side": "after",
+                "path": "packages/ui/form/MultiEmailLazy.tsx",
+                "line": 1,
+                "excerpt": "import dynamic from \"next/dynamic\";"
+              },
+              {
+                "side": "after",
+                "path": "packages/ui/form/MultiEmailLazy.tsx",
+                "line": 3,
+                "excerpt": "/** These are like 40kb that not every user needs */"
+              },
+              {
+                "side": "after",
+                "path": "packages/ui/form/MultiEmailLazy.tsx",
+                "line": 4,
+                "excerpt": "const MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;"
+              },
+              {
+                "side": "after",
+                "path": "packages/ui/form/MultiEmailLazy.tsx",
+                "line": 6,
+                "excerpt": "export default MultiEmail;"
+              }
+            ]
+          },
+          "trigger_basis": {
+            "side": "after",
+            "path": "packages/ui/form/MultiEmailLazy.tsx",
+            "line": 4,
+            "excerpt": "const MultiEmail = dynamic(() => import(\"./MultiEmail\")) as unknown as typeof import(\"./MultiEmail\").default;"
+          }
+        }
+      },
+      "tool_call": {
+        "name": "submit_refuted",
+        "args": {
+          "case_id": "case_088a0e65121edf90b0b921ef",
+          "reason": "The impact premise requires a prop/shape difference between the eager component and the dynamic wrapper. Observed source shows the exact opposite: MultiEmailLazy wraps ./MultiEmail itself (obs_3:e1), the barrel re-exports that lazy file as MultiEmail (obs_4:e1, obs_5:e3), the eager default export takes exactly MultiEmailProps {value, readOnly, label, setValue, placeholder?} (obs_8:e1, obs_5:e6) and the cast targets typeof import(\"./MultiEmail\").default, so the static type is the identical props contract. The only real call site delivered passes precisely those props (obs_7:e3, obs_7:e4), and AddGuestsDialog imports MultiEmail from @calcom/ui (obs_0:e1). next/dynamic's returned component forwards all received props to the resolved module's default export unchanged, and no additional prop is required by the wrapper; ssr/fallback are optional configuration, not part of the props contract, so nothing \"required by the dynamic wrapper\" can go unchecked. Hence no compile-time-valid call can produce the alleged runtime prop error or missing-fallback failure for this witness.",
+          "statement": "There is no differing props contract: the cast in MultiEmailLazy.tsx names the very module it dynamically loads (./MultiEmail), whose declared props interface MultiEmailProps is exactly what consumers such as AddGuestsDialog pass (label, value, readOnly, setValue), so type checking validates against the same shape the dynamic wrapper receives and forwards unchanged; no prop is added or required by dynamic() and none of the alleged unchecked-prop consequences can occur at this call site.",
+          "evidence": [
+            "obs_3:e1",
+            "obs_8:e1",
+            "obs_5:e6",
+            "obs_4:e1",
+            "obs_7:e3",
+            "obs_7:e4",
+            "obs_0:e1"
+          ],
+          "premise": "impact"
+        }
+      }
+    },
+    {
+      "case": {
+        "id": "h_5752a9fe",
+        "identity": "su_e1416ad1b3fded56::contract-mismatch::sendAddGuestsEmails",
+        "unit_id": "su_e1416ad1b3fded56",
+        "mechanism": "contract-mismatch",
+        "claim": "sendAddGuestsEmails builds attendee emails with the same (calendarEvent, attendee) call shape used by other senders, but the only delivered definition of AttendeeAddGuestsEmail (packages/emails/src/templates/AttendeeAddGuestsEmail.tsx) is a React component whose single parameter is a props object {calEvent, attendee}; no template wrapper class for it was delivered in this source set.",
+        "trigger": "Any booking where addGuests reaches sendAddGuestsEmails and calendarEvent.attendees contains at least one email not present in newGuests (normal case: existing attendees when a guest is added).",
+        "impact": "The existing-attendee notification either fails to render/send or renders with undefined calEvent/attendee data (missing subject, links, ICS), while organizer emails still go out; users who already booked get no 'guest added' notice.",
+        "open_question": "Does packages/emails/templates/attendee-add-guests-email.ts (imported at f0.R21) export a default BaseEmail class accepting (calEvent, attendee) positionally, or does it re-export/wrap the src/templates functional component that requires a props object?",
+        "refutation": "If the imported module defines a class `export default class AttendeeAddGuestsEmail extends BaseEmail` with constructor(calEvent: CalendarEvent, attendee: Person) \u2014 mirroring attendee-location-change-email \u2014 then the positional call matches its contract and there is no defect; likewise if the functional component were wrapped so positional args are accepted.",
+        "sites": [
+          {
+            "path": "packages/emails/email-manager.ts",
+            "line": 541,
+            "excerpt": "      if (newGuests.includes(attendee.email)) {"
+          }
+        ],
+        "severity": "error",
+        "source": "generator",
+        "status": "open",
+        "evidence_strength": "none",
+        "observations": [
+          {
+            "id": "obs_0",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/templates/organizer-scheduled-email.ts\"}",
+            "path": "packages/emails/templates/organizer-scheduled-email.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "c7174f9cdf408d9c",
+            "excerpt": "// eslint-disable-next-line no-restricted-imports\nimport { cloneDeep } from \"lodash\";\nimport type { TFunction } from \"next-i18next\";\n\nimport { getRichDescription } from \"@calcom/lib/CalEventParser\";\nimport { EMAIL_FROM_NAME } from \"@calcom/lib/constants\";\nimport { TimeFormat } from \"@calcom/lib/timeFormat\";\nimport type { CalendarEvent, Person } from \"@calcom/types/Calendar\";\n\nimport { renderEmail } from \"../\";\nimport generateIcsString from \"../lib/generateIcsString\";\nimport BaseEmail from \"./_base-email\";\n\nexport default class OrganizerScheduledEmail extends BaseEmail {\n  calEvent: CalendarEvent;\n  t: TFunction;\n  newSeat?: boolean;\n  teamMember?: Person;\n\n  constructor(input: { calEvent: CalendarEvent; newSeat?: boolean; teamMember?: Person }) {\n    super();\n    this.name = \"SEND_BOOKING_CONFIRMATION\";\n    this.calEvent = input.calEvent;\n    this.t = this.calEvent.organizer.language.translate;\n    this.newSeat = input.newSeat;\n    this.teamMember = input.teamMember;\n  }\n\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const clonedCalEvent = cloneDeep(this.calEvent);\n    const toAddresses = [this.teamMember?.email || this.calEvent.organizer.email];\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              31
+            ]
+          },
+          {
+            "id": "obs_1",
+            "tool": "read_diff",
+            "query": "read_diff {\"path\": \"packages/emails/src/templates/index.ts\"}",
+            "path": "packages/emails/src/templates/index.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "e745e97adb1e17b3",
+            "excerpt": "@@ -35,4 +35,6 @@ export { AdminOrganizationNotificationEmail } from \"./AdminOrganizationNotificat\n export { BookingRedirectEmailNotification } from \"./BookingRedirectEmailNotification\";\n export { VerifyEmailChangeEmail } from \"./VerifyEmailChangeEmail\";\n export { OrganizationCreationEmail } from \"./OrganizationCreationEmail\";\n+export { OrganizerAddGuestsEmail } from \"./OrganizerAddGuestsEmail\";\n+export { AttendeeAddGuestsEmail } from \"./AttendeeAddGuestsEmail\";\n export { OrganizationAdminNoSlotsEmail } from \"./OrganizationAdminNoSlots\";",
+            "status": "success",
+            "excerpt_line_range": null
+          },
+          {
+            "id": "obs_2",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/src/templates/index.ts\"}",
+            "path": "packages/emails/src/templates/index.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "6ba2bf8ebff47f8f",
+            "excerpt": "export { AttendeeAwaitingPaymentEmail } from \"./AttendeeAwaitingPaymentEmail\";\nexport { AttendeeCancelledEmail } from \"./AttendeeCancelledEmail\";\nexport { AttendeeCancelledSeatEmail } from \"./AttendeeCancelledSeatEmail\";\nexport { AttendeeDeclinedEmail } from \"./AttendeeDeclinedEmail\";\nexport { AttendeeLocationChangeEmail } from \"./AttendeeLocationChangeEmail\";\nexport { AttendeeRequestEmail } from \"./AttendeeRequestEmail\";\nexport { AttendeeWasRequestedToRescheduleEmail } from \"./AttendeeWasRequestedToRescheduleEmail\";\nexport { AttendeeRescheduledEmail } from \"./AttendeeRescheduledEmail\";\nexport { AttendeeScheduledEmail } from \"./AttendeeScheduledEmail\";\nexport { DisabledAppEmail } from \"./DisabledAppEmail\";\nexport { SlugReplacementEmail } from \"./SlugReplacementEmail\";\nexport { FeedbackEmail } from \"./FeedbackEmail\";\nexport { ForgotPasswordEmail } from \"./ForgotPasswordEmail\";\nexport { OrganizerCancelledEmail } from \"./OrganizerCancelledEmail\";\nexport { OrganizerLocationChangeEmail } from \"./OrganizerLocationChangeEmail\";\nexport { OrganizerPaymentRefundFailedEmail } from \"./OrganizerPaymentRefundFailedEmail\";\nexport { OrganizerRequestEmail } from \"./OrganizerRequestEmail\";\nexport { ",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              18
+            ]
+          },
+          {
+            "id": "obs_3",
+            "tool": "read_diff",
+            "query": "read_diff {\"end\": 541, \"path\": \"packages/emails/email-manager.ts\", \"start\": 541}",
+            "path": "packages/emails/email-manager.ts",
+            "line_range": [
+              541,
+              541
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "4e5308d41d43cc94",
+            "excerpt": "@@ -520,6 +522,32 @@ export const sendLocationChangeEmails = async (\n \n   await Promise.all(emailsToSend);\n };\n+export const sendAddGuestsEmails = async (calEvent: CalendarEvent, newGuests: string[]) => {\n+  const calendarEvent = formatCalEvent(calEvent);\n+\n+  const emailsToSend: Promise<unknown>[] = [];\n+  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));\n+\n+  if (calendarEvent.team?.members) {\n+    for (const teamMember of calendarEvent.team.members) {\n+      emailsToSend.push(\n+        sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent, teamMember }))\n+      );\n+    }\n+  }\n+\n+  emailsToSend.push(\n+    ...calendarEvent.attendees.map((attendee) => {\n+      if (newGuests.includes(attendee.email)) {\n+        return sendEmail(() => new AttendeeScheduledEmail(calendarEvent, attendee));\n+      } else {\n+        return sendEmail(() => new AttendeeAddGuestsEmail(calendarEvent, attendee));\n+      }\n+    })\n+  );\n+\n+  await Promise.all(emailsToSend);\n+};\n export const sendFeedbackEmail = async (feedback: Feedback) => {\n   await sendEmail(() => new FeedbackEmail(feedback));\n };",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_b8f531dec8bd93f787573f94"
+          },
+          {
+            "id": "obs_4",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 551, \"path\": \"packages/emails/email-manager.ts\", \"start\": 524}",
+            "path": "packages/emails/email-manager.ts",
+            "line_range": [
+              524,
+              551
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "2b34741a8d7cf128",
+            "excerpt": "};\nexport const sendAddGuestsEmails = async (calEvent: CalendarEvent, newGuests: string[]) => {\n  const calendarEvent = formatCalEvent(calEvent);\n\n  const emailsToSend: Promise<unknown>[] = [];\n  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));\n\n  if (calendarEvent.team?.members) {\n    for (const teamMember of calendarEvent.team.members) {\n      emailsToSend.push(\n        sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent, teamMember }))\n      );\n    }\n  }\n\n  emailsToSend.push(\n    ...calendarEvent.attendees.map((attendee) => {\n      if (newGuests.includes(attendee.email)) {\n        return sendEmail(() => new AttendeeScheduledEmail(calendarEvent, attendee));\n      } else {\n        return sendEmail(() => new AttendeeAddGuestsEmail(calendarEvent, attendee));\n      }\n    })\n  );\n\n  await Promise.all(emailsToSend);\n};\nexport const sendFeedbackEmail = async (feedback: Feedback) => {\n",
+            "status": "success",
+            "excerpt_line_range": [
+              524,
+              551
+            ],
+            "shared_result_id": "sr_031aa6f0bb5e84cd6de97d46"
+          },
+          {
+            "id": "obs_5",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/templates/attendee-add-guests-email.ts\"}",
+            "path": "packages/emails/templates/attendee-add-guests-email.ts",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "e692c200cb265b0f",
+            "excerpt": "import { renderEmail } from \"../\";\nimport generateIcsString from \"../lib/generateIcsString\";\nimport AttendeeScheduledEmail from \"./attendee-scheduled-email\";\n\nexport default class AttendeeAddGuestsEmail extends AttendeeScheduledEmail {\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    return {\n      icalEvent: {\n        filename: \"event.ics\",\n        content: generateIcsString({\n          event: this.calEvent,\n          title: this.t(\"new_guests_added\"),\n          subtitle: this.t(\"emailed_you_and_any_other_attendees\"),\n          role: \"attendee\",\n          status: \"CONFIRMED\",\n        }),\n        method: \"REQUEST\",\n      },\n      to: `${this.attendee.name} <${this.attendee.email}>`,\n      from: `${this.calEvent.organizer.name} <${this.getMailerOptions().from}>`,\n      replyTo: this.calEvent.organizer.email,\n      subject: `${this.t(\"guests_added_event_type_subject\", {\n        eventType: this.calEvent.type,\n        name: this.calEvent.team?.name || this.calEvent.organizer.name,\n        date: this.getFormattedDate(),\n      })}`,\n      html: await renderEmail(\"AttendeeAddGuestsEmail\", {\n        calEvent: this.calEvent,\n        attendee: this.attendee,\n ",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              30
+            ],
+            "shared_result_id": "sr_2ef7ccf2d40d1291d15a521c"
+          },
+          {
+            "id": "obs_6",
+            "tool": "read_file",
+            "query": "read_file {\"path\": \"packages/emails/src/templates/AttendeeAddGuestsEmail.tsx\"}",
+            "path": "packages/emails/src/templates/AttendeeAddGuestsEmail.tsx",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "d81978fcd7fefb5b",
+            "excerpt": "import { AttendeeScheduledEmail } from \"./AttendeeScheduledEmail\";\n\nexport const AttendeeAddGuestsEmail = (props: React.ComponentProps<typeof AttendeeScheduledEmail>) => (\n  <AttendeeScheduledEmail\n    title=\"new_guests_added\"\n    headerType=\"calendarCircle\"\n    subject=\"guests_added_event_type_subject\"\n    {...props}\n  />\n);\n",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              10
+            ],
+            "shared_result_id": "sr_3a532092f342ec2234b5dcb4"
+          },
+          {
+            "id": "obs_7",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 45, \"path\": \"packages/emails/templates/attendee-add-guests-email.ts\", \"start\": 28}",
+            "path": "packages/emails/templates/attendee-add-guests-email.ts",
+            "line_range": [
+              28,
+              45
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "e2fd314da6ce97b7",
+            "excerpt": "        calEvent: this.calEvent,\n        attendee: this.attendee,\n      }),\n      text: this.getTextBody(\"new_guests_added\"),\n    };\n  }\n}\n",
+            "status": "success",
+            "excerpt_line_range": [
+              28,
+              34
+            ],
+            "shared_result_id": "sr_ce13cb2acdb7f8422cdca734"
+          },
+          {
+            "id": "obs_8",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 60, \"path\": \"packages/emails/email-manager.ts\", \"start\": 1}",
+            "path": "packages/emails/email-manager.ts",
+            "line_range": [
+              1,
+              60
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "b532d15884edafc7",
+            "excerpt": "// eslint-disable-next-line no-restricted-imports\nimport { cloneDeep } from \"lodash\";\nimport type { TFunction } from \"next-i18next\";\nimport type { z } from \"zod\";\n\nimport type { EventNameObjectType } from \"@calcom/core/event\";\nimport { getEventName } from \"@calcom/core/event\";\nimport type BaseEmail from \"@calcom/emails/templates/_base-email\";\nimport { formatCalEvent } from \"@calcom/lib/formatCalendarEvent\";\nimport logger from \"@calcom/lib/logger\";\nimport { safeStringify } from \"@calcom/lib/safeStringify\";\nimport type { EventTypeMetaDataSchema } from \"@calcom/prisma/zod-utils\";\nimport type { CalendarEvent, Person } from \"@calcom/types/Calendar\";\n\nimport type { MonthlyDigestEmailData } from \"./src/templates/MonthlyDigestEmail\";\nimport type { OrganizationAdminNoSlotsEmailInput } from \"./src/templates/OrganizationAdminNoSlots\";\nimport type { EmailVerifyLink } from \"./templates/account-verify-email\";\nimport AccountVerifyEmail from \"./templates/account-verify-email\";\nimport type { OrganizationNotification } from \"./templates/admin-organization-notification\";\nimport AdminOrganizationNotification from \"./templates/admin-organization-notification\";\nimport AttendeeAddGuestsEmail from \"./temp",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              21
+            ],
+            "shared_result_id": "sr_e57a428c623dd6b4b4ff3e58"
+          },
+          {
+            "id": "obs_9",
+            "tool": "grep",
+            "query": "grep {\"glob\": \"\", \"max_hits\": 30, \"pattern\": \"AttendeeAddGuestsEmail\"}",
+            "path": "",
+            "line_range": null,
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "bb7159192ac9737b",
+            "excerpt": "- packages/emails/email-manager.ts:21: import AttendeeAddGuestsEmail from \"./templates/attendee-add-guests-email\";\n- packages/emails/src/templates/AttendeeAddGuestsEmail.tsx:3: export const AttendeeAddGuestsEmail = (props: React.ComponentProps<typeof AttendeeScheduledEmail>) => (\n- packages/emails/src/templates/index.ts:39: export { AttendeeAddGuestsEmail } from \"./AttendeeAddGuestsEmail\";\n- packages/emails/templates/attendee-add-guests-email.ts:5: export default class AttendeeAddGuestsEmail extends AttendeeScheduledEmail {\n- packages/emails/email-manager.ts:544:         return sendEmail(() => new AttendeeAddGuestsEmail(calendarEvent, attendee));\n- packages/emails/templates/attendee-add-guests-email.ts:27:       html: await renderEmail(\"AttendeeAddGuestsEmail\", {",
+            "status": "success",
+            "excerpt_line_range": null,
+            "shared_result_id": "sr_93106c4eb28312b27dcee8d9"
+          },
+          {
+            "id": "obs_10",
+            "tool": "read_file",
+            "query": "read_file {\"end\": 40, \"path\": \"packages/emails/templates/attendee-scheduled-email.ts\", \"start\": 1}",
+            "path": "packages/emails/templates/attendee-scheduled-email.ts",
+            "line_range": [
+              1,
+              40
+            ],
+            "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+            "result_digest": "226430297b7709b6",
+            "excerpt": "// eslint-disable-next-line no-restricted-imports\nimport { cloneDeep } from \"lodash\";\nimport type { TFunction } from \"next-i18next\";\n\nimport { getRichDescription } from \"@calcom/lib/CalEventParser\";\nimport { TimeFormat } from \"@calcom/lib/timeFormat\";\nimport type { CalendarEvent, Person } from \"@calcom/types/Calendar\";\n\nimport { renderEmail } from \"../\";\nimport generateIcsString from \"../lib/generateIcsString\";\nimport BaseEmail from \"./_base-email\";\n\nexport default class AttendeeScheduledEmail extends BaseEmail {\n  calEvent: CalendarEvent;\n  attendee: Person;\n  showAttendees: boolean | undefined;\n  t: TFunction;\n\n  constructor(calEvent: CalendarEvent, attendee: Person, showAttendees?: boolean | undefined) {\n    super();\n    if (!showAttendees && calEvent.seatsPerTimeSlot) {\n      this.calEvent = cloneDeep(calEvent);\n      this.calEvent.attendees = [attendee];\n    } else {\n      this.calEvent = calEvent;\n    }\n    this.name = \"SEND_BOOKING_CONFIRMATION\";\n    this.attendee = attendee;\n    this.t = attendee.language.translate;\n  }\n\n  protected async getNodeMailerPayload(): Promise<Record<string, unknown>> {\n    const clonedCalEvent = cloneDeep(this.calEvent);\n\n    return {\n      icalE",
+            "status": "success",
+            "excerpt_line_range": [
+              1,
+              36
+            ],
+            "shared_result_id": "sr_92bd71a4f59311195e8fbc9d"
+          }
+        ],
+        "verdict_reason": "case-result-repair-limit",
+        "attempts": 1,
+        "investigation_steps": 6,
+        "investigation_tokens": 40002,
+        "retryable": false,
+        "assessment": null,
+        "investigation_outcome": "output-error",
+        "investigation_task_id": "it_02dd2f748ec1b05b5fdc3f78",
+        "discovery_basis": {
+          "behavior": {
+            "source_facts": [
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 525,
+                "excerpt": "export const sendAddGuestsEmails = async (calEvent: CalendarEvent, newGuests: string[]) => {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 526,
+                "excerpt": "  const calendarEvent = formatCalEvent(calEvent);"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 529,
+                "excerpt": "  emailsToSend.push(sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent })));"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 534,
+                "excerpt": "        sendEmail(() => new OrganizerAddGuestsEmail({ calEvent: calendarEvent, teamMember }))"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 540,
+                "excerpt": "    ...calendarEvent.attendees.map((attendee) => {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 541,
+                "excerpt": "      if (newGuests.includes(attendee.email)) {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 542,
+                "excerpt": "        return sendEmail(() => new AttendeeScheduledEmail(calendarEvent, attendee));"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 543,
+                "excerpt": "      } else {"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 544,
+                "excerpt": "        return sendEmail(() => new AttendeeAddGuestsEmail(calendarEvent, attendee));"
+              },
+              {
+                "side": "after",
+                "path": "packages/emails/email-manager.ts",
+                "line": 549,
+                "excerpt": "  await Promise.all(emailsToSend);"
+              },
+              {
+                "side": "context",
+                "path": "packages/emails/email-manager.ts",
+                "line": 541,
+                "excerpt": "      if (newGuests.includes(attendee.email)) {"
+              },
+              {
+                "side": "context",
+                "path": "packages/emails/email-manager.ts",
+                "line": 544,
+                "excerpt": "        return sendEmail(() => new AttendeeAddGuestsEmail(calendarEvent, attendee));"
+              }
+            ]
+          },
+          "trigger_basis": {
+            "side": "after",
+            "path": "packages/emails/email-manager.ts",
+            "line": 541,
+            "excerpt": "      if (newGuests.includes(attendee.email)) {"
+          }
+        }
+      },
+      "tool_call": {
+        "name": "submit_refuted",
+        "args": {
+          "case_id": "case_4f38bfab2c35356ed410823c",
+          "reason": "The candidate's premise rests on the claim that \"the only delivered definition of AttendeeAddGuestsEmail ... is a React component\" and that \"no template wrapper class for it was delivered.\" Direct reads disprove this: packages/emails/templates/attendee-add-guests-email.ts contains `export default class AttendeeAddGuestsEmail extends AttendeeScheduledEmail`, whose inherited constructor (obs_10:e2) is `(calEvent: CalendarEvent, attendee: Person, showAttendees?)`. email-manager.ts imports that class as its default export (obs_9:e1), so the positional call at obs_9:e5 matches the class contract exactly, mirroring the sibling call `new AttendeeScheduledEmail(calendarEvent, attendee)` in the same loop. The .tsx functional component is only rendered by the wrapper via renderEmail(\"AttendeeAddGuestsEmail\", {calEvent, attendee}) (obs_5:e4, obs_7:e1), so no undefined calEvent/attendee or failed send can occur on the existing-attendee path.",
+          "evidence": [
+            "obs_9:e1",
+            "obs_9:e4",
+            "obs_9:e5",
+            "obs_10:e2",
+            "obs_5:e4",
+            "obs_7:e1",
+            "obs_4:e2"
+          ],
+          "premise": "mechanism",
+          "statement": "Counterevidence to the alleged contract mismatch: the delivered wrapper class exists and accepts positional args. packages/emails/templates/attendee-add-guests-email.ts:5 is `export default class AttendeeAddGuestsEmail extends AttendeeScheduledEmail`, and the base constructor is `constructor(calEvent: CalendarEvent, attendee: Person, showAttendees?: boolean | undefined)`. email-manager.ts:21 imports exactly that default class (`import AttendeeAddGuestsEmail from \"./templates/attendee-add-guests-email\"`), so `new AttendeeAddGuestsEmail(calendarEvent, attendee)` at line 544 satisfies its signature; the props-object component in src/templates/AttendeeAddGuestsEmail.tsx is never constructed by email-manager and is instead passed props correctly by the wrapper's renderEmail(\"AttendeeAddGuestsEmail\", {calEvent: this.calEvent, attendee: this.attendee})."
+        }
+      }
+    }
+  ],
+  "last_turn": {
+    "case": {
+      "id": "h_36f6fb69",
+      "identity": "su_d8da3c181ba5506b::state-leak::handleAdd",
+      "unit_id": "su_d8da3c181ba5506b",
+      "mechanism": "state-leak",
+      "claim": "isInvalidEmail is a write-only-until-cancel flag: it is set true on validation failure (f0.R56) but never reset when the user edits emails via setValue (f0.R73); only the Cancel button (f0.R91) clears it, so a stale 'emails must be unique/valid' error stays visible while the user corrects input.",
+      "trigger": "Submit invalid/duplicate emails, then type corrected emails in the same open dialog without clicking Cancel.",
+      "impact": "Persistent misleading inline error message misrepresents current field validity until dialog close/cancel.",
+      "open_question": "Is there a delivered onChange/useEffect in MultiEmail or the dialog that resets isInvalidEmail when multiEmailValue changes?",
+      "refutation": "If MultiEmail internally signals validity changes back through setValue and the component re-derives isInvalidEmail, the error would clear on edit.",
+      "sites": [
+        {
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line": 56,
+          "excerpt": "      setIsInvalidEmail(true);"
+        }
+      ],
+      "severity": "warning",
+      "source": "generator",
+      "status": "unknown",
+      "evidence_strength": "none",
+      "observations": [
+        {
+          "id": "obs_0",
+          "tool": "read_file",
+          "query": "read_file {\"end\": 58, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 48}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": [
+            48,
+            58
+          ],
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "a057c6fd9812fc59",
+          "excerpt": "  const handleAdd = () => {\n    if (multiEmailValue.length === 0) {\n      return;\n    }\n    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n  };\n",
+          "status": "success",
+          "excerpt_line_range": [
+            48,
+            58
+          ]
+        },
+        {
+          "id": "obs_1",
+          "tool": "read_diff",
+          "query": "read_diff {\"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\"}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": null,
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "a2f33a4c2b168587",
+          "excerpt": "@@ -0,0 +1,107 @@\n+import type { Dispatch, SetStateAction } from \"react\";\n+import { useState } from \"react\";\n+import { z } from \"zod\";\n+\n+import { useLocale } from \"@calcom/lib/hooks/useLocale\";\n+import { trpc } from \"@calcom/trpc/react\";\n+import {\n+  Button,\n+  Dialog,\n+  DialogContent,\n+  DialogFooter,\n+  DialogHeader,\n+  MultiEmail,\n+  Icon,\n+  showToast,\n+} from \"@calcom/ui\";\n+\n+interface IAddGuestsDialog {\n+  isOpenDialog: boolean;\n+  setIsOpenDialog: Dispatch<SetStateAction<boolean>>;\n+  bookingId: number;\n+}\n+\n+export const AddGuestsDialog = (props: IAddGuestsDialog) => {\n+  const { t } = useLocale();\n+  const ZAddGuestsInputSchema = z.array(z.string().email()).refine((emails) => {\n+    const uniqueEmails = new Set(emails);\n+    return uniqueEmails.size === emails.length;\n+  });\n+  const { isOpenDialog, setIsOpenDialog, bookingId } = props;\n+  const utils = trpc.useUtils();\n+  const [multiEmailValue, setMultiEmailValue] = useState<string[]>([\"\"]);\n+  const [isInvalidEmail, setIsInvalidEmail] = useState(false);\n+\n+  const addGuestsMutation = trpc.viewer.bookings.addGuests.useMutation({\n+    onSuccess: async () => {\n+      showToast(t(\"guests_added\"), \"success\");\n+      setIsO",
+          "status": "success",
+          "excerpt_line_range": null
+        },
+        {
+          "id": "obs_2",
+          "tool": "find_definition",
+          "query": "find_definition {\"symbol\": \"MultiEmail\"}",
+          "path": "",
+          "line_range": null,
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "2eb74e26e9bc945f",
+          "excerpt": "- MultiEmail [function] packages/features/form-builder/Components.tsx:234\n  233:     //TODO: Make it a ui component\n234:     factory: function MultiEmail({ value, readOnly, label, setValue, ...props }) {\n235:       const placeholder = props.placeholder;\n236:       const { t } = useLocale();\n237:       value = value || [];\n238:       const inputClassName =\n239:         \"dark:placeholder:text-muted focus:border-emphasis border-subtle block w-full rounded-md border-default text-sm focus:ring-black disabled:bg-emphasis disabled:hover:cursor-not-allowed dark:selection:bg-green-500 disabled:dark:text-subtle bg-default\";\n240:       return (\n241:         <>\n242:           {value.length ? (\n243:             <div>\n244:               <label htmlFor=\"guests\" className=\"text-default  mb-1 block text-sm font-medium\">\n245:                 {label}\n246:               </label>\n247:               <ul>\n248:                 {value.map((field, index) => (\n249:                   <li key={index}>\n250:                     <EmailField\n251:                       disabled={readOnly}\n252:                       value={value[index]}\n253:                       className={inputClassName}\n254:                      ",
+          "status": "success",
+          "excerpt_line_range": null
+        },
+        {
+          "id": "obs_3",
+          "tool": "read_diff",
+          "query": "read_diff {\"end\": 56, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 56}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": [
+            56,
+            56
+          ],
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "5e462b1721d29a29",
+          "excerpt": "+      showToast(message || t(\"unable_to_add_guests\"), \"error\");\n+    },\n+  });\n+\n+  const handleAdd = () => {\n+    if (multiEmailValue.length === 0) {\n+      return;\n+    }\n+    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n+    if (validationResult.success) {\n+      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n+    } else {\n+      setIsInvalidEmail(true);\n+    }\n+  };\n+\n+  return (\n+    <Dialog open={isOpenDialog} onOpenChange={setIsOpenDialog}>\n+      <DialogContent enableOverflow>\n+        <div className=\"flex flex-row space-x-3\">\n+          <div className=\"bg-subtle flex h-10 w-10 flex-shrink-0 justify-center rounded-full \">\n+            <Icon name=\"user-plus\" className=\"m-auto h-6 w-6\" />\n+          </div>\n+          <div className=\"w-full pt-1\">\n+            <DialogHeader title={t(\"additional_guests\")} />\n+            <MultiEmail\n+              label={t(\"add_emails\")}\n+              value={multiEmailValue}\n+              readOnly={false}\n+              setValue={setMultiEmailValue}\n+            />\n+\n+            {isInvalidEmail && (\n+              <div className=\"my-4 flex text-sm text-red-700\">\n+                <div classNam",
+          "status": "success",
+          "excerpt_line_range": null,
+          "shared_result_id": "sr_cd2899449f6d338bab9824db"
+        },
+        {
+          "id": "obs_4",
+          "tool": "read_file",
+          "query": "read_file {\"end\": 59, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 47}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": [
+            47,
+            59
+          ],
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "5e76c3330616252b",
+          "excerpt": "\n  const handleAdd = () => {\n    if (multiEmailValue.length === 0) {\n      return;\n    }\n    const validationResult = ZAddGuestsInputSchema.safeParse(multiEmailValue);\n    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n  };\n\n",
+          "status": "success",
+          "excerpt_line_range": [
+            47,
+            59
+          ],
+          "shared_result_id": "sr_db65e05403c0abaa0e180ffd"
+        },
+        {
+          "id": "obs_5",
+          "tool": "read_file",
+          "query": "read_file {\"end\": 81, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 70}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": [
+            70,
+            81
+          ],
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "3166db973b7a92f1",
+          "excerpt": "              label={t(\"add_emails\")}\n              value={multiEmailValue}\n              readOnly={false}\n              setValue={setMultiEmailValue}\n            />\n\n            {isInvalidEmail && (\n              <div className=\"my-4 flex text-sm text-red-700\">\n                <div className=\"flex-shrink-0\">\n                  <Icon name=\"triangle-alert\" className=\"h-5 w-5\" />\n                </div>\n                <div className=\"ml-3\">\n",
+          "status": "success",
+          "excerpt_line_range": [
+            70,
+            81
+          ],
+          "shared_result_id": "sr_ea91c7b99defe7bbaadde389"
+        },
+        {
+          "id": "obs_6",
+          "tool": "read_file",
+          "query": "read_file {\"end\": 107, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 1}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": [
+            1,
+            107
+          ],
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "6d635c89dff159ef",
+          "excerpt": "    if (validationResult.success) {\n      addGuestsMutation.mutate({ bookingId, guests: multiEmailValue });\n    } else {\n      setIsInvalidEmail(true);\n    }\n  };\n\n  return (\n    <Dialog open={isOpenDialog} onOpenChange={setIsOpenDialog}>\n      <DialogContent enableOverflow>\n        <div className=\"flex flex-row space-x-3\">\n          <div className=\"bg-subtle flex h-10 w-10 flex-shrink-0 justify-center rounded-full \">\n",
+          "status": "success",
+          "excerpt_line_range": [
+            53,
+            64
+          ],
+          "shared_result_id": "sr_588b869c8a185d60137b2f43"
+        },
+        {
+          "id": "obs_7",
+          "tool": "read_file",
+          "query": "read_file {\"end\": 107, \"path\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"start\": 60}",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line_range": [
+            60,
+            107
+          ],
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "ca92d8e92bcc3f7a",
+          "excerpt": "  return (\n    <Dialog open={isOpenDialog} onOpenChange={setIsOpenDialog}>\n      <DialogContent enableOverflow>\n        <div className=\"flex flex-row space-x-3\">\n          <div className=\"bg-subtle flex h-10 w-10 flex-shrink-0 justify-center rounded-full \">\n            <Icon name=\"user-plus\" className=\"m-auto h-6 w-6\" />\n          </div>\n          <div className=\"w-full pt-1\">\n            <DialogHeader title={t(\"additional_guests\")} />\n            <MultiEmail\n              label={t(\"add_emails\")}\n              value={multiEmailValue}\n              readOnly={false}\n              setValue={setMultiEmailValue}\n            />\n\n            {isInvalidEmail && (\n              <div className=\"my-4 flex text-sm text-red-700\">\n                <div className=\"flex-shrink-0\">\n                  <Icon name=\"triangle-alert\" className=\"h-5 w-5\" />\n                </div>\n                <div className=\"ml-3\">\n                  <p className=\"font-medium\">{t(\"emails_must_be_unique_valid\")}</p>\n                </div>\n              </div>\n            )}\n\n            <DialogFooter>\n              <Button\n                onClick={() => {\n                  setMultiEmailValue([\"\"]);\n                  setIsI",
+          "status": "success",
+          "excerpt_line_range": [
+            60,
+            91
+          ],
+          "shared_result_id": "sr_c3015a23436653ccea39eba9"
+        },
+        {
+          "id": "obs_8",
+          "tool": "grep",
+          "query": "grep {\"glob\": \"apps/web/components/dialog/AddGuestsDialog.tsx\", \"max_hits\": 10, \"pattern\": \"setIsInvalidEmail|isInvalidEmail\"}",
+          "path": "",
+          "line_range": null,
+          "sha": "92f44dcea7ff19e9123a30c63c167a2938df5a55",
+          "result_digest": "3738d6be9d8b9aa5",
+          "excerpt": "- apps/web/components/dialog/AddGuestsDialog.tsx:33:   const [isInvalidEmail, setIsInvalidEmail] = useState(false);\n- apps/web/components/dialog/AddGuestsDialog.tsx:56:       setIsInvalidEmail(true);\n- apps/web/components/dialog/AddGuestsDialog.tsx:76:             {isInvalidEmail && (\n- apps/web/components/dialog/AddGuestsDialog.tsx:91:                   setIsInvalidEmail(false);",
+          "status": "success",
+          "excerpt_line_range": null,
+          "shared_result_id": "sr_98d34d87bcff175b73eed33d"
+        }
+      ],
+      "verdict_reason": "session-step-limit",
+      "attempts": 1,
+      "investigation_steps": 4,
+      "investigation_tokens": 20221,
+      "retryable": false,
+      "assessment": null,
+      "investigation_outcome": "output-error",
+      "investigation_task_id": "it_a061db507747efb237d89019",
+      "discovery_basis": {
+        "behavior": {
+          "source_facts": [
+            {
+              "side": "after",
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+              "line": 33,
+              "excerpt": "  const [isInvalidEmail, setIsInvalidEmail] = useState(false);"
+            },
+            {
+              "side": "after",
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+              "line": 56,
+              "excerpt": "      setIsInvalidEmail(true);"
+            },
+            {
+              "side": "after",
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+              "line": 73,
+              "excerpt": "              setValue={setMultiEmailValue}"
+            },
+            {
+              "side": "after",
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+              "line": 90,
+              "excerpt": "                  setMultiEmailValue([\"\"]);"
+            },
+            {
+              "side": "after",
+              "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+              "line": 91,
+              "excerpt": "                  setIsInvalidEmail(false);"
+            }
+          ]
+        },
+        "trigger_basis": {
+          "side": "after",
+          "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+          "line": 73,
+          "excerpt": "              setValue={setMultiEmailValue}"
+        }
+      }
+    },
+    "tool_call": {
+      "name": "read_file",
+      "args": {
+        "path": "apps/web/components/dialog/AddGuestsDialog.tsx",
+        "start": "86",
+        "end": "107"
+      },
+      "id": "call_100501670b844901ad7975c1",
+      "type": "tool_call"
+    },
+    "input_sha256": "f20fc5e6c8cc4dfb19033f22e29d702d398b69b4d3ca7bdcccde0b7da1ba9ea8",
+    "output_sha256": "be7b9f269fb5de7ab1f30343b51cf8e13d802dbce5823d18063275202867b683"
+  },
+  "source": {
+    "path": "packages/trpc/server/routers/viewer/bookings/addGuests.handler.ts",
+    "text": "import EventManager from \"@calcom/core/EventManager\";\nimport dayjs from \"@calcom/dayjs\";\nimport { sendAddGuestsEmails } from \"@calcom/emails\";\nimport { parseRecurringEvent } from \"@calcom/lib\";\nimport { getTranslation } from \"@calcom/lib/server\";\nimport { getUsersCredentials } from \"@calcom/lib/server/getUsersCredentials\";\nimport { isTeamAdmin, isTeamOwner } from \"@calcom/lib/server/queries/teams\";\nimport { prisma } from \"@calcom/prisma\";\nimport type { CalendarEvent } from \"@calcom/types/Calendar\";\n\nimport { TRPCError } from \"@trpc/server\";\n\nimport type { TrpcSessionUser } from \"../../../trpc\";\nimport type { TAddGuestsInputSchema } from \"./addGuests.schema\";\n\ntype AddGuestsOptions = {\n  ctx: {\n    user: NonNullable<TrpcSessionUser>;\n  };\n  input: TAddGuestsInputSchema;\n};\nexport const addGuestsHandler = async ({ ctx, input }: AddGuestsOptions) => {\n  const { user } = ctx;\n  const { bookingId, guests } = input;\n\n  const booking = await prisma.booking.findFirst({\n    where: {\n      id: bookingId,\n    },\n    include: {\n      attendees: true,\n      eventType: true,\n      destinationCalendar: true,\n      references: true,\n      user: {\n        include: {\n          destinationCalendar: true,\n          credentials: true,\n        },\n      },\n    },\n  });\n\n  if (!booking) throw new TRPCError({ code: \"NOT_FOUND\", message: \"booking_not_found\" });\n\n  const isTeamAdminOrOwner =\n    (await isTeamAdmin(user.id, booking.eventType?.teamId ?? 0)) &&\n    (await isTeamOwner(user.id, booking.eventType?.teamId ?? 0));\n\n  const isOrganizer = booking.userId === user.id;\n\n  const isAttendee = !!booking.attendees.find((attendee) => attendee.email === user.email);\n\n  if (!isTeamAdminOrOwner && !isOrganizer && !isAttendee) {\n    throw new TRPCError({ code: \"FORBIDDEN\", message: \"you_do_not_have_permission\" });\n  }\n\n  const organizer = await prisma.user.findFirstOrThrow({\n    where: {\n      id: booking.userId || 0,\n    },\n    select: {\n      name: true,\n      email: true,\n      timeZone: true,\n      locale: true,\n    },\n  });\n\n  const blacklistedGuestEmails = process.env.BLACKLISTED_GUEST_EMAILS\n    ? process.env.BLACKLISTED_GUEST_EMAILS.split(\",\").map((email) => email.toLowerCase())\n    : [];\n\n  const uniqueGuests = guests.filter(\n    (guest) =>\n      !booking.attendees.some((attendee) => guest === attendee.email) &&\n      !blacklistedGuestEmails.includes(guest)\n  );\n\n  if (uniqueGuests.length === 0)\n    throw new TRPCError({ code: \"BAD_REQUEST\", message: \"emails_must_be_unique_valid\" });\n\n  const guestsFullDetails = uniqueGuests.map((guest) => {\n    return {\n      name: \"\",\n      email: guest,\n      timeZone: organizer.timeZone,\n      locale: organizer.locale,\n    };\n  });\n\n  const bookingAttendees = await prisma.booking.update({\n    where: {\n      id: bookingId,\n    },\n    include: {\n      attendees: true,\n    },\n    data: {\n      attendees: {\n        createMany: {\n          data: guestsFullDetails,\n        },\n      },\n    },\n  });\n\n  const attendeesListPromises = bookingAttendees.attendees.map(async (attendee) => {\n    return {\n      name: attendee.name,\n      email: attendee.email,\n      timeZone: attendee.timeZone,\n      language: {\n        translate: await getTranslation(attendee.locale ?? \"en\", \"common\"),\n        locale: attendee.locale ?? \"en\",\n      },\n    };\n  });\n\n  const attendeesList = await Promise.all(attendeesListPromises);\n  const tOrganizer = await getTranslation(organizer.locale ?? \"en\", \"common\");\n  const videoCallReference = booking.references.find((reference) => reference.type.includes(\"_video\"));\n\n  const evt: CalendarEvent = {\n    title: booking.title || \"\",\n    type: (booking.eventType?.title as string) || booking?.title || \"\",\n    description: booking.description || \"\",\n    startTime: booking.startTime ? dayjs(booking.startTime).format() : \"\",\n    endTime: booking.endTime ? dayjs(booking.endTime).format() : \"\",\n    organizer: {\n      email: booking?.userPrimaryEmail ?? organizer.email,\n      name: organizer.name ?? \"Nameless\",\n      timeZone: organizer.timeZone,\n      language: { translate: tOrganizer, locale: organizer.locale ?? \"en\" },\n    },\n    attendees: attendeesList,\n    uid: booking.uid,\n    recurringEvent: parseRecurringEvent(booking.eventType?.recurringEvent),\n    location: booking.location,\n    destinationCalendar: booking?.destinationCalendar\n      ? [booking?.destinationCalendar]\n      : booking?.user?.destinationCalendar\n      ? [booking?.user?.destinationCalendar]\n      : [],\n    seatsPerTimeSlot: booking.eventType?.seatsPerTimeSlot,\n    seatsShowAttendees: booking.eventType?.seatsShowAttendees,\n  };\n\n  if (videoCallReference) {\n    evt.videoCallData = {\n      type: videoCallReference.type,\n      id: videoCallReference.meetingId,\n      password: videoCallReference?.meetingPassword,\n      url: videoCallReference.meetingUrl,\n    };\n  }\n\n  const credentials = await getUsersCredentials(ctx.user);\n\n  const eventManager = new EventManager({\n    ...user,\n    credentials: [...credentials],\n  });\n\n  await eventManager.updateCalendarAttendees(evt, booking);\n\n  try {\n    await sendAddGuestsEmails(evt, guests);\n  } catch (err) {\n    console.log(\"Error sending AddGuestsEmails\");\n  }\n\n  return { message: \"Guests added\" };\n};\n"
+  }
+}

@@ -2,17 +2,39 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
 from langchain_core.tools import StructuredTool
-from pydantic import ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from reviewforge.engine.hypothesis import Mechanism
 from reviewforge.engine.review_session import fingerprint
 
+MAX_RESULT_BYTES = 32_768
 
-def result_tool(name: str, description: str, fields: dict[str, Any]) -> StructuredTool:
-    schema = create_model(name.title().replace("_", ""), __config__=ConfigDict(extra="forbid", strict=True), **fields)
+
+class ResultRecord(BaseModel):
+    """Bound the transport record, rather than the length of its reasoning.
+
+    Protocols 1–8 retain their original per-field schemas. In protocol 9 the
+    finite provider output and this whole-record guard bound memory; cosmetic
+    length never substitutes for case identity or evidence validation.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def bounded_record(cls, value):
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_BYTES:
+            raise ValueError("result-transport-record-too-large")
+        return value
+
+
+def result_tool(name: str, description: str, fields: dict[str, Any], *, bounded_record=False) -> StructuredTool:
+    options = {"__base__": ResultRecord} if bounded_record else {"__config__": ConfigDict(extra="forbid", strict=True)}
+    schema = create_model(name.title().replace("_", ""), **options, **fields)
 
     def submit(**kwargs):
         raise RuntimeError("Result actions are decoded by the controller, never executed")
@@ -20,11 +42,11 @@ def result_tool(name: str, description: str, fields: dict[str, Any]) -> Structur
     return StructuredTool.from_function(func=submit, name=name, description=description, args_schema=schema)
 
 
-def prose():
-    return str, Field(min_length=1, max_length=600)
+def prose(protocol_version=5):
+    return str, Field(min_length=1, **({"max_length": 600} if protocol_version < 9 else {}))
 
 
-def discovery_tools(block):
+def discovery_tools(block, *, protocol_version=5):
     unit = Literal[tuple(item.id for item in block.units)]
     ref = Annotated[str, Field(pattern=r"^f[0-9]+\.[BRC][0-9]+(?:\.s[0-9]+)?$")]
     common = {"unit_id": (unit, ...), "source_refs": (list[ref], Field(min_length=1, max_length=12))}
@@ -39,28 +61,31 @@ def discovery_tools(block):
                 "mechanism": (Literal[tuple(item.value for item in Mechanism)], ...),
                 "severity": (Literal["error", "warning", "info"], ...),
                 **{
-                    name: prose()
+                    name: prose(protocol_version)
                     for name in ("claim", "trigger", "impact", "open_question", "refutation", "discrepancy")
                 },
                 "site_refs": (list[ref], Field(max_length=1)),
                 "trigger_ref": (ref, ...),
             },
+            bounded_record=protocol_version >= 9,
         ),
         result_tool(
             "submit_no_issue",
             "Finish one unit with an actual source-backed checked boundary.",
             {
                 **common,
-                "checked": prose(),
+                "checked": prose(protocol_version),
             },
+            bounded_record=protocol_version >= 9,
         ),
         result_tool(
             "defer_unit",
             "Finish an unavailable boundary explicitly; it remains uncovered.",
             {
                 "unit_id": (unit, ...),
-                "reason": prose(),
+                "reason": prose(protocol_version),
             },
+            bounded_record=protocol_version >= 9,
         ),
     ]
 
@@ -78,21 +103,22 @@ def case_identity(hypothesis, head_sha: str) -> str:
     )
 
 
-def decision_tools(hypothesis, head_sha: str):
+def decision_tools(hypothesis, head_sha: str, *, protocol_version=5):
     case = (Literal[case_identity(hypothesis, head_sha)], ...)
     refs = (list[str], Field(min_length=1, max_length=8))
-    common = {"case_id": case, "reason": prose()}
+    common = {"case_id": case, "reason": prose(protocol_version)}
     return [
         result_tool(
             "submit_confirmed",
             "Submit a conflicting expected/actual proof for the ORIGINAL bound case.",
             {
                 **common,
-                "expected": prose(),
-                "actual": prose(),
+                "expected": prose(protocol_version),
+                "actual": prose(protocol_version),
                 "expected_evidence": refs,
                 "actual_evidence": refs,
             },
+            bounded_record=protocol_version >= 9,
         ),
         result_tool(
             "submit_refuted",
@@ -100,17 +126,19 @@ def decision_tools(hypothesis, head_sha: str):
             {
                 **common,
                 "premise": (Literal["trigger", "mechanism", "impact", "regression"], ...),
-                "statement": prose(),
+                "statement": prose(protocol_version),
                 "evidence": refs,
             },
+            bounded_record=protocol_version >= 9,
         ),
         result_tool(
             "submit_unknown",
             "Stop when a particular missing fact cannot be acquired in this session.",
             {
                 **common,
-                "missing_fact": prose(),
+                "missing_fact": prose(protocol_version),
             },
+            bounded_record=protocol_version >= 9,
         ),
     ]
 

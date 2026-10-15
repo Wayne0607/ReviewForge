@@ -27,8 +27,12 @@ def audit_hash(item, ledger: HypothesisLedger) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def validate(raw: Any, item) -> dict[str, Any]:
+def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
     from reviewforge.engine.proof_gate import _proof, _references, _text
+    from reviewforge.engine.session_tools import MAX_RESULT_BYTES
+
+    if protocol_version >= 9 and len(json.dumps(raw, ensure_ascii=False).encode()) > MAX_RESULT_BYTES:
+        raise ValueError("source-audit-transport-record-too-large")
 
     if not isinstance(raw, dict) or set(raw) != {"hypothesis_id", "execution", "contracts", "gaps"}:
         raise ValueError("invalid-source-audit-shape")
@@ -56,7 +60,7 @@ def validate(raw: Any, item) -> dict[str, Any]:
                 if isinstance(row, dict)
                 else None
             )
-            if proof is None or len(proof["statement"]) > 600 or len(proof["evidence"]) > 8:
+            if proof is None or (protocol_version < 9 and len(proof["statement"]) > 600) or len(proof["evidence"]) > 8:
                 raise ValueError("invalid-source-fact")
             if name == "execution" and set(row) != {"statement", "evidence"}:
                 raise ValueError("invalid-source-execution")
@@ -64,7 +68,7 @@ def validate(raw: Any, item) -> dict[str, Any]:
     # Gaps are caveats, not evidence statements. Preserve an unevenly sized
     # explanation verbatim within the original 8 * 600 character total rather
     # than discard valid evidence because one caveat exceeded a style limit.
-    if sum(map(len, result["gaps"])) > 8 * 600:
+    if protocol_version < 9 and sum(map(len, result["gaps"])) > 8 * 600:
         raise ValueError("unbounded-source-gap")
     if not any(result[name] for name in ("execution", "contracts", "gaps")):
         raise ValueError("empty-source-audit")
@@ -75,7 +79,11 @@ def current(item, ledger: HypothesisLedger) -> bool:
     from reviewforge.engine.proof_gate import proof_fingerprint
 
     record = ledger.source_audits.get(item.id, {})
-    if record.get("version") != 1 or record.get("run_id") != ledger.run_id or record.get("outcome") != "resolved":
+    if (
+        record.get("version") != (2 if ledger.protocol_version >= 9 else 1)
+        or record.get("run_id") != ledger.run_id
+        or record.get("outcome") != "resolved"
+    ):
         return False
     if record.get("input_fingerprint"):
         if record["input_fingerprint"] != input_fingerprint(item, ledger):
@@ -83,19 +91,23 @@ def current(item, ledger: HypothesisLedger) -> bool:
     elif record.get("fingerprint") != proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest):
         return False
     try:
-        validate(record.get("facts"), item)
+        validate(record.get("facts"), item, protocol_version=ledger.protocol_version)
     except (TypeError, ValueError):
         return False
     return True
 
 
-def consume(raw, item):
+def consume(raw, item, *, protocol_version=4):
     """Keep independently valid source records; never launder a bad citation.
 
     The envelope and each retained record remain strict. Invalid records become
     explicit gaps and audit metadata, not facts. A final proof still needs a
     surviving independently sourced contract and execution observation.
     """
+    from reviewforge.engine.session_tools import MAX_RESULT_BYTES
+
+    if protocol_version >= 9 and len(json.dumps(raw, ensure_ascii=False).encode()) > MAX_RESULT_BYTES:
+        raise ValueError("source-audit-transport-record-too-large")
     if not isinstance(raw, dict) or set(raw) != {"hypothesis_id", "execution", "contracts", "gaps"}:
         raise ValueError("invalid-source-audit-shape")
     if raw["hypothesis_id"] != item.id or any(
@@ -105,12 +117,12 @@ def consume(raw, item):
     kept = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": raw["gaps"][:]}
     rejected = []
     # Validate model gaps before adding program diagnostics.
-    validate({**kept, "gaps": kept["gaps"] or ["Validation placeholder"]}, item)
+    validate({**kept, "gaps": kept["gaps"] or ["Validation placeholder"]}, item, protocol_version=protocol_version)
     for name in ("execution", "contracts"):
         for index, row in enumerate(raw[name]):
             trial = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": [], name: [row]}
             try:
-                valid = validate(trial, item)
+                valid = validate(trial, item, protocol_version=protocol_version)
             except (TypeError, ValueError) as exc:
                 rejected.append({"array": name, "index": index, "reason": str(exc)})
             else:
@@ -119,7 +131,7 @@ def consume(raw, item):
         kept["gaps"] = kept["gaps"][:7] + [
             "Some source reconstruction records failed schema/reference validation; they supply no evidence."
         ]
-    return validate(kept, item), rejected
+    return validate(kept, item, protocol_version=protocol_version), rejected
 
 
 def messages(batch, ledger):
@@ -138,7 +150,7 @@ def messages(batch, ledger):
             }
         )
     return [
-        SystemMessage(content=load_prompt("source_audit_v4")),
+        SystemMessage(content=load_prompt("source_audit_v9" if ledger.protocol_version >= 9 else "source_audit_v4")),
         HumanMessage(content=json.dumps({"head_sha": ledger.head_sha, "items": entries}, ensure_ascii=False)),
     ]
 
@@ -202,7 +214,7 @@ async def run_source_audit(llm, ledger, on_update=None):
             ledger.source_audit_batches = calls
         for item, old, fingerprint in selected:
             ledger.source_audits[item.id] = {
-                "version": 1,
+                "version": 2 if ledger.protocol_version >= 9 else 1,
                 "run_id": ledger.run_id,
                 "fingerprint": fingerprint,
                 "input_fingerprint": input_fingerprint(item, ledger),
@@ -254,7 +266,7 @@ async def run_source_audit(llm, ledger, on_update=None):
         else:
             for item in batch:
                 try:
-                    facts, rejected = consume(by_id[item.id], item)
+                    facts, rejected = consume(by_id[item.id], item, protocol_version=ledger.protocol_version)
                 except (TypeError, ValueError) as exc:
                     ledger.source_audits[item.id].update(outcome="output-error", reason=str(exc))
                 else:

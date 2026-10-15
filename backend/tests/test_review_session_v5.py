@@ -502,8 +502,8 @@ def test_wire_receipts_observe_real_http_tools_without_headers_messages_or_respo
 
 
 def test_new_default_and_old_explicit_versions_remain_available():
-    assert PipelineV4Config().protocol_version == 8 and PipelineV4Config().mode == "legacy"
-    for version in range(1, 9):
+    assert PipelineV4Config().protocol_version == 9 and PipelineV4Config().mode == "legacy"
+    for version in range(1, 10):
         assert _pipeline_v4_from_dict({"protocol_version": version}).protocol_version == version
 
 

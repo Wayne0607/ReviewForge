@@ -1026,7 +1026,12 @@ class HypothesisGenerator:
                 continue
             for kind, raw in entries:
                 if kind == "deferred":
-                    if not isinstance(raw.get("reason"), str) or not raw["reason"].strip() or len(raw["reason"]) > 600:
+                    if (
+                        not isinstance(raw.get("reason"), str)
+                        or not raw["reason"].strip()
+                        or ledger.protocol_version < 9
+                        and len(raw["reason"]) > 600
+                    ):
                         failed[unit_id] = "invalid deferred assessment"
                     else:
                         failed[unit_id] = "deferred: " + raw["reason"].strip()
@@ -1043,7 +1048,8 @@ class HypothesisGenerator:
                     if (
                         not isinstance(raw.get("checked"), str)
                         or not raw["checked"].strip()
-                        or len(raw["checked"]) > 600
+                        or ledger.protocol_version < 9
+                        and len(raw["checked"]) > 600
                     ):
                         failed[unit_id] = "missing concrete checked boundary"
                     else:
@@ -1062,7 +1068,10 @@ class HypothesisGenerator:
                 if (
                     payload is None
                     or any(
-                        not isinstance(raw.get(field), str) or not raw[field].strip() or len(raw[field]) > 600
+                        not isinstance(raw.get(field), str)
+                        or not raw[field].strip()
+                        or ledger.protocol_version < 9
+                        and len(raw[field]) > 600
                         for field in required
                     )
                     or not isinstance(raw.get("severity"), str)

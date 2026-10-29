@@ -4,6 +4,12 @@
 
 ## 当前修订：结果交付事务与可追踪源码窗口（内部协议 9）
 
+### Grafana 无 token 额度空状态复测（2026-10-29）
+
+固定 `c06ad44e26aeaa1a42b767ef1553592cb539fc8f` 和 Grafana #97529 head `26fed312840cd76b766cbd2158e17a7e6c0ec548`，新目录空状态运行，未绑定外层额度，产品 limit null；23 次 HTTP 200，实报 284630 tokens，无未知或在途、额度拒绝 0，耗时约 698 秒。三个调查全部完成交付：2 refuted、1 confirmed；确认项为 BuildIndex 缩小锁范围可能导致同一 key 并发重复构建，与基准第一项方向相近，但独立核验不通过，最终 partial、零正式评论，严格裁判未运行。另一项基准 TotalDocs 并发读写未形成正式发现。
+
+已确认的调查结果未能进入独立来源还原：原样重建请求总长 53314 字符，`source_audit.py` 单包上限 32000 字符；排队前拒绝且未发送来源核验请求，结果统称 `source-audit-packet-or-budget-limit` / `budget-exhausted`，ProofGate 因来源未完成 preflight 结束。故这次失败是证据包容量/交接问题，不能归因为 token 额度或直接降低独立核验门槛。原始目录 `.reviewforge/benchmarks/deepseek-grafana-unlimited-20261029-162545/`。
+
 ### 后续评测额度策略（2026-10-29）
 
 用户取消后续评测 token 额度限制。协议 9 的产品侧本来即为 usage-only；基准入口不传 `--token-budget` 时也不启用外层额度。后续新评测不再使用此前三案脚本硬编码的有限外层授权，仍记录用量并保留请求次数、步骤、超时、重试及机器资源保护。旧脚本和已绑定账本的 checkpoint 不改写，新的评测使用新目录。此前 500000 grant 的账目仅为历史记录；取消额度不等于调用免费，也不自动解决调查未完成。

@@ -4,6 +4,12 @@
 
 ## 当前修订：结果交付事务与可追踪源码窗口（内部协议 9）
 
+### 三 PR 空状态复测（2026-10-29 至 2026-10-30）
+
+固定 `4640cfb80c0828b24da8d7b69b50583c3b773a69`、DeepSeek、无 token 额度。Grafana #97529 completed、零评论、166597 tokens；裁判 TP 0 / FP 0 / FN 2。发现阶段仅提出两条其他候选，未提出 BuildIndex，故本次不能验证并列后果调查指引是否奏效。Cal.com #14740 partial、零评论、592361 tokens；两个调查确认项的盲来源还原均 output-error。Keycloak #37429 partial、零评论、785381 tokens；三个调查确认项的盲来源还原均 output-error，另有四个发现单元因 discovery-request-limit 未覆盖。后两例裁判均 not-run，禁止计算整体三案质量指标。
+
+142 次 HTTP 响应均 200；模型实报总计 1544339 tokens，无未知用量、在途或 token 额度拒绝。五份来源还原响应的 execution 数组分别为 19、16、10、9、9，超过 `consume` 允许的 8 条上限，被标记 invalid-source-audit-envelope；没有将有效条目截断或当作已证明。Cal.com 另有一次 read_file ValueError，不能仅凭日志把 partial 全归因于它。原始目录 `.reviewforge/benchmarks/deepseek-dev3-unlimited-20261029-231602/`；三例证据显示发现覆盖、来源还原交付和调用效率还需分别诊断。
+
 ### 并列后果调查修复（2026-10-29）
 
 按固定 Grafana 原始回执回查：原案例 impact 同时列出重复构建、句柄和可能丢失文档，调查认为重复构建可发生却因未证明丢失文档而反驳整体。`867e480` 的原案例绑定和 `session_investigation_v9` 的必要前提反驳保护防止替换输入，其假设并列后果均为互相依赖的必要条件不成立。仅更新协议 9 调查指引：逐项核实原有后果，允许以证据支持的原后果形成限定结论，未证明则 UNKNOWN；不扩大原触发输入、不发明后果、不降低原证据与独立 ProofGate 要求。最终评论仍只采用独立 ProofGate 的四项限定结论。模型仍可能误判，必须实跑检验，不能凭提示词宣称问题解决。

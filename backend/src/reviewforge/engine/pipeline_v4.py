@@ -199,6 +199,7 @@ async def _run_llm_stages(
             events.emit("pipeline_v4.provider_attempt", {"agent": name, "closing": closing, **attempt})
 
         options = {}
+        effective = {}
         if ledger.protocol_version >= 2:
             effective = router.effective(name) if callable(getattr(router, "effective", None)) else {}
             options = request_options(
@@ -219,7 +220,16 @@ async def _run_llm_stages(
             return TrackedChatLLM(raw, ctx, name, usage_sink=record, request_options=options)
         phase = "editor" if name == "editor" else "investigation" if name == "investigator" else "discovery"
         admitted = BudgetedChatLLM(raw, request_budget, phase=phase, on_change=budget_changed)
-        tracked = TrackedChatLLM(admitted, ctx, name, usage_sink=record, request_options=options, receipt_first=True)
+        tracked = TrackedChatLLM(
+            admitted,
+            ctx,
+            name,
+            usage_sink=record,
+            request_options=options,
+            receipt_first=True,
+            deepseek_native_tools=ledger.protocol_version >= 9
+            and effective.get("model", "").lower().startswith("deepseek-"),
+        )
         return RetryChatLLM(
             tracked,
             policy=RetryPolicy(

@@ -57,6 +57,7 @@ class TrackedChatLLM(BaseChatModel):
     _usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None
     _request_options: dict[str, Any]
     _receipt_first: bool
+    _deepseek_native_tools: bool
 
     class Config:
         arbitrary_types_allowed = True
@@ -69,6 +70,7 @@ class TrackedChatLLM(BaseChatModel):
         usage_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         request_options: dict[str, Any] | None = None,
         receipt_first: bool = False,
+        deepseek_native_tools: bool = False,
     ) -> None:
         super().__init__()
         self._inner = inner
@@ -77,10 +79,23 @@ class TrackedChatLLM(BaseChatModel):
         self._usage_sink = usage_sink
         self._request_options = dict(request_options or {})
         self._receipt_first = receipt_first
+        self._deepseek_native_tools = deepseek_native_tools
+
+    def _effective_options(self, options: dict[str, Any]) -> dict[str, Any]:
+        merged = self._request_options | options
+        if self._deepseek_native_tools and merged.get("tools"):
+            # DeepSeek thinking mode rejects forced tool_choice, while the
+            # OpenAI SDK treats response_format + non-strict tools as an
+            # auto-parse request. Native actions have their own strict local
+            # schema and do not need JSON-object response framing.
+            merged.pop("response_format", None)
+            merged["extra_body"] = {**(merged.get("extra_body") or {}), "thinking": {"type": "disabled"}}
+            merged["reasoning_effort"] = None
+        return merged
 
     def request_budget_view(self, messages, options):
         planner = getattr(self._inner, "request_budget_view", None)
-        return planner(messages, self._request_options | options) if callable(planner) else None
+        return planner(messages, self._effective_options(options)) if callable(planner) else None
 
     async def _agenerate(
         self,
@@ -89,7 +104,7 @@ class TrackedChatLLM(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        result = await self._inner._agenerate(messages, stop, run_manager, **(self._request_options | kwargs))
+        result = await self._inner._agenerate(messages, stop, run_manager, **self._effective_options(kwargs))
 
         # A valid response may omit usage or expose token_usage=None. Preserve
         # its content without fabricating a zero-cost receipt: the physical
@@ -155,7 +170,7 @@ class TrackedChatLLM(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        return self._inner._generate(messages, stop, run_manager, **(self._request_options | kwargs))
+        return self._inner._generate(messages, stop, run_manager, **self._effective_options(kwargs))
 
     @property
     def _llm_type(self) -> str:

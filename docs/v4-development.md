@@ -4,6 +4,14 @@
 
 ## 当前修订：结果交付事务与可追踪源码窗口（内部协议 9）
 
+### DeepSeek 原生工具兼容（2026-10-29）
+
+在当前 `deepseek-flash` 开发集三案实测中，自动 JSON 模式与非 strict 原生工具同时启用时，SDK 在 HTTP 发送前报 `Only strict function tools can be auto-parsed`；关闭 JSON 模式的诊断继续取得六份响应，但调查工具请求连续三次 HTTP 400。使用同一授权账本对真实失败请求做一次受限重放，提供方明确返回 `Thinking mode does not support this tool_choice`。这两个故障发生于模型接口交接，不是缺陷质量结果。
+
+协议 9 的 DeepSeek 原生工具调用在最内层受计量 wrapper 处统一去除 `response_format`，强制设置 `thinking.disabled`，保留必需的原生工具选择和本地严格 schema 校验。纯文本来源还原/ProofGate 仍使用配置的 JSON 模式；其他模型和协议 1–8 的既有选项不变。请求计划与实际发送使用同一选项，防止错误预估预算。对三个发现/调查/收尾工具路径和文本 JSON 路径使用真实 SDK + MockTransport 检查请求体及计量；历史模式不隐式更改。
+
+实测资产和未明费用保留在 `.reviewforge/benchmarks/deepseek-dev3-20261029-154015/`、`deepseek-dev3-no-json-20261029-154323/` 和 `deepseek-failure-probe-20261029/`。截止重放后本次 500000 grant 的实报为 68074、未知预占 129989、无在途，保守余 301937；未知预占含此前中断以及失败请求，不能当作实际账单或擅自退款。未来续测使用 `.reviewforge/eval-private/current-v4-grant-lineage-root.txt`，不从任何父账本重置。
+
 用户要求继续从第一性原理解决 600 字符门槛、末轮交付及关键证据未取得。开工重查 Issue/开放 PR，均为空；回溯 `b7b57e20` 的短字段/末轮假设，以及 `a20a1130`、`ce0738b1` 的默认源码定位假设。根因和新约束见 [规格 §15](hypothesis-pipeline-spec.md#15-结果交付事务与可追踪源码窗口内部协议-9)。
 
 - 逐字段 600 字符约束把文风当成结果正确性，协议 8 的十二次压缩请求只救回一份。新原生结果/发现消费/独立来源还原统一取消此门槛；保留非空、严格类型、原案例身份和真实引用校验，改由单记录 32768 UTF-8 bytes、有限物理输出与资源边界保护。没有自动删字、伪造证据或把 UNKNOWN 变成确认。

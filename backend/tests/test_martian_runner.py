@@ -65,6 +65,24 @@ async def test_benchmark_runtime_loads_config_and_blocks_all_real_github_writes(
 
 
 @pytest.mark.asyncio
+async def test_new_benchmark_without_token_limit_still_records_usage(runner, monkeypatch, tmp_path):
+    from test_request_budget import _Model
+
+    from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget
+
+    meter = RequestBudget(None)
+
+    async def exercise(_args):
+        await BudgetedChatLLM(_Model(), meter, phase="editor").ainvoke([])
+
+    monkeypatch.setattr(runner, "_main_async", exercise)
+    await runner.main_async(SimpleNamespace(output=str(tmp_path / "results.json"), pipeline="hypothesis"))
+    assert meter.available("editor") is None
+    assert meter.snapshot()["reported_tokens"] == 12
+    assert not (tmp_path / "authorized-budget.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_runner_native_grant_persists_calls_and_rejects_missing_scope_on_resume(runner, monkeypatch, tmp_path):
     from test_request_budget import _Model
 

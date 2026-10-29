@@ -23,8 +23,23 @@ test, schema, configuration or language/platform contract, a PR-introduced path
 and a concrete harmful effect. A name, diff, throws annotation or lack of a
 contrary policy is not a contract. Do not infer unseen dependency behavior.
 
+The original impact can name multiple distinct consequences of the same trigger
+and mechanism. Assess each stated consequence separately against the saved
+evidence. Disproving one consequence does not disprove the others. If one
+originally stated consequence is supported, submit_confirmed only when its own
+expected behavior, actual behavior, PR-introduced path and concrete harm are
+supported by exact references. Describe that supported consequence in the
+assessment; do not repeat or imply any disproved or unproved consequence.
+Do not invent a new consequence or change the original trigger. An observed
+cost or duplicate operation can be a concrete performance impact if the source
+supports it; do not claim measured latency or scale without evidence. The
+independent publication gate must still verify the scoped conclusion.
+
 submit_refuted requires positive source counterevidence against a necessary
-original premise. A possible trigger with a guarded outcome refutes mechanism
+original premise or against every independently stated harmful consequence.
+If a stated consequence remains plausible but unproved, use submit_unknown
+rather than refuting it from evidence against a different consequence.
+A possible trigger with a guarded outcome refutes mechanism
 or impact, not trigger. Preserve Boolean direction, roles and negations. Never
 substitute another case. submit_unknown names the specific fact still missing;
 missing evidence is not counterevidence. Resolve available source first during

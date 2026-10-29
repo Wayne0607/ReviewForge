@@ -245,3 +245,62 @@ async def test_source_audit_dispatch_allowance_is_checkpointed_before_the_model_
     assert snapshots[0]["source_audit_batches"] == 1
     assert snapshots[0]["source_audits"][item.id]["reason"] == "source-audit-interrupted"
     assert len(llm.calls) == 1 and book.source_audit_batches == 1
+
+
+@pytest.mark.asyncio
+async def test_v9_large_single_case_reaches_blind_audit_and_proof_with_all_sources():
+    item = candidate()
+    for index in range(50):
+        item.observations.append(
+            replace(item.observations[0], id=f"obs_extra_{index}", excerpt="source evidence line\n" * 50)
+        )
+    book = ledger(item, protocol=9)
+    assert 32_000 < sum(len(message.content) for message in messages([item], book)) < 128_000
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [verdict()]}])
+    await ProofGate(llm).run(book)
+    assert len(llm.calls) == 2
+    assert current(item, book)
+    for call, _ in llm.calls:
+        assert "obs_extra_49" in call[-1].content
+    assert item.claim not in llm.calls[0][0][-1].content
+    assert accepted(item, book)
+
+
+@pytest.mark.asyncio
+async def test_v9_oversized_case_reports_packet_size_not_budget():
+    item = candidate()
+    for index in range(180):
+        item.observations.append(
+            replace(item.observations[0], id=f"obs_extra_{index}", excerpt="source evidence line\n" * 50)
+        )
+    book = ledger(item, protocol=9)
+    llm = GateLLM(replies=[])
+    await ProofGate(llm).run(book)
+    assert not llm.calls
+    assert book.source_audits[item.id]["outcome"] == "output-error"
+    assert book.source_audits[item.id]["reason"] == "source-audit-packet-too-large"
+    assert book.publication_reviews[item.id]["reason"] == "independent-source-audit-packet-too-large"
+    assert not accepted(item, book)
+
+
+@pytest.mark.asyncio
+async def test_v9_oversized_final_proof_reports_packet_size_not_budget():
+    item = candidate()
+    for index in range(180):
+        item.observations.append(
+            replace(item.observations[0], id=f"obs_extra_{index}", excerpt="source evidence line\n" * 50)
+        )
+    book = ledger(item, protocol=9)
+    book.source_audits[item.id] = {
+        "version": 2,
+        "run_id": book.run_id,
+        "outcome": "resolved",
+        "input_fingerprint": input_fingerprint(item, book),
+        "facts": audit(),
+    }
+    assert current(item, book)
+    llm = GateLLM(replies=[])
+    await ProofGate(llm).run(book)
+    assert not llm.calls
+    assert book.publication_reviews[item.id]["outcome"] == "output-error"
+    assert book.publication_reviews[item.id]["reason"] == "complete-proof-packet-too-large"

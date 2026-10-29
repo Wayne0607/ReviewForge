@@ -23,6 +23,7 @@ from reviewforge.core.json_output import strip_reasoning_blocks
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus
 from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.proof_packet_limits import fits_proof_input
 from reviewforge.engine.publication_contracts import contract_catalog
 from reviewforge.engine.request_budget import budget_snapshot_over_limit, plan_request, snapshot_available
 from reviewforge.engine.source_audit import audit_hash, run_source_audit
@@ -40,7 +41,6 @@ PROOF_VERSION = 1
 OBLIGATIONS = ("supported_input", "required_behavior", "introduced_regression", "bad_consequence")
 _MAX_CALLS = 4
 _MAX_ATTEMPTS = 2
-_INPUT_CHARS = 32_000
 _MAX_OUTPUT = 4_096
 _DEFAULT_AVAILABLE = 16_000
 _COMPLETED = {"resolved", "insufficient-evidence"}
@@ -223,9 +223,12 @@ def _publication_problem(item: Hypothesis, ledger: HypothesisLedger) -> tuple[st
     if not audit_current(item, ledger):
         record = ledger.source_audits.get(item.id, {})
         outcome = record.get("outcome", "output-error")
+        reason = "independent-source-audit-not-complete"
+        if ledger.protocol_version >= 9 and record.get("reason") == "source-audit-packet-too-large":
+            reason = "independent-source-audit-packet-too-large"
         return (
             outcome if outcome in {"budget-exhausted", "provider-error", "output-error"} else "output-error",
-            "independent-source-audit-not-complete",
+            reason,
         )
     facts = ledger.source_audits[item.id]["facts"]
     if not contract_catalog(item, ledger) or not facts["execution"]:
@@ -600,10 +603,11 @@ class ProofGate:
         while pending:
             batch = []
             planned = messages = None
+            refusal_reason = "complete-proof-packet-too-large"
             for item in pending:
                 trial = [*batch, item]
                 trial_messages = self._messages(ledger, trial)
-                if sum(len(message.content) for message in trial_messages) > _INPUT_CHARS:
+                if not fits_proof_input(trial_messages, cases=len(trial), protocol_version=ledger.protocol_version):
                     break
                 live_available = _live_available(self._llm, trial_messages)
                 fallback = (
@@ -617,6 +621,7 @@ class ProofGate:
                 # A policy floor gives a useful response room; it is no guarantee
                 # that a model can finish an arbitrary proof in this many tokens.
                 if trial_plan.max_output_tokens < 512 + 384 * len(trial):
+                    refusal_reason = "publication-request-budget-insufficient"
                     break
                 batch, planned, messages = trial, trial_plan, trial_messages
             if not batch or calls >= _MAX_CALLS:
@@ -628,8 +633,20 @@ class ProofGate:
                     item,
                     ledger,
                     old,
-                    outcome="budget-exhausted",
-                    reason=("publication-call-cap" if calls >= _MAX_CALLS else "complete-proof-packet-does-not-fit"),
+                    outcome=(
+                        "output-error"
+                        if ledger.protocol_version >= 9
+                        and calls < _MAX_CALLS
+                        and refusal_reason == "complete-proof-packet-too-large"
+                        else "budget-exhausted"
+                    ),
+                    reason=(
+                        "publication-call-cap"
+                        if calls >= _MAX_CALLS
+                        else refusal_reason
+                        if ledger.protocol_version >= 9
+                        else "complete-proof-packet-does-not-fit"
+                    ),
                 )
                 await self._changed(ledger)
                 continue

@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from reviewforge.core.json_output import strip_reasoning_blocks
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus
 from reviewforge.engine.prompts_v4 import load_prompt
+from reviewforge.engine.proof_packet_limits import fits_proof_input
 from reviewforge.engine.request_budget import plan_request, snapshot_available
 
 _KINDS = {"caller", "test", "schema", "configuration", "format", "language"}
@@ -187,9 +188,10 @@ async def run_source_audit(llm, ledger, on_update=None):
     while pending:
         batch = []
         request = plan = None
+        refusal_reason = "source-audit-packet-too-large"
         for item, _, _ in pending:
             trial = messages([*batch, item], ledger)
-            if sum(len(message.content) for message in trial) > 32_000:
+            if not fits_proof_input(trial, cases=len(batch) + 1, protocol_version=ledger.protocol_version):
                 break
             budget = ledger.request_budget
             available = snapshot_available(
@@ -201,12 +203,15 @@ async def run_source_audit(llm, ledger, on_update=None):
                 trial_plan.available_tokens is not None
                 and trial_plan.available_tokens - trial_plan.input_tokens < 2048 + 512 * (len(batch) + 1)
             ):
+                refusal_reason = "source-audit-request-budget-insufficient"
                 break
             batch.append(item)
             request, plan = trial, trial_plan
         selected = pending[: len(batch)] if batch and calls < 4 else pending[:1]
         del pending[: len(selected)]
         refused = not batch or calls >= 4
+        if calls >= 4:
+            refusal_reason = "source-audit-call-cap"
         if not refused:
             calls += 1
             # Checkpoint the run-wide allowance before dispatch. Feedback and
@@ -220,8 +225,20 @@ async def run_source_audit(llm, ledger, on_update=None):
                 "input_fingerprint": input_fingerprint(item, ledger),
                 "attempts": old.get("attempts", 0) + 1,
                 "tokens": old.get("tokens", 0),
-                "outcome": "budget-exhausted" if refused else "provider-error",
-                "reason": "source-audit-packet-or-budget-limit" if refused else "source-audit-interrupted",
+                "outcome": (
+                    "output-error"
+                    if refused and ledger.protocol_version >= 9 and refusal_reason == "source-audit-packet-too-large"
+                    else "budget-exhausted"
+                    if refused
+                    else "provider-error"
+                ),
+                "reason": (
+                    refusal_reason
+                    if refused and ledger.protocol_version >= 9
+                    else "source-audit-packet-or-budget-limit"
+                    if refused
+                    else "source-audit-interrupted"
+                ),
             }
         await save()
         if refused:

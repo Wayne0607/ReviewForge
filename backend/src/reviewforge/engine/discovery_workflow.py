@@ -57,8 +57,8 @@ REPAIR_REQUESTS = 2
 INPUT_PARTITION = "separate-structural-v1"
 
 
-def compact_packet(block, aliases, pending, observations):
-    packet = source_packet(block, aliases, pending)
+def compact_packet(block, aliases, pending, observations, *, protocol_version=6):
+    packet = source_packet(block, aliases, pending, protocol_version=protocol_version)
     files = {}
     rows = []
     for alias, _side, path, _line, text in packet.pop("source"):
@@ -129,7 +129,9 @@ def request(generator, work, *, read=False, global_remaining=0):
         scope.update(phase="field-repair", repair_record_count=len(pending_repairs(work)))
         repair_tool, chat = repair_request(work, schemas, scope)
         return bind_discovery_submission(generator._llm, [repair_tool]), chat, [repair_tool], schemas, scope
-    packet = compact_packet(work.block, work.aliases, pending, work.broker._observations) | {"session": scope}
+    packet = compact_packet(
+        work.block, work.aliases, pending, work.broker._observations, protocol_version=work.protocol_version
+    ) | {"session": scope}
     if work.protocol_version >= 11:
         packet["shared_review_workspace"] = workspace_view(work)
     if work.protocol_version >= 12:
@@ -148,7 +150,9 @@ def request(generator, work, *, read=False, global_remaining=0):
         )
     )
     prompt = load_prompt(
-        "discovery_workflow_v12"
+        "discovery_workflow_v13"
+        if work.protocol_version >= 13
+        else "discovery_workflow_v12"
         if work.protocol_version >= 12
         else "discovery_workflow_v11"
         if work.protocol_version >= 11

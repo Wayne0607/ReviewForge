@@ -25,6 +25,33 @@ class DiscoveryReviewProgress(BaseModel):
     evidence_ids: list[str]
 
 
+class DiscoveryReviewProgressV13(DiscoveryReviewProgress):
+    """One local progress fragment, preserved in an ordered navigation journal."""
+
+    summary: str = Field(
+        min_length=1,
+        description="The local topic of this action. Prior topics remain in progress_journal; "
+        "this fragment does not replace all prior progress or establish source truth.",
+    )
+    open_questions: list[str] = Field(
+        description="Questions still open for this local topic, not a complete task inventory."
+    )
+    resolved_questions: list[str] = Field(
+        description="Locally addressed questions as untrusted navigation. A correction must identify the earlier "
+        "specific proposition/event; it does not erase unrelated journal entries."
+    )
+    next_action: str = Field(
+        min_length=1,
+        description="The next missing fact or independent ready submission, "
+        "considering existing source and journal history.",
+    )
+    evidence_ids: list[str] = Field(
+        description="Existing immutable ledger evidence IDs beginning ev_..., "
+        "never obs_N audit IDs or fN source aliases. "
+        "An empty array is allowed; notes themselves are not evidence."
+    )
+
+
 def requires_review_progress(name):
     return name not in _PROGRESS_EXEMPT
 
@@ -32,17 +59,25 @@ def requires_review_progress(name):
 def with_review_progress(tools, *, protocol_version):
     if protocol_version < 12:
         return tools
+    progress_schema = DiscoveryReviewProgressV13 if protocol_version >= 13 else DiscoveryReviewProgress
+    description = (
+        " Include a local review_progress fragment; previous topics remain ordered in progress_journal. "
+        "Identify specific earlier propositions when correcting them. evidence_ids are existing ev_... IDs, "
+        "not obs_N audit IDs, and may be empty. Notes are navigation, never source proof or private reasoning."
+        if protocol_version >= 13
+        else " Include review_progress describing already established facts, "
+        "open/resolved questions and the next requested action. Evidence IDs may be empty. "
+        "This is visible navigation, never source proof or private reasoning."
+    )
     return [
         tool.model_copy(
             update={
                 "args_schema": create_model(
                     tool.args_schema.__name__ + "WithReviewProgress",
                     __base__=tool.args_schema,
-                    review_progress=(DiscoveryReviewProgress, ...),
+                    review_progress=(progress_schema, ...),
                 ),
-                "description": tool.description + " Include review_progress describing already established facts, "
-                "open/resolved questions and the next requested action. Evidence IDs may be empty. "
-                "This is visible navigation, never source proof or private reasoning.",
+                "description": tool.description + description,
             }
         )
         if requires_review_progress(tool.name)

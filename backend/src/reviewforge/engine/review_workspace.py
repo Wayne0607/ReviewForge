@@ -37,6 +37,11 @@ def _owner(note: dict[str, Any]) -> str:
     return "owner_" + fingerprint({"task_id": note["task_id"], "actor": note["actor"]})[:24]
 
 
+def _journal_event(binding, owner, sequence, note_id, previous_digest):
+    event = {"sequence": sequence, "note_id": note_id, "previous_digest": previous_digest}
+    return {**event, "digest": fingerprint({"binding": binding, "owner": owner, **event})}
+
+
 def _merge_ranges(ranges: list[list[int]]) -> list[list[int]]:
     """Describe exactly the union of known source spans, retaining gaps."""
     merged: list[list[int]] = []
@@ -79,6 +84,7 @@ class SharedReviewWorkspace:
                     "binding": dict(self._binding),
                     "notes": {},
                     "current": {},
+                    **({"journal": {}} if ledger.protocol_version >= 13 else {}),
                 }
             self._validate_state()
             self._validate_evidence(ledger.evidence_records, include_records=False)
@@ -125,7 +131,9 @@ class SharedReviewWorkspace:
         state = self.ledger.shared_workspace
         if (
             not isinstance(state, dict)
-            or set(state) != {"protocol", "binding", "notes", "current"}
+            or set(state)
+            != {"protocol", "binding", "notes", "current"}
+            | ({"journal"} if self.ledger.protocol_version >= 13 else set())
             or state.get("protocol") != _PROTOCOL
             or state.get("binding") != self._binding
             or not isinstance(state.get("notes"), dict)
@@ -155,6 +163,34 @@ class SharedReviewWorkspace:
                 raise ValueError("invalid-restored-workspace-current")
             if _owner(state["notes"][identity]) != owner:
                 raise ValueError("invalid-restored-workspace-current")
+        if self.ledger.protocol_version >= 13:
+            journal = state["journal"]
+            if not isinstance(journal, dict) or set(journal) != owners:
+                raise ValueError("invalid-restored-workspace-journal")
+            recorded = set()
+            for owner, events in journal.items():
+                if not isinstance(events, list) or not events:
+                    raise ValueError("invalid-restored-workspace-journal")
+                previous_digest, previous_note = "", ""
+                for sequence, event in enumerate(events, 1):
+                    if (
+                        not isinstance(event, dict)
+                        or set(event) != {"sequence", "note_id", "previous_digest", "digest"}
+                        or type(event.get("sequence")) is not int
+                        or event["sequence"] != sequence
+                        or not isinstance(event.get("note_id"), str)
+                        or event["note_id"] not in state["notes"]
+                        or event["note_id"] == previous_note
+                        or _owner(state["notes"][event["note_id"]]) != owner
+                        or event != _journal_event(self._binding, owner, sequence, event["note_id"], previous_digest)
+                    ):
+                        raise ValueError("invalid-restored-workspace-journal-order-or-binding")
+                    recorded.add(event["note_id"])
+                    previous_digest, previous_note = event["digest"], event["note_id"]
+                if state["current"][owner] != previous_note:
+                    raise ValueError("invalid-restored-workspace-journal-current")
+            if recorded != set(state["notes"]):
+                raise ValueError("invalid-restored-workspace-journal-orphan-note")
 
     def publish_progress(
         self,
@@ -194,7 +230,20 @@ class SharedReviewWorkspace:
             saved = self.ledger.shared_workspace["notes"].setdefault(identity, note)
             if saved != note:
                 raise ValueError("workspace-note-identity-collision")
-            self.ledger.shared_workspace["current"][_owner(note)] = identity
+            owner = _owner(note)
+            if self.ledger.protocol_version >= 13:
+                events = self.ledger.shared_workspace["journal"].setdefault(owner, [])
+                if not events or events[-1]["note_id"] != identity:
+                    events.append(
+                        _journal_event(
+                            self._binding,
+                            owner,
+                            len(events) + 1,
+                            identity,
+                            events[-1]["digest"] if events else "",
+                        )
+                    )
+            self.ledger.shared_workspace["current"][owner] = identity
             return copy.deepcopy(saved)
 
     def read_evidence(self, evidence_ids: Iterable[str]) -> list[dict[str, Any]]:
@@ -230,17 +279,61 @@ class SharedReviewWorkspace:
             self._validate_state()
             notes = []
             state = self.ledger.shared_workspace
+            journals = []
+            journal_notes = []
             for owner in sorted(state["current"]):
                 note = state["notes"][state["current"][owner]]
-                evidence_paths = []
-                for identity in note["evidence_ids"]:
-                    record = self.ledger.evidence_records[identity]
-                    raw = record.get("observation", {}) if record["kind"] == "tool-observation" else record
-                    if raw.get("path"):
-                        evidence_paths.append(raw["path"])
-                if related(note["task_id"], note["unit_ids"], [*note["paths"], *evidence_paths]):
+                history = (
+                    [state["notes"][event["note_id"]] for event in state["journal"][owner]]
+                    if self.ledger.protocol_version >= 13
+                    else [note]
+                )
+                selected = False
+                for progress in history:
+                    evidence_paths = []
+                    for identity in progress["evidence_ids"]:
+                        record = self.ledger.evidence_records[identity]
+                        raw = record.get("observation", {}) if record["kind"] == "tool-observation" else record
+                        if raw.get("path"):
+                            evidence_paths.append(raw["path"])
+                    if related(progress["task_id"], progress["unit_ids"], [*progress["paths"], *evidence_paths]):
+                        selected = True
+                        break
+                if selected:
                     notes.append(note)
-            evidence_ids = {identity for note in notes for identity in note["evidence_ids"]}
+                    if self.ledger.protocol_version >= 13:
+                        # Include this related owner's ordered context, even if
+                        # a later correction omits the original dependency path.
+                        # No union of historical opinions becomes a current fact.
+                        journal_notes.extend(history)
+                        journals.append(
+                            {
+                                "task_id": note["task_id"],
+                                "actor": note["actor"],
+                                "trust": "untrusted-navigation-history",
+                                "events": [
+                                    {
+                                        "sequence": event["sequence"],
+                                        "note_id": event["note_id"],
+                                        **{
+                                            key: state["notes"][event["note_id"]][key]
+                                            for key in (
+                                                "summary",
+                                                "open_questions",
+                                                "resolved_questions",
+                                                "next_action",
+                                                "evidence_ids",
+                                                "unit_ids",
+                                                "paths",
+                                                "trust",
+                                            )
+                                        },
+                                    }
+                                    for event in state["journal"][owner]
+                                ],
+                            }
+                        )
+            evidence_ids = {identity for note in [*notes, *journal_notes] for identity in note["evidence_ids"]}
             for identity, record in self.ledger.evidence_records.items():
                 if not isinstance(record, dict):
                     raise ValueError("invalid-shared-evidence-record")
@@ -349,4 +442,6 @@ class SharedReviewWorkspace:
                         }
                     )
             result.update(notes=notes, tasks=tasks, candidates=candidates)
+            if self.ledger.protocol_version >= 13:
+                result["progress_journal"] = journals
             return copy.deepcopy(result)

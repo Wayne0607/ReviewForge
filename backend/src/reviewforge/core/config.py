@@ -145,7 +145,7 @@ class PipelineV4Config:
     """
 
     mode: str = "legacy"
-    protocol_version: int = 12
+    protocol_version: int = 13
     output_language: str = "auto"
     workspace_max_bytes: int = 200_000_000
     context_pack_max_slices: int = 12
@@ -191,6 +191,7 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         10,
         11,
         12,
+        13,
     }:
         cfg.protocol_version = data["protocol_version"]
     if type(data.get("provider_max_attempts")) is int and data["provider_max_attempts"] in {1, 2, 3}:

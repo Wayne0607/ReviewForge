@@ -204,7 +204,7 @@ async def test_v12_progress_is_visible_across_reads_restore_streamed_investigati
 
     model = SessionModel(handler=answer)
     current_runtime = runtime(model)
-    config = PipelineV4Config(provider_max_attempts=1)
+    config = PipelineV4Config(protocol_version=12, provider_max_attempts=1)
     assert config.protocol_version == 12
     arguments = (current_runtime, review_state, changes, pack)
     if restore_after_first_read:
@@ -243,4 +243,4 @@ def test_new_default_does_not_upgrade_saved_protocols():
         original = HypothesisLedger("run", "head", "digest", protocol_version=protocol)
         restored = HypothesisLedger.from_dict(original.to_dict())
         assert restored.protocol_version == protocol
-    assert PipelineV4Config().protocol_version == 12
+    assert PipelineV4Config().protocol_version == 13

@@ -58,12 +58,12 @@ def extend_source_aliases(block, aliases):
         aliases[alias] = reference
 
 
-def source_packet(block, aliases, pending):
+def source_packet(block, aliases, pending, *, protocol_version=5):
     """An explicit registry also delivers newly acquired source after each read."""
     from reviewforge.engine.discovery_aliases import target_source_choices
 
     reverse = {reference: alias for alias, reference in aliases.items()}
-    return {
+    packet = {
         "pending_units": [
             {
                 "unit_id": unit.id,
@@ -90,6 +90,27 @@ def source_packet(block, aliases, pending):
         "unchecked_navigation_only": block.unchecked,
         "source_rows_may_be_partial": True,
     }
+    if protocol_version >= 13:
+        # These descriptions were computed when the initial packet was built.
+        # They have no source coordinates with which to prove a gap closed after
+        # later reads. Preserve them as historical navigation, never live status.
+        known_units = sorted((unit.id for unit in block.units), key=len, reverse=True)
+        initial_gaps = []
+        for description in packet.pop("unchecked_navigation_only"):
+            identity = next((key for key in known_units if description.startswith(key + ":")), None)
+            if identity is not None and identity not in pending:
+                continue
+            if description not in initial_gaps:
+                initial_gaps.append(description)
+        packet["initial_context_gaps_navigation_only"] = {
+            "scope": "initial-packet-only",
+            "live_coverage": False,
+            "items": initial_gaps,
+            "interpretation": "Initial collection gaps, not current outstanding obligations. "
+            "Later source rows and read receipts may supply these locations; "
+            "this historical list neither proves a gap remains nor certifies it closed.",
+        }
+    return packet
 
 
 def result_payload(name, args, block, aliases):

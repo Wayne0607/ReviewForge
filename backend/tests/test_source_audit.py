@@ -287,6 +287,16 @@ async def test_v9_large_single_case_reaches_blind_audit_and_proof_with_all_sourc
     assert accepted(item, book)
 
 
+def test_v9_blind_and_final_requests_explicitly_identify_json_output():
+    item = candidate()
+    book = ledger(item, protocol=9)
+    blind = messages([item], book)
+    final = ProofGate(None)._messages(book, [item], forecast=True)
+    assert "json" in blind[0].content.lower()
+    assert "json" in final[0].content.lower()
+    assert '{"reviews":[' in final[0].content
+
+
 @pytest.mark.asyncio
 async def test_v9_oversized_case_reports_packet_size_not_budget():
     item = candidate()

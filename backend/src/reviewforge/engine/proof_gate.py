@@ -528,7 +528,11 @@ class ProofGate:
         return [
             SystemMessage(
                 content=load_prompt(
-                    "proof_gate_v4" if ledger.protocol_version >= 4 else "proof_gate_v3",
+                    "proof_gate_v9"
+                    if ledger.protocol_version >= 9
+                    else "proof_gate_v4"
+                    if ledger.protocol_version >= 4
+                    else "proof_gate_v3",
                     output_language=("简体中文" if self._output_language == "zh-CN" else "English"),
                 )
             ),

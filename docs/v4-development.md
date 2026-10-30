@@ -4,6 +4,12 @@
 
 ## 当前修订：结果交付事务与可追踪源码窗口（内部协议 9）
 
+### Keycloak 单 PR 复测与 DeepSeek 证明请求（2026-10-30）
+
+冻结 `c0b666f4ae1d99f7efd00ff25a2c069be07232e7` 空状态运行 Keycloak #37429，发现 16 组扩至 90 次上限，实际 38 次；不再出现原 4 项 discovery-request-limit，但仍有 1 个 protocol-repair-limit 未覆盖。3 个调查确认项的独立来源还原全部 resolved，原 8 项拒绝未再发生；最终证明的 3 次请求均 HTTP 400、provider-error，零正式评论、partial、裁判未运行。全审查实报 782492 tokens，失败请求无用量回执，保守未知预占 56820 不是实付；73 个 HTTP 200、3 个 HTTP 400。
+
+失败 trace 的证明请求设置 `response_format=json_object`，消息没有 `json` 字样，与 [DeepSeek JSON Output](https://api-docs.deepseek.com/guides/json_mode/) 的接口要求不符。对原失败的同一 PR 请求只增加 `JSON` 字样做一次定向探测，HTTP 200、可解析的 proof JSON、实报 11725 tokens；探测响应没有进入正式 ProofGate，不能记为已确认评论。协议 9 单独使用包含 JSON 字样的证明 prompt；旧协议 prompt 不改，真实恢复和质量指标另记。原始运行及探测目录 `.reviewforge/benchmarks/deepseek-keycloak-unlimited-20261030-092447/`。
+
 ### 来源还原交付与大 PR 调度修复（2026-10-30）
 
 回溯 `a752115` 的每数组 8 项和 `34336aa` 的 32768 字节整记录保护：模型会把合法独立事实拆成 9–19 项，固定条数导致整包丢弃；协议 9 仅使用整记录字节和每条引用的资源保护，逐项校验，不裁剪缺口。离线重放 5 个真实模型回复，分别保留 19/16/9/9/8 条合法执行事实，两个错误引用仍逐条拒绝。协议 1–8 原限制不变，不能将还原成功等同于独立证明通过。

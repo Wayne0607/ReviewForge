@@ -419,7 +419,11 @@ def _unique_object(pairs):
 
 
 def _parse_response(
-    content: Any, *, allow_container_closers: bool = False, framing: dict[str, str] | None = None
+    content: Any,
+    *,
+    allow_container_closers: bool = False,
+    allow_json_object_metadata: bool = False,
+    framing: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     # Single envelope and unique keys; never extract a substring or invent a
     # value. V4 can close outer containers after a fully closed nested value.
@@ -435,7 +439,20 @@ def _parse_response(
         raw = json.loads(source, object_pairs_hook=_unique_object)
         if framing is not None:
             framing["recovery"] = "missing-container-closers"
-    if not isinstance(raw, dict) or set(raw) != {"reviews"} or not isinstance(raw["reviews"], list):
+    if (
+        allow_json_object_metadata
+        and isinstance(raw, dict)
+        and set(raw) == {"reviews", "type"}
+        and raw["type"] == "json_object"
+    ):
+        # A provider-format label is not a second verdict. Keep the original
+        # receipt and audit this exact, narrow envelope variant; no arbitrary
+        # extra fields or competing roots are accepted.
+        if framing is not None:
+            framing["transport_metadata"] = "json_object"
+    elif not isinstance(raw, dict) or set(raw) != {"reviews"}:
+        raise ValueError("invalid-review-envelope")
+    if not isinstance(raw["reviews"], list):
         raise ValueError("invalid-review-envelope")
     return raw["reviews"]
 
@@ -571,6 +588,37 @@ class ProofGate:
             **fields,
         }
 
+    def _consume_received(self, item: Hypothesis, ledger: HypothesisLedger) -> None:
+        """Revalidate a durably received answer without asking for a new vote."""
+        record = ledger.publication_reviews[item.id]
+        receipt = record["received_result"]
+        try:
+            content, batch_ids = receipt["content"], receipt["batch_ids"]
+            if (
+                receipt.get("state") != "received"
+                or not isinstance(content, str)
+                or len(content.encode("utf-8")) > 128_000
+                or hashlib.sha256(content.encode("utf-8")).hexdigest() != receipt.get("sha256")
+                or not isinstance(batch_ids, list)
+                or not all(isinstance(identity, str) for identity in batch_ids)
+                or len(batch_ids) != len(set(batch_ids))
+                or item.id not in batch_ids
+            ):
+                raise ValueError("invalid-received-proof-binding")
+            framing = {"recovery": "none"}
+            reviews = _parse_response(
+                content, allow_container_closers=True, allow_json_object_metadata=True, framing=framing
+            )
+            ids = [review.get("hypothesis_id") for review in reviews if isinstance(review, dict)]
+            if len(ids) != len(reviews) or len(ids) != len(set(ids)) or set(ids) != set(batch_ids):
+                raise ValueError("missing-duplicate-or-unexpected-review-id")
+            raw = next(review for review in reviews if review["hypothesis_id"] == item.id)
+            record["output_framing"] = framing
+            record.update(_validate_v4_review(raw, item, ledger))
+        except (KeyError, TypeError, ValueError) as exc:
+            record.update(outcome="output-error", reason=str(exc))
+        receipt["state"] = "processed"
+
     async def run(self, ledger: HypothesisLedger) -> None:
         if ledger.protocol_version < 3:
             return
@@ -583,6 +631,10 @@ class ProofGate:
             old = ledger.publication_reviews.get(item.id, {})
             if not _scope_matches(old, item, ledger):
                 old = {}
+            if ledger.protocol_version >= 9 and old.get("received_result", {}).get("state") == "received":
+                self._consume_received(item, ledger)
+                await self._changed(ledger)
+                continue
             if completed(item, ledger):
                 continue
             if old.get("attempts", 0) >= _MAX_ATTEMPTS:
@@ -700,7 +752,10 @@ class ProofGate:
             try:
                 framing: dict[str, str] = {"recovery": "none"}
                 reviews = _parse_response(
-                    response.content, allow_container_closers=ledger.protocol_version >= 4, framing=framing
+                    response.content,
+                    allow_container_closers=ledger.protocol_version >= 4,
+                    allow_json_object_metadata=ledger.protocol_version >= 9,
+                    framing=framing,
                 )
                 for item in batch:
                     ledger.publication_reviews[item.id]["output_framing"] = dict(framing)
@@ -712,6 +767,29 @@ class ProofGate:
                 for item in batch:
                     ledger.publication_reviews[item.id].update(outcome="output-error", reason="invalid-review-envelope")
             else:
+                if ledger.protocol_version >= 9:
+                    content = response.content
+                    if not isinstance(content, str) or len(content.encode("utf-8")) > 128_000:
+                        for item in batch:
+                            ledger.publication_reviews[item.id].update(
+                                outcome="output-error", reason="proof-result-receipt-too-large"
+                            )
+                        await self._changed(ledger)
+                        continue
+                    for item in batch:
+                        ledger.publication_reviews[item.id]["received_result"] = {
+                            "state": "received",
+                            "content": content,
+                            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                            "batch_ids": sorted(by_id),
+                        }
+                    # The checked envelope is saved before any semantic/source
+                    # validation. An interrupted run consumes this same receipt.
+                    await self._changed(ledger)
+                    for item in batch:
+                        self._consume_received(item, ledger)
+                    await self._changed(ledger)
+                    continue
                 for item in batch:
                     try:
                         validated = (

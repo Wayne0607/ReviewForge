@@ -4,6 +4,12 @@
 
 ## 当前修订：结果交付事务与可追踪源码窗口（内部协议 9）
 
+### 证明持久化与重命名输入修复（2026-10-30）
+
+继续核对失败原文：唯一未覆盖单元对应 duplicate_keys.properties → duplicateKeys_en.properties 纯重命名，没有 textual diff，输入 required_source_sides=[[], []]、allowed_site_refs=[]。前次冻结 harness 没有实现 get_comparison_base/get_git_entries，拒绝实时未冻结请求后结构验证未完成；discovery_workflow 却忽略 missing-diff，继续要求模型反复满足不存在的证据。现修正协议 9 的前置输入检查，并读回固定比较基点/两端 Git 条目，确认 blob/mode/type 相同，离线经过原 gateway 验证为结构重命名。后续单 PR 新运行冻结这些输入，旧实录保持。
+
+最终证明补上 JSON 提示后仍有模型返回中性的 type=json_object 标签。协议 9 仅识别这个精确 envelope 扩展，保留原始内容及审计说明；其它额外字段、重复 key、错案例 ID 和坏引用仍拒绝。对旧真实 h_e52640b8 原回复零模型调用重验，原严格四义务及来源校验通过；并非重新猜测结论。新增 received→processed 的持久回执，在 envelope/ID 校验后、证明校验前保存原文及摘要；中断恢复只重验原回复，不重问、不重置次数和用量。测试覆盖收到后中断、摘要损坏、已知格式标签和未知附加字段。全量本地 2837 passed / 1 skipped。
+
 ### Keycloak 证明定向恢复（2026-10-30）
 
 在原 `c0b666f` 空状态运行的独立副本上，保留原 head、3 份来源还原和原冻结计数，使用 `3d0a9c6` 修正后的证明 prompt 执行 3 条原 provider-error 的剩余一次正常尝试。3 次请求均成功、额外实报 36938 tokens，无新增未知预占。两项通过独立 ProofGate，另一项模型在 JSON 顶层额外返回 `type: json_object`，因严格根形状而 output-error，未通过。定向恢复不重跑发现、不重新评分、没有正式发布评论；原评测还有一个 protocol-repair-limit 未覆盖，不能报告完整 PR 成功。该次输出提示追加“根对象只允许 reviews”，仍严格拒绝多余字段，不擅自移除模型输出或重置尝试次数；该提示更改尚未真实复测。总实报包括完整运行 782492、单次定位探测 11725、定向恢复 36938，共 831155；原 56820 未知预占不是实际用量。恢复结果保存在原运行目录的 `proof-resume-3d0a9c6/`。

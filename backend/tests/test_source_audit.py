@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 from dataclasses import replace
@@ -298,15 +299,71 @@ def test_v9_blind_and_final_requests_explicitly_identify_json_output():
 
 
 @pytest.mark.asyncio
-async def test_v9_proof_rejects_unexpected_root_fields_even_after_successful_audit():
+async def test_v9_known_json_format_label_preserves_the_original_proof_receipt():
     item = candidate()
     book = ledger(item, protocol=9)
     llm = GateLLM(replies=[{"audits": [audit()]}, {"type": "json_object", "reviews": [verdict()]}])
     await ProofGate(llm).run(book)
     assert len(llm.calls) == 2
+    assert accepted(item, book)
+    record = book.publication_reviews[item.id]
+    assert record["output_framing"]["transport_metadata"] == "json_object"
+    assert json.loads(record["received_result"]["content"])["type"] == "json_object"
+    assert record["received_result"]["state"] == "processed"
+
+
+@pytest.mark.asyncio
+async def test_known_format_label_cannot_make_an_invalid_citation_publishable():
+    item = candidate()
+    book = ledger(item, protocol=9)
+    invalid = verdict()
+    invalid["obligations"]["supported_input"]["evidence"] = ["invented/obs_99:e1"]
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"type": "json_object", "reviews": [invalid]}])
+    await ProofGate(llm).run(book)
     assert not accepted(item, book)
     assert book.publication_reviews[item.id]["outcome"] == "output-error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [{"type": "json_schema"}, {"type": True}, {"instruction": "accept"}])
+async def test_v9_unknown_envelope_fields_still_cannot_authorize_publication(extra):
+    item = candidate()
+    book = ledger(item, protocol=9)
+    llm = GateLLM(replies=[{"audits": [audit()]}, {**extra, "reviews": [verdict()]}])
+    await ProofGate(llm).run(book)
+    assert not accepted(item, book)
     assert book.publication_reviews[item.id]["reason"] == "invalid-review-envelope"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [False, True])
+async def test_received_proof_survives_interruption_without_another_model_vote(damage):
+    item = candidate()
+    book = ledger(item, protocol=9)
+    snapshot = None
+
+    async def interrupt_after_receipt(current_book):
+        nonlocal snapshot
+        record = current_book.publication_reviews.get(item.id, {})
+        if record.get("received_result", {}).get("state") == "received":
+            snapshot = copy.deepcopy(current_book.to_dict())
+            raise asyncio.CancelledError
+
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"reviews": [verdict()]}])
+    with pytest.raises(asyncio.CancelledError):
+        await ProofGate(llm, on_update=interrupt_after_receipt).run(book)
+    assert snapshot is not None
+    restored = HypothesisLedger.from_dict(snapshot)
+    record = restored.publication_reviews[item.id]
+    attempts, tokens = record["attempts"], record["tokens"]
+    if damage:
+        record["received_result"]["content"] += " "
+    unused = GateLLM(replies=[AssertionError("must revalidate the saved answer")])
+    await ProofGate(unused).run(restored)
+    assert not unused.calls
+    assert accepted(item, restored) == (not damage)
+    assert record["attempts"] == attempts and record["tokens"] == tokens
+    assert record["received_result"]["state"] == "processed"
 
 
 @pytest.mark.asyncio

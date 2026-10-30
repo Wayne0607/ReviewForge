@@ -422,7 +422,19 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             or flow["read_requests"] > READ_REQUESTS
         ):
             raise ValueError("invalid-discovery-workflow-counters")
-        worklist.append(Work(block, record, broker, aliases, session, order, ledger.protocol_version))
+        # Neither head-file reads nor another model answer can manufacture an
+        # absent before/after diff. Pure renames must arrive through the
+        # verified structural path, not an impossible textual assessment.
+        input_failure = (
+            f"input-unavailable:{block.failure}"
+            if ledger.protocol_version >= 9 and block.failure in {"missing-diff", "incomplete-diff"}
+            else ""
+        )
+        if input_failure:
+            record["input_failure"] = input_failure
+        worklist.append(
+            Work(block, record, broker, aliases, session, order, ledger.protocol_version, stopped=input_failure)
+        )
     await checkpoint(generator, ledger)
     used = sum(record.get("session", {}).get("turns", 0) for record in ledger.discovery_blocks.values())
     while used < request_limit:

@@ -106,6 +106,22 @@ async def test_v9_scales_requests_for_partial_batches_without_sacrificing_reads(
 
 
 @pytest.mark.asyncio
+async def test_v9_missing_diff_is_an_input_failure_not_a_model_protocol_failure():
+    state, changes, _, _ = fixture(1)
+    state.head_sha = "head"
+    state.file_diffs = {}
+    state.diff = ""
+    book = HypothesisLedger("run", "head", "digest", protocol_version=9)
+    model = SessionModel(handler=lambda *_: pytest.fail("an absent diff is not a model-repair task"))
+    await HypothesisGenerator(model, executor=source_executor([])).run(state, ContextPack(), changes, book)
+    assert not model.calls and not book.no_issue_units
+    assert len(book.unresolved_units) == 1
+    assert set(book.unresolved_units.values()) == {"generator input-unavailable:missing-diff"}
+    work = next(iter(book.discovery_blocks.values()))
+    assert work["workflow"]["invalid_receipts"] == 0
+
+
+@pytest.mark.asyncio
 async def test_all_groups_receive_an_initial_opportunity_before_optional_continuations():
     groups = []
 

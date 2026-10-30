@@ -186,6 +186,26 @@ async def test_v9_missing_diff_is_an_input_failure_not_a_model_protocol_failure(
 
 
 @pytest.mark.asyncio
+async def test_v9_source_side_failure_explains_exact_missing_boundary_for_repair():
+    def answer(messages, _options, turn):
+        unit = packet(messages)["pending_units"][0]
+        record = no_issue(unit)
+        if turn == 1:
+            record["source_refs"] = unit["required_source_sides"][1][:1]
+        else:
+            feedback = json.loads(messages[-1].content)["controller_receipt"]
+            error = next(row for row in feedback if row.get("error") == "missing-required-source-sides")
+            assert error["missing_source_sides"] == ["before"]
+            assert error["eligible_source_refs"]["before"] == unit["required_source_sides"][0]
+            assert error["rejected_record_untrusted"]["source_refs"] == unit["required_source_sides"][1][:1]
+        return batch(record)
+
+    model = SessionModel(handler=answer)
+    _, book = await run(model, count=1, ledger=HypothesisLedger("run", "head", "digest", protocol_version=9))
+    assert len(model.calls) == 2 and len(book.no_issue_units) == 1 and not book.unresolved_units
+
+
+@pytest.mark.asyncio
 async def test_all_groups_receive_an_initial_opportunity_before_optional_continuations():
     groups = []
 

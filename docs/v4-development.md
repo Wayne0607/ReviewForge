@@ -4,6 +4,10 @@
 
 ## 当前修订：结果交付事务与可追踪源码窗口（内部协议 9）
 
+### 缺失来源侧的精确反馈（2026-10-30）
+
+后续隔离 schema 的冻结复测中，发现覆盖达到 57/58，剩余斯洛伐克消息单元反复引用修改后来源而没有引用必需的修改前来源；控制器只回传 invalid source-backed behavior assessment，导致模型不断删减上下文而没有补上缺失前侧。协议 9 现从同一 target_source_choices 目录报告具体 missing_source_sides、各侧原已交付的合法引用及被拒原记录；程序不选择引用、不更改 checked 或判断。原 `_valid_behavior` 继续执行相同边界，旧协议反馈不变。回归测试验证模型能在下一次原有修复机会补齐引用，保留其他有效结果。
+
 ### d0e97c7 单 PR 复测及发现 schema 修复（2026-10-30）
 
 Keycloak #37429 空状态运行 d0e97c7，补齐固定 Git 条目后结构验证成功；89 次 HTTP 200，无接口错误，实报 959982 tokens、无未知预占；独立来源还原 3 resolved、证明 2 accepted / 1 insufficient-evidence，已产出 2 条本地评测评论（lt 账户/登录资源中的意大利语）。但发现仅 51/58 单元完成，另有 7 protocol-repair-limit 和 1 明确延期，完整状态 partial、裁判未运行，不能记为完整 PR 验收。原始目录 `.reviewforge/benchmarks/deepseek-keycloak-receipts-20261030-113423/`。

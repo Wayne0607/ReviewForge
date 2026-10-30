@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from reviewforge.core.change_manifest import FileChange, is_verified_rename
 from reviewforge.engine.discovery import SourceLine, plan_discovery
-from reviewforge.engine.discovery_aliases import expand_response_refs, source_aliases
+from reviewforge.engine.discovery_aliases import expand_response_refs, source_aliases, target_source_choices
 from reviewforge.engine.discovery_repair import apply_repairs, pending_repairs, remember, repair_request
 from reviewforge.engine.discovery_session import extend_sources, restore_observation, result_payload, source_packet
 from reviewforge.engine.discovery_submission import bind_discovery_submission
@@ -243,6 +243,27 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 groups[unit_id] = [
                     result_payload(KINDS[args["kind"]], args, work.block, delivered) for args in carried[unit_id]
                 ]
+    if work.protocol_version >= 9:
+        for unit_id in groups:
+            choices = target_source_choices(work.block, unit_id, delivered)
+            for raw in carried.get(unit_id, []):
+                if raw.get("kind") == "deferred":
+                    continue
+                missing = [
+                    side
+                    for side, refs in zip(("before", "after"), choices, strict=True)
+                    if refs and not set(refs).intersection(raw.get("source_refs", []))
+                ]
+                if missing:
+                    feedback.append(
+                        rejected("submit_assessments", raw, "missing-required-source-sides")
+                        | {
+                            "missing_source_sides": missing,
+                            "eligible_source_refs": dict(zip(("before", "after"), choices, strict=True)),
+                            "instruction": "Select actual evidence from each missing required side. "
+                            "Context or RIGHT-only references cannot establish a replacement's before behavior.",
+                        }
+                    )
     counted_error = work.protocol_version >= 7 and (bool(errors) or any("error" in entry for entry in feedback))
     if counted_error:
         # Freeze a rejected receipt before an independent sibling checkpoint

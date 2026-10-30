@@ -343,9 +343,15 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
     result = HypothesisGenerationResult()
     store = EvidenceStore(ledger)
     right = _right_lines_by_path(state)
+    # New v9 runs need capacity for both source acquisition and incremental
+    # results. A fixed 32 requests cannot cover large PRs even when every
+    # request succeeds. The calculated ceiling remains finite and is frozen on
+    # the first checkpoint; historical and resumed ceilings are never raised.
+    base_limit = generator._session_request_limit
+    if ledger.protocol_version >= 9:
+        base_limit = max(base_limit, min(128, 2 * len(blocks) + sum(len(block.units) for block in blocks)))
     request_limit = min(
-        [generator._session_request_limit]
-        + [r["request_limit"] for r in ledger.discovery_blocks.values() if "request_limit" in r]
+        [base_limit] + [r["request_limit"] for r in ledger.discovery_blocks.values() if "request_limit" in r]
     )
     acknowledged = {
         unit_id: copy.deepcopy(row)

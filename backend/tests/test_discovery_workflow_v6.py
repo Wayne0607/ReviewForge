@@ -84,6 +84,28 @@ async def test_partial_success_can_continue_beyond_three_turns_without_reasking_
 
 
 @pytest.mark.asyncio
+async def test_v9_scales_requests_for_partial_batches_without_sacrificing_reads():
+    def answer(messages, options, _turn):
+        names = {tool["function"]["name"] for tool in options["tools"]}
+        if "read_file" in names:
+            return receipt(call("read_file", {"path": "consumer.py", "start": 1, "end": 1}))
+        return batch(no_issue(packet(messages)["pending_units"][0]))
+
+    model = SessionModel(handler=answer)
+    book = HypothesisLedger("run", "head", "digest", protocol_version=9)
+    _, book = await run(model, count=4, ledger=book, session_request_limit=4)
+    assert len(model.calls) == 6 and len(book.no_issue_units) == 4
+    assert not book.unresolved_units
+    work = next(iter(book.discovery_blocks.values()))
+    assert work["workflow"]["read_requests"] == 2
+    assert work["workflow"]["result_requests"] == 4
+    assert work["request_limit"] == 6
+    restored = HypothesisLedger.from_dict(book.to_dict())
+    await run(model, count=4, ledger=restored, session_request_limit=32)
+    assert len(model.calls) == 6
+
+
+@pytest.mark.asyncio
 async def test_all_groups_receive_an_initial_opportunity_before_optional_continuations():
     groups = []
 

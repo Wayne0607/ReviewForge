@@ -43,7 +43,7 @@ def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
     result = {"hypothesis_id": item.id}
     for name in ("execution", "contracts", "gaps"):
         rows = raw[name]
-        if not isinstance(rows, list) or len(rows) > 8:
+        if not isinstance(rows, list) or (protocol_version < 9 and len(rows) > 8):
             raise ValueError("invalid-source-audit-rows")
         result[name] = []
         for row in rows:
@@ -112,7 +112,8 @@ def consume(raw, item, *, protocol_version=4):
     if not isinstance(raw, dict) or set(raw) != {"hypothesis_id", "execution", "contracts", "gaps"}:
         raise ValueError("invalid-source-audit-shape")
     if raw["hypothesis_id"] != item.id or any(
-        not isinstance(raw[name], list) or len(raw[name]) > 8 for name in ("execution", "contracts", "gaps")
+        not isinstance(raw[name], list) or (protocol_version < 9 and len(raw[name]) > 8)
+        for name in ("execution", "contracts", "gaps")
     ):
         raise ValueError("invalid-source-audit-envelope")
     kept = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": raw["gaps"][:]}
@@ -129,7 +130,7 @@ def consume(raw, item, *, protocol_version=4):
             else:
                 kept[name].extend(valid[name])
     if rejected:
-        kept["gaps"] = kept["gaps"][:7] + [
+        kept["gaps"] = (kept["gaps"] if protocol_version >= 9 else kept["gaps"][:7]) + [
             "Some source reconstruction records failed schema/reference validation; they supply no evidence."
         ]
     return validate(kept, item, protocol_version=protocol_version), rejected

@@ -28,8 +28,8 @@ requirements explicit. Output a JSON object, no prose outside it:
 "contracts":[{"kind":"caller|test|schema|configuration|format|language","statement":"requirement imposed by this cited consumer or applicable operation","evidence":["COPY_REF"]}],
 "gaps":["specific missing fact, if any"]}]}
 
-One entry for every input ID. Each array has at most 8 entries with 1–8 exact
-references per statement. Prose should be concise, without a per-field character
+One entry for every input ID. Include the facts needed to explain the source;
+each evidence statement must have 1–8 exact references. Prose should be concise, without a per-field character
 limit. Each complete audit record is bounded to 32768 UTF-8 bytes. An empty contracts array is
 correct when no binding requirement is visible. At least one execution, contract
 or gap is required. Do not fabricate completeness, callers, examples or runtime

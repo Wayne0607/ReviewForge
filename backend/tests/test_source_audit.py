@@ -8,7 +8,7 @@ from test_proof_gate import GateLLM, candidate, ledger, review
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.proof_gate import ProofGate, accepted, completed
 from reviewforge.engine.publication_contracts import contract_catalog
-from reviewforge.engine.source_audit import current, input_fingerprint, messages, run_source_audit, validate
+from reviewforge.engine.source_audit import consume, current, input_fingerprint, messages, run_source_audit, validate
 
 
 def verdict(decision="accepted"):
@@ -72,6 +72,27 @@ def test_caveat_total_budget_preserves_long_individual_gap_without_changing_evid
     raw["gaps"] = ["x" * 4801]
     with pytest.raises(ValueError, match="unbounded-source-gap"):
         validate(raw, candidate())
+
+
+def test_v9_preserves_large_audit_and_rejects_invalid_records_without_dropping_gaps():
+    raw = audit()
+    raw["execution"] = [copy.deepcopy(raw["execution"][0]) for _ in range(19)]
+    raw["execution"][12]["evidence"] = ["invented/obs_99:e1"]
+    raw["gaps"] = [f"Missing fact {index}" for index in range(9)]
+    saved, rejected = consume(raw, candidate(), protocol_version=9)
+    assert len(saved["execution"]) == 18
+    assert rejected == [{"array": "execution", "index": 12, "reason": "invalid-proof-reference"}]
+    assert saved["gaps"][:9] == raw["gaps"]
+    assert len(saved["gaps"]) == 10
+    with pytest.raises(ValueError, match="invalid-source-audit-envelope"):
+        consume(raw, candidate(), protocol_version=8)
+
+
+def test_v9_large_audit_still_enforces_whole_record_size():
+    raw = audit()
+    raw["gaps"] = ["x" * 33_000]
+    with pytest.raises(ValueError, match="source-audit-transport-record-too-large"):
+        consume(raw, candidate(), protocol_version=9)
 
 
 @pytest.mark.asyncio

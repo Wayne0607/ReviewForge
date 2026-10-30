@@ -96,6 +96,7 @@ class SharedEvidenceCache:
         *,
         max_entries: int = MAX_CACHE_ENTRIES,
         max_bytes: int = MAX_CACHE_BYTES,
+        max_result_chars: int | None = MAX_RESULT_CHARS,
     ) -> None:
         self.scope = scope
         self._max_entries = min(MAX_CACHE_ENTRIES, max(0, max_entries))
@@ -103,6 +104,8 @@ class SharedEvidenceCache:
         self._results: dict[str, SharedToolResult] = {}
         self._inflight: dict[str, asyncio.Task[SharedToolResult]] = {}
         self._bytes = 0
+        self._max_result_chars = max_result_chars
+        self._closed = False
 
     @property
     def entry_count(self) -> int:
@@ -114,6 +117,7 @@ class SharedEvidenceCache:
 
     async def close(self) -> None:
         """Release this run's cache and any reads left after cancellation."""
+        self._closed = True
         pending = list(self._inflight.values())
         for task in pending:
             if not task.done():
@@ -131,6 +135,8 @@ class SharedEvidenceCache:
         *,
         scope: EvidenceScope,
     ) -> SharedToolResult:
+        if self._closed:
+            raise RuntimeError("shared evidence cache is closed")
         if scope != self.scope:
             raise ValueError("shared evidence scope does not match this run/head/workspace")
         if name not in READ_ONLY_TOOLS:
@@ -156,7 +162,7 @@ class SharedEvidenceCache:
         executor: Callable[[str, dict[str, Any]], Awaitable[str]],
     ) -> SharedToolResult:
         try:
-            text = str(await executor(name, args) or "")[:MAX_RESULT_CHARS]
+            text = str(await executor(name, args) or "")[: self._max_result_chars]
             if result_status(text) != "success":
                 return SharedToolResult(text)
             identity = hashlib.sha256(

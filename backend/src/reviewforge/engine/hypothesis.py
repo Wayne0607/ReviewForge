@@ -290,15 +290,31 @@ class HypothesisLedger:
     source_audit_batches: int = 0
     structural_checks: dict[str, Any] = field(default_factory=dict)
     evidence_records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    shared_workspace: dict[str, Any] = field(default_factory=dict)
+    streaming_review: dict[str, Any] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.protocol_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+        if self.protocol_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
             raise ValueError("unsupported investigation protocol")
         if type(self.source_audit_batches) is not int or self.source_audit_batches < 0:
             raise ValueError("source audit batch count must be a nonnegative integer")
         for item in self.items.values():
             self._validate_change_anchor(item)
+        if self.protocol_version >= 11:
+            # Validate persisted collaboration state before any consumer can
+            # use it. Local import avoids coupling the source dataclasses to
+            # the workspace implementation at module import time.
+            from reviewforge.engine.review_workspace import SharedReviewWorkspace
+
+            SharedReviewWorkspace(self)
+            from reviewforge.engine.streaming_review import validate_streaming_review
+
+            validate_streaming_review(self)
+        elif self.shared_workspace:
+            raise ValueError("shared workspace requires protocol 11")
+        elif self.streaming_review:
+            raise ValueError("streaming review requires protocol 11")
 
     def _validate_change_anchor(self, hypothesis: Hypothesis) -> None:
         if hypothesis.change_anchor is not None and (
@@ -498,6 +514,8 @@ class HypothesisLedger:
                 "unresolved_units": dict(sorted(self.unresolved_units.items())),
                 "protocol_version": self.protocol_version,
                 **({"evidence_records": copy.deepcopy(self.evidence_records)} if self.protocol_version >= 5 else {}),
+                **({"shared_workspace": copy.deepcopy(self.shared_workspace)} if self.protocol_version >= 11 else {}),
+                **({"streaming_review": copy.deepcopy(self.streaming_review)} if self.protocol_version >= 11 else {}),
                 "investigation_tasks": copy.deepcopy(self.investigation_tasks),
                 **(
                     {
@@ -544,4 +562,6 @@ class HypothesisLedger:
             ),
             structural_checks=copy.deepcopy(data.get("structural_checks", {})),
             evidence_records=copy.deepcopy(data.get("evidence_records", {})),
+            shared_workspace=copy.deepcopy(data.get("shared_workspace", {})),
+            streaming_review=copy.deepcopy(data.get("streaming_review", {})),
         )

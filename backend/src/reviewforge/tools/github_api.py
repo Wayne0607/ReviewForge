@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -292,6 +294,93 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_pr_issue_context(self, repo: str, pr_number: int, head_sha: str) -> dict[str, Any]:
+        """Snapshot same-repository incoming issue references using GET only.
+
+        REST cross-referenced.source.issue identifies the referencing issue.
+        Connected/disconnected REST events do not identify their other target,
+        so this is explicitly partial context, never all closing/linked issues.
+        https://docs.github.com/en/rest/using-the-rest-api/issue-event-types
+        """
+        if not valid_repo(repo) or type(pr_number) is not int or pr_number <= 0 or not head_sha:
+            raise ValueError("invalid PR issue-context binding")
+        path = f"/repos/{repo}/issues/{pr_number}/timeline"
+        result = {
+            "schema": "github-pr-issue-context-v1",
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "source_url": self.BASE_URL + path,
+            "relation": "cross-referenced",
+            "coverage": "partial",
+            "status": "unavailable",
+            "limitation": "REST incoming cross-references only; closing/manual links are not completely available.",
+            "timeline_events": [],
+            "issues": [],
+            "failures": [],
+        }
+        page, seen = 1, set()
+        while True:
+            try:
+                response = await self._client.get(path, params={"per_page": 100, "page": page})
+                response.raise_for_status()
+                batch = response.json()
+                if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                    raise ValueError("invalid-timeline-response")
+                digest = hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
+                if batch and digest in seen:
+                    raise ValueError("repeated-timeline-page")
+                seen.add(digest)
+                result["timeline_events"].extend(batch)
+            except (httpx.HTTPError, ValueError) as exc:
+                result["failures"].append(_issue_context_failure("timeline", exc))
+                break
+            if len(batch) < 100:
+                break
+            page += 1
+        numbers = set()
+        for event in result["timeline_events"]:
+            source = event.get("source")
+            if (
+                event.get("event") != "cross-referenced"
+                or not isinstance(source, dict)
+                or source.get("type") != "issue"
+            ):
+                continue
+            issue = source.get("issue")
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            number = issue.get("number")
+            if (
+                type(number) is int
+                and number > 0
+                and number != pr_number
+                and _same_issue_url(issue.get("url"), repo, number)
+            ):
+                numbers.add(number)
+        for number in sorted(numbers):
+            try:
+                response = await self._client.get(f"/repos/{repo}/issues/{number}")
+                response.raise_for_status()
+                issue = response.json()
+                if not _valid_issue_snapshot(issue, repo, number):
+                    raise ValueError("invalid-issue-snapshot")
+                result["issues"].append(issue)
+            except (httpx.HTTPError, ValueError) as exc:
+                result["failures"].append(_issue_context_failure("issue", exc) | {"issue_number": number})
+        result["status"] = (
+            "partial"
+            if result["issues"] and result["failures"]
+            else "unavailable"
+            if result["failures"]
+            else "available"
+            if result["issues"]
+            else "no-cross-references"
+        )
+        result["snapshot_sha256"] = _issue_context_digest(result)
+        return result
+
     async def get_comparison_base(self, repo: str, base_sha: str, head_repo: str, head_sha: str) -> str:
         """Resolve the merge-base from fixed SHAs, including fork-network heads."""
         if not valid_repo(repo) or not valid_repo(head_repo) or not valid_sha(base_sha) or not valid_sha(head_sha):
@@ -391,6 +480,85 @@ class GitHubClient:
             for path, entry in found.items()
             if valid_sha(entry.get("sha")) and isinstance(entry.get("mode"), str) and isinstance(entry.get("type"), str)
         }
+
+
+def _same_issue_url(url, repo, number):
+    return isinstance(url, str) and url.casefold() == f"{GitHubClient.BASE_URL}/repos/{repo}/issues/{number}".casefold()
+
+
+def _valid_issue_snapshot(issue, repo, number):
+    if not isinstance(issue, dict) or type(number) is not int or number <= 0:
+        return False
+    revision = issue.get("updated_at")
+    try:
+        parsed_revision = datetime.fromisoformat(revision.replace("Z", "+00:00")) if isinstance(revision, str) else None
+    except ValueError:
+        return False
+    return (
+        issue.get("number") == number
+        and "pull_request" not in issue
+        and _same_issue_url(issue.get("url"), repo, number)
+        and str(issue.get("html_url", "")).casefold() == f"https://github.com/{repo}/issues/{number}".casefold()
+        and isinstance(issue.get("title"), str)
+        and (issue.get("body") is None or isinstance(issue.get("body"), str))
+        and parsed_revision is not None
+        and parsed_revision.tzinfo is not None
+    )
+
+
+def _issue_context_failure(operation, exc):
+    return {
+        "operation": operation,
+        "error_type": type(exc).__name__,
+        "status_code": exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0,
+        **({"reason": str(exc)} if isinstance(exc, ValueError) else {}),
+    }
+
+
+def _issue_context_digest(snapshot):
+    value = {key: value for key, value in snapshot.items() if key != "snapshot_sha256"}
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def validate_pr_issue_context(snapshot, *, repo, pr_number, head_sha):
+    """Reject a changed/rebound prepared snapshot instead of refreshing it."""
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("schema") != "github-pr-issue-context-v1"
+        or any(
+            snapshot.get(key) != value
+            for key, value in {"repo": repo, "pr_number": pr_number, "head_sha": head_sha}.items()
+        )
+        or snapshot.get("relation") != "cross-referenced"
+        or snapshot.get("coverage") != "partial"
+        or snapshot.get("status") not in {"available", "partial", "unavailable", "no-cross-references"}
+        or snapshot.get("source_url") != f"{GitHubClient.BASE_URL}/repos/{repo}/issues/{pr_number}/timeline"
+        or snapshot.get("snapshot_sha256") != _issue_context_digest(snapshot)
+        or not isinstance(snapshot.get("issues"), list)
+        or any(
+            not _valid_issue_snapshot(issue, repo, issue.get("number"))
+            for issue in snapshot.get("issues", [])
+            if isinstance(issue, dict)
+        )
+        or any(not isinstance(issue, dict) for issue in snapshot.get("issues", []))
+        or not isinstance(snapshot.get("timeline_events"), list)
+        or any(not isinstance(event, dict) for event in snapshot.get("timeline_events", []))
+    ):
+        raise ValueError("invalid prepared PR issue-context snapshot")
+    referenced = {
+        source["issue"].get("number")
+        for event in snapshot["timeline_events"]
+        if event.get("event") == "cross-referenced"
+        and isinstance(source := event.get("source"), dict)
+        and source.get("type") == "issue"
+        and isinstance(source.get("issue"), dict)
+        and "pull_request" not in source["issue"]
+        and type(source["issue"].get("number")) is int
+        and _same_issue_url(source["issue"].get("url"), repo, source["issue"]["number"])
+    }
+    if any(issue["number"] not in referenced or issue["number"] == pr_number for issue in snapshot["issues"]):
+        raise ValueError("prepared issue snapshot lacks its authoritative cross-reference")
+    return json.loads(json.dumps(snapshot))
 
 
 def _classify_write_error(operation: str, response: httpx.Response) -> GitHubAPIError:

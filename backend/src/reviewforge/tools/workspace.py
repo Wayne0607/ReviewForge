@@ -232,6 +232,16 @@ class _ArchiveView:
             with io.TextIOWrapper(extracted, encoding="utf-8", errors="replace") as source:
                 return source.read()
 
+    def read_bytes(self, path: str) -> bytes:
+        with self._lock:
+            if self._tar is None:
+                raise WorkspaceUnavailable("archive view is closed")
+            source = self._tar.extractfile(self.files[path])
+            if source is None:
+                raise WorkspaceUnavailable("missing archive member body")
+            with source:
+                return source.read()
+
     def close(self) -> None:
         with self._lock:
             if self._tar is not None:
@@ -638,6 +648,40 @@ class PRHeadWorkspace:
             return relative in self._archive_view.files
         candidate = self._local_path(relative) if relative else None
         return bool(candidate and candidate.is_file())
+
+    def list_paths(self) -> list[str]:
+        """List fixed source paths, without materializing Windows archive files."""
+        if self._closed or self.source == "api-fallback":
+            return []
+        return [path for path, _ in self._iter_files()]
+
+    def export_source_tar(self) -> bytes:
+        """Export regular source bytes for a container, never execute/extract on host.
+
+        A partial checkout is not a reproducible execution input. The tar is
+        deterministic and uses plain files only; links, devices and host paths
+        are never forwarded into the execution environment.
+        """
+        if self._closed or self.source != "tarball" or self.truncated:
+            raise WorkspaceUnavailable("execution requires a complete fixed source archive")
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as target:
+            directory = tarfile.TarInfo("workspace")
+            directory.type, directory.mode = tarfile.DIRTYPE, 0o755
+            target.addfile(directory)
+            for path, candidate in self._iter_files():
+                if _normalise_repo_path(path) != path:
+                    raise WorkspaceUnavailable("unsafe execution source path")
+                if self._archive_view:
+                    data = self._archive_view.read_bytes(path)
+                else:
+                    if candidate.is_symlink() or not candidate.resolve().is_relative_to(self.root.resolve()):
+                        raise WorkspaceUnavailable("execution source escaped workspace")
+                    data = candidate.read_bytes()
+                member = tarfile.TarInfo("workspace/" + path)
+                member.mode, member.size = 0o644, len(data)
+                target.addfile(member, io.BytesIO(data))
+        return output.getvalue()
 
     def grep(
         self,

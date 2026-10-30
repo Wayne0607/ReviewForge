@@ -194,9 +194,9 @@ class StateStore:
     pr_body: str = field(default="", kw_only=True)
     head_repo: str = field(default="", kw_only=True)
     head_ref: str = field(default="", kw_only=True)
-    # Reserved for issue metadata returned by a later authoritative API call.
-    # Do not infer issue links from free-form PR text at ingestion time.
+    # Authoritative API snapshots; never infer issue links from free-form PR text.
     linked_issues: list[dict[str, Any]] = field(default_factory=list, kw_only=True)
+    linked_issue_context: dict[str, Any] = field(default_factory=dict, kw_only=True)
     files_changed: list[str] = field(default_factory=list)
     diff_summary: str = ""
     # Per-run patch cache. ``None`` means the PR file list has not been loaded;
@@ -283,6 +283,7 @@ class StateStore:
             "head_repo": self.head_repo,
             "head_ref": self.head_ref,
             "linked_issues": copy.deepcopy(self.linked_issues),
+            **({"linked_issue_context": copy.deepcopy(self.linked_issue_context)} if self.linked_issue_context else {}),
             "files_changed": self.files_changed,
             "impact_manifest": copy.deepcopy(self.impact_manifest),
             "findings": {k: v.to_dict() for k, v in self.findings.items()},

@@ -16,12 +16,28 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from reviewforge.core.change_manifest import FileChange, is_verified_rename
+from reviewforge.engine.atomic_candidates import (
+    AtomicRecord,
+    atomic_coverage,
+    expand_atomic_records,
+    finalize_atomic_records,
+    pending_atomic_claims,
+)
 from reviewforge.engine.discovery import SourceLine, plan_discovery
 from reviewforge.engine.discovery_aliases import expand_response_refs, source_aliases, target_source_choices
 from reviewforge.engine.discovery_repair import apply_repairs, pending_repairs, remember, repair_request
 from reviewforge.engine.discovery_session import extend_sources, restore_observation, result_payload, source_packet
 from reviewforge.engine.discovery_submission import bind_discovery_submission
 from reviewforge.engine.discovery_workflow_tools import KINDS, assessment_tools
+from reviewforge.engine.discovery_workspace import (
+    WORKSPACE_ACTIONS,
+    initialize_progress,
+    remember_evidence,
+    repeated_progress,
+    workspace_action,
+    workspace_tools,
+    workspace_view,
+)
 from reviewforge.engine.execution_policy import output_capacity, repeated_state
 from reviewforge.engine.investigator import Investigator
 from reviewforge.engine.prompts_v4 import load_prompt
@@ -70,6 +86,7 @@ class Work:
     order: int
     protocol_version: int = 6
     stopped: str = ""
+    workspace: object = None
 
     @property
     def flow(self):
@@ -85,6 +102,8 @@ def request(generator, work, *, read=False, global_remaining=0):
     active = replace(work.block, units=[unit for unit in work.block.units if unit.id in pending])
     result_tool, schemas = assessment_tools(active, protocol_version=work.protocol_version)
     tools = [result_tool, *(work.broker._build_tools() if read else [])]
+    if work.protocol_version >= 11:
+        tools.extend(workspace_tools())
     scope = {}
     if work.protocol_version < 10:
         scope = {
@@ -104,6 +123,8 @@ def request(generator, work, *, read=False, global_remaining=0):
         repair_tool, chat = repair_request(work, schemas, scope)
         return bind_discovery_submission(generator._llm, [repair_tool]), chat, [repair_tool], schemas, scope
     packet = compact_packet(work.block, work.aliases, pending, work.broker._observations) | {"session": scope}
+    if work.protocol_version >= 11:
+        packet["shared_review_workspace"] = workspace_view(work)
     rules = "\n".join(
         dict.fromkeys(
             generator._responsibility_rules.get(name, "")
@@ -112,7 +133,9 @@ def request(generator, work, *, read=False, global_remaining=0):
         )
     )
     prompt = load_prompt(
-        "discovery_workflow_v10"
+        "discovery_workflow_v11"
+        if work.protocol_version >= 11
+        else "discovery_workflow_v10"
         if work.protocol_version >= 10
         else "discovery_workflow_v9"
         if work.protocol_version >= 9
@@ -182,12 +205,36 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
             feedback.append({"action": call["name"], "transport_normalizations": call["transport_normalizations"]})
     groups = {}
     reads = 0
+    workspace_activity = False
     had_result = False
     invalid_units = set()
     touched = set()
     carried = work.flow.setdefault("accepted_records", {}) if work.protocol_version >= 7 else {}
+    existing_candidates = set(ledger.items) if work.protocol_version >= 11 else set()
+    atomic_units = set()
     for call in calls:
         name, args = call["name"], call["args"]
+        if work.protocol_version >= 11 and name in WORKSPACE_ACTIONS:
+            before = len(work.broker._observations)
+            try:
+                reply = workspace_action(work, name, args, store)
+            except ValidationError as exc:
+                fields = [
+                    {"field": list(error["loc"]), "type": error["type"]} for error in exc.errors(include_input=False)
+                ]
+                feedback.append(reject(name, args, "invalid-shared-workspace-schema", fields))
+                continue
+            except (ValueError, TypeError, KeyError) as exc:
+                feedback.append(
+                    reject(name, args, "invalid-shared-workspace-action") | {"failure_kind": str(exc).split(":", 1)[0]}
+                )
+                continue
+            reads += len(work.broker._observations) - before
+            workspace_activity = True
+            feedback.append({"action": name, "result": reply})
+            save_observations(work)
+            await checkpoint(generator, ledger)
+            continue
         if name not in {"submit_assessments", "repair_assessments"}:
             before = len(work.broker._observations)
             try:
@@ -198,7 +245,9 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
             reply = await work.broker._run_tool(name, prepared)
             feedback.append({"action": name, "result": reply})
             for obs in work.broker._observations[before:]:
-                store.observation(obs)
+                identity = store.observation(obs)
+                if work.protocol_version >= 11:
+                    remember_evidence(work, identity, obs)
                 extend_sources(work.block, obs, work.aliases)
                 reads += 1
             save_observations(work)
@@ -222,6 +271,18 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         ):
             feedback.append(reject(name, args, "invalid-assessment-envelope"))
             continue
+        if work.protocol_version >= 11:
+            atomic_units.update(
+                raw["unit_id"]
+                for raw in records
+                if isinstance(raw, dict)
+                and raw.get("kind") == "atomic_hypotheses"
+                and isinstance(raw.get("unit_id"), str)
+                and raw["unit_id"] in work.pending
+            )
+            records, atomic_feedback = expand_atomic_records(work, records, schemas)
+            feedback.extend(atomic_feedback)
+            invalid_units.update(entry["unit_id"] for entry in atomic_feedback if "error" in entry)
         for raw in records:
             if not isinstance(raw, dict):
                 feedback.append({"error": "assessment-record-must-be-object"})
@@ -236,7 +297,14 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                     invalid_units.add(unit_id)
                 continue
             try:
-                args = schema.model_validate(raw).model_dump(exclude_none=True)
+                source = (
+                    {key: value for key, value in raw.items() if key != "atomic_origin"}
+                    if isinstance(raw, AtomicRecord)
+                    else raw
+                )
+                args = schema.model_validate(source).model_dump(exclude_none=True)
+                if isinstance(raw, AtomicRecord):
+                    args["atomic_origin"] = copy.deepcopy(raw["atomic_origin"])
             except ValidationError as exc:
                 fields = [
                     {"field": list(error["loc"]), "type": error["type"]} for error in exc.errors(include_input=False)
@@ -320,6 +388,8 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         )
         if work.protocol_version >= 7:
             validated = local.get("validated_assessments", [])
+            if work.protocol_version >= 11:
+                finalize_atomic_records(work, validated)
             keep = []
             for raw in carried.get(unit_id, []):
                 collection, item = result_payload(KINDS[raw["kind"]], raw, work.block, delivered)
@@ -332,6 +402,9 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         finished = (work.protocol_version < 7 or unit_id not in invalid_units) and (
             row["status"] in {"assessed", "capacity-deferred"} or any(kind == "deferred_units" for kind, _ in entries)
         )
+        if work.protocol_version >= 11 and pending_atomic_claims(work, unit_id):
+            finished = False
+            feedback.append({"unit_id": unit_id, "pending_atomic_claims": pending_atomic_claims(work, unit_id)})
         if finished:
             carried.pop(unit_id, None)
         work.record["units"][unit_id] = row | {"finished": finished}
@@ -340,11 +413,31 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         if row["status"] == "assessed" and unit_id in result.unresolved_units:
             result.unresolved_units.remove(unit_id)
         await checkpoint(generator, ledger)
+    if work.protocol_version >= 11:
+        for unit_id in atomic_units:
+            coverage = atomic_coverage(work, ledger, unit_id)
+            row = work.record["units"].setdefault(unit_id, {"status": "unresolved", "finished": False})
+            row["atomic_claims"] = coverage
+            if (
+                coverage
+                and all(entry["status"] == "accepted" for entry in coverage)
+                and not pending_atomic_claims(work, unit_id)
+                and unit_id not in invalid_units
+                and not any(entry["unit_id"] in {"", unit_id} for entry in errors)
+            ):
+                committed += int(not row.get("finished"))
+                row.update(status="assessed", assessment="hypothesis", finished=True)
+                row.pop("reason", None)
+                carried.pop(unit_id, None)
+                if ledger.unresolved_units.get(unit_id, "").startswith(generator._source + " "):
+                    ledger.unresolved_units.pop(unit_id)
+                if unit_id in result.unresolved_units:
+                    result.unresolved_units.remove(unit_id)
     save_observations(work)
     for item in ledger.items.values():
         if item.unit_id in {unit.id for unit in work.block.units} and item.attempts == 0 and not item.observations:
             item.observations = copy.deepcopy(work.broker._observations)
-    if errors or any("error" in entry for entry in feedback) or not (reads or committed):
+    if errors or any("error" in entry for entry in feedback) or not (reads or committed or workspace_activity):
         if not counted_error:
             work.flow["invalid_receipts"] += 1
         if not reads:
@@ -366,6 +459,16 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         "receipt", actions=[call["name"] for call in calls], feedback=work.flow["feedback"], committed=committed
     )
     await checkpoint(generator, ledger)
+    if work.protocol_version >= 11 and getattr(generator, "_on_candidates", None):
+        identities = tuple(
+            identity
+            for identity, item in ledger.items.items()
+            if identity not in existing_candidates
+            and item.unit_id in {unit.id for unit in work.block.units}
+            and item.status.value == "open"
+        )
+        if identities:
+            await generator._on_candidates(ledger, identities)
 
 
 async def run_discovery(generator, state, pack, changeset, ledger, *, overview_changeset=None):
@@ -432,6 +535,11 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             blocks.sort(key=lambda block: (-max(unit.risk_score for unit in block.units), block.id))
     result = HypothesisGenerationResult()
     store = EvidenceStore(ledger)
+    workspace = None
+    if ledger.protocol_version >= 11:
+        from reviewforge.engine.review_workspace import SharedReviewWorkspace
+
+        workspace = SharedReviewWorkspace(ledger)
     right = _right_lines_by_path(state)
     # New v9 runs need capacity for both source acquisition and incremental
     # results. A fixed 32 requests cannot cover large PRs even when every
@@ -500,6 +608,10 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             evidence_cache=generator._evidence_cache,
         )
         broker._state = state
+        if ledger.protocol_version >= 11:
+            from reviewforge.engine.investigation_evidence import EvidenceScope
+
+            broker._evidence_scope = EvidenceScope(ledger.run_id, ledger.head_sha, ledger.workspace_digest)
         broker._observations = [restore_observation(raw) for raw in record["observations"]]
         broker._obs_counter = len(broker._observations)
         session = ReviewSession(
@@ -530,8 +642,22 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
         if input_failure:
             record["input_failure"] = input_failure
         worklist.append(
-            Work(block, record, broker, aliases, session, order, ledger.protocol_version, stopped=input_failure)
+            Work(
+                block,
+                record,
+                broker,
+                aliases,
+                session,
+                order,
+                ledger.protocol_version,
+                stopped=input_failure,
+                workspace=workspace,
+            )
         )
+        if ledger.protocol_version >= 11:
+            initialize_progress(worklist[-1])
+            for source in block.source_refs.values():
+                remember_evidence(worklist[-1], store.source(source, base_sha=state.base_sha))
     await checkpoint(generator, ledger)
     used = sum(record.get("session", {}).get("turns", 0) for record in ledger.discovery_blocks.values())
     while request_limit is None or used < request_limit:
@@ -639,8 +765,14 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             continue
         result.blocks += 1
         for source in work.block.source_refs.values():
-            store.source(source, base_sha=state.base_sha)
+            identity = store.source(source, base_sha=state.base_sha)
+            if ledger.protocol_version >= 11:
+                remember_evidence(work, identity)
         await consume(generator, work, response, tools, schemas, delivered, ledger, result, right, store)
+        if ledger.protocol_version >= 11:
+            if work.pending and repeated_progress(work, response):
+                work.stopped = "no-progress-cycle"
+            continue
         if (
             unlimited
             and work.pending

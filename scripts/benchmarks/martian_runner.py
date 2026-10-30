@@ -64,7 +64,7 @@ from reviewforge.engine.publication_policy import (
 )
 from reviewforge.engine.reviewers import BaseReviewer
 from reviewforge.tools.gateway import ToolGateway
-from reviewforge.tools.github_api import GitHubClient
+from reviewforge.tools.github_api import GitHubClient, validate_pr_issue_context
 
 logger = logging.getLogger("martian_runner")
 _SCHEDULER_CONCURRENCY = 4
@@ -472,6 +472,7 @@ async def _run_one(
     github: GitHubClient,
     *,
     workspace_preflight_dir: Path | None = None,
+    knowledge_snapshot_dir: Path | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     repo = str(item["repo"])
@@ -500,6 +501,26 @@ async def _run_one(
         file_diffs={str(file["filename"]): str(file.get("patch") or "") for file in files},
     )
     populate_file_changes(state, files)
+    config = getattr(orchestrator, "_pipeline_v4_config", None)
+    if getattr(config, "protocol_version", 0) >= 11 and getattr(config, "mode", "legacy") in {"hypothesis", "shadow"}:
+        context = item.get("linked_issue_context")
+        snapshot_path = None
+        if knowledge_snapshot_dir is not None:
+            key = hashlib.sha256(f"{repo}:{pr_number}:{state.head_sha}".encode()).hexdigest()
+            snapshot_path = knowledge_snapshot_dir / f"{key}.json"
+            if snapshot_path.exists():
+                prepared = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                if context is not None and context != prepared:
+                    raise ValueError("workload issue context differs from the prepared snapshot")
+                context = prepared
+        if context is None:
+            context = await github.get_pr_issue_context(repo, pr_number, state.head_sha)
+        context = validate_pr_issue_context(context, repo=repo, pr_number=pr_number, head_sha=state.head_sha)
+        if snapshot_path is not None and not snapshot_path.exists():
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_json(snapshot_path, context)
+        state.linked_issue_context = context
+        state.linked_issues = context["issues"]
     if workspace_preflight_dir is not None:
         workspace_preflight_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -550,6 +571,7 @@ async def _run_one(
         "tokens_by_agent": token_rows,
         "duration_seconds": round(time.monotonic() - started, 3),
         "status": "completed",
+        **({"linked_issue_context": state.linked_issue_context} if state.linked_issue_context else {}),
     }
     if not is_complete_result(result):
         result["status"] = "partial"
@@ -687,6 +709,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                     db,
                     raw_github,
                     workspace_preflight_dir=root / "workspace-preflight" if args.require_complete_workspace else None,
+                    knowledge_snapshot_dir=root / "linked-issue-context",
                 )
                 results[key] = result
                 print(

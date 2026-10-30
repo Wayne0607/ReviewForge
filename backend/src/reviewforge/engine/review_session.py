@@ -44,20 +44,27 @@ class EvidenceStore:
     def __init__(self, ledger):
         self.ledger = ledger
         self.records = ledger.evidence_records
-        for identity, record in self.records.items():
-            if (
-                not isinstance(record, dict)
-                or record.get("head_sha") != ledger.head_sha
-                or record.get("workspace_digest") != ledger.workspace_digest
-                or identity != "ev_" + fingerprint(record)[:24]
-            ):
-                raise ValueError("invalid-restored-evidence-binding")
-        self._bytes = sum(len(json.dumps(record, ensure_ascii=False).encode()) for record in self.records.values())
+        with ledger._lock:
+            for identity, record in self.records.items():
+                if (
+                    not isinstance(record, dict)
+                    or record.get("head_sha") != ledger.head_sha
+                    or record.get("workspace_digest") != ledger.workspace_digest
+                    or (ledger.protocol_version >= 11 and record.get("run_id") != ledger.run_id)
+                    or identity != "ev_" + fingerprint(record)[:24]
+                ):
+                    raise ValueError("invalid-restored-evidence-binding")
+            self._bytes = sum(len(json.dumps(record, ensure_ascii=False).encode()) for record in self.records.values())
 
     def put(self, value: dict[str, Any]) -> str:
+        with self.ledger._lock:
+            return self._put(value)
+
+    def _put(self, value: dict[str, Any]) -> str:
         record = json.loads(json.dumps(value, ensure_ascii=False)) | {
             "head_sha": self.ledger.head_sha,
             "workspace_digest": self.ledger.workspace_digest,
+            **({"run_id": self.ledger.run_id} if self.ledger.protocol_version >= 11 else {}),
         }
         identity = "ev_" + fingerprint(record)[:24]
         if identity in self.records:

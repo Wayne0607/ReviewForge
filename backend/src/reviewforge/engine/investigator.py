@@ -39,7 +39,12 @@ from reviewforge.engine.hypothesis import (
     Observation,
     Site,
 )
-from reviewforge.engine.investigation_evidence import EvidenceScope, SharedEvidenceCache, diff_evidence_window
+from reviewforge.engine.investigation_evidence import (
+    READ_ONLY_TOOLS,
+    EvidenceScope,
+    SharedEvidenceCache,
+    diff_evidence_window,
+)
 from reviewforge.engine.investigation_tasks import (
     InvestigationTask,
     build_investigation_tasks,
@@ -211,6 +216,11 @@ def build_workspace_executor(
     """Bind the SPEC §4.6 tool names to a pinned :class:`PRHeadWorkspace`."""
 
     reference_lookups: dict[str, dict[str, Any]] = {}
+    review_context = None
+    if protocol_version >= 11:
+        from reviewforge.engine.review_context import ReviewContext
+
+        review_context = ReviewContext(workspace, state, protocol_version=protocol_version)
 
     async def _execute(name: str, args: dict[str, Any]) -> str:
         if name == "read_change":
@@ -288,9 +298,13 @@ def build_workspace_executor(
             if start < 0 or end < start:
                 raise ValueError("read_diff requires an ordered RIGHT-line window")
             return select_diff_hunks(patch, [(start, end)])
+        if review_context is not None and review_context.owns(name):
+            return await review_context.execute(name, args)
         raise KeyError(f"unknown investigator tool: {name}")
 
     _execute.reference_lookups = reference_lookups
+    if review_context is not None:
+        _execute.review_context = review_context
     return _execute
 
 
@@ -315,6 +329,8 @@ class Investigator:
         starting_steps: int = 0,
         evidence_store: Any = None,
         on_progress: Any = None,
+        shared_workspace: Any = None,
+        evidence_scope: EvidenceScope | None = None,
     ) -> None:
         self._llm = llm
         self._executor = executor
@@ -345,6 +361,9 @@ class Investigator:
         self._tool_schemas: dict[str, Any] | None = None
         self._evidence_store = evidence_store
         self._on_progress = on_progress
+        self._shared_workspace = shared_workspace
+        self._evidence_scope = evidence_scope
+        self._current_hypothesis: Hypothesis | None = None
 
     def workload_allowance(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> tuple[int, int, int]:
         """Size bounded work from real request inputs, independently of severity.
@@ -492,6 +511,12 @@ class Investigator:
                     **schema_options,
                 )
             )
+        if self._protocol_version >= 11 and self._shared_workspace is not None:
+            from reviewforge.engine.investigation_workspace import tools as workspace_tools
+
+            tools.extend(workspace_tools(self))
+        if self._protocol_version >= 11 and getattr(self._executor, "review_context", None) is not None:
+            tools.extend(self._executor.review_context.tool_definitions())
         return tools
 
     def _normalize_tool_args(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -541,10 +566,17 @@ class Investigator:
         return None
 
     async def _run_tool(self, name: str, args: dict[str, Any]) -> str:
+        if self._protocol_version >= 11:
+            from reviewforge.engine.investigation_workspace import WORKSPACE_ACTIONS, error_reply, run_action
+
         try:
             args = self._prepared_tool_args(name, args)
         except (ValueError, TypeError):
+            if self._protocol_version >= 11 and name in WORKSPACE_ACTIONS:
+                return error_reply("invalid-shared-workspace-arguments")
             return "Invalid tool arguments; use the supplied tool schema. No source read was performed."
+        if self._protocol_version >= 11 and name in WORKSPACE_ACTIONS:
+            return await run_action(self, name, args)
         query = _query_string(name, args)
         if self._protocol_version >= 3:
             existing = self._query_observation(name, args)
@@ -564,23 +596,49 @@ class Investigator:
         shared_result_id = ""
         reused = False
         diff_navigation = {}
+        context = getattr(self._executor, "review_context", None) if self._protocol_version >= 11 else None
+        context_receipt = None
 
         async def execute(name: str, args: dict[str, Any]) -> str:
             text = str(await self._executor(name, args) or "")
-            if self._protocol_version >= 3 and name == "read_diff" and isinstance(args.get("start"), int):
+            if 3 <= self._protocol_version < 11 and name == "read_diff" and isinstance(args.get("start"), int):
                 text, _ = diff_evidence_window(text, args["start"])
             return text
 
         try:
-            if self._protocol_version >= 3 and self._evidence_cache is not None:
+            if (
+                self._protocol_version >= 3
+                and self._evidence_cache is not None
+                and (self._protocol_version < 11 or name in READ_ONLY_TOOLS)
+            ):
                 scope = self._evidence_cache.scope
                 if self._state is None or self._state.head_sha != scope.head_sha:
                     raise ValueError("investigation source does not match the shared evidence head")
+                if self._protocol_version >= 11 and self._evidence_scope != scope:
+                    raise ValueError("investigation source does not match the shared evidence scope")
                 shared = await self._evidence_cache.execute(name, args, execute, scope=scope)
                 text, shared_result_id, reused = shared.text, shared.shared_result_id, shared.reused
             else:
                 text = await execute(name, args)
-            if self._protocol_version >= 3 and name == "read_diff" and self._state is not None:
+            if context is not None and context.owns(name):
+                context_receipt = json.loads(text)
+                expected_digest = (
+                    self._evidence_scope.workspace_digest
+                    if self._evidence_scope is not None
+                    else getattr(self, "_workspace_digest", "")
+                )
+                if not isinstance(context_receipt, dict) or (
+                    context_receipt.get("head_sha") != self._state.head_sha
+                    or context_receipt.get("workspace_digest") != expected_digest
+                ):
+                    raise ValueError("review context receipt source binding mismatch")
+                if name == "read_review_knowledge" and context_receipt.get("status") == "success":
+                    from reviewforge.engine.knowledge_receipt import validate_knowledge_receipt
+
+                    validate_knowledge_receipt(
+                        context_receipt, head_sha=self._state.head_sha, workspace_digest=expected_digest
+                    )
+            if 3 <= self._protocol_version < 11 and name == "read_diff" and self._state is not None:
                 patch = (self._state.file_diffs or {}).get(args.get("path"), "") or ""
                 _, diff_navigation = diff_evidence_window(patch, int(args.get("start") or 1))
         except Exception as exc:
@@ -609,6 +667,17 @@ class Investigator:
         ]
         if failed:
             status = "error"
+        elif context_receipt is not None:
+            receipt_status = context_receipt.get("status")
+            status = (
+                "success"
+                if receipt_status == "success" and name in {"read_review_knowledge", "run_repository_test"}
+                else "not_found"
+                if receipt_status in {"navigation", "unavailable"}
+                else "error"
+            )
+            if status != "success":
+                self._progress.append({"phase": "review-context-navigation", "query": query, "result": context_receipt})
         elif _is_not_found(text):
             status = "not_found"
         else:
@@ -616,9 +685,33 @@ class Investigator:
         if self._protocol_version >= 9:
             from reviewforge.engine.source_navigation import save_window
 
-            return await save_window(
-                self, name, args, query, text, status, original_chars, shared_result_id, reused, diff_navigation
+            if context_receipt is None or status != "success":
+                return await save_window(
+                    self, name, args, query, text, status, original_chars, shared_result_id, reused, diff_navigation
+                )
+            # Bind the full raw receipt before the single durable progress callback.
+            callback, before = self._on_progress, len(self._observations)
+            self._on_progress = None
+            try:
+                reply = await save_window(
+                    self, name, args, query, text, status, original_chars, shared_result_id, reused, diff_navigation
+                )
+            finally:
+                self._on_progress = callback
+            self._progress.append(
+                {
+                    "phase": "review-context-receipt",
+                    "tool": name,
+                    "query": query,
+                    "receipt_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "observation_ids": [obs.id for obs in self._observations[before:]],
+                    "head_sha": self._state.head_sha,
+                    "workspace_digest": expected_digest,
+                }
             )
+            if callback is not None:
+                await callback(self._observations, self._progress)
+            return reply
         excerpt, excerpt_range = text[:_OBS_EXCERPT_CHARS], None
         if name == "read_file" and status == "success":
             excerpt, excerpt_range = self._saved_read_excerpt(text, args)
@@ -1157,6 +1250,8 @@ class Investigator:
         token_limit: int | None,
         max_steps: int | None,
         gaps: list[str],
+        obligations: list[dict[str, Any]] | None = None,
+        previous_attempts: list[dict[str, Any]] | None = None,
     ) -> InvestigationResult:
         """Collect missing source facts once within the caller's remaining allowance.
 
@@ -1188,13 +1283,15 @@ class Investigator:
             raise ValueError("evidence collection requires nonnegative integer limits")
         if not isinstance(gaps, list) or any(not isinstance(gap, str) or not gap.strip() for gap in gaps):
             raise ValueError("evidence collection requires explicit source gaps")
+        self._collection_obligations = list(obligations or []) if self._protocol_version >= 11 else []
+        self._collection_attempts = list(previous_attempts or []) if self._protocol_version >= 11 else []
         self._prepare_investigation(hypothesis, state, pack)
         if self._metered:
             token_limit = None
         with investigation_request_scope(token_limit) as task_budget:
             self._task_request_budget = task_budget
             try:
-                if not gaps:
+                if not gaps and not self._collection_obligations:
                     self._collection_state["reason"] = "no-source-gaps"
                 elif hypothesis.change_anchor is not None and (
                     state.file_changes.get(hypothesis.change_anchor.path) != hypothesis.change_anchor
@@ -1229,6 +1326,10 @@ class Investigator:
         tools = self._build_tools()
         known_tools = {tool.name: tool for tool in tools}
         bound = self._llm.bind_tools(tools)
+        if self._protocol_version >= 11:
+            from reviewforge.engine.discovery_submission import bind_discovery_submission
+
+            bound = bind_discovery_submission(self._llm, tools, automatic=True)
         system = SystemMessage(
             content=(
                 "Collect source facts needed to resolve the supplied source-audit gaps. "
@@ -1242,13 +1343,32 @@ class Investigator:
                 "next_evidence {tool,args}."
             )
         )
+        if self._protocol_version >= 11:
+            system.content += (
+                " Structured proof_obligations identify the missing inputs, observed paths/symbols, existing "
+                "references and concrete next_actions. Follow those sources rather than repeating a defect verdict. "
+                "When provided, query/read pinned review knowledge or run an existing repository test through "
+                "the isolated run_repository_test tool. Navigation and unavailable/failed execution receipts "
+                "are not proof; actual program behavior still requires the concrete source operation."
+            )
         assert self._collection_state is not None
         from itertools import count
 
+        seen_directions = set()
         for step in count() if max_steps is None else range(max_steps):
             self._refresh_allocation(hypothesis)
             packet = json.loads(self._exploration_chat(hypothesis, pack)[-1].content)
             packet["gaps"] = gaps
+            if self._protocol_version >= 11:
+                for private in (
+                    "candidate",
+                    "shared_review_workspace_untrusted",
+                    "shared_workspace_instruction",
+                    "proof_duty",
+                ):
+                    packet.pop(private, None)
+                packet["proof_obligations"] = self._collection_obligations
+                packet["previous_collection_attempts"] = self._collection_attempts
             chat = [system, HumanMessage(content=json.dumps(packet, ensure_ascii=False, separators=(",", ":")))]
             plan = plan_request(
                 bound,
@@ -1271,6 +1391,8 @@ class Investigator:
                 break
             # Count dispatch even if its physical retries fail or are interrupted.
             self._collection_state["steps"] = step + 1
+            if self._protocol_version >= 11 and self._on_progress is not None:
+                await self._on_progress(self._observations, self._progress)
             response = await bound.ainvoke(chat, max_tokens=plan.max_output_tokens)
             self._record_tokens(response, chat)
             snapshot = self._task_request_budget.snapshot()
@@ -1302,7 +1424,29 @@ class Investigator:
                     if self._collection_query_exists(name, args, known_tools[name]):
                         self._collection_state["reason"] = "repeated-evidence"
                         return
+                    if self._protocol_version >= 11:
+                        from reviewforge.engine.proof_obligations import query_direction, source_state
+
+                        direction = query_direction(name, args)
+                        before_source = source_state(self._observations, self._progress)
+                        direction_state = json.dumps([before_source, direction], sort_keys=True)
+                        if direction_state in seen_directions:
+                            self._collection_state.update(reason="incomplete-no-new-source-for-direction")
+                            return
+                        seen_directions.add(direction_state)
+                        if any(
+                            direction == {key: row[key] for key in ("tool", "args")}
+                            for attempt in self._collection_attempts
+                            for row in attempt.get("failed_directions", [])
+                        ):
+                            self._collection_state.update(reason="incomplete-repeated-failed-direction")
+                            return
                     await self._run_tool(name, args)
+                    if (
+                        self._protocol_version >= 11
+                        and source_state(self._observations, self._progress) == before_source
+                    ):
+                        self._progress.append({"phase": "obligation-no-new-source", "direction": direction})
             except (ValueError, TypeError):
                 self._collection_state.update(reason="invalid-evidence-tool", outcome="output-error")
                 break
@@ -1327,6 +1471,29 @@ class Investigator:
 
     def _prepare_investigation(self, hypothesis: Hypothesis, state: StateStore, pack: ContextPack) -> None:
         self._state = state
+        self._workspace_digest = pack.workspace_digest
+        self._current_hypothesis = hypothesis
+        if self._protocol_version >= 11 and self._shared_workspace is not None:
+            workspace_ledger = self._shared_workspace.ledger
+            if (
+                workspace_ledger.head_sha != state.head_sha
+                or workspace_ledger.workspace_digest != pack.workspace_digest
+                or self._evidence_store is not None
+                and self._evidence_store.ledger is not workspace_ledger
+                or self._evidence_scope is not None
+                and self._evidence_scope
+                != EvidenceScope(workspace_ledger.run_id, workspace_ledger.head_sha, workspace_ledger.workspace_digest)
+            ):
+                raise ValueError("investigation shared workspace scope mismatch")
+        if (
+            self._protocol_version >= 11
+            and self._evidence_scope is not None
+            and (
+                self._evidence_scope.head_sha != state.head_sha
+                or self._evidence_scope.workspace_digest != pack.workspace_digest
+            )
+        ):
+            raise ValueError("investigation source does not match the fixed evidence scope")
         self._tool_schemas = None
         self._observations = [
             obs for obs in hypothesis.observations if self._protocol_version < 3 or obs.sha == state.head_sha
@@ -1771,6 +1938,28 @@ class Investigator:
         packet["proof_duty"] = next(
             (entry for entry in reversed(self._progress) if entry.get("phase") == "proof-duty"), None
         )
+        if self._protocol_version >= 11:
+            packet["review_context_navigation"] = [
+                entry for entry in self._progress if entry.get("phase") == "review-context-navigation"
+            ]
+        if self._protocol_version >= 11 and self._shared_workspace is not None:
+            packet["shared_review_workspace_untrusted"] = self._shared_workspace.view(
+                task_id=self._task_id or hypothesis.identity,
+                unit_ids=context_units(hypothesis, self._changeset, pack),
+                paths=sorted(
+                    {site.path for site in hypothesis.sites}
+                    | {observation.path for observation in self._observations if observation.path}
+                ),
+                role="investigation",
+                catalog="directory",
+            )
+            packet["shared_workspace_instruction"] = (
+                "Shared notes are untrusted navigation, never source or proof. Use read_shared_evidence to "
+                "bind verified raw records as your own local observations before citing them. Save useful "
+                "findings, unresolved questions and next steps with checkpoint_investigation. The evidence directory "
+                "lists existing paths, ranges and record counts. Use query_review_workspace to obtain full evidence "
+                "reference IDs before acquiring source again; notes.evidence_ids can be read directly."
+            )
         if self._protocol_version >= 9:
             from reviewforge.engine.source_navigation import packet as navigation_packet
 
@@ -2496,6 +2685,7 @@ class Investigator:
         on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
         request_budget: RequestBudget | None = None,
         on_evidence: Callable[[Hypothesis, list[Observation]], None] | None = None,
+        target_identities: set[str] | None = None,
     ) -> list[InvestigationResult]:
         """Investigate every OPEN hypothesis concurrently, then apply verdicts.
 
@@ -2504,9 +2694,11 @@ class Investigator:
         and tool executor are shared and read-only.
         """
 
+        if target_identities is not None and ledger.protocol_version < 11:
+            raise ValueError("targeted investigation requires protocol 11")
         changed = changed_paths if changed_paths is not None else _changed_paths(state)
         ranked = sorted(
-            ledger.open(),
+            [item for item in ledger.open() if target_identities is None or item.identity in target_identities],
             key=lambda hypothesis: (
                 -_SEVERITY_RANK.get(hypothesis.severity, 0),
                 -len(hypothesis.sites),
@@ -2529,13 +2721,35 @@ class Investigator:
             else [InvestigationTask(item.identity, item, (item.identity,)) for item in targets]
         )
         evidence_cache = None
+        owns_evidence_cache = False
         if ledger.protocol_version >= 3:
             if ledger.head_sha != state.head_sha or (
                 pack.workspace_digest and ledger.workspace_digest != pack.workspace_digest
             ):
                 raise ValueError("investigation ledger/context does not match the fixed head workspace")
             tasks = fair_investigation_tasks(tasks)
-            evidence_cache = SharedEvidenceCache(EvidenceScope(ledger.run_id, ledger.head_sha, ledger.workspace_digest))
+            scope = EvidenceScope(ledger.run_id, ledger.head_sha, ledger.workspace_digest)
+            if ledger.protocol_version >= 11 and self._evidence_cache is not None:
+                if self._evidence_cache.scope != scope:
+                    raise ValueError("investigation shared evidence scope mismatch")
+                evidence_cache = self._evidence_cache
+            else:
+                evidence_cache = SharedEvidenceCache(
+                    scope, **({"max_result_chars": None} if ledger.protocol_version >= 11 else {})
+                )
+                owns_evidence_cache = True
+        shared_workspace = None
+        if ledger.protocol_version >= 11:
+            from reviewforge.engine.review_session import EvidenceStore
+            from reviewforge.engine.review_workspace import SharedReviewWorkspace
+
+            if self._shared_workspace is not None and self._shared_workspace.ledger is not ledger:
+                raise ValueError("investigation shared workspace does not belong to this ledger")
+            if self._evidence_store is not None and self._evidence_store.ledger is not ledger:
+                raise ValueError("investigation evidence store does not belong to this ledger")
+            shared_workspace = self._shared_workspace or SharedReviewWorkspace(ledger)
+            if self._evidence_store is None:
+                self._evidence_store = EvidenceStore(ledger)
         semaphore = asyncio.Semaphore(max(1, concurrency))
         available_tokens = None if token_budget is None else max(0, token_budget)
         adaptive = request_budget is not None and request_budget.adaptive
@@ -2550,6 +2764,10 @@ class Investigator:
                     member = ledger.items[identity]
                     member.observations = list(observations)
                     member.investigation_progress = list(progress)
+                if shared_workspace is not None:
+                    from reviewforge.engine.investigation_workspace import publish_progress
+
+                    publish_progress(shared_workspace, self._evidence_store, hypothesis, observations, progress)
                 if on_update is not None:
                     await on_update(ledger)
 
@@ -2596,6 +2814,8 @@ class Investigator:
                     starting_steps=allowance.get("total_steps", 0) if managed else 0,
                     evidence_store=self._evidence_store,
                     on_progress=save_progress if ledger.protocol_version >= 5 else None,
+                    shared_workspace=shared_workspace,
+                    evidence_scope=scope if ledger.protocol_version >= 11 else None,
                 )
                 if managed:
                     worker._max_steps = (
@@ -2676,6 +2896,17 @@ class Investigator:
                 allowance["request_usage_synced"] = dict(usage)
                 hypothesis.investigation_task_id = task.id
             result = await _investigate(index, hypothesis, ledger.investigation_tasks.get(task.id, {}))
+            if shared_workspace is not None:
+                from reviewforge.engine.investigation_workspace import publish_progress
+
+                publish_progress(
+                    shared_workspace,
+                    self._evidence_store,
+                    hypothesis,
+                    result.observations,
+                    result.progress,
+                    result=result,
+                )
             verdict = dict(
                 status=result.verdict,
                 evidence_strength=result.strength,
@@ -2717,7 +2948,7 @@ class Investigator:
                 if not job.done():
                     job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
-            if evidence_cache is not None:
+            if evidence_cache is not None and owns_evidence_cache:
                 await evidence_cache.close()
 
 

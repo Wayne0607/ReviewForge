@@ -32,6 +32,7 @@ from reviewforge.engine.editor import (
 from reviewforge.engine.evidence_followup import run_evidence_followup
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus, Mechanism, Site
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator, build_anchor_resolver
+from reviewforge.engine.investigation_evidence import EvidenceScope, SharedEvidenceCache
 from reviewforge.engine.investigation_tasks import build_investigation_tasks, fair_investigation_tasks
 from reviewforge.engine.investigator import Investigator, build_workspace_executor
 from reviewforge.engine.language import resolve_output_language
@@ -48,6 +49,7 @@ from reviewforge.engine.request_budget import BudgetedChatLLM, RequestBudget, bu
 from reviewforge.engine.run_health import RunHealth
 from reviewforge.engine.security_categories import is_security_category
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit
+from reviewforge.engine.streaming_review import unfinished_discovery_units
 from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 
 logger = logging.getLogger(__name__)
@@ -164,6 +166,59 @@ async def _run_llm_stages(
     published_clusters: set[tuple[str, str]] | None = None,
     inline_used: int = 0,
 ) -> Publication:
+    """Own the protocol-11 source cache across discovery and investigation."""
+    cache = (
+        SharedEvidenceCache(
+            EvidenceScope(ledger.run_id, ledger.head_sha, ledger.workspace_digest), max_result_chars=None
+        )
+        if ledger.protocol_version >= 11
+        else None
+    )
+    try:
+        return await _run_llm_stages_cached(
+            orchestrator,
+            state,
+            changeset,
+            pack,
+            ledger,
+            workspace,
+            config,
+            language,
+            usage_by_agent,
+            resume=resume,
+            covered_ids=covered_ids,
+            published_clusters=published_clusters,
+            inline_used=inline_used,
+            evidence_cache=cache,
+        )
+    except BaseException:
+        if ledger.protocol_version >= 11:
+            for unit_id in unfinished_discovery_units(ledger):
+                ledger.unresolved_units.setdefault(unit_id, "interrupted-discovery")
+            await _persist_ledger(orchestrator, ledger)
+        raise
+    finally:
+        if cache is not None:
+            await cache.close()
+
+
+async def _run_llm_stages_cached(
+    orchestrator: Any,
+    state: StateStore,
+    changeset: SemanticChangeSet,
+    pack: ContextPack,
+    ledger: HypothesisLedger,
+    workspace: Any,
+    config: Any,
+    language: str,
+    usage_by_agent: dict[str, int],
+    *,
+    resume: bool = False,
+    covered_ids: set[str] | None = None,
+    published_clusters: set[tuple[str, str]] | None = None,
+    inline_used: int = 0,
+    evidence_cache: SharedEvidenceCache | None = None,
+) -> Publication:
     """Discover with specialist responsibilities, investigate, then edit.
 
     Saved v1/v2 protocols retain their separate generator and lens passes.
@@ -242,7 +297,8 @@ async def _run_llm_stages(
         )
 
     active_sources: dict[str, list[Any]] = {}
-    discovery_active = not resume or bool(ledger.unresolved_units)
+    discovery_pending = bool(ledger.unresolved_units) or bool(unfinished_discovery_units(ledger))
+    discovery_active = not resume or discovery_pending
     allocation_models = (
         (routed("investigator"), routed("investigator", closing=True), routed("editor"))
         if request_budget is not None and request_budget.adaptive
@@ -329,9 +385,55 @@ async def _run_llm_stages(
     if request_budget is not None:
         await budget_changed(request_budget.snapshot())
 
+    async def investigate_candidates(target_identities: set[str] | None = None) -> None:
+        from reviewforge.engine.review_session import EvidenceStore
+
+        investigator = Investigator(
+            routed("investigator"),
+            executor,
+            output_language=language,
+            changeset=changeset,
+            protocol_version=ledger.protocol_version,
+            closing_llm=routed("investigator", closing=True) if ledger.protocol_version >= 2 else None,
+            evidence_store=EvidenceStore(ledger) if ledger.protocol_version >= 5 else None,
+            **({"evidence_cache": evidence_cache} if evidence_cache is not None else {}),
+        )
+        await investigator.run(
+            ledger,
+            state,
+            pack,
+            max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
+            concurrency=1 if target_identities is not None else config.investigator_concurrency,
+            on_update=checkpoint,
+            token_budget=(
+                request_budget.available("investigation")
+                if request_budget is not None
+                else max(0, config.max_tokens_per_pr - sum(usage_by_agent.values()) - 16_000)
+                if ledger.protocol_version >= 2
+                else None
+            ),
+            request_budget=request_budget,
+            on_evidence=evidence_changed if request_budget is not None and request_budget.adaptive else None,
+            **({"target_identities": target_identities} if target_identities is not None else {}),
+        )
+
+    streaming = None
+    if ledger.protocol_version >= 11:
+        from reviewforge.engine.streaming_review import StreamingReviewScheduler
+
+        # Retry only pre-existing operational interruptions. A failure from
+        # this execution is kept partial until a later resume, never claimed
+        # a second time by the end-of-discovery drain.
+        for item in ledger.items.values():
+            if item.status == HypothesisStatus.UNKNOWN and item.retryable:
+                item.status = HypothesisStatus.OPEN
+        streaming = StreamingReviewScheduler(ledger, investigate_candidates, checkpoint, emit=events.emit)
+        events.emit("streaming_review.started", {"mode": "receipt-interleaving", "background_concurrency": False})
+        await streaming.drain()
+
     # A frozen first review proves discovery was attempted. Retry only if
     # generation/lens failures remain; finished verdicts stay in the ledger.
-    if not resume or ledger.unresolved_units:
+    if not resume or discovery_pending:
         anchor_resolver = build_anchor_resolver(workspace, changeset)
         selections = select_lenses(state, changeset, max_lenses=config.max_lenses)
         events.emit(
@@ -354,6 +456,8 @@ async def _run_llm_stages(
             if ledger.protocol_version >= 5:
                 discovery_options["executor"] = executor
                 discovery_options["session_request_limit"] = config.session_max_requests
+            if evidence_cache is not None:
+                discovery_options["evidence_cache"] = evidence_cache
         generator = HypothesisGenerator(
             routed("hypothesis_generator"),
             max_input_chars=config.generator_max_input_chars,
@@ -361,6 +465,7 @@ async def _run_llm_stages(
             context_max_chars=config.context_pack_max_chars,
             output_language=language,
             on_update=checkpoint,
+            **({"on_candidates": streaming.on_candidates} if streaming is not None else {}),
             anchor_resolver=anchor_resolver,
             **discovery_options,
         )
@@ -406,38 +511,14 @@ async def _run_llm_stages(
 
     discovery_active = False
     refresh_allocation()
-    for item in ledger.items.values():
-        if item.status == HypothesisStatus.UNKNOWN and item.retryable:
-            item.status = HypothesisStatus.OPEN
-    if ledger.open():
-        from reviewforge.engine.review_session import EvidenceStore
-
-        investigator = Investigator(
-            routed("investigator"),
-            executor,
-            output_language=language,
-            changeset=changeset,
-            protocol_version=ledger.protocol_version,
-            closing_llm=routed("investigator", closing=True) if ledger.protocol_version >= 2 else None,
-            evidence_store=EvidenceStore(ledger) if ledger.protocol_version >= 5 else None,
-        )
-        await investigator.run(
-            ledger,
-            state,
-            pack,
-            max_hypotheses_per_pr=config.investigator_max_hypotheses_per_pr,
-            concurrency=config.investigator_concurrency,
-            on_update=checkpoint,
-            token_budget=(
-                request_budget.available("investigation")
-                if request_budget is not None
-                else max(0, config.max_tokens_per_pr - sum(usage_by_agent.values()) - 16_000)
-                if ledger.protocol_version >= 2
-                else None
-            ),
-            request_budget=request_budget,
-            on_evidence=evidence_changed if request_budget is not None and request_budget.adaptive else None,
-        )
+    if streaming is not None:
+        await streaming.drain()
+    else:
+        for item in ledger.items.values():
+            if item.status == HypothesisStatus.UNKNOWN and item.retryable:
+                item.status = HypothesisStatus.OPEN
+        if ledger.open():
+            await investigate_candidates()
 
     if ledger.protocol_version >= 3:
         gate = ProofGate(routed("editor"), output_language=language, on_update=checkpoint)
@@ -452,13 +533,24 @@ async def _run_llm_stages(
                     changeset=changeset,
                     protocol_version=ledger.protocol_version,
                     on_evidence=evidence_changed if request_budget is not None and request_budget.adaptive else None,
+                    **(
+                        {
+                            "evidence_cache": evidence_cache,
+                            "evidence_scope": EvidenceScope(ledger.run_id, ledger.head_sha, ledger.workspace_digest),
+                        }
+                        if evidence_cache is not None
+                        else {}
+                    ),
                 )
 
-            changed_evidence = await run_evidence_followup(collector, ledger, state, pack, on_update=checkpoint)
-            if changed_evidence:
+            changed_evidence = False
+            while await run_evidence_followup(collector, ledger, state, pack, on_update=checkpoint):
+                changed_evidence = True
                 # New saved source invalidates prior permission. The independent
                 # reconstruction and original gate must judge it again.
                 await gate.run(ledger)
+                if ledger.protocol_version < 11:
+                    break
             events.emit("evidence_followup.completed", {"new_source_evidence": changed_evidence})
         events.emit(
             "publication_proof.completed",
@@ -826,11 +918,15 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
             or review.get("workspace_digest") != ledger.workspace_digest
         )
 
-    needs_resume = bool(ledger.unresolved_units) or any(
-        item.status == HypothesisStatus.OPEN
-        or (item.status == HypothesisStatus.UNKNOWN and item.retryable)
-        or (item.status == HypothesisStatus.CONFIRMED and publication_pending(item))
-        for item in ledger.items.values()
+    needs_resume = (
+        bool(ledger.unresolved_units)
+        or bool(unfinished_discovery_units(ledger))
+        or any(
+            item.status == HypothesisStatus.OPEN
+            or (item.status == HypothesisStatus.UNKNOWN and item.retryable)
+            or (item.status == HypothesisStatus.CONFIRMED and publication_pending(item))
+            for item in ledger.items.values()
+        )
     )
     if saved and needs_resume and any("coverage" not in record["payload"] for record in records):
         # Old dev records cannot prove which confirmed facts were published.
@@ -968,7 +1064,7 @@ async def run_hypothesis_pipeline(orchestrator: Any, state: Any) -> RunHealth:
     return RunHealth.build(
         publication_failures=proof_failures,
         publication_retryable=any(proof_retryable(item, ledger) for item in hypotheses),
-        hypothesis_failures=len(ledger.unresolved_units),
+        hypothesis_failures=len(set(ledger.unresolved_units) | unfinished_discovery_units(ledger)),
         investigation_unknown_errors=unknown_error,
         investigation_retryable=any(item.retryable for item in hypotheses),
         protocol_version=ledger.protocol_version,

@@ -266,11 +266,17 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
             for call in calls if unlimited else calls[:8]:
                 reply = await worker._run_tool(call["name"], call["args"])
                 added = worker._observations[before:]
+                details = {"error": reply} if not added else {}
+                if worker._protocol_version >= 11:
+                    from reviewforge.engine.investigation_workspace import WORKSPACE_ACTIONS, action_feedback
+
+                    if call["name"] in WORKSPACE_ACTIONS:
+                        details = action_feedback(reply)
                 feedback.append(
                     {
                         "action": call["name"],
                         "observations": [item.id for item in added],
-                        **({"error": reply} if not added else {}),
+                        **details,
                     }
                 )
                 before = len(worker._observations)
@@ -284,14 +290,37 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
         if final or results or errors:
             feedback.append({"previous_receipt": record["last_receipt"]})
         record["feedback"] = feedback
-        if unlimited and repeated_state(
-            record,
-            state={"observations": [asdict(obs) for obs in worker._observations], "feedback": feedback},
-            receipt={
-                "calls": [{"name": call["name"], "args": call["args"]} for call in calls],
+        transition_state = {"observations": [asdict(obs) for obs in worker._observations], "feedback": feedback}
+        transition_receipt = {
+            "calls": [{"name": call["name"], "args": call["args"]} for call in calls],
+            "errors": errors,
+            "content": getattr(response, "content", ""),
+        }
+        fresh_source = False
+        if worker._protocol_version >= 11:
+            from reviewforge.engine.proof_obligations import query_direction, source_state
+
+            transition_state = {
+                "source": source_state(worker._observations, worker._progress),
+                "feedback": [{key: value for key, value in row.items() if key != "observations"} for row in feedback],
+            }
+            fresh_source = record.get("semantic_source_state") != transition_state["source"]
+            if fresh_source:
+                record["semantic_source_state"] = transition_state["source"]
+                record["transition_fingerprints"] = []
+            transition_receipt = {
+                "calls": [query_direction(call["name"], call["args"]) for call in calls],
                 "errors": errors,
-                "content": getattr(response, "content", ""),
-            },
+                **({"content": getattr(response, "content", "")} if not calls else {}),
+            }
+        if (
+            unlimited
+            and not fresh_source
+            and repeated_state(
+                record,
+                state=transition_state,
+                receipt=transition_receipt,
+            )
         ):
             await save()
             return result_error("no-progress-cycle")

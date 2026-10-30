@@ -353,6 +353,7 @@ class HypothesisGenerator:
         prompt_template: str = "generator",
         skill_body: str = "",
         on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
+        on_candidates: Callable[[HypothesisLedger, tuple[str, ...]], Awaitable[None]] | None = None,
         anchor_resolver: AnchorResolver | None = None,
         json_object_output: bool | None = None,
         discovery_target_input_chars: int = 32_000,
@@ -376,6 +377,7 @@ class HypothesisGenerator:
         self._prompt_template = prompt_template
         self._skill_body = skill_body
         self._on_update = on_update
+        self._on_candidates = on_candidates
         self._anchor_resolver = anchor_resolver
         self._json_object_output = (
             bool(getattr(llm, "json_object_output", False)) if json_object_output is None else json_object_output
@@ -1439,7 +1441,13 @@ class HypothesisGenerator:
                     payload["discovery_basis"] = copy.deepcopy(
                         {
                             field: item[field]
-                            for field in ("behavior", "discrepancy", "trigger_basis", "violation")
+                            for field in (
+                                "behavior",
+                                "discrepancy",
+                                "trigger_basis",
+                                "violation",
+                                *(("atomic_origin",) if ledger.protocol_version >= 11 else ()),
+                            )
                             if field in item
                         }
                     )
@@ -1493,6 +1501,10 @@ class HypothesisGenerator:
                 **({"discovery_basis": payload["discovery_basis"]} if ledger.protocol_version >= 3 else {}),
                 **({"change_anchor": change} if change is not None else {}),
             )
+            if ledger.protocol_version >= 11:
+                from reviewforge.engine.atomic_candidates import bind_atomic_identity
+
+                hypothesis = bind_atomic_identity(hypothesis, ledger)
             ledger.upsert(hypothesis)
             ledger.no_issue_units.pop(hypothesis.unit_id, None)
             result.accepted += 1

@@ -131,6 +131,14 @@ async def handle_github_webhook(request: Request) -> dict[str, str]:
                             file_diffs={f["filename"]: f.get("patch") or "" for f in files_data},
                         )
                         populate_file_changes(state, files_data)
+                        v4_config = getattr(orchestrator, "_pipeline_v4_config", None)
+                        if getattr(v4_config, "protocol_version", 0) >= 11 and getattr(v4_config, "mode", "legacy") in {
+                            "hypothesis",
+                            "shadow",
+                        }:
+                            context = await github.get_pr_issue_context(repo, int(pr_number), head_sha)
+                            state.linked_issue_context = context
+                            state.linked_issues = context["issues"]
 
                         logger.info(f"Starting review for PR #{pr_number} on {repo}")
                         summary = await orchestrator.run(state)

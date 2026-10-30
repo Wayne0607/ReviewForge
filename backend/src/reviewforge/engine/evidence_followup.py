@@ -1,9 +1,10 @@
-"""One evidence-only continuation inside the original investigation allowance.
+"""Evidence-only continuation inside the original investigation policy.
 
 A source-audit gap is a navigation request, never evidence or permission to
 revise a claim. Only fresh saved source facts invalidate the original proof
 receipt; failed searches and repeated text remain in the followup audit trail.
-The persisted task marker is written before dispatch and is never retried.
+Protocols 4–10 retain their persisted one-shot marker. Protocol 11 records
+source-bound obligation segments and continues only while actual evidence grows.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ def _preflight(item: Hypothesis, ledger: HypothesisLedger) -> bool:
 def _original_task(item: Hypothesis, ledger: HypothesisLedger) -> dict[str, Any] | None:
     task = ledger.investigation_tasks.get(item.investigation_task_id)
     if not isinstance(task, dict) or "evidence_followup" in task:
+        return None
+    if ledger.protocol_version >= 11 and any(field not in task for field in (*_COUNTERS, *_LIMITS)):
         return None
     # A historical task without frozen limits/counters cannot be upgraded into
     # a fresh allowance. Bool is deliberately not accepted as a numeric limit.
@@ -179,11 +182,12 @@ async def run_evidence_followup(
     pack: Any,
     on_update: Callable[[HypothesisLedger], Awaitable[None]] | None = None,
 ) -> bool:
-    """Add sources once per original task; return whether independent audit is due.
+    """Add missing sources; return whether a new independent audit is due.
 
     The caller serializes this phase and reruns the independent audit/proof gate
     only when True is returned. No task, status, claim or assessment is created
     or reopened here, and the worker retains its physical PR budget.
+    Historical protocols remain one-shot; protocol 11 uses durable obligation segments.
     """
     if (
         ledger.protocol_version < 4
@@ -191,6 +195,8 @@ async def run_evidence_followup(
         or getattr(pack, "workspace_digest", None) != ledger.workspace_digest
     ):
         return False
+    if ledger.protocol_version >= 11:
+        return await _run_obligation_followup(worker, ledger, state, pack, on_update)
     changed = False
     resolved_worker = None
     for item in list(ledger.items.values()):
@@ -298,4 +304,208 @@ async def run_evidence_followup(
                 record["state"] = "interrupted"
             if on_update is not None:
                 await on_update(ledger)
+    return changed
+
+
+async def _run_obligation_followup(worker, ledger, state, pack, on_update):
+    """Continue only missing preflight inputs, bound to actual acquired sources."""
+    from reviewforge.engine.proof_obligations import build_obligations, failed_directions, source_facts, source_state
+    from reviewforge.engine.review_session import EvidenceStore, fingerprint
+
+    changed = False
+    visited = set()
+    resolved_worker = None
+
+    async def save():
+        if on_update is not None:
+            await on_update(ledger)
+
+    for item in list(ledger.items.values()):
+        if not _preflight(item, ledger) or item.investigation_task_id in visited:
+            continue
+        task = _original_task(item, ledger)
+        if task is None:
+            continue
+        if task.get("budget_policy") != "usage-only-v1" or any(
+            field not in task or task[field] is not None for field in ("budget_steps_limit", "token_limit")
+        ):
+            continue  # Historical finite tasks never receive a fresh execution policy.
+        visited.add(item.investigation_task_id)
+        obligations = build_obligations(item, ledger)
+        if not obligations:
+            continue
+        binding = {
+            "run_id": ledger.run_id,
+            "head_sha": ledger.head_sha,
+            "workspace_digest": ledger.workspace_digest,
+            "task_id": item.investigation_task_id,
+            "budget_steps_limit": task["budget_steps_limit"],
+            "token_limit": task["token_limit"],
+        }
+        followup = task.setdefault(
+            "evidence_followup_v11",
+            {
+                "binding": binding,
+                "binding_id": fingerprint(binding),
+                "segments": [],
+                "state": "pending",
+            },
+        )
+        if followup.get("binding") != binding or followup.get("binding_id") != fingerprint(binding):
+            raise ValueError("proof-obligation-followup-binding-mismatch")
+        trigger = fingerprint(
+            [source_state(item.observations, item.investigation_progress), [row["id"] for row in obligations]]
+        )
+        segments = followup["segments"]
+        if any(
+            segment.get("trigger") == trigger
+            and segment.get("state")
+            in {
+                "incomplete",
+                "started",
+                "interrupted",
+                "rejected",
+            }
+            for segment in segments
+        ):
+            followup.update(state="incomplete", reason="no-new-source-for-unresolved-obligation")
+            await save()
+            continue
+        original = copy.deepcopy(item)
+        expected_scope = {
+            identity: proof_fingerprint(ledger.items[identity], ledger.head_sha, ledger.workspace_digest)
+            for identity in task["members"]
+        }
+        allocated = {
+            "tokens": None
+            if task["token_limit"] is None
+            else task["token_limit"] - task["total_tokens"] - task["total_unreported_tokens"],
+            "steps": None if task["budget_steps_limit"] is None else task["budget_steps_limit"] - task["total_steps"],
+        }
+        segment = {
+            "state": "started",
+            "trigger": trigger,
+            "source_state": source_state(item.observations, item.investigation_progress),
+            "obligations": copy.deepcopy(obligations),
+            "allocated": allocated,
+            "audit_hash": audit_hash(item, ledger),
+            "original_audit": copy.deepcopy(ledger.source_audits[item.id]),
+            "original_review": copy.deepcopy(ledger.publication_reviews[item.id]),
+            "tokens": 0,
+            "unreported_tokens": 0,
+            "steps": 0,
+            "new_facts": 0,
+            "charged": {},
+        }
+        segments.append(segment)
+        followup.update(state="collecting", obligations=copy.deepcopy(obligations))
+        await save()  # Admission and original allowance are durable before dispatch.
+        if resolved_worker is None:
+            resolved_worker = worker if hasattr(worker, "collect_evidence") else worker()
+        store = EvidenceStore(ledger)
+
+        def account():
+            charged = ledger.items[task["charged_to"]]
+            for source, total, member in (
+                ("tokens", "total_tokens", "investigation_tokens"),
+                ("unreported_tokens", "total_unreported_tokens", "investigation_unreported_tokens"),
+                ("steps", "total_steps", "investigation_steps"),
+            ):
+                delta = segment[source] - segment["charged"].get(source, 0)
+                task[total] += delta
+                setattr(charged, member, getattr(charged, member) + delta)
+                segment["charged"][source] = segment[source]
+
+        async def retain(result):
+            nonlocal changed, expected_scope
+            # Counters are checkpointed as deltas, including unknown provider usage.
+            valid_usage = False
+            try:
+                valid_usage = _save_segment(segment, result)
+            finally:
+                account()
+            if not valid_usage:
+                raise ValueError("invalid-segment-accounting")
+            if (allocated["tokens"] is not None and result.tokens + result.unreported_tokens > allocated["tokens"]) or (
+                allocated["steps"] is not None and result.steps > allocated["steps"]
+            ):
+                raise ValueError("segment-exceeded-original-allocation")
+            _new_facts(result, original, ledger.head_sha)
+            if any(
+                proof_fingerprint(ledger.items[identity], ledger.head_sha, ledger.workspace_digest) != expected
+                for identity, expected in expected_scope.items()
+            ):
+                raise ValueError("original-proof-scope-changed")
+            count = len(
+                source_facts(result.observations, result.progress)
+                - source_facts(original.observations, original.investigation_progress)
+            )
+            segment["new_facts"] = count
+            segment["failed_directions"] = failed_directions(result.observations)
+            if count:
+                for observation in result.observations:
+                    store.observation(observation)
+                for identity in task["members"]:
+                    member = ledger.items[identity]
+                    member.observations = copy.deepcopy(result.observations)
+                    member.investigation_progress = copy.deepcopy(result.progress)
+                expected_scope = {
+                    identity: proof_fingerprint(ledger.items[identity], ledger.head_sha, ledger.workspace_digest)
+                    for identity in task["members"]
+                }
+                changed = True
+            await save()
+
+        previous_callback = getattr(resolved_worker, "_on_progress", None)
+
+        async def progress(_observations, _progress):
+            snapshot = resolved_worker.evidence_followup_snapshot()
+            budget = getattr(resolved_worker, "_task_request_budget", None)
+            if budget is not None:
+                usage = budget.snapshot()
+                snapshot.unreported_tokens = int(usage["unreported_reserved_tokens"])
+                if usage["request_count"]:
+                    snapshot.tokens = int(usage["reported_tokens"])
+            await retain(snapshot)
+
+        resolved_worker._on_progress = progress
+        returned = None
+        try:
+            returned = await resolved_worker.collect_evidence(
+                copy.deepcopy(original),
+                state,
+                pack,
+                token_limit=allocated["tokens"],
+                max_steps=allocated["steps"],
+                gaps=copy.deepcopy(ledger.source_audits[item.id]["facts"]["gaps"]),
+                obligations=copy.deepcopy(obligations),
+                previous_attempts=[
+                    {
+                        "failed_directions": row.get("failed_directions", []),
+                        "reason": row.get("reason", ""),
+                    }
+                    for row in segments[:-1]
+                ],
+            )
+            await retain(returned)
+            segment.update(
+                state="awaiting-independent-audit" if segment["new_facts"] else "incomplete",
+                reason=returned.reason,
+                outcome=returned.outcome,
+            )
+            followup.update(state=segment["state"], reason=returned.reason)
+        except (Exception, asyncio.CancelledError) as exc:
+            segment.update(state="interrupted" if returned is None else "rejected", error_type=type(exc).__name__)
+            if returned is None:
+                try:
+                    await retain(resolved_worker.evidence_followup_snapshot())
+                except (Exception, asyncio.CancelledError) as snapshot_error:
+                    segment["snapshot_error_type"] = type(snapshot_error).__name__
+                    segment["usage_unavailable"] = True
+            followup.update(state=segment["state"], reason=type(exc).__name__)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            resolved_worker._on_progress = previous_callback
+            await save()
     return changed

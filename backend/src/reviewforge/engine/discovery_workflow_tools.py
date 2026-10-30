@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, create_model
 
+from reviewforge.engine.atomic_candidates import atomic_proposal_schema
 from reviewforge.engine.session_tools import discovery_tools, result_tool
 
 KINDS = {"hypothesis": "submit_hypothesis", "no_issue": "submit_no_issue", "deferred": "defer_unit"}
@@ -33,9 +34,17 @@ def assessment_tools(block, *, protocol_version=6):
     }
     hypothesis_record, clean_record, deferred_record = records.values()
     record = Annotated[hypothesis_record | clean_record | deferred_record, Field(discriminator="kind")]
+    if protocol_version >= 11:
+        atomic_record = atomic_proposal_schema(hypothesis_record)
+        records["atomic_hypotheses"] = atomic_record
+        record = Annotated[
+            hypothesis_record | clean_record | deferred_record | atomic_record, Field(discriminator="kind")
+        ]
     tool = result_tool(
         "submit_assessments",
-        "Submit records for ALL pending units in one call. Each record is a hypothesis, no_issue or deferred.",
+        "Submit independently validated pending records. Use atomic_hypotheses for independent consequences."
+        if protocol_version >= 11
+        else "Submit records for ALL pending units in one call. Each record is a hypothesis, no_issue or deferred.",
         {
             "records": (
                 list[record],

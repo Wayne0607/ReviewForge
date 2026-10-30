@@ -35,6 +35,11 @@ def extend_sources(block, observation, aliases):
     for offset, text in enumerate(observation.excerpt.splitlines()):
         block.facts.append(SourceLine("context", observation.path, first + offset, text))
     block.register_source_refs()
+    extend_source_aliases(block, aliases)
+
+
+def extend_source_aliases(block, aliases):
+    """Assign consumer-local aliases to newly registered immutable source."""
     existing = set(aliases.values())
     paths = {}
     for alias, reference in aliases.items():
@@ -125,6 +130,7 @@ def result_payload(name, args, block, aliases):
         },
         "sites": [{"source_ref": ref} for ref in sites],
         "trigger_basis": {"source_ref": args["trigger_ref"]},
+        **({"atomic_origin": copy.deepcopy(args["atomic_origin"])} if "atomic_origin" in args else {}),
     }
 
 

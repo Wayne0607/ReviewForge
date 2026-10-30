@@ -43,6 +43,11 @@ def build_investigation_tasks(
         }
         if item.change_anchor is not None:
             facts["change_anchor"] = item.change_anchor.to_dict()
+        atomic = item.discovery_basis.get("atomic_origin")
+        if atomic:
+            # Shared source is reusable; separately declared proof obligations
+            # keep their own case even when their present wording is equal.
+            facts["atomic_case"] = {key: atomic[key] for key in ("proposal_identity", "claim_id")}
         if not anchor or anchor == "<module>":
             facts["unit_id"] = item.unit_id
         task_id = (

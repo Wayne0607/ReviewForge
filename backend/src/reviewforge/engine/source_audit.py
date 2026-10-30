@@ -22,6 +22,84 @@ from reviewforge.engine.proof_packet_limits import fits_proof_input
 from reviewforge.engine.request_budget import plan_request, snapshot_available
 
 _KINDS = {"caller", "test", "schema", "configuration", "format", "language"}
+_KNOWLEDGE_KINDS = {"documentation", "issue"}
+
+
+def knowledge_sources(item, ledger: HypothesisLedger | None) -> dict[str, dict[str, Any]]:
+    """Map local observations to verified complete original knowledge receipts.
+
+    The controller's group metadata binds all fragments before JSON parsing.
+    A partial JSON excerpt, agent checkpoint or copied successful-looking text
+    cannot supply knowledge provenance on its own.
+    """
+    from reviewforge.engine.knowledge_receipt import validate_knowledge_receipt
+    from reviewforge.engine.proof_gate import _unique_object
+
+    if ledger is None or ledger.protocol_version < 11:
+        return {}
+    by_id = {observation.id: observation for observation in item.observations}
+    if len(by_id) != len(item.observations):
+        return {}
+    sources = {}
+    for entry in item.investigation_progress:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("phase") != "review-context-receipt"
+            or entry.get("tool") != "read_review_knowledge"
+        ):
+            continue
+        try:
+            ids = entry["observation_ids"]
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or any(not isinstance(identity, str) for identity in ids)
+                or len(set(ids)) != len(ids)
+                or any(identity not in by_id for identity in ids)
+                or entry.get("head_sha") != ledger.head_sha
+                or entry.get("workspace_digest") != ledger.workspace_digest
+                or not isinstance(entry.get("query"), str)
+            ):
+                raise ValueError("invalid-knowledge-observation-group")
+            group = [by_id[identity] for identity in ids]
+            if any(
+                observation.tool != "read_review_knowledge"
+                or observation.status != "success"
+                or observation.sha != ledger.head_sha
+                or observation.query != entry["query"]
+                for observation in group
+            ):
+                raise ValueError("invalid-knowledge-observation")
+            text = "".join(observation.excerpt for observation in group)
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if entry.get("receipt_sha256") != digest or any(
+                observation.result_digest != digest[:16] for observation in group
+            ):
+                raise ValueError("invalid-knowledge-receipt-hash")
+            if not any(
+                isinstance(record, dict)
+                and record.get("phase") == "source-window-v9"
+                and record.get("query") == entry["query"]
+                and record.get("observation_ids") == ids
+                and record.get("saved_chars") == len(text)
+                and record.get("truncated") is False
+                for record in item.investigation_progress
+            ):
+                raise ValueError("missing-complete-knowledge-window")
+            receipt = validate_knowledge_receipt(
+                json.loads(text, object_pairs_hook=_unique_object),
+                head_sha=ledger.head_sha,
+                workspace_digest=ledger.workspace_digest,
+            )
+        except (KeyError, TypeError, ValueError):
+            # Invalid provenance is not supplied to the blind model and cannot
+            # become a contract. Other unrelated valid sources remain useful.
+            continue
+        metadata = {key: value for key, value in receipt.items() if key not in {"content", "status"}}
+        metadata["observation_ids"] = ids[:]
+        for identity in ids:
+            sources[identity] = metadata
+    return sources
 
 
 def audit_hash(item, ledger: HypothesisLedger) -> str:
@@ -29,7 +107,7 @@ def audit_hash(item, ledger: HypothesisLedger) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
+def validate(raw: Any, item, *, protocol_version=4, ledger: HypothesisLedger | None = None) -> dict[str, Any]:
     from reviewforge.engine.proof_gate import _proof, _references, _text
     from reviewforge.engine.session_tools import MAX_RESULT_BYTES
 
@@ -41,6 +119,7 @@ def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
     if raw["hypothesis_id"] != item.id:
         raise ValueError("invalid-source-audit-id")
     refs = _references(item)
+    knowledge = knowledge_sources(item, ledger) if protocol_version >= 11 else {}
     result = {"hypothesis_id": item.id}
     for name in ("execution", "contracts", "gaps"):
         rows = raw[name]
@@ -55,7 +134,7 @@ def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
             if name == "contracts":
                 if not isinstance(row, dict) or set(row) != {"kind", "statement", "evidence"}:
                     raise ValueError("invalid-source-contract")
-                if row["kind"] not in _KINDS:
+                if row["kind"] not in _KINDS | (_KNOWLEDGE_KINDS if protocol_version >= 11 else set()):
                     raise ValueError("invalid-source-contract-kind")
             proof = (
                 _proof({key: row.get(key) for key in ("statement", "evidence")}, refs)
@@ -70,6 +149,12 @@ def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
                 raise ValueError("invalid-source-fact")
             if name == "execution" and set(row) != {"statement", "evidence"}:
                 raise ValueError("invalid-source-execution")
+            if name == "contracts" and row["kind"] in _KNOWLEDGE_KINDS:
+                if any(
+                    knowledge.get(refs[reference]["observation_id"], {}).get("kind") != row["kind"]
+                    for reference in proof["evidence"]
+                ):
+                    raise ValueError("invalid-knowledge-contract-provenance")
             result[name].append({"kind": row["kind"], **proof} if name == "contracts" else proof)
     # Gaps are caveats, not evidence statements. Preserve an unevenly sized
     # explanation verbatim within the original 8 * 600 character total rather
@@ -97,13 +182,13 @@ def current(item, ledger: HypothesisLedger) -> bool:
     elif record.get("fingerprint") != proof_fingerprint(item, ledger.head_sha, ledger.workspace_digest):
         return False
     try:
-        validate(record.get("facts"), item, protocol_version=ledger.protocol_version)
+        validate(record.get("facts"), item, protocol_version=ledger.protocol_version, ledger=ledger)
     except (TypeError, ValueError):
         return False
     return True
 
 
-def consume(raw, item, *, protocol_version=4):
+def consume(raw, item, *, protocol_version=4, ledger: HypothesisLedger | None = None):
     """Keep independently valid source records; never launder a bad citation.
 
     The envelope and each retained record remain strict. Invalid records become
@@ -124,12 +209,17 @@ def consume(raw, item, *, protocol_version=4):
     kept = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": raw["gaps"][:]}
     rejected = []
     # Validate model gaps before adding program diagnostics.
-    validate({**kept, "gaps": kept["gaps"] or ["Validation placeholder"]}, item, protocol_version=protocol_version)
+    validate(
+        {**kept, "gaps": kept["gaps"] or ["Validation placeholder"]},
+        item,
+        protocol_version=protocol_version,
+        ledger=ledger,
+    )
     for name in ("execution", "contracts"):
         for index, row in enumerate(raw[name]):
             trial = {"hypothesis_id": item.id, "execution": [], "contracts": [], "gaps": [], name: [row]}
             try:
-                valid = validate(trial, item, protocol_version=protocol_version)
+                valid = validate(trial, item, protocol_version=protocol_version, ledger=ledger)
             except (TypeError, ValueError) as exc:
                 rejected.append({"array": name, "index": index, "reason": str(exc)})
             else:
@@ -138,7 +228,7 @@ def consume(raw, item, *, protocol_version=4):
         kept["gaps"] = (kept["gaps"] if protocol_version >= 9 else kept["gaps"][:7]) + [
             "Some source reconstruction records failed schema/reference validation; they supply no evidence."
         ]
-    return validate(kept, item, protocol_version=protocol_version), rejected
+    return validate(kept, item, protocol_version=protocol_version, ledger=ledger), rejected
 
 
 def messages(batch, ledger):
@@ -156,10 +246,21 @@ def messages(batch, ledger):
                 "applicable_rules": packet["contract_constraints"],
             }
         )
+        if ledger.protocol_version >= 11:
+            # Source metadata is controller-verified and contains no candidate,
+            # assessment, shared note or agent-authored interpretation.
+            entries[-1]["knowledge_sources"] = list(
+                {
+                    tuple(metadata["observation_ids"]): metadata
+                    for metadata in knowledge_sources(item, ledger).values()
+                }.values()
+            )
     return [
         SystemMessage(
             content=load_prompt(
-                "source_audit_v10"
+                "source_audit_v11"
+                if ledger.protocol_version >= 11
+                else "source_audit_v10"
                 if ledger.protocol_version >= 10
                 else "source_audit_v9"
                 if ledger.protocol_version >= 9
@@ -330,7 +431,12 @@ async def run_source_audit(llm, ledger, on_update=None):
         else:
             for item in batch:
                 try:
-                    facts, rejected = consume(by_id[item.id], item, protocol_version=ledger.protocol_version)
+                    facts, rejected = consume(
+                        by_id[item.id],
+                        item,
+                        protocol_version=ledger.protocol_version,
+                        ledger=ledger,
+                    )
                 except (TypeError, ValueError) as exc:
                     ledger.source_audits[item.id].update(outcome="output-error", reason=str(exc))
                 else:

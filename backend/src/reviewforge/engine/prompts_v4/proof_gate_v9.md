@@ -51,7 +51,8 @@ multiple obligations; references need not be distinct. A source excerpt may be
 partial: do not infer absence, full hunk coverage, or surrounding bindings from it.
 All citable Observations must belong to the supplied fixed head.
 
-Return a JSON object {"reviews":[...]} with exactly one verdict per supplied item, in
+Return a JSON object {"reviews":[...]} with exactly one verdict per supplied item.
+The root object must contain only the reviews key; do not add type or other fields. In
 {{output_language}}. Use exactly ONE of these disjoint shapes; never fill unused
 obligations for refutation or uncertainty. Do not return null placeholder fields.
 

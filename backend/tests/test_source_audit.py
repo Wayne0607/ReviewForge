@@ -298,6 +298,18 @@ def test_v9_blind_and_final_requests_explicitly_identify_json_output():
 
 
 @pytest.mark.asyncio
+async def test_v9_proof_rejects_unexpected_root_fields_even_after_successful_audit():
+    item = candidate()
+    book = ledger(item, protocol=9)
+    llm = GateLLM(replies=[{"audits": [audit()]}, {"type": "json_object", "reviews": [verdict()]}])
+    await ProofGate(llm).run(book)
+    assert len(llm.calls) == 2
+    assert not accepted(item, book)
+    assert book.publication_reviews[item.id]["outcome"] == "output-error"
+    assert book.publication_reviews[item.id]["reason"] == "invalid-review-envelope"
+
+
+@pytest.mark.asyncio
 async def test_v9_oversized_case_reports_packet_size_not_budget():
     item = candidate()
     for index in range(180):

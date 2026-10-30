@@ -3,10 +3,13 @@
 OpenAI-style SDKs expose parsed tool arguments as well as the original argument
 string. A permissive JSON parse can erase duplicate keys; typing the resulting
 dict cannot recover them. Retain the same uniqueness boundary as text outputs.
+V9 discovery may explicitly accept an identical repeated kind discriminator;
+conflicts, duplicate factual fields and the original raw body remain protected.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -38,7 +41,7 @@ def raw_tool_calls(response: Any) -> list[dict[str, Any]] | None:
     return raw
 
 
-def strict_tool_call(call: Any, raw: Any = None) -> dict[str, Any]:
+def strict_tool_call(call: Any, raw: Any = None, *, allow_redundant_kind: bool = False) -> dict[str, Any]:
     """Validate a single untouched call and its explicitly associated raw body."""
     if not isinstance(call, dict) or not isinstance(call.get("name"), str) or not isinstance(call.get("args"), dict):
         raise ValueError("invalid-native-tool-call")
@@ -53,13 +56,38 @@ def strict_tool_call(call: Any, raw: Any = None) -> dict[str, Any]:
             raise ValueError("mismatched-native-tool-call")
         arguments = function.get("arguments")
         if isinstance(arguments, str):
-            arguments = json.loads(arguments, object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+            normalized = []
+
+            def pairs_hook(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        if (
+                            allow_redundant_kind
+                            and key == "kind"
+                            and isinstance(value, str)
+                            and value in {"hypothesis", "no_issue", "deferred"}
+                            and result[key] == value
+                        ):
+                            normalized.append("duplicate-identical-kind")
+                            continue
+                        raise ValueError("duplicate-native-argument-key")
+                    result[key] = value
+                return result
+
+            arguments = json.loads(
+                arguments,
+                object_pairs_hook=pairs_hook if allow_redundant_kind else _unique_object,
+                parse_constant=_invalid_constant,
+            )
+            if normalized:
+                call = {**call, "transport_normalizations": normalized, "transport_raw_call": copy.deepcopy(raw)}
         if not isinstance(arguments, dict) or arguments != call["args"]:
             raise ValueError("changed-native-tool-arguments")
     return call
 
 
-def inspect_tool_calls(response: Any) -> tuple[list[dict[str, Any]], list[str]]:
+def inspect_tool_calls(response: Any, *, allow_redundant_kind: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
     """Keep individually complete calls, recording any incomplete outer stream.
 
     The caller may retain complete candidate leads, but any error prevents
@@ -99,7 +127,7 @@ def inspect_tool_calls(response: Any) -> tuple[list[dict[str, Any]], list[str]]:
                 if raw is None or raw_index in consumed_raw:
                     raise ValueError("mismatched-native-tool-call")
                 consumed_raw.add(raw_index)
-            valid.append(strict_tool_call(call, raw))
+            valid.append(strict_tool_call(call, raw, allow_redundant_kind=allow_redundant_kind))
         except json.JSONDecodeError:
             errors.append("malformed-native-json")
         except (ValueError, TypeError):

@@ -31,6 +31,7 @@ POLICY = "fair-assessments-v1"
 REPAIR_POLICY = "fair-assessments-v2"
 READ_REQUESTS = 2
 REPAIR_REQUESTS = 2
+INPUT_PARTITION = "separate-structural-v1"
 
 
 def compact_packet(block, aliases, pending, observations):
@@ -148,8 +149,17 @@ def rejected(name, args, reason, fields=None):
 
 
 async def consume(generator, work, response, tools, schemas, delivered, ledger, result, right, store):
-    calls, errors = actions(response, tools)
+    calls, errors = actions(response, tools, allow_redundant_kind=work.protocol_version >= 9)
     feedback = [{"error": error["reason"], "unit_id": error["unit_id"]} for error in errors]
+    for call in calls:
+        if call.get("transport_normalizations"):
+            work.session.event(
+                "native-transport-normalized",
+                action=call["name"],
+                normalizations=call["transport_normalizations"],
+                raw_tool_call=call["transport_raw_call"],
+            )
+            feedback.append({"action": call["name"], "transport_normalizations": call["transport_normalizations"]})
     groups = {}
     reads = 0
     had_result = False
@@ -340,6 +350,36 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             and is_verified_rename(change, ledger.head_sha)
         },
     )
+    existing = [r for r in ledger.discovery_blocks.values() if r.get("source") == generator._source]
+    isolate_structural = ledger.protocol_version >= 9 and (
+        not existing or all(r.get("input_partition") == INPUT_PARTITION for r in existing)
+    )
+    if isolate_structural:
+        structural_ids = {unit_id for block in blocks for unit_id in block.structural_changes}
+        if structural_ids:
+            file_changes = {
+                unit.path: state.file_changes[unit.path] for unit in changeset.units if unit.id in structural_ids
+            }
+            partitions = [
+                [unit for unit in changeset.units if unit.id not in structural_ids],
+                *[[unit] for unit in changeset.units if unit.id in structural_ids],
+            ]
+            blocks = [
+                block
+                for units in partitions
+                if units
+                for block in plan_discovery(
+                    replace(changeset, units=units),
+                    pack,
+                    state.file_diffs or {},
+                    limits=replace(
+                        generator._discovery_limits, max_units=min(4, generator._discovery_limits.max_units)
+                    ),
+                    overview_changeset=overview_changeset or changeset,
+                    file_changes=file_changes,
+                )
+            ]
+            blocks.sort(key=lambda block: (-max(unit.risk_score for unit in block.units), block.id))
     result = HypothesisGenerationResult()
     store = EvidenceStore(ledger)
     right = _right_lines_by_path(state)
@@ -372,6 +412,7 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
                 "unit_ids": [u.id for u in block.units],
                 "units": {},
                 "submission_mode": policy,
+                **({"input_partition": INPUT_PARTITION} if isolate_structural else {}),
                 "status": "pending",
                 "head_sha": ledger.head_sha,
                 "workspace_digest": ledger.workspace_digest,

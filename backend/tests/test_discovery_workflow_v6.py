@@ -69,6 +69,70 @@ async def test_one_native_batch_commits_each_unit_independently():
 
 
 @pytest.mark.asyncio
+async def test_v9_repeated_identical_kind_does_not_discard_valid_sibling_results():
+    def answer(messages, *_):
+        records = [no_issue(unit) for unit in packet(messages)["pending_units"]]
+        reply = batch(*records)
+        args = json.dumps({"records": records}).replace('"kind": "no_issue"', '"kind":"no_issue","kind":"no_issue"', 1)
+        reply.additional_kwargs["reviewforge_raw_tool_calls"] = [
+            {
+                "id": reply.tool_calls[0]["id"],
+                "type": "function",
+                "function": {"name": "submit_assessments", "arguments": args},
+            }
+        ]
+        return reply
+
+    model = SessionModel(handler=answer)
+    _, book = await run(model, ledger=HypothesisLedger("run", "head", "digest", protocol_version=9))
+    assert len(model.calls) == 1 and len(book.no_issue_units) == 4 and not book.unresolved_units
+    work = next(iter(book.discovery_blocks.values()))
+    assert work["workflow"]["invalid_receipts"] == 0
+    assert any("transport_normalizations" in entry for entry in work["workflow"]["feedback"])
+    saved = next(entry for entry in work["session"]["events"] if entry["kind"] == "native-transport-normalized")
+    assert '"kind":"no_issue","kind":"no_issue"' in saved["raw_tool_call"]["function"]["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_v9_structural_and_text_units_have_separate_native_schemas():
+    from test_structural_discovery_v3 import HEAD, Workspace, inputs, text_diff
+
+    from reviewforge.engine.semantic_diff import compile_semantic_changeset
+
+    state, _, _, _ = inputs(protocol=9)
+    state.files_changed.append("service.py")
+    state.file_diffs["service.py"] = text_diff()
+    changes = compile_semantic_changeset(state)
+    context = ContextPack.build(changes, Workspace(updated=True), state, protocol_version=9)
+    seen = []
+
+    def answer(messages, *_):
+        data = packet(messages)
+        units = data["pending_units"]
+        structural = ["change" in unit for unit in units]
+        assert all(structural) or not any(structural)
+        seen.append(any(structural))
+        if not any(structural):
+            return batch(*map(no_issue, units))
+        ref = next(ref for ref, text in data["rows"] if 'load_json("resources/new.json")' in text)
+        return batch(
+            {
+                "kind": "no_issue",
+                "unit_id": units[0]["unit_id"],
+                "source_refs": [ref],
+                "change_fields": ["previous_path", "path"],
+                "checked": "The actual consumer uses the new verified resource path.",
+            }
+        )
+
+    model = SessionModel(handler=answer)
+    book = HypothesisLedger("run", HEAD, "digest", protocol_version=9)
+    await HypothesisGenerator(model, executor=source_executor([])).run(state, context, changes, book)
+    assert set(seen) == {False, True} and not book.unresolved_units
+    assert len(book.no_issue_units) == len(changes.units)
+
+
+@pytest.mark.asyncio
 async def test_partial_success_can_continue_beyond_three_turns_without_reasking_completed_units():
     seen = []
 

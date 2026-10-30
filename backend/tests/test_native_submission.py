@@ -55,6 +55,32 @@ def test_sdk_erased_duplicates_or_non_json_numbers_cannot_licence_native_output(
     assert not valid and errors
 
 
+def test_v9_can_preserve_an_identical_repeated_discriminator_without_changing_arguments():
+    message = converted('{"records":[{"kind":"no_issue","kind":"no_issue","unit_id":"target"}]}')
+    original = copy.deepcopy(message.additional_kwargs["reviewforge_raw_tool_calls"])
+    assert inspect_tool_calls(message)[1]
+    calls, errors = inspect_tool_calls(message, allow_redundant_kind=True)
+    assert not errors and len(calls) == 1
+    assert calls[0]["args"] == message.tool_calls[0]["args"]
+    assert calls[0]["transport_normalizations"] == ["duplicate-identical-kind"]
+    assert calls[0]["transport_raw_call"] == original[0]
+    assert message.additional_kwargs["reviewforge_raw_tool_calls"] == original
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"kind":"hypothesis","kind":"no_issue"}',
+        '{"kind":"unknown","kind":"unknown"}',
+        '{"source_ref":"allowed","source_ref":"allowed"}',
+        '{"unit_id":"target","unit_id":"foreign"}',
+    ],
+)
+def test_v9_discriminator_recovery_still_rejects_conflicts_and_duplicate_fact_fields(arguments):
+    calls, errors = inspect_tool_calls(converted(arguments), allow_redundant_kind=True)
+    assert not calls and errors
+
+
 @pytest.mark.asyncio
 async def test_actual_closure_rejects_duplicate_comparison_even_after_sdk_typed_parse():
     arguments = json.dumps(wire_submission()).replace(

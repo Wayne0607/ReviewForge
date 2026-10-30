@@ -126,8 +126,10 @@ class ReviewSession:
         self.record["status"] = status
 
 
-def actions(response: Any, tools: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    calls, malformed = inspect_tool_calls(response)
+def actions(
+    response: Any, tools: list[Any], *, allow_redundant_kind: bool = False
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    calls, malformed = inspect_tool_calls(response, allow_redundant_kind=allow_redundant_kind)
     errors = [{"reason": reason, "unit_id": ""} for reason in malformed]
     allowed = {tool.name for tool in tools}
     accepted = []

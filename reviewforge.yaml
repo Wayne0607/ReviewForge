@@ -175,7 +175,8 @@ coverage_gap:
 # Hypothesis pipeline remains opt-in through the holdout gate (T11).
 pipeline_v4:
   mode: "legacy"
-  protocol_version: 11
+  protocol_version: 12
+  # Each discovery read carries visible progress that remains available on resume.
   # Shared investigation progress and source reuse are scoped to this run/head/workspace.
   # Completion-driven review: no token, request, step, repair, candidate,
   # citation, result-size or inline-comment quota. Old checkpoint policies stay frozen.

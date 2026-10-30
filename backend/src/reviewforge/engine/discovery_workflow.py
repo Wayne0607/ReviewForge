@@ -28,7 +28,13 @@ from reviewforge.engine.discovery_aliases import expand_response_refs, source_al
 from reviewforge.engine.discovery_repair import apply_repairs, pending_repairs, remember, repair_request
 from reviewforge.engine.discovery_session import extend_sources, restore_observation, result_payload, source_packet
 from reviewforge.engine.discovery_submission import bind_discovery_submission
-from reviewforge.engine.discovery_workflow_tools import KINDS, assessment_tools
+from reviewforge.engine.discovery_workflow_tools import (
+    KINDS,
+    assessment_tools,
+    extract_review_progress,
+    requires_review_progress,
+    with_review_progress,
+)
 from reviewforge.engine.discovery_workspace import (
     WORKSPACE_ACTIONS,
     initialize_progress,
@@ -103,7 +109,8 @@ def request(generator, work, *, read=False, global_remaining=0):
     result_tool, schemas = assessment_tools(active, protocol_version=work.protocol_version)
     tools = [result_tool, *(work.broker._build_tools() if read else [])]
     if work.protocol_version >= 11:
-        tools.extend(workspace_tools())
+        tools.extend(workspace_tools(work.protocol_version) if work.protocol_version >= 12 else workspace_tools())
+    tools = with_review_progress(tools, protocol_version=work.protocol_version)
     scope = {}
     if work.protocol_version < 10:
         scope = {
@@ -125,6 +132,14 @@ def request(generator, work, *, read=False, global_remaining=0):
     packet = compact_packet(work.block, work.aliases, pending, work.broker._observations) | {"session": scope}
     if work.protocol_version >= 11:
         packet["shared_review_workspace"] = workspace_view(work)
+    if work.protocol_version >= 12:
+        packet["discovery_reference_contract"] = {
+            "source_refs": "Use fN.B/R/C aliases in this packet, never obs_N:eN audit IDs.",
+            "required_source_sides": "Each nonempty side lists alternative eligible source refs. "
+            "Choose actual supporting evidence from every nonempty side; do not enumerate every listed ref.",
+            "submissions": "Submit any independently ready units or source-supported OPEN candidates incrementally. "
+            "A missing independent behavior contract belongs in open_question for investigation.",
+        }
     rules = "\n".join(
         dict.fromkeys(
             generator._responsibility_rules.get(name, "")
@@ -133,7 +148,9 @@ def request(generator, work, *, read=False, global_remaining=0):
         )
     )
     prompt = load_prompt(
-        "discovery_workflow_v11"
+        "discovery_workflow_v12"
+        if work.protocol_version >= 12
+        else "discovery_workflow_v11"
         if work.protocol_version >= 11
         else "discovery_workflow_v10"
         if work.protocol_version >= 10
@@ -186,6 +203,31 @@ def rejected(name, args, reason, fields=None, *, unrestricted=False):
     return receipt
 
 
+def discovery_read_receipt(work, name, args, before, reply):
+    """Keep raw saved observations without the investigator's citation command."""
+    observations = work.broker._observations[before:]
+    if not observations:
+        existing = work.broker._query_observation(name, args)
+        if existing is not None:
+            observations = [obs for obs in work.broker._observations if obs.query == existing.query]
+    records = []
+    for observation in observations:
+        record = asdict(observation)
+        if observation.tool == "read_file" and observation.status == "success" and observation.excerpt_line_range:
+            # extend_sources projects these exact saved bytes into the next
+            # packet's f-alias rows. Retain the immutable excerpt in the ledger
+            # and deliver its body once instead of duplicating it in feedback.
+            record.pop("excerpt")
+            record["source_delivery"] = "next-packet-rows"
+        records.append(record)
+    return {
+        "reference_instruction": "Discovery assessments use only fN.B/R/C source aliases in the next source packet. "
+        "Observation IDs below are audit/navigation IDs, not valid discovery source_refs or site_refs.",
+        "observations": records,
+        **({"controller_result": reply} if not observations else {}),
+    }
+
+
 async def consume(generator, work, response, tools, schemas, delivered, ledger, result, right, store):
     from functools import partial
 
@@ -214,6 +256,28 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
     atomic_units = set()
     for call in calls:
         name, args = call["name"], call["args"]
+        progress_note = None
+        if work.protocol_version >= 12 and requires_review_progress(name):
+            submitted_args = args
+            try:
+                tool = next(tool for tool in tools if tool.name == name)
+                args, progress = extract_review_progress(tool, args)
+                from reviewforge.engine.discovery_workspace import publish_review_progress
+
+                progress_note = publish_review_progress(work, progress)
+            except ValidationError as exc:
+                fields = [
+                    {"field": list(error["loc"]), "type": error["type"]} for error in exc.errors(include_input=False)
+                ]
+                feedback.append(reject(name, submitted_args, "invalid-review-progress-schema", fields))
+                continue
+            except (ValueError, TypeError, KeyError) as exc:
+                feedback.append(
+                    reject(name, submitted_args, "invalid-review-progress-binding")
+                    | {"failure_kind": str(exc).split(":", 1)[0]}
+                )
+                continue
+            await checkpoint(generator, ledger)
         if work.protocol_version >= 11 and name in WORKSPACE_ACTIONS:
             before = len(work.broker._observations)
             try:
@@ -231,7 +295,10 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 continue
             reads += len(work.broker._observations) - before
             workspace_activity = True
-            feedback.append({"action": name, "result": reply})
+            feedback.append(
+                {"action": name, "result": reply}
+                | ({"review_progress_note_id": progress_note["id"]} if progress_note else {})
+            )
             save_observations(work)
             await checkpoint(generator, ledger)
             continue
@@ -243,7 +310,15 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 feedback.append(reject(name, args, "invalid-source-tool-arguments"))
                 continue
             reply = await work.broker._run_tool(name, prepared)
-            feedback.append({"action": name, "result": reply})
+            feedback.append(
+                {
+                    "action": name,
+                    "result": discovery_read_receipt(work, name, prepared, before, reply)
+                    if work.protocol_version >= 12
+                    else reply,
+                }
+                | ({"review_progress_note_id": progress_note["id"]} if progress_note else {})
+            )
             for obs in work.broker._observations[before:]:
                 identity = store.observation(obs)
                 if work.protocol_version >= 11:

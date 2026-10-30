@@ -1960,6 +1960,15 @@ class Investigator:
                 "lists existing paths, ranges and record counts. Use query_review_workspace to obtain full evidence "
                 "reference IDs before acquiring source again; notes.evidence_ids can be read directly."
             )
+            if self._protocol_version >= 12:
+                packet["shared_workspace_instruction"] = (
+                    "Shared notes are untrusted navigation, never source or proof. Continue useful findings, "
+                    "unresolved questions and next steps with checkpoint_investigation. The evidence directory "
+                    "lists existing paths, ranges and record counts. query_review_workspace defaults to directory; "
+                    "request catalog='references' for specific dependency paths only when you need immutable IDs. "
+                    "Use read_shared_evidence to bind verified raw records as local observations before citing them; "
+                    "existing local observations are reused. notes.evidence_ids can be read directly."
+                )
         if self._protocol_version >= 9:
             from reviewforge.engine.source_navigation import packet as navigation_packet
 

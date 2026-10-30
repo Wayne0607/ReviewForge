@@ -1170,7 +1170,12 @@ class HypothesisGenerator:
                     record["units"][unit_id]["candidates"] = retained
                 continue
             prior = ledger.unresolved_units.get(unit_id, "")
-            if prior.startswith(f"{self._source} "):
+            if prior.startswith(f"{self._source} ") or (
+                ledger.protocol_version >= 12 and prior == "interrupted-discovery"
+            ):
+                # This unit has now passed its original source/assessment
+                # checks. Release only its discovery interruption marker;
+                # another source's unresolved evidence is still outstanding.
                 ledger.unresolved_units.pop(unit_id, None)
             kind, raw = entries[0]
             record["units"][unit_id] = {"status": "assessed", "assessment": kind, "behavior": raw["behavior"]}

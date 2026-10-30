@@ -307,6 +307,11 @@ class SharedReviewWorkspace:
                     entry["line_ranges"] = _merge_ranges(entry["line_ranges"])
                     entries.append(entry)
                 result["evidence_directory"] = entries
+                if self.ledger.protocol_version >= 12:
+                    # An empty references array incorrectly suggests that no
+                    # evidence exists. This view deliberately exposes only the
+                    # directory; references remain available on explicit query.
+                    result.pop("evidence_catalog")
             if role in {"proof", "source_audit"}:
                 return copy.deepcopy(result)
             candidates = [

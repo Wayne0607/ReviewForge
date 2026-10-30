@@ -1,4 +1,8 @@
-from reviewforge.core.config import ReviewForgeConfig
+from pathlib import Path
+
+import pytest
+
+from reviewforge.core.config import PipelineV4Config, ReviewForgeConfig, _pipeline_v4_from_dict
 from reviewforge.engine.model_router import ROLE_MAP
 
 
@@ -13,7 +17,7 @@ def test_pipeline_v4_defaults_and_yaml(tmp_path) -> None:
     assert cfg.pipeline_v4.output_language == "en"
     assert cfg.pipeline_v4.max_lenses == 2
     assert cfg.pipeline_v4.generator_max_hypotheses == 12
-    assert cfg.pipeline_v4.protocol_version == 11
+    assert cfg.pipeline_v4.protocol_version == 12
     assert cfg.pipeline_v4.budget_policy == "metered"
     assert cfg.pipeline_v4.provider_max_attempts == 3
     assert cfg.pipeline_v4.provider_retry_404 is False
@@ -34,7 +38,25 @@ def test_v4_protocol_and_retry_policy_are_explicit_and_bounded(tmp_path):
         encoding="utf-8",
     )
     cfg = ReviewForgeConfig.load(path).pipeline_v4
-    assert (cfg.protocol_version, cfg.provider_max_attempts, cfg.provider_retry_404) == (11, 3, False)
+    assert (cfg.protocol_version, cfg.provider_max_attempts, cfg.provider_retry_404) == (12, 3, False)
+
+
+@pytest.mark.parametrize("protocol", range(1, 13))
+def test_explicit_protocols_are_preserved_without_automatic_upgrade(protocol):
+    assert _pipeline_v4_from_dict({"protocol_version": protocol}).protocol_version == protocol
+
+
+@pytest.mark.parametrize("invalid", [0, 13, 99, True, "12", None])
+def test_invalid_protocols_use_the_new_run_default(invalid):
+    assert _pipeline_v4_from_dict({"protocol_version": invalid}).protocol_version == 12
+    assert PipelineV4Config().protocol_version == 12
+
+
+def test_repository_yaml_matches_the_library_new_run_protocol_default():
+    path = Path(__file__).resolve().parents[2] / "reviewforge.yaml"
+    config = ReviewForgeConfig.load(path).pipeline_v4
+    assert config.protocol_version == PipelineV4Config().protocol_version == 12
+    assert config.mode == "legacy"
 
 
 def test_pipeline_v4_environment_overrides_yaml(monkeypatch, tmp_path) -> None:

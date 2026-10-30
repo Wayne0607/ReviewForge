@@ -11,11 +11,12 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import replace
+from dataclasses import asdict, replace
+from typing import Literal
 
 from pydantic import Field
 
-from reviewforge.engine.discovery import SourceLine
+from reviewforge.engine.discovery import SourceLine, _source_segments
 from reviewforge.engine.discovery_session import extend_source_aliases, extend_sources, restore_observation
 from reviewforge.engine.hypothesis import Observation
 from reviewforge.engine.investigation_evidence import READ_ONLY_TOOLS
@@ -25,7 +26,7 @@ from reviewforge.engine.session_tools import result_tool
 WORKSPACE_ACTIONS = {"checkpoint_review_progress", "read_shared_evidence", "query_review_workspace"}
 
 
-def workspace_tools():
+def workspace_tools(protocol_version=11):
     return [
         result_tool(
             "checkpoint_review_progress",
@@ -45,8 +46,17 @@ def workspace_tools():
         ),
         result_tool(
             "query_review_workspace",
-            "Find existing related investigation notes and evidence before acquiring a dependency again.",
-            {"paths": (list[str], ...), "unit_ids": (list[str], ...)},
+            (
+                "Inspect a compact directory of related progress and evidence. "
+                "Set catalog='references' explicitly to obtain every original evidence ID for a selected dependency."
+                if protocol_version >= 12
+                else "Find existing related investigation notes and evidence before acquiring a dependency again."
+            ),
+            {
+                "paths": (list[str], ...),
+                "unit_ids": (list[str], ...),
+                **({"catalog": (Literal["directory", "references"], "directory")} if protocol_version >= 12 else {}),
+            },
         ),
     ]
 
@@ -76,8 +86,22 @@ def remember_evidence(work, identity, observation=None):
         work.record.setdefault("workspace_observation_ids", {})[observation.id] = identity
 
 
+def publish_review_progress(work, progress):
+    """Controller-owned scope includes only this group and actually read paths."""
+    return work.workspace.publish_progress(
+        task_id=work.session.record["task_id"],
+        actor="discovery",
+        unit_ids=[unit.id for unit in work.block.units],
+        paths=sorted(
+            {unit.path for unit in work.block.units}
+            | {observation.path for observation in work.broker._observations if observation.path}
+        ),
+        **progress,
+    )
+
+
 def workspace_action(work, name, args, store):
-    schema = next(tool.args_schema for tool in workspace_tools() if tool.name == name)
+    schema = next(tool.args_schema for tool in workspace_tools(work.protocol_version) if tool.name == name)
     args = schema.model_validate(args).model_dump()
     if name == "query_review_workspace":
         return work.workspace.view(task_id=work.session.record["task_id"], role="discovery", **args)
@@ -92,6 +116,8 @@ def workspace_action(work, name, args, store):
         return {"note": note, "trust": "untrusted-navigation-only"}
     # Validate the whole request before mutating consumer-local evidence.
     records = work.workspace.read_evidence(args["evidence_ids"])
+    if work.protocol_version >= 12:
+        return _import_records(work, records, store)
     prepared = [_prepare_record(record, store.ledger.head_sha) for record in records]
     imported = []
     for record, (source, observation) in zip(records, prepared, strict=True):
@@ -125,6 +151,191 @@ def workspace_action(work, name, args, store):
     return {
         "evidence": imported,
         "instruction": "Source aliases are supplied in the next request; notes are not evidence.",
+    }
+
+
+def _observation_value(observation):
+    value = asdict(observation)
+    value.pop("id")
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _source_matches(source, expected):
+    return (
+        source.side == expected.side
+        and source.path == expected.path
+        and source.line == expected.line
+        and source.text == expected.text
+    )
+
+
+def _has_source(work, expected):
+    if any(_source_matches(source, expected) for source in work.block.facts):
+        return True
+    return all(
+        any(_source_matches(source, replace(expected, text=part)) for source in work.block.source_refs.values())
+        for _start, part in _source_segments(expected.text)
+    )
+
+
+def _read_sources(observations):
+    return [
+        SourceLine("context", observation.path, observation.excerpt_line_range[0] + offset, line)
+        for observation in observations
+        if observation.tool == "read_file" and observation.excerpt_line_range
+        for offset, line in enumerate(observation.excerpt.splitlines())
+    ]
+
+
+def _prepare_import(record, head_sha):
+    if record["kind"] == "tool-observation":
+        _source, observation = _prepare_record(record, head_sha)
+        return [], [observation]
+    if record["kind"] != "delivered-source":
+        raise ValueError("unsupported-shared-evidence-kind")
+    if record["side"] not in {"before", "after", "context"} or (
+        record["side"] != "before" and record["source_sha"] != head_sha
+    ):
+        raise ValueError("shared-source-is-not-pinned-head")
+    from reviewforge.engine.source_navigation import _pieces
+
+    text, first = record["excerpt"], record["line"]
+    sources = [
+        SourceLine(record["side"], record["path"], first + offset, line, changed=record["changed"])
+        for offset, line in enumerate(text.splitlines())
+    ]
+    if record["side"] == "before":
+        return sources, []
+    observations = [
+        Observation(
+            id="",
+            tool="read_file",
+            query="read_file "
+            + json.dumps(
+                {"path": record["path"], "start": first, "end": first + max(1, len(text.splitlines())) - 1},
+                sort_keys=True,
+            ),
+            path=record["path"],
+            line_range=(first, first + max(1, len(text.splitlines())) - 1),
+            sha=head_sha,
+            result_digest=hashlib.sha256(text.encode()).hexdigest()[:16],
+            excerpt=part,
+            status="success",
+            excerpt_line_range=span,
+        )
+        for part, span in _pieces(text, first)
+    ]
+    return sources, observations
+
+
+def _existing_import(work, record, sources, observations, by_id, by_value):
+    identity = record["evidence_id"]
+    prior = work.record.get("workspace_imports", {}).get(identity)
+    if prior is not None:
+        if (
+            not isinstance(prior, dict)
+            or prior.get("consumer_task_id") != work.session.record["task_id"]
+            or prior.get("evidence_fingerprint") != fingerprint(record)
+            or not isinstance(prior.get("observation_ids"), list)
+            or not isinstance(prior.get("source_refs"), list)
+            or any(local_id not in by_id for local_id in prior["observation_ids"])
+            or any(alias not in work.aliases for alias in prior["source_refs"])
+        ):
+            raise ValueError("invalid-shared-evidence-import-binding")
+        local = [by_id[local_id] for local_id in prior["observation_ids"]]
+        if not sources and not local:
+            raise ValueError("missing-shared-observation-import")
+        if local and [_observation_value(item) for item in local] != [
+            _observation_value(item) for item in observations
+        ]:
+            raise ValueError("invalid-shared-evidence-import-content")
+        if sources and not all(_has_source(work, expected) for expected in sources):
+            raise ValueError("missing-shared-source-import")
+        if prior["source_refs"] != _source_aliases(work, sources or _read_sources(observations)):
+            raise ValueError("invalid-shared-source-alias-import")
+        return prior
+    if sources and all(_has_source(work, expected) for expected in sources):
+        return {"observation_ids": [], "source_refs": _source_aliases(work, sources)}
+    if not sources:
+        observation = by_value.get(fingerprint(record["observation"]))
+        if observation is not None and _observation_value(observation) == record["observation"]:
+            return {
+                "observation_ids": [observation.id],
+                "source_refs": _source_aliases(work, _read_sources(observations)),
+            }
+    return None
+
+
+def _source_aliases(work, sources):
+    return sorted(
+        alias
+        for alias, reference in work.aliases.items()
+        if reference in work.block.source_refs
+        and any(
+            actual.side == expected.side
+            and actual.path == expected.path
+            and actual.line == expected.line
+            and actual.text in {part for _start, part in _source_segments(expected.text)}
+            for expected in sources
+            for actual in [work.block.source_refs[reference]]
+        )
+    )
+
+
+def _import_records(work, records, store):
+    prepared = [_prepare_import(record, store.ledger.head_sha) for record in records]
+    by_id = {observation.id: observation for observation in work.broker._observations}
+    by_value = {fingerprint(_observation_value(observation)): observation for observation in by_id.values()}
+    # Validate restored consumer mappings and the complete batch before writes.
+    existing = [
+        _existing_import(work, record, *group, by_id, by_value) for record, group in zip(records, prepared, strict=True)
+    ]
+    imported = []
+    for record, (sources, observations), prior in zip(records, prepared, existing, strict=True):
+        identity, local_ids = record["evidence_id"], []
+        if prior is None:
+            if sources:
+                for source in sources:
+                    if not any(_source_matches(item, source) for item in work.block.facts):
+                        work.block.facts.append(source)
+                work.block.register_source_refs()
+                extend_source_aliases(work.block, work.aliases)
+            else:
+                for observation in observations:
+                    extend_sources(work.block, observation, work.aliases)
+            for observation in observations:
+                saved = replace(observation, id=_next_id(work))
+                work.broker._observations.append(saved)
+                remember_evidence(work, store.observation(saved), saved)
+                local_ids.append(saved.id)
+            aliases = _source_aliases(work, sources or _read_sources(observations))
+        else:
+            local_ids, aliases = prior["observation_ids"][:], prior["source_refs"][:]
+        remember_evidence(work, identity)
+        binding = {
+            "consumer_task_id": work.session.record["task_id"],
+            "evidence_fingerprint": fingerprint(record),
+            "observation_ids": local_ids,
+            "source_refs": aliases,
+        }
+        work.record.setdefault("workspace_imports", {})[identity] = binding
+        reply = {
+            "evidence_id": identity,
+            "observation_ids": local_ids,
+            "source_refs": aliases,
+            "reused": prior is not None,
+        }
+        if local_ids:
+            reply["observation_id"] = local_ids[0]
+        else:
+            reply["source_reference_only"] = True
+        if prior is None:
+            reply["record"] = copy.deepcopy(record)
+        imported.append(reply)
+    return {
+        "evidence": imported,
+        "instruction": "Reuse the returned local observation IDs and source aliases. "
+        "No new source is established by rereading an already held evidence ID; notes remain navigation.",
     }
 
 

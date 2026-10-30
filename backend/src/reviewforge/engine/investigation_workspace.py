@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
+from typing import Literal
 
 from langchain_core.tools import StructuredTool
 
@@ -60,10 +61,24 @@ def tools(worker):
         """Find shared notes and raw evidence for dependency paths or units in this fixed run."""
         return await worker._run_tool("query_review_workspace", {"paths": paths, "unit_ids": unit_ids})
 
+    async def query_review_workspace_v12(
+        paths: list[str],
+        unit_ids: list[str],
+        catalog: Literal["directory", "references"] = "directory",
+    ) -> str:
+        """Inspect a compact evidence directory; explicitly request references to obtain every original ID."""
+        return await worker._run_tool(
+            "query_review_workspace",
+            {"paths": paths, "unit_ids": unit_ids, "catalog": catalog},
+        )
+
     return [
         StructuredTool.from_function(coroutine=checkpoint_investigation),
         StructuredTool.from_function(coroutine=read_shared_evidence),
-        StructuredTool.from_function(coroutine=query_review_workspace),
+        StructuredTool.from_function(
+            name="query_review_workspace",
+            coroutine=query_review_workspace_v12 if worker._protocol_version >= 12 else query_review_workspace,
+        ),
     ]
 
 
@@ -146,6 +161,8 @@ async def run_action(worker, name, args):
         return error_reply("shared-investigation-workspace-unavailable")
     try:
         if name == "query_review_workspace":
+            if worker._protocol_version >= 12:
+                args = {"catalog": "directory", **args}
             return json.dumps(
                 {
                     "status": "success",
@@ -177,6 +194,36 @@ async def run_action(worker, name, args):
                 for record, group in zip(records, observations, strict=True)
                 for index, observation in enumerate(group)
             ]
+            reusable = {}
+            if worker._protocol_version >= 12:
+                for record, fragment, observation in fragments:
+                    prior = next(
+                        (
+                            entry
+                            for entry in worker._progress
+                            if entry.get("phase") == "shared-evidence-import"
+                            and entry.get("evidence_id") == record["evidence_id"]
+                            and entry.get("source_fragment", 0) == fragment
+                        ),
+                        None,
+                    )
+                    saved = None
+                    if prior is not None:
+                        saved = next(
+                            (item for item in worker._observations if item.id == prior["observation_id"]), None
+                        )
+                        if saved is None or _observation_value(saved) != _observation_value(observation):
+                            raise ValueError("invalid-local-shared-evidence-import")
+                    elif record["kind"] == "tool-observation":
+                        saved = next(
+                            (
+                                item
+                                for item in worker._observations
+                                if _observation_value(item) == record["observation"]
+                            ),
+                            None,
+                        )
+                    reusable[(record["evidence_id"], fragment)] = saved
             for record, fragment, observation in fragments:
                 prior = next(
                     (
@@ -188,7 +235,19 @@ async def run_action(worker, name, args):
                     ),
                     None,
                 )
-                if prior is not None:
+                already_local = reusable.get((record["evidence_id"], fragment))
+                if worker._protocol_version >= 12 and already_local is not None:
+                    saved = already_local
+                    if prior is None:
+                        worker._progress.append(
+                            {
+                                "phase": "shared-evidence-import",
+                                "evidence_id": record["evidence_id"],
+                                "observation_id": saved.id,
+                                "source_fragment": fragment,
+                            }
+                        )
+                elif prior is not None:
                     saved = next(item for item in worker._observations if item.id == prior["observation_id"])
                 else:
                     saved = replace(observation, id=f"obs_{worker._obs_counter}")
@@ -226,3 +285,9 @@ async def run_action(worker, name, args):
     if worker._on_progress is not None:
         await worker._on_progress(worker._observations, worker._progress)
     return json.dumps({"status": "success", "result": result}, ensure_ascii=False)
+
+
+def _observation_value(observation):
+    value = asdict(observation)
+    value.pop("id")
+    return json.loads(json.dumps(value, ensure_ascii=False))

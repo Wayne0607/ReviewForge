@@ -65,7 +65,9 @@ class EvidenceStore:
                 raise ValueError("evidence-identity-collision")
             return identity
         size = len(json.dumps(record, ensure_ascii=False).encode())
-        if len(self.records) >= MAX_EVIDENCE_RECORDS or self._bytes + size > MAX_EVIDENCE_BYTES:
+        if self.ledger.protocol_version < 10 and (
+            len(self.records) >= MAX_EVIDENCE_RECORDS or self._bytes + size > MAX_EVIDENCE_BYTES
+        ):
             return ""
         self.records[identity] = record
         self._bytes += size
@@ -93,7 +95,7 @@ class EvidenceStore:
 
 
 class ReviewSession:
-    def __init__(self, record: dict[str, Any], *, task_id: str, phase: str, max_turns: int):
+    def __init__(self, record: dict[str, Any], *, task_id: str, phase: str, max_turns: int | None):
         self.record = record.setdefault(
             "session",
             {
@@ -110,10 +112,13 @@ class ReviewSession:
             raise ValueError("session-binding-mismatch")
         if type(self.record.get("turns")) is not int or self.record["turns"] < 0:
             raise ValueError("invalid-session-counter")
-        self.record["max_turns"] = min(self.record["max_turns"], max_turns)
+        saved_limit = self.record["max_turns"]
+        if (saved_limit is None) != (max_turns is None):
+            raise ValueError("session-policy-mismatch")
+        self.record["max_turns"] = saved_limit if max_turns is None else min(saved_limit, max_turns)
 
     def dispatch(self) -> bool:
-        if self.record["turns"] >= self.record["max_turns"]:
+        if self.record["max_turns"] is not None and self.record["turns"] >= self.record["max_turns"]:
             return False
         self.record["turns"] += 1
         self.record["status"] = "running"
@@ -127,7 +132,7 @@ class ReviewSession:
 
 
 def actions(
-    response: Any, tools: list[Any], *, allow_redundant_kind: bool = False
+    response: Any, tools: list[Any], *, allow_redundant_kind: bool = False, allow_explanation: bool = False
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     calls, malformed = inspect_tool_calls(response, allow_redundant_kind=allow_redundant_kind)
     errors = [{"reason": reason, "unit_id": ""} for reason in malformed]
@@ -142,7 +147,7 @@ def actions(
     if metadata.get("finish_reason") in {"length", "max_tokens"} or metadata.get("stop_reason") == "max_tokens":
         errors.append({"reason": "incomplete-action-stream", "unit_id": ""})
     content = getattr(response, "content", "")
-    if content.strip() if isinstance(content, str) else content:
+    if (content.strip() if isinstance(content, str) else content) and not (allow_explanation and calls):
         errors.append({"reason": "non-action-text", "unit_id": ""})
     if not calls and not errors:
         errors.append({"reason": "empty-action-receipt", "unit_id": ""})

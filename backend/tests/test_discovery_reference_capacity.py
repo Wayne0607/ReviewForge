@@ -10,6 +10,8 @@ from test_structural_discovery_v3 import Workspace, change_facts, inputs
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.discovery import DiscoveryLimits, plan_discovery
+from reviewforge.engine.discovery_aliases import source_aliases
+from reviewforge.engine.discovery_workflow_tools import assessment_tools
 from reviewforge.engine.hypothesis import HypothesisLedger
 from reviewforge.engine.hypothesis_generator import HypothesisGenerator
 from reviewforge.engine.semantic_diff import SemanticChangeSet, SemanticUnit, UnitKind
@@ -72,6 +74,26 @@ def test_old_protocols_keep_the_four_reference_limit(protocol):
 def test_v4_still_rejects_over_capacity_even_when_every_reference_is_true(count):
     unit, _, _, block, item = packet(count, addition=True)
     assert not valid(item, unit, block)
+
+
+@pytest.mark.parametrize("count", [7, 13])
+def test_v10_keeps_all_required_source_pairs_without_a_record_quota(count):
+    unit, _, _, block, item = packet(count)
+    assert len(item["behavior"]["source_facts"]) == 2 * count
+    aliases = source_aliases(block.source_refs, scoped=True)
+    reverse = {reference: alias for alias, reference in aliases.items()}
+    record = {
+        "unit_id": unit.id,
+        "kind": "no_issue",
+        "checked": item["checked"],
+        "source_refs": [reverse[fact["source_ref"]] for fact in item["behavior"]["source_facts"]],
+    }
+    _, schemas = assessment_tools(block, protocol_version=10)
+    assert schemas["no_issue"].model_validate(record).source_refs == record["source_refs"]
+    assert valid(item, unit, block, protocol=10)
+    item["behavior"]["source_facts"].append({"source_ref": "sr_fabricated"})
+    assert not valid(item, unit, block, protocol=10)
+    assert schemas["no_issue"].model_validate({**record, "checked": "x" * 33_000}).checked == "x" * 33_000
 
 
 @pytest.mark.parametrize("index", [0, 4, 7])

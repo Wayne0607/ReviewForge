@@ -51,7 +51,13 @@ def _original_task(item: Hypothesis, ledger: HypothesisLedger) -> dict[str, Any]
         and task.get("budget_policy") == "usage-only-v1"
         and task.get("token_limit") is None
     )
-    limits = ("budget_steps_limit",) if metered else _LIMITS
+    limits = (
+        ()
+        if ledger.protocol_version >= 10 and task.get("budget_steps_limit") is None
+        else ("budget_steps_limit",)
+        if metered
+        else _LIMITS
+    )
     if any(type(task.get(key)) is not int or task[key] < 0 for key in (*_COUNTERS, *limits)):
         return None
     members = task.get("members")
@@ -70,7 +76,7 @@ def _original_task(item: Hypothesis, ledger: HypothesisLedger) -> dict[str, Any]
         }
     ):
         return None
-    if task["budget_steps_limit"] <= task["total_steps"] or (
+    if (task["budget_steps_limit"] is not None and task["budget_steps_limit"] <= task["total_steps"]) or (
         not metered and task["token_limit"] <= task["total_tokens"] + task["total_unreported_tokens"]
     ):
         return None
@@ -212,7 +218,9 @@ async def run_evidence_followup(
                 "tokens": None
                 if task["token_limit"] is None
                 else task["token_limit"] - task["total_tokens"] - task["total_unreported_tokens"],
-                "steps": task["budget_steps_limit"] - task["total_steps"],
+                "steps": None
+                if task["budget_steps_limit"] is None
+                else task["budget_steps_limit"] - task["total_steps"],
             },
             "original_audit": copy.deepcopy(ledger.source_audits[item.id]),
             "original_review": copy.deepcopy(ledger.publication_reviews[item.id]),
@@ -245,7 +253,7 @@ async def run_evidence_followup(
             if (
                 record["allocated"]["tokens"] is not None
                 and record["tokens"] + record["unreported_tokens"] > record["allocated"]["tokens"]
-            ) or record["steps"] > record["allocated"]["steps"]:
+            ) or (record["allocated"]["steps"] is not None and record["steps"] > record["allocated"]["steps"]):
                 record["rejection_reason"] = "segment-exceeded-allocated-budget"
                 raise ValueError(record["rejection_reason"])
             count = _new_facts(returned, original, ledger.head_sha)

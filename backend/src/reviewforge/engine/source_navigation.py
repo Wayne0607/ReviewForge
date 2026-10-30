@@ -50,7 +50,7 @@ async def save_window(
     Keeping the complete delivered window avoids silently losing its argument
     construction. No old Observation schema/checkpoint changes are necessary.
     """
-    excerpt, line_range = text[:SOURCE_CHARS], None
+    excerpt, line_range = text[: None if worker._protocol_version >= 10 else SOURCE_CHARS], None
     if name == "read_file" and status == "success":
         excerpt, line_range = worker._saved_read_excerpt(text, args)
     parts = _pieces(excerpt, line_range[0] if line_range else None)
@@ -131,7 +131,7 @@ async def save_window(
     )
     if worker._on_progress is not None:
         await worker._on_progress(worker._observations, worker._progress)
-    return "\n\n".join(replies)[:TOOL_CHARS]
+    return "\n\n".join(replies)[: None if worker._protocol_version >= 10 else TOOL_CHARS]
 
 
 def targets(observations):
@@ -233,8 +233,8 @@ def packet(observations, *, limit=24):
         "navigation_only": True,
         "execution_resolved": False,
         "locations": locations[:limit],
-        "omitted_locations": max(0, len(locations) - limit),
-        "adjacent_windows": continuations[-limit:],
+        "omitted_locations": 0 if limit is None else max(0, len(locations) - limit),
+        "adjacent_windows": continuations if limit is None else continuations[-limit:],
         "instruction": "A hit is a location, not proof. Read the use and follow the actual argument/guard definitions. "
         "Adjacent windows may be outside the file; an empty read proves no source there, not no consumer. "
         "Supply explicit start/end to override the automatic use-first window.",

@@ -88,7 +88,7 @@ def discovery_submission_tools(block: DiscoveryBlock, aliases: dict[str, str]) -
     return [tool("submit_hypothesis", hypothesis), tool("submit_no_issue", {**common, "checked": prose()}), defer]
 
 
-def bind_discovery_submission(llm: Any, tools: list[StructuredTool]) -> Any:
+def bind_discovery_submission(llm: Any, tools: list[StructuredTool], *, automatic=False) -> Any:
     """Preserve prior request options and bind the exact client-validated shape.
 
     Delegating bind_tools through a RunnableBinding can lose its request kwargs.
@@ -110,7 +110,7 @@ def bind_discovery_submission(llm: Any, tools: list[StructuredTool]) -> Any:
         }
         for tool in tools
     ]
-    bound = llm.bind_tools(wire, tool_choice="any")
+    bound = llm.bind_tools(wire, tool_choice="auto" if automatic else "any")
     options = getattr(bound, "kwargs", None)
     if not isinstance(options, dict):
         raise TypeError("provider submission tools must return bindable request arguments")

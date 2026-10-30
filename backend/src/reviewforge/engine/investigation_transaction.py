@@ -15,6 +15,7 @@ from dataclasses import asdict
 from pydantic import ValidationError
 
 from reviewforge.core.change_manifest import is_verified_rename
+from reviewforge.engine.execution_policy import output_capacity, repeated_state
 from reviewforge.engine.investigation_session import request
 from reviewforge.engine.native_submission import inspect_tool_calls
 from reviewforge.engine.request_budget import plan_request
@@ -30,9 +31,11 @@ def _latest(progress):
 
 
 def _record(worker, hypothesis, pack, limit):
-    record = _latest(worker._progress)
+    unlimited = worker._protocol_version >= 10
+    phase = "case-transaction-v10" if unlimited else PHASE
+    record = next((item for item in reversed(worker._progress) if item.get("phase") == phase), None)
     binding = {
-        "policy": PHASE,
+        "policy": phase,
         "case_id": case_identity(hypothesis, worker._state.head_sha),
         "head_sha": worker._state.head_sha,
         "workspace_digest": pack.workspace_digest,
@@ -40,12 +43,12 @@ def _record(worker, hypothesis, pack, limit):
     if record is None:
         binding["evidence_limit"] = limit
         record = {
-            "phase": PHASE,
+            "phase": phase,
             "binding": binding,
             "binding_id": fingerprint(binding),
             "evidence_steps": worker._starting_steps,
             "delivery_attempts": 0,
-            "state": "collecting" if limit > worker._starting_steps else "finalizing",
+            "state": "collecting" if unlimited or limit > worker._starting_steps else "finalizing",
             "feedback": [],
         }
         worker._progress.append(record)
@@ -53,16 +56,20 @@ def _record(worker, hypothesis, pack, limit):
     if (
         record.get("binding_id") != fingerprint(saved)
         or any(saved.get(key) != value for key, value in binding.items() if key != "evidence_limit")
-        or type(saved.get("evidence_limit")) is not int
-        or saved["evidence_limit"] < 0
+        or (not unlimited and (type(saved.get("evidence_limit")) is not int or saved["evidence_limit"] < 0))
+        or (unlimited and saved.get("evidence_limit") is not None)
         or type(record.get("evidence_steps")) is not int
-        or not 0 <= record["evidence_steps"] <= saved["evidence_limit"]
+        or record["evidence_steps"] < 0
+        or (not unlimited and record["evidence_steps"] > saved["evidence_limit"])
         or type(record.get("delivery_attempts")) is not int
-        or not 0 <= record["delivery_attempts"] <= MAX_DELIVERY_REQUESTS
+        or record["delivery_attempts"] < 0
+        or (not unlimited and record["delivery_attempts"] > MAX_DELIVERY_REQUESTS)
         or record.get("state") not in {"collecting", "finalizing", "delivering", "complete", "rejected"}
     ):
         raise ValueError("case-transaction-binding-mismatch")
-    record["evidence_steps"] = min(saved["evidence_limit"], max(record["evidence_steps"], worker._starting_steps))
+    record["evidence_steps"] = max(record["evidence_steps"], worker._starting_steps)
+    if not unlimited:
+        record["evidence_steps"] = min(saved["evidence_limit"], record["evidence_steps"])
     if "decision" in record and record.get("decision_id") != fingerprint(record["decision"]):
         raise ValueError("case-transaction-decision-mismatch")
     return record
@@ -83,11 +90,15 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
             outcome="tool-error",
         )
     changed = changed_paths if changed_paths is not None else _changed_paths(state)
+    unlimited = worker._protocol_version >= 10
     steps = worker._max_steps if worker._max_steps is not None else budget_steps(hypothesis)
-    record = _record(worker, hypothesis, pack, worker._starting_steps + steps)
+    record = _record(worker, hypothesis, pack, None if unlimited else worker._starting_steps + steps)
     baseline = record["evidence_steps"]
     limit = record["binding"]["evidence_limit"]
-    schemas = {tool.name: tool.args_schema for tool in decision_tools(hypothesis, state.head_sha, protocol_version=9)}
+    schemas = {
+        tool.name: tool.args_schema
+        for tool in decision_tools(hypothesis, state.head_sha, protocol_version=worker._protocol_version)
+    }
 
     def used():
         return record["evidence_steps"] - baseline
@@ -113,6 +124,20 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
         # Every replay checks identity/schema and the original evidence gates.
         args = schemas[call["name"]].model_validate(call["args"]).model_dump()
         result = worker._finalize(decision_payload(call["name"], args, hypothesis), hypothesis, changed, steps=used())
+        if unlimited and result.outcome == "output-error":
+            # Schema-valid is not yet a valid result: an unavailable reference
+            # or inconsistent source binding must receive actionable feedback.
+            # Keep the rejected receipt; freeze only a fully validated result.
+            rejected = {"decision": copy.deepcopy(call), "error": result.reason}
+            record.setdefault("rejected_decisions", []).append(rejected)
+            cycle = repeated_state(
+                record, state={"evidence": record["evidence_id"], "error": result.reason}, receipt=call
+            )
+            for key in ("decision", "decision_id", "evidence_count", "evidence_id"):
+                record.pop(key, None)
+            record.update(state="collecting", feedback=[{"rejected_result_untrusted": rejected}])
+            await save()
+            return result_error("no-progress-cycle") if cycle else None
         record["state"] = "rejected" if result.outcome == "output-error" else "complete"
         record["outcome"] = result.outcome
         await save()
@@ -120,20 +145,22 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
         return result
 
     if "decision" in record:
-        return await deliver()
+        result = await deliver()
+        if result is not None:
+            return result
     if record["state"] in {"complete", "rejected", "delivering"}:
         raise ValueError("case-transaction-missing-decision")
     await save()
-    if record["state"] == "collecting" and record["evidence_steps"] == 0 and limit:
+    if record["state"] == "collecting" and record["evidence_steps"] == 0 and (unlimited or limit):
         record["evidence_steps"] += 1
         await save()  # An interrupted bootstrap never gains another evidence step.
         await worker._bootstrap(hypothesis, pack)
         await save()
     stagnant = 0
     while True:
-        if record["evidence_steps"] >= limit:
+        if not unlimited and record["evidence_steps"] >= limit:
             record["state"] = "finalizing"
-        final = record["state"] == "finalizing"
+        final = not unlimited and record["state"] == "finalizing"
         if final:
             if record["delivery_attempts"] >= MAX_DELIVERY_REQUESTS:
                 await save()
@@ -156,7 +183,9 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
         plan = plan_request(
             bound,
             chat,
-            max_output_tokens=worker._closing_output(hypothesis) if final else 2048,
+            max_output_tokens=output_capacity(
+                worker._protocol_version, worker._closing_output(hypothesis) if final else 2048
+            ),
             fallback_available=None,
         )
         worker._progress.append(
@@ -193,13 +222,13 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
                 outcome="budget-exhausted" if exhausted else "provider-error",
                 retryable=not exhausted,
             )
-        calls, errors = actions(response, tools)
+        calls, errors = actions(response, tools, allow_explanation=unlimited)
         # Keep the actual failed attempt, not just a repeated original draft.
         raw_calls, malformed = inspect_tool_calls(response)
         raw = {"calls": raw_calls, "errors": errors, "malformed": malformed}
         record["last_receipt"] = (
             copy.deepcopy(raw)
-            if len(json.dumps(raw, ensure_ascii=False).encode()) <= MAX_RESULT_BYTES
+            if unlimited or len(json.dumps(raw, ensure_ascii=False).encode()) <= MAX_RESULT_BYTES
             else {"errors": [{"reason": "result-transport-record-too-large"}]}
         )
         feedback = [{"error": error["reason"]} for error in errors]
@@ -225,13 +254,16 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
                     record["evidence_id"] = fingerprint([asdict(item) for item in worker._observations])
                     record["state"] = "delivering"
                     await save()
-                    return await deliver()
+                    result = await deliver()
+                    if result is not None:
+                        return result
+                    continue
             # A declared result is a delivery attempt; do not restart evidence
             # collection or re-ask a successfully delivered semantic decision.
             record["state"] = "finalizing"
         elif not final and not errors:
             before = len(worker._observations)
-            for call in calls[:8]:
+            for call in calls if unlimited else calls[:8]:
                 reply = await worker._run_tool(call["name"], call["args"])
                 added = worker._observations[before:]
                 feedback.append(
@@ -243,13 +275,24 @@ async def investigate(worker, hypothesis, state, pack, *, changed_paths=None):
                 )
                 before = len(worker._observations)
             stagnant = 0 if any(item.get("observations") for item in feedback) else stagnant + 1
-            if len(calls) > 8:
+            if not unlimited and len(calls) > 8:
                 feedback.append({"error": "read-action-batch-limit", "max_actions": 8})
-            if stagnant >= 2:
+            if not unlimited and stagnant >= 2:
                 record["state"] = "finalizing"
         # In finalization only terminal tools were registered. Unregistered
         # source reads are feedback, never executed and never silently dropped.
         if final or results or errors:
             feedback.append({"previous_receipt": record["last_receipt"]})
         record["feedback"] = feedback
+        if unlimited and repeated_state(
+            record,
+            state={"observations": [asdict(obs) for obs in worker._observations], "feedback": feedback},
+            receipt={
+                "calls": [{"name": call["name"], "args": call["args"]} for call in calls],
+                "errors": errors,
+                "content": getattr(response, "content", ""),
+            },
+        ):
+            await save()
+            return result_error("no-progress-cycle")
         await save()

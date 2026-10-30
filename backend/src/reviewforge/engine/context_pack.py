@@ -154,7 +154,7 @@ class ContextPack:
             changeset=changeset,
             workspace=workspace,
             pr_intent=resolved_intent,
-            max_slices=max(0, int(max_slices)),
+            max_slices=None if protocol_version >= 10 else max(0, int(max_slices)),
             max_slice_lines=max(1, int(max_slice_lines)),
             max_callers=max(0, int(max_callers)),
             file_changes={
@@ -297,7 +297,7 @@ class _PackBuilder:
         changeset: SemanticChangeSet,
         workspace: Any,
         pr_intent: str,
-        max_slices: int,
+        max_slices: int | None,
         max_slice_lines: int,
         max_callers: int,
         file_changes: dict[str, FileChange] | None = None,
@@ -350,7 +350,7 @@ class _PackBuilder:
 
         candidates = _deduplicate_slices(candidates)
         context.slices = candidates[: self.max_slices]
-        if len(candidates) > self.max_slices:
+        if self.max_slices is not None and len(candidates) > self.max_slices:
             kept = len(context.slices)
             context.truncated_kinds = _ordered_unique(slice_.kind for slice_ in candidates[kept:])
         context.truncated_kinds = _ordered_unique([*self._unchecked, *context.truncated_kinds])

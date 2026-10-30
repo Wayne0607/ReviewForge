@@ -36,6 +36,11 @@ def assessment_tools(block, *, protocol_version=6):
     tool = result_tool(
         "submit_assessments",
         "Submit records for ALL pending units in one call. Each record is a hypothesis, no_issue or deferred.",
-        {"records": (list[record], Field(min_length=1, max_length=max(4, 2 * len(block.units))))},
+        {
+            "records": (
+                list[record],
+                Field(min_length=1, **({"max_length": max(4, 2 * len(block.units))} if protocol_version < 10 else {})),
+            )
+        },
     )
     return tool, records

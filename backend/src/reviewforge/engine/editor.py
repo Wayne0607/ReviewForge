@@ -415,7 +415,9 @@ def resumed_publication(
     ordered = order_clusters(cluster_confirmed(pending))
     fresh = [cluster for cluster in ordered if cluster.key not in published_clusters]
     inline, _ = split_for_publication(
-        fresh, max(0, max_inline - inline_used), max(0, max_inline_overflow - inline_used)
+        fresh,
+        len(fresh) if ledger.protocol_version >= 10 else max(0, max_inline - inline_used),
+        len(fresh) if ledger.protocol_version >= 10 else max(0, max_inline_overflow - inline_used),
     )
     inline_keys = {cluster.key for cluster in inline}
     return Publication(

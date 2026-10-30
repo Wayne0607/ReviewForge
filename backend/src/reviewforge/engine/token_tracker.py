@@ -58,6 +58,7 @@ class TrackedChatLLM(BaseChatModel):
     _request_options: dict[str, Any]
     _receipt_first: bool
     _deepseek_native_tools: bool
+    _automatic_native_tools: bool
 
     class Config:
         arbitrary_types_allowed = True
@@ -71,6 +72,7 @@ class TrackedChatLLM(BaseChatModel):
         request_options: dict[str, Any] | None = None,
         receipt_first: bool = False,
         deepseek_native_tools: bool = False,
+        automatic_native_tools: bool = False,
     ) -> None:
         super().__init__()
         self._inner = inner
@@ -80,6 +82,7 @@ class TrackedChatLLM(BaseChatModel):
         self._request_options = dict(request_options or {})
         self._receipt_first = receipt_first
         self._deepseek_native_tools = deepseek_native_tools
+        self._automatic_native_tools = automatic_native_tools
 
     def _effective_options(self, options: dict[str, Any]) -> dict[str, Any]:
         merged = self._request_options | options
@@ -89,8 +92,11 @@ class TrackedChatLLM(BaseChatModel):
             # auto-parse request. Native actions have their own strict local
             # schema and do not need JSON-object response framing.
             merged.pop("response_format", None)
-            merged["extra_body"] = {**(merged.get("extra_body") or {}), "thinking": {"type": "disabled"}}
-            merged["reasoning_effort"] = None
+            choice = merged.get("tool_choice")
+            automatic = choice is None or isinstance(choice, str) and choice in {"auto", "none"}
+            if not self._automatic_native_tools or not automatic:
+                merged["extra_body"] = {**(merged.get("extra_body") or {}), "thinking": {"type": "disabled"}}
+                merged["reasoning_effort"] = None
         return merged
 
     def request_budget_view(self, messages, options):

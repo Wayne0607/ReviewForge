@@ -752,7 +752,7 @@ class PRHeadWorkspace:
         return hits
 
     def find_references(
-        self, symbol: str, *, path: str = "", globs: list[str] | None = None, max_hits: int = 10
+        self, symbol: str, *, path: str = "", globs: list[str] | None = None, max_hits: int = 10, cap_hits: bool = True
     ) -> ReferenceSearchResult:
         """Navigate literal identifiers across this head; not resolved callers.
 
@@ -761,7 +761,7 @@ class PRHeadWorkspace:
         remain separate metadata, so no match cannot prove no consumer exists.
         """
         matcher = reference_pattern(symbol)
-        limit = reference_hit_limit(max_hits)
+        limit = reference_hit_limit(max_hits, cap_hits=cap_hits)
         origin = _normalise_repo_path(path) if path else ""
         if path and origin is None:
             raise ValueError("find_references path must be repository-relative")
@@ -796,7 +796,7 @@ class PRHeadWorkspace:
                     if matcher.search(text):
                         yield GrepHit(path=relative, line=line, text=text)
 
-        result = select_reference_hits(scan(), path=origin or "", max_hits=limit)
+        result = select_reference_hits(scan(), path=origin or "", max_hits=limit, cap_hits=cap_hits)
         return replace(
             result,
             scanned_files=scanned,

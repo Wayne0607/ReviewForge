@@ -21,7 +21,16 @@ def request_options(
     options: dict[str, Any] = {}
     if final_output and (json_mode == "json_object" or (json_mode == "auto" and deepseek)):
         options["response_format"] = {"type": "json_object"}
-    if deepseek and final_output and (agent != "investigator" or closure_thinking in {"auto", "disabled"}):
+    if (
+        deepseek
+        and final_output
+        and (
+            protocol_version < 10
+            and (agent != "investigator" or closure_thinking in {"auto", "disabled"})
+            or protocol_version >= 10
+            and closure_thinking == "disabled"
+        )
+    ):
         options.update(extra_body={"thinking": {"type": "disabled"}}, reasoning_effort=None)
     # The tested flash route uses the Qwen switch, not DeepSeek's thinking
     # object. Bound all v4 stages; unknown providers and saved protocols keep

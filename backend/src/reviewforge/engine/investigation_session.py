@@ -23,12 +23,16 @@ def request(worker, hypothesis, pack, *, final=False, turn=1, feedback=None, sta
         *([] if final else worker._build_tools()),
     ]
     model = worker._closing_llm if final and worker._closing_llm is not None else worker._llm
-    bound = bind_discovery_submission(model, tools)
+    bound = bind_discovery_submission(model, tools, automatic=worker._protocol_version >= 10)
     packet = json.loads(worker._exploration_chat(hypothesis, pack)[-1].content)
     packet["case_id"] = case_identity(hypothesis, state.head_sha)
     packet["session"] = {"state": status, "turn": turn, "last_turn": final}
     prompt = load_prompt(
-        "session_investigation_v9" if worker._protocol_version >= 9 else "session_investigation_v5",
+        "session_investigation_v10"
+        if worker._protocol_version >= 10
+        else "session_investigation_v9"
+        if worker._protocol_version >= 9
+        else "session_investigation_v5",
         output_language=worker._output_language,
     )
     if worker._closure_constraints:

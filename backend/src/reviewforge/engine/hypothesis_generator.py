@@ -916,13 +916,15 @@ class HypothesisGenerator:
         ):
             return False
         facts = behavior.get("source_facts")
-        # A resource unit can contain several distinct before/after pairs.
-        # Short v4 refs need bounded metadata, not the old four-quote ceiling;
-        # every fact still passes the same source and target checks below.
-        max_facts = 12 if protocol_version >= 4 else 4
+        # A resource unit can contain many distinct before/after pairs. Native
+        # v10 records use provider capacity; an arbitrary ref
+        # count must not discard true sources. Validate every source and side.
+        max_facts = None if protocol_version >= 10 else 12 if protocol_version >= 4 else 4
         if (
             not isinstance(facts, list)
-            or not 1 <= len(facts) <= max_facts
+            or not facts
+            or max_facts is not None
+            and len(facts) > max_facts
             or not all(block.source_matches(fact) for fact in facts)
         ):
             return False
@@ -1445,7 +1447,7 @@ class HypothesisGenerator:
                 valid.append((payload, sites))
 
         valid.sort(key=lambda entry: (-_SEVERITY_PRIORITY.get(entry[0]["severity"], 0), entry[0]["unit_id"]))
-        kept = valid[: self._max_hypotheses]
+        kept = valid if ledger.protocol_version >= 10 else valid[: self._max_hypotheses]
         overflow = len(valid) - len(kept)
 
         for payload, sites in kept:

@@ -20,6 +20,7 @@ from langchain_core.runnables.base import RunnableBindingBase
 
 from reviewforge.core.change_manifest import is_verified_rename
 from reviewforge.core.json_output import strip_reasoning_blocks
+from reviewforge.engine.execution_policy import output_capacity, repeated_state
 from reviewforge.engine.hypothesis import Hypothesis, HypothesisLedger, HypothesisStatus
 from reviewforge.engine.investigator import _evidence_segments
 from reviewforge.engine.prompts_v4 import load_prompt
@@ -357,7 +358,9 @@ def retryable(item: Hypothesis, ledger: HypothesisLedger) -> bool:
         and _scope_matches(record, item, ledger)
         and record.get("outcome") in {"provider-error", "output-error"}
         and type(record.get("attempts")) is int
-        and 0 < record["attempts"] < _MAX_ATTEMPTS
+        and record["attempts"] > 0
+        and (ledger.protocol_version >= 10 or record["attempts"] < _MAX_ATTEMPTS)
+        and record.get("reason") != "no-progress-cycle"
     )
 
 
@@ -545,7 +548,9 @@ class ProofGate:
         return [
             SystemMessage(
                 content=load_prompt(
-                    "proof_gate_v9"
+                    "proof_gate_v10"
+                    if ledger.protocol_version >= 10
+                    else "proof_gate_v9"
                     if ledger.protocol_version >= 9
                     else "proof_gate_v4"
                     if ledger.protocol_version >= 4
@@ -575,6 +580,11 @@ class ProofGate:
             "head_sha": ledger.head_sha,
             "workspace_digest": ledger.workspace_digest,
             "attempts": old.get("attempts", 0) + 1,
+            **(
+                {"transition_fingerprints": old.get("transition_fingerprints", [])}
+                if ledger.protocol_version >= 10
+                else {}
+            ),
             "model_attempts": old.get("model_attempts", 0),
             "tokens": old.get("tokens", 0),
             "decision": "unknown",
@@ -597,7 +607,8 @@ class ProofGate:
             if (
                 receipt.get("state") != "received"
                 or not isinstance(content, str)
-                or len(content.encode("utf-8")) > 128_000
+                or ledger.protocol_version < 10
+                and len(content.encode("utf-8")) > 128_000
                 or hashlib.sha256(content.encode("utf-8")).hexdigest() != receipt.get("sha256")
                 or not isinstance(batch_ids, list)
                 or not all(isinstance(identity, str) for identity in batch_ids)
@@ -624,6 +635,7 @@ class ProofGate:
             return
         if ledger.protocol_version >= 4:
             await run_source_audit(self._llm, ledger, self._on_update)
+        unlimited = ledger.protocol_version >= 10
         candidates = [item for item in ledger.items.values() if item.status == HypothesisStatus.CONFIRMED]
         duplicate_ids = {identity for identity, count in Counter(item.id for item in candidates).items() if count > 1}
         pending = []
@@ -634,10 +646,11 @@ class ProofGate:
             if ledger.protocol_version >= 9 and old.get("received_result", {}).get("state") == "received":
                 self._consume_received(item, ledger)
                 await self._changed(ledger)
-                continue
+                if ledger.protocol_version < 10 or old.get("outcome") != "output-error":
+                    continue
             if completed(item, ledger):
                 continue
-            if old.get("attempts", 0) >= _MAX_ATTEMPTS:
+            if (not unlimited and old.get("attempts", 0) >= _MAX_ATTEMPTS) or old.get("reason") == "no-progress-cycle":
                 continue
             if old.get("outcome") == "budget-exhausted":
                 continue
@@ -655,6 +668,22 @@ class ProofGate:
         await self._changed(ledger)
         budget = ledger.request_budget or {}
         available = snapshot_available(budget, fallback=None if ledger.protocol_version >= 8 else _DEFAULT_AVAILABLE)
+
+        def repair_output(batch, response):
+            if not unlimited:
+                return
+            for candidate in batch:
+                record = ledger.publication_reviews[candidate.id]
+                if record.get("outcome") != "output-error":
+                    continue
+                record["rejected_result"] = response.content
+                if repeated_state(
+                    record, state={"input": record["fingerprint"], "reason": record["reason"]}, receipt=response.content
+                ):
+                    record["reason"] = "no-progress-cycle"
+                else:
+                    pending.append(candidate)
+
         spent = calls = 0
         while pending:
             batch = []
@@ -663,6 +692,30 @@ class ProofGate:
             for item in pending:
                 trial = [*batch, item]
                 trial_messages = self._messages(ledger, trial)
+                if unlimited:
+                    feedback = [
+                        {
+                            "hypothesis_id": candidate.id,
+                            "error": ledger.publication_reviews.get(candidate.id, {}).get("reason"),
+                            "rejected_result_untrusted": ledger.publication_reviews.get(candidate.id, {}).get(
+                                "rejected_result"
+                            ),
+                        }
+                        for candidate in trial
+                        if ledger.publication_reviews.get(candidate.id, {}).get("rejected_result") is not None
+                    ]
+                    if feedback:
+                        trial_messages.append(
+                            HumanMessage(
+                                content=json.dumps(
+                                    {
+                                        "controller_receipt": feedback,
+                                        "instruction": "Correct the reported errors for the original cases.",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        )
                 if not fits_proof_input(trial_messages, cases=len(trial), protocol_version=ledger.protocol_version):
                     break
                 live_available = _live_available(self._llm, trial_messages)
@@ -672,7 +725,10 @@ class ProofGate:
                     else (None if available is None else max(0, available - spent))
                 )
                 trial_plan = plan_request(
-                    self._llm, trial_messages, max_output_tokens=_MAX_OUTPUT, fallback_available=fallback
+                    self._llm,
+                    trial_messages,
+                    max_output_tokens=output_capacity(ledger.protocol_version, _MAX_OUTPUT),
+                    fallback_available=fallback,
                 )
                 # A policy floor gives a useful response room; it is no guarantee
                 # that a model can finish an arbitrary proof in this many tokens.
@@ -680,7 +736,7 @@ class ProofGate:
                     refusal_reason = "publication-request-budget-insufficient"
                     break
                 batch, planned, messages = trial, trial_plan, trial_messages
-            if not batch or calls >= _MAX_CALLS:
+            if not batch or (not unlimited and calls >= _MAX_CALLS):
                 item = pending.pop(0)
                 old = ledger.publication_reviews.get(item.id, {})
                 if not _scope_matches(old, item, ledger):
@@ -692,13 +748,13 @@ class ProofGate:
                     outcome=(
                         "output-error"
                         if ledger.protocol_version >= 9
-                        and calls < _MAX_CALLS
+                        and (unlimited or calls < _MAX_CALLS)
                         and refusal_reason == "complete-proof-packet-too-large"
                         else "budget-exhausted"
                     ),
                     reason=(
                         "publication-call-cap"
-                        if calls >= _MAX_CALLS
+                        if not unlimited and calls >= _MAX_CALLS
                         else refusal_reason
                         if ledger.protocol_version >= 9
                         else "complete-proof-packet-does-not-fit"
@@ -769,7 +825,11 @@ class ProofGate:
             else:
                 if ledger.protocol_version >= 9:
                     content = response.content
-                    if not isinstance(content, str) or len(content.encode("utf-8")) > 128_000:
+                    if (
+                        not isinstance(content, str)
+                        or ledger.protocol_version < 10
+                        and len(content.encode("utf-8")) > 128_000
+                    ):
                         for item in batch:
                             ledger.publication_reviews[item.id].update(
                                 outcome="output-error", reason="proof-result-receipt-too-large"
@@ -788,6 +848,7 @@ class ProofGate:
                     await self._changed(ledger)
                     for item in batch:
                         self._consume_received(item, ledger)
+                    repair_output(batch, response)
                     await self._changed(ledger)
                     continue
                 for item in batch:
@@ -801,6 +862,7 @@ class ProofGate:
                         ledger.publication_reviews[item.id].update(outcome="output-error", reason=str(exc))
                     else:
                         ledger.publication_reviews[item.id].update(validated)
+            repair_output(batch, response)
             await self._changed(ledger)
 
 

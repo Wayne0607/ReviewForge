@@ -229,6 +229,7 @@ async def _run_llm_stages(
             receipt_first=True,
             deepseek_native_tools=ledger.protocol_version >= 9
             and effective.get("model", "").lower().startswith("deepseek-"),
+            automatic_native_tools=ledger.protocol_version >= 10,
         )
         return RetryChatLLM(
             tracked,
@@ -323,7 +324,7 @@ async def _run_llm_stages(
         refresh_allocation()
         await _persist_ledger(orchestrator, current)
 
-    executor = build_workspace_executor(workspace, state)
+    executor = build_workspace_executor(workspace, state, protocol_version=ledger.protocol_version)
     refresh_allocation()
     if request_budget is not None:
         await budget_changed(request_budget.snapshot())

@@ -22,6 +22,7 @@ from reviewforge.engine.discovery_repair import apply_repairs, pending_repairs, 
 from reviewforge.engine.discovery_session import extend_sources, restore_observation, result_payload, source_packet
 from reviewforge.engine.discovery_submission import bind_discovery_submission
 from reviewforge.engine.discovery_workflow_tools import KINDS, assessment_tools
+from reviewforge.engine.execution_policy import output_capacity, repeated_state
 from reviewforge.engine.investigator import Investigator
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.request_budget import plan_request
@@ -84,17 +85,21 @@ def request(generator, work, *, read=False, global_remaining=0):
     active = replace(work.block, units=[unit for unit in work.block.units if unit.id in pending])
     result_tool, schemas = assessment_tools(active, protocol_version=work.protocol_version)
     tools = [result_tool, *(work.broker._build_tools() if read else [])]
-    scope = {
-        "policy": work.flow["policy"],
-        "phase": "acquire" if read else "repair" if work.flow["invalid_receipts"] else "submit",
-        "turn": work.session.record["turns"] + 1,
-        "requests_remaining": max(
-            0, min(work.session.record["max_turns"] - work.session.record["turns"], global_remaining) - 1
-        ),
-        "read_requests_remaining": max(0, READ_REQUESTS - work.flow["read_requests"] - int(read)),
-        "last_turn": min(work.session.record["max_turns"] - work.session.record["turns"], global_remaining) <= 1,
-    }
-    if work.protocol_version >= 7 and not read and pending_repairs(work):
+    scope = {}
+    if work.protocol_version < 10:
+        scope = {
+            "policy": work.flow["policy"],
+            "phase": "acquire" if read else "repair" if work.flow["invalid_receipts"] else "submit",
+            "turn": work.session.record["turns"] + 1,
+            "requests_remaining": max(
+                0, min(work.session.record["max_turns"] - work.session.record["turns"], global_remaining) - 1
+            ),
+            "read_requests_remaining": max(0, READ_REQUESTS - work.flow["read_requests"] - int(read)),
+            "last_turn": min(work.session.record["max_turns"] - work.session.record["turns"], global_remaining) <= 1,
+        }
+    if work.protocol_version >= 10:
+        scope = {"policy": "completion-driven-v1", "phase": "review", "turn": work.session.record["turns"] + 1}
+    if 7 <= work.protocol_version < 10 and not read and pending_repairs(work):
         scope.update(phase="field-repair", repair_record_count=len(pending_repairs(work)))
         repair_tool, chat = repair_request(work, schemas, scope)
         return bind_discovery_submission(generator._llm, [repair_tool]), chat, [repair_tool], schemas, scope
@@ -107,7 +112,11 @@ def request(generator, work, *, read=False, global_remaining=0):
         )
     )
     prompt = load_prompt(
-        "discovery_workflow_v9" if work.protocol_version >= 9 else "discovery_workflow_v6",
+        "discovery_workflow_v10"
+        if work.protocol_version >= 10
+        else "discovery_workflow_v9"
+        if work.protocol_version >= 9
+        else "discovery_workflow_v6",
         output_language=generator._output_language,
     )
     if work.protocol_version >= 7:
@@ -125,7 +134,13 @@ def request(generator, work, *, read=False, global_remaining=0):
                 )
             )
         )
-    return bind_discovery_submission(generator._llm, tools), chat, tools, schemas, scope
+    return (
+        bind_discovery_submission(generator._llm, tools, automatic=work.protocol_version >= 10),
+        chat,
+        tools,
+        schemas,
+        scope,
+    )
 
 
 async def checkpoint(generator, ledger):
@@ -138,18 +153,23 @@ def save_observations(work):
     work.record["source_registry"] = {ref: asdict(source) for ref, source in work.block.source_refs.items()}
 
 
-def rejected(name, args, reason, fields=None):
+def rejected(name, args, reason, fields=None, *, unrestricted=False):
     receipt = {"action": name, "unit_id": str(args.get("unit_id") or "")[:128], "error": reason}
     if fields:
         receipt["fields"] = fields
     # Preserve a malformed submission as quoted repair material, never a fact.
-    if len(json.dumps(args, ensure_ascii=False)) <= 8000:
+    if unrestricted or len(json.dumps(args, ensure_ascii=False)) <= 8000:
         receipt["rejected_record_untrusted"] = copy.deepcopy(args)
     return receipt
 
 
 async def consume(generator, work, response, tools, schemas, delivered, ledger, result, right, store):
-    calls, errors = actions(response, tools, allow_redundant_kind=work.protocol_version >= 9)
+    from functools import partial
+
+    reject = partial(rejected, unrestricted=work.protocol_version >= 10)
+    calls, errors = actions(
+        response, tools, allow_redundant_kind=work.protocol_version >= 9, allow_explanation=work.protocol_version >= 10
+    )
     feedback = [{"error": error["reason"], "unit_id": error["unit_id"]} for error in errors]
     for call in calls:
         if call.get("transport_normalizations"):
@@ -173,7 +193,7 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
             try:
                 prepared = work.broker._prepared_tool_args(name, args)
             except (ValueError, TypeError):
-                feedback.append(rejected(name, args, "invalid-source-tool-arguments"))
+                feedback.append(reject(name, args, "invalid-source-tool-arguments"))
                 continue
             reply = await work.broker._run_tool(name, prepared)
             feedback.append({"action": name, "result": reply})
@@ -196,9 +216,11 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         if (
             set(args) != {"records"}
             or not isinstance(records, list)
-            or not 1 <= len(records) <= max(4, 2 * len(work.pending))
+            or not records
+            or work.protocol_version < 10
+            and len(records) > max(4, 2 * len(work.pending))
         ):
-            feedback.append(rejected(name, args, "invalid-assessment-envelope"))
+            feedback.append(reject(name, args, "invalid-assessment-envelope"))
             continue
         for raw in records:
             if not isinstance(raw, dict):
@@ -209,7 +231,7 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 touched.add(unit_id)
             schema = schemas.get(raw.get("kind")) if isinstance(raw.get("kind"), str) else None
             if schema is None:
-                feedback.append(rejected(name, raw, "unknown-assessment-kind"))
+                feedback.append(reject(name, raw, "unknown-assessment-kind"))
                 if isinstance(unit_id, str):
                     invalid_units.add(unit_id)
                 continue
@@ -219,16 +241,16 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 fields = [
                     {"field": list(error["loc"]), "type": error["type"]} for error in exc.errors(include_input=False)
                 ]
-                feedback.append(rejected(name, raw, "invalid-assessment-schema", fields))
+                feedback.append(reject(name, raw, "invalid-assessment-schema", fields))
                 if isinstance(unit_id, str):
                     invalid_units.add(unit_id)
-                if work.protocol_version >= 7:
+                if 7 <= work.protocol_version < 10:
                     remember(work, raw, fields, schemas)
                 continue
             try:
                 collection, item = result_payload(KINDS[args["kind"]], args, work.block, delivered)
             except (ValueError, TypeError):
-                feedback.append(rejected(name, raw, "invalid-assessment-reference"))
+                feedback.append(reject(name, raw, "invalid-assessment-reference"))
                 invalid_units.add(args["unit_id"])
                 continue
             groups.setdefault(args["unit_id"], []).append((collection, item))
@@ -236,7 +258,7 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 prior = carried.setdefault(args["unit_id"], [])
                 if args not in prior:
                     prior.append(copy.deepcopy(args))
-    if work.protocol_version >= 7:
+    if 7 <= work.protocol_version < 10:
         invalid_units.update(value["raw"]["unit_id"] for value in pending_repairs(work).values())
         for unit_id in touched & work.pending:
             if unit_id in carried:
@@ -256,7 +278,7 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
                 ]
                 if missing:
                     feedback.append(
-                        rejected("submit_assessments", raw, "missing-required-source-sides")
+                        reject("submit_assessments", raw, "missing-required-source-sides")
                         | {
                             "missing_source_sides": missing,
                             "eligible_source_refs": dict(zip(("before", "after"), choices, strict=True)),
@@ -285,6 +307,8 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
         allowance = min(
             generator._discovery_max_hypotheses_per_block, max(0, generator._max_hypotheses - len(ledger.items))
         )
+        if work.protocol_version >= 10:
+            allowance = sum(kind == "hypotheses" for kind, _ in entries)
         await generator._consume_discovery(
             expand_response_refs(payload, delivered),
             replace(work.block, units=[unit]),
@@ -332,7 +356,7 @@ async def consume(generator, work, response, tools, schemas, delivered, ledger, 
     # The output cap bounds source replies; still bound accumulated feedback.
     work.flow["feedback"] = (
         feedback
-        if len(json.dumps(feedback, ensure_ascii=False)) <= 16000
+        if work.protocol_version >= 10 or len(json.dumps(feedback, ensure_ascii=False)) <= 16000
         else [
             {key: value for key, value in entry.items() if key not in {"result", "rejected_record_untrusted"}}
             for entry in feedback
@@ -355,6 +379,11 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
     if generator._executor is None:
         raise ValueError("protocol-6 discovery requires the pinned read-only executor")
     policy = REPAIR_POLICY if ledger.protocol_version >= 7 else POLICY
+    unlimited = ledger.protocol_version >= 10
+    if unlimited:
+        policy = "completion-driven-v1"
+    if unlimited:
+        generator._discovery_limits = replace(generator._discovery_limits, global_context_max_chars=None)
     blocks = plan_discovery(
         changeset,
         pack,
@@ -411,8 +440,10 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
     base_limit = generator._session_request_limit
     if ledger.protocol_version >= 9:
         base_limit = max(base_limit, min(128, 2 * len(blocks) + sum(len(block.units) for block in blocks)))
-    request_limit = min(
-        [base_limit] + [r["request_limit"] for r in ledger.discovery_blocks.values() if "request_limit" in r]
+    request_limit = (
+        None
+        if unlimited
+        else min([base_limit] + [r["request_limit"] for r in ledger.discovery_blocks.values() if "request_limit" in r])
     )
     acknowledged = {
         unit_id: copy.deepcopy(row)
@@ -472,7 +503,10 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
         broker._observations = [restore_observation(raw) for raw in record["observations"]]
         broker._obs_counter = len(broker._observations)
         session = ReviewSession(
-            record, task_id=key, phase="discovery", max_turns=READ_REQUESTS + len(block.units) + REPAIR_REQUESTS
+            record,
+            task_id=key,
+            phase="discovery",
+            max_turns=None if unlimited else READ_REQUESTS + len(block.units) + REPAIR_REQUESTS,
         )
         flow = record["workflow"]
         if (
@@ -481,7 +515,8 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
                 for name in ("read_requests", "result_requests", "invalid_receipts")
             )
             or flow["read_requests"] + flow["result_requests"] != session.record["turns"]
-            or flow["read_requests"] > READ_REQUESTS
+            or not unlimited
+            and flow["read_requests"] > READ_REQUESTS
         ):
             raise ValueError("invalid-discovery-workflow-counters")
         # Neither head-file reads nor another model answer can manufacture an
@@ -499,26 +534,31 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
         )
     await checkpoint(generator, ledger)
     used = sum(record.get("session", {}).get("turns", 0) for record in ledger.discovery_blocks.values())
-    while used < request_limit:
+    while request_limit is None or used < request_limit:
         active = [
             work
             for work in worklist
             if work.pending
             and not work.stopped
-            and work.session.record["turns"] < work.session.record["max_turns"]
-            and work.flow["result_requests"] < len(work.block.units) + REPAIR_REQUESTS
-            and work.flow["invalid_receipts"] <= REPAIR_REQUESTS
+            and (
+                unlimited
+                or (
+                    work.session.record["turns"] < work.session.record["max_turns"]
+                    and work.flow["result_requests"] < len(work.block.units) + REPAIR_REQUESTS
+                    and work.flow["invalid_receipts"] <= REPAIR_REQUESTS
+                )
+            )
         ]
         if not active:
             break
         # Least-dispatched groups first: optional continuation cannot starve an
         # unvisited group. Persistent counters make resumed ordering identical.
         work = min(active, key=lambda item: (item.session.record["turns"], item.order))
-        remaining = request_limit - used
+        remaining = None if unlimited else request_limit - used
         available = _discovery_available(ledger)
         costs = {}
         closings = {}
-        for other in active:
+        for other in [] if unlimited else active:
             closing = request(generator, other, global_remaining=remaining)
             allowance = min(
                 generator._discovery_max_hypotheses_per_block, max(0, generator._max_hypotheses - len(ledger.items))
@@ -529,20 +569,32 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
             plan = plan_request(closing[0], closing[1], max_output_tokens=4096, fallback_available=available)
             costs[other.order] = plan.input_tokens + floor
             closings[other.order] = (closing, plan, floor)
-        closing, closing_plan, floor = closings[work.order]
+        if unlimited:
+            current = request(generator, work, read=True)
+            bound, chat, tools, schemas, scope = current
+            plan = plan_request(
+                bound,
+                chat,
+                max_output_tokens=output_capacity(ledger.protocol_version, 4096),
+                fallback_available=available,
+            )
+            read, reserve, floor = True, 0, 1
+        else:
+            closing, closing_plan, floor = closings[work.order]
         other_reserve = sum(cost for key, cost in costs.items() if key != work.order)
-        read = (
+        read = unlimited or (
             work.flow["mode"] == "acquire"
             and work.flow["read_requests"] < READ_REQUESTS
             and remaining > len(active)
             and work.session.record["turns"] + 1 < work.session.record["max_turns"]
         )
-        current = request(generator, work, read=True, global_remaining=remaining) if read else closing
-        reserve = other_reserve + costs[work.order] + min(costs.values()) if read else 0
-        plan = plan_request(
-            current[0], current[1], max_output_tokens=4096, fallback_available=available, reserve_tokens=reserve
-        )
-        if read and plan.max_output_tokens < 512:
+        if not unlimited:
+            current = request(generator, work, read=True, global_remaining=remaining) if read else closing
+            reserve = other_reserve + costs[work.order] + min(costs.values()) if read else 0
+            plan = plan_request(
+                current[0], current[1], max_output_tokens=4096, fallback_available=available, reserve_tokens=reserve
+            )
+        if not unlimited and read and plan.max_output_tokens < 512:
             read = False
             current, plan = closing, closing_plan
         if not read:
@@ -558,7 +610,7 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
                 current[0], current[1], max_output_tokens=4096, fallback_available=available, reserve_tokens=reserve
             )
         bound, chat, tools, schemas, scope = current
-        if sum(len(message.content) for message in chat) > generator._max_input_chars:
+        if not unlimited and sum(len(message.content) for message in chat) > generator._max_input_chars:
             work.stopped = "session-input-limit"
             continue
         if plan.max_output_tokens < (512 if read else floor):
@@ -589,11 +641,32 @@ async def run_discovery(generator, state, pack, changeset, ledger, *, overview_c
         for source in work.block.source_refs.values():
             store.source(source, base_sha=state.base_sha)
         await consume(generator, work, response, tools, schemas, delivered, ledger, result, right, store)
+        if (
+            unlimited
+            and work.pending
+            and repeated_state(
+                work.flow,
+                state={
+                    "pending": sorted(work.pending),
+                    "sources": work.record.get("source_registry"),
+                    "accepted": work.flow.get("carried", {}),
+                    "feedback": work.flow["feedback"],
+                },
+                receipt={
+                    "calls": [
+                        {"name": call.get("name"), "args": call.get("args")}
+                        for call in (getattr(response, "tool_calls", []) or [])
+                    ],
+                    "content": getattr(response, "content", ""),
+                },
+            )
+        ):
+            work.stopped = "no-progress-cycle"
     for work in worklist:
         for unit_id in work.pending:
             reason = work.stopped or (
                 "discovery-request-limit"
-                if used >= request_limit
+                if request_limit is not None and used >= request_limit
                 else "protocol-repair-limit"
                 if work.flow["invalid_receipts"] > REPAIR_REQUESTS
                 else "result-request-limit"

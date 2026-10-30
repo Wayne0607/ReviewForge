@@ -15,6 +15,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from reviewforge.core.json_output import strip_reasoning_blocks
+from reviewforge.engine.execution_policy import output_capacity, repeated_state
 from reviewforge.engine.hypothesis import HypothesisLedger, HypothesisStatus
 from reviewforge.engine.prompts_v4 import load_prompt
 from reviewforge.engine.proof_packet_limits import fits_proof_input
@@ -32,7 +33,7 @@ def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
     from reviewforge.engine.proof_gate import _proof, _references, _text
     from reviewforge.engine.session_tools import MAX_RESULT_BYTES
 
-    if protocol_version >= 9 and len(json.dumps(raw, ensure_ascii=False).encode()) > MAX_RESULT_BYTES:
+    if protocol_version == 9 and len(json.dumps(raw, ensure_ascii=False).encode()) > MAX_RESULT_BYTES:
         raise ValueError("source-audit-transport-record-too-large")
 
     if not isinstance(raw, dict) or set(raw) != {"hypothesis_id", "execution", "contracts", "gaps"}:
@@ -61,7 +62,11 @@ def validate(raw: Any, item, *, protocol_version=4) -> dict[str, Any]:
                 if isinstance(row, dict)
                 else None
             )
-            if proof is None or (protocol_version < 9 and len(proof["statement"]) > 600) or len(proof["evidence"]) > 8:
+            if (
+                proof is None
+                or (protocol_version < 9 and len(proof["statement"]) > 600)
+                or (protocol_version < 10 and len(proof["evidence"]) > 8)
+            ):
                 raise ValueError("invalid-source-fact")
             if name == "execution" and set(row) != {"statement", "evidence"}:
                 raise ValueError("invalid-source-execution")
@@ -107,7 +112,7 @@ def consume(raw, item, *, protocol_version=4):
     """
     from reviewforge.engine.session_tools import MAX_RESULT_BYTES
 
-    if protocol_version >= 9 and len(json.dumps(raw, ensure_ascii=False).encode()) > MAX_RESULT_BYTES:
+    if protocol_version == 9 and len(json.dumps(raw, ensure_ascii=False).encode()) > MAX_RESULT_BYTES:
         raise ValueError("source-audit-transport-record-too-large")
     if not isinstance(raw, dict) or set(raw) != {"hypothesis_id", "execution", "contracts", "gaps"}:
         raise ValueError("invalid-source-audit-shape")
@@ -152,7 +157,15 @@ def messages(batch, ledger):
             }
         )
     return [
-        SystemMessage(content=load_prompt("source_audit_v9" if ledger.protocol_version >= 9 else "source_audit_v4")),
+        SystemMessage(
+            content=load_prompt(
+                "source_audit_v10"
+                if ledger.protocol_version >= 10
+                else "source_audit_v9"
+                if ledger.protocol_version >= 9
+                else "source_audit_v4"
+            )
+        ),
         HumanMessage(content=json.dumps({"head_sha": ledger.head_sha, "items": entries}, ensure_ascii=False)),
     ]
 
@@ -170,6 +183,7 @@ async def run_source_audit(llm, ledger, on_update=None):
         if on_update is not None:
             await on_update(ledger)
 
+    unlimited = ledger.protocol_version >= 10
     pending = []
     for item in ledger.items.values():
         if item.status != HypothesisStatus.CONFIRMED or _source_problem(item, ledger.head_sha) is not None:
@@ -181,7 +195,11 @@ async def run_source_audit(llm, ledger, on_update=None):
         same_input = old.get("input_fingerprint") == input_fingerprint(item, ledger)
         if old.get("run_id") != ledger.run_id or not same_input and old.get("fingerprint") != fingerprint:
             old = {}
-        if old.get("attempts", 0) >= 2 or old.get("outcome") == "budget-exhausted":
+        if (
+            (not unlimited and old.get("attempts", 0) >= 2)
+            or old.get("outcome") == "budget-exhausted"
+            or old.get("reason") == "no-progress-cycle"
+        ):
             continue
         pending.append((item, old, fingerprint))
     spent = 0
@@ -192,6 +210,28 @@ async def run_source_audit(llm, ledger, on_update=None):
         refusal_reason = "source-audit-packet-too-large"
         for item, _, _ in pending:
             trial = messages([*batch, item], ledger)
+            if unlimited:
+                feedback = [
+                    {
+                        "hypothesis_id": candidate.id,
+                        "error": old.get("reason"),
+                        "rejected_result_untrusted": old.get("rejected_result"),
+                    }
+                    for candidate, old, _ in pending[: len(batch) + 1]
+                    if old.get("rejected_result") is not None
+                ]
+                if feedback:
+                    trial.append(
+                        HumanMessage(
+                            content=json.dumps(
+                                {
+                                    "controller_receipt": feedback,
+                                    "instruction": "Correct the reported errors using the same sources.",
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    )
             if not fits_proof_input(trial, cases=len(batch) + 1, protocol_version=ledger.protocol_version):
                 break
             budget = ledger.request_budget
@@ -199,7 +239,12 @@ async def run_source_audit(llm, ledger, on_update=None):
                 budget, fallback=None if ledger.protocol_version >= 8 else max(0, 16_000 - spent)
             )
             # Leave useful room for comparing the claim to the reconstruction.
-            trial_plan = plan_request(llm, trial, max_output_tokens=4096, fallback_available=available)
+            trial_plan = plan_request(
+                llm,
+                trial,
+                max_output_tokens=output_capacity(ledger.protocol_version, 4096),
+                fallback_available=available,
+            )
             if (
                 trial_plan.available_tokens is not None
                 and trial_plan.available_tokens - trial_plan.input_tokens < 2048 + 512 * (len(batch) + 1)
@@ -208,10 +253,10 @@ async def run_source_audit(llm, ledger, on_update=None):
                 break
             batch.append(item)
             request, plan = trial, trial_plan
-        selected = pending[: len(batch)] if batch and calls < 4 else pending[:1]
+        selected = pending[: len(batch)] if batch and (unlimited or calls < 4) else pending[:1]
         del pending[: len(selected)]
-        refused = not batch or calls >= 4
-        if calls >= 4:
+        refused = not batch or (not unlimited and calls >= 4)
+        if not unlimited and calls >= 4:
             refusal_reason = "source-audit-call-cap"
         if not refused:
             calls += 1
@@ -225,6 +270,7 @@ async def run_source_audit(llm, ledger, on_update=None):
                 "fingerprint": fingerprint,
                 "input_fingerprint": input_fingerprint(item, ledger),
                 "attempts": old.get("attempts", 0) + 1,
+                **({"transition_fingerprints": old.get("transition_fingerprints", [])} if unlimited else {}),
                 "tokens": old.get("tokens", 0),
                 "outcome": (
                     "output-error"
@@ -291,4 +337,17 @@ async def run_source_audit(llm, ledger, on_update=None):
                     ledger.source_audits[item.id].update(
                         outcome="resolved", reason="source-reconstructed", facts=facts, rejected_records=rejected
                     )
+        if unlimited:
+            for item in batch:
+                record = ledger.source_audits[item.id]
+                if record.get("outcome") == "output-error":
+                    record["rejected_result"] = response.content
+                    if repeated_state(
+                        record,
+                        state={"input": record["input_fingerprint"], "reason": record["reason"]},
+                        receipt=response.content,
+                    ):
+                        record["reason"] = "no-progress-cycle"
+                    else:
+                        pending.append((item, record, record["fingerprint"]))
         await save()

@@ -76,7 +76,7 @@ class DiscoveryLimits:
     hard_input_chars: int = 120_000
     diff_max_chars: int = 20_000
     context_max_chars: int = 8_000
-    global_context_max_chars: int = 40_000
+    global_context_max_chars: int | None = 40_000
     max_units: int = 12
     overview_max_chars: int = 2_000
     navigation_max_chars: int = 2_000
@@ -755,7 +755,7 @@ def plan_discovery(
                 related[unit.id].add(other.id)
                 related[other.id].add(unit.id)
     overview = _overview(overview_changeset or changeset, pack, limits.overview_max_chars)
-    context_left = max(0, limits.global_context_max_chars)
+    context_left = None if limits.global_context_max_chars is None else max(0, limits.global_context_max_chars)
     blocks = []
 
     def make(units: list[SemanticUnit]) -> DiscoveryBlock:
@@ -769,7 +769,7 @@ def plan_discovery(
             overview,
             selected,
             limits,
-            min(limits.context_max_chars, context_left),
+            limits.context_max_chars if context_left is None else min(limits.context_max_chars, context_left),
             before_states,
             structural_changes,
             keys,
@@ -834,7 +834,8 @@ def plan_discovery(
                 break
             group.append(chosen)
             remaining.remove(chosen)
-        context_left -= len(block.context_text)
+        if context_left is not None:
+            context_left -= len(block.context_text)
         blocks.append(block)
     return blocks
 

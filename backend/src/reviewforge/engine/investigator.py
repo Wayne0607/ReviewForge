@@ -28,6 +28,7 @@ from reviewforge.core.json_output import extract_json_value
 from reviewforge.core.state import StateStore
 from reviewforge.engine.context_pack import ContextPack
 from reviewforge.engine.detectors.unified_diff import iter_right_lines, select_diff_hunks
+from reviewforge.engine.execution_policy import output_capacity
 from reviewforge.engine.hypothesis import (
     ContractAssessment,
     CounterEvidence,
@@ -204,7 +205,9 @@ def _changed_paths(state: StateStore) -> set[str]:
     return paths
 
 
-def build_workspace_executor(workspace: Any, state: StateStore, *, language: str = "") -> ToolExecutor:
+def build_workspace_executor(
+    workspace: Any, state: StateStore, *, language: str = "", protocol_version: int = 1
+) -> ToolExecutor:
     """Bind the SPEC §4.6 tool names to a pinned :class:`PRHeadWorkspace`."""
 
     reference_lookups: dict[str, dict[str, Any]] = {}
@@ -253,6 +256,7 @@ def build_workspace_executor(workspace: Any, state: StateStore, *, language: str
                 path=str(args.get("path") or ""),
                 globs=[args["glob"]] if args.get("glob") else None,
                 max_hits=int(args.get("max_hits", 10)),
+                **({"cap_hits": False} if protocol_version >= 10 else {}),
             )
             reference_lookups[_query_string(name, args)] = {
                 "kind": "literal-identifier-reference",
@@ -549,7 +553,7 @@ class Investigator:
                     return (
                         "\n\n".join(
                             self._observation_reply(item) for item in self._observations if item.query == existing.query
-                        )[:TOOL_CHARS]
+                        )[: None if self._protocol_version >= 10 else TOOL_CHARS]
                         + "\nAlready recorded; choose a different missing fact."
                     )
                 return self._observation_reply(existing) + "\nAlready recorded; choose a different missing fact."
@@ -596,7 +600,13 @@ class Investigator:
             text = ""
             failed = True
         original_chars = len(text)
-        text = text[: TOOL_CHARS if self._protocol_version >= 9 else _TOOL_RESULT_CHARS]
+        text = text[
+            : None
+            if self._protocol_version >= 10
+            else TOOL_CHARS
+            if self._protocol_version >= 9
+            else _TOOL_RESULT_CHARS
+        ]
         if failed:
             status = "error"
         elif _is_not_found(text):
@@ -727,6 +737,8 @@ class Investigator:
         # Never fetch extra text or promote an omitted byte into evidence.
         first = max(1, int(args.get("start") or 1))
         lines = text.splitlines(keepends=True)
+        if self._protocol_version >= 10:
+            return text, (first, first + len(lines) - 1)
         limit = SOURCE_CHARS if self._protocol_version >= 9 else _OBS_EXCERPT_CHARS
         excerpt = text[:limit]
         path = str(args.get("path") or "")
@@ -1143,7 +1155,7 @@ class Investigator:
         pack: ContextPack,
         *,
         token_limit: int | None,
-        max_steps: int,
+        max_steps: int | None,
         gaps: list[str],
     ) -> InvestigationResult:
         """Collect missing source facts once within the caller's remaining allowance.
@@ -1170,8 +1182,8 @@ class Investigator:
         if (
             (token_limit is None and not self._metered)
             or (token_limit is not None and (type(token_limit) is not int or token_limit < 0))
-            or type(max_steps) is not int
-            or max_steps < 0
+            or not (max_steps is None and self._protocol_version >= 10)
+            and (type(max_steps) is not int or max_steps < 0)
         ):
             raise ValueError("evidence collection requires nonnegative integer limits")
         if not isinstance(gaps, list) or any(not isinstance(gap, str) or not gap.strip() for gap in gaps):
@@ -1231,7 +1243,9 @@ class Investigator:
             )
         )
         assert self._collection_state is not None
-        for step in range(max_steps):
+        from itertools import count
+
+        for step in count() if max_steps is None else range(max_steps):
             self._refresh_allocation(hypothesis)
             packet = json.loads(self._exploration_chat(hypothesis, pack)[-1].content)
             packet["gaps"] = gaps
@@ -1239,7 +1253,7 @@ class Investigator:
             plan = plan_request(
                 bound,
                 chat,
-                max_output_tokens=1_000,
+                max_output_tokens=output_capacity(self._protocol_version, 1_000),
                 fallback_available=None if token_limit is None else token_limit - self._accounted_tokens(),
             )
             self._progress.append(
@@ -1760,7 +1774,9 @@ class Investigator:
         if self._protocol_version >= 9:
             from reviewforge.engine.source_navigation import packet as navigation_packet
 
-            packet["source_navigation"] = navigation_packet(self._observations)
+            packet["source_navigation"] = navigation_packet(
+                self._observations, **({"limit": None} if self._protocol_version >= 10 else {})
+            )
         return [
             SystemMessage(content=self._system_prompt()),
             HumanMessage(content=json.dumps(packet, ensure_ascii=False, separators=(",", ":"))),
@@ -2537,7 +2553,7 @@ class Investigator:
                 if on_update is not None:
                     await on_update(ledger)
 
-            if index >= max(0, max_hypotheses_per_pr):
+            if ledger.protocol_version < 10 and index >= max(0, max_hypotheses_per_pr):
                 return self._result(
                     verdict="unknown",
                     reason="investigation-task-cap" if managed else "budget-exhausted",
@@ -2582,7 +2598,11 @@ class Investigator:
                     on_progress=save_progress if ledger.protocol_version >= 5 else None,
                 )
                 if managed:
-                    worker._max_steps = max(0, allowance["budget_steps_limit"] - allowance.get("total_steps", 0))
+                    worker._max_steps = (
+                        None
+                        if ledger.protocol_version >= 10
+                        else max(0, allowance["budget_steps_limit"] - allowance.get("total_steps", 0))
+                    )
                     from reviewforge.engine.investigation_repair import has_saved_result
 
                     if (
@@ -2633,7 +2653,7 @@ class Investigator:
                 ledger.investigation_tasks[task.id] = {
                     "members": list(task.members),
                     "charged_to": hypothesis.identity,
-                    "budget_steps_limit": limit,
+                    "budget_steps_limit": None if ledger.protocol_version >= 10 else limit,
                     "token_limit": None if metered else token_limit,
                     **({"budget_policy": "usage-only-v1" if metered else "adaptive-v1"} if managed else {}),
                     "total_steps": 0,

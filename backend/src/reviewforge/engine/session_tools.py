@@ -49,7 +49,10 @@ def prose(protocol_version=5):
 def discovery_tools(block, *, protocol_version=5):
     unit = Literal[tuple(item.id for item in block.units)]
     ref = Annotated[str, Field(pattern=r"^f[0-9]+\.[BRC][0-9]+(?:\.s[0-9]+)?$")]
-    common = {"unit_id": (unit, ...), "source_refs": (list[ref], Field(min_length=1, max_length=12))}
+    common = {
+        "unit_id": (unit, ...),
+        "source_refs": (list[ref], Field(min_length=1, **({"max_length": 12} if protocol_version < 10 else {}))),
+    }
     if block.structural_changes:
         common["change_fields"] = (list[Literal["previous_path", "path"]], Field(max_length=2))
     return [
@@ -67,7 +70,7 @@ def discovery_tools(block, *, protocol_version=5):
                 "site_refs": (list[ref], Field(max_length=1)),
                 "trigger_ref": (ref, ...),
             },
-            bounded_record=protocol_version >= 9,
+            bounded_record=protocol_version == 9,
         ),
         result_tool(
             "submit_no_issue",
@@ -76,7 +79,7 @@ def discovery_tools(block, *, protocol_version=5):
                 **common,
                 "checked": prose(protocol_version),
             },
-            bounded_record=protocol_version >= 9,
+            bounded_record=protocol_version == 9,
         ),
         result_tool(
             "defer_unit",
@@ -85,7 +88,7 @@ def discovery_tools(block, *, protocol_version=5):
                 "unit_id": (unit, ...),
                 "reason": prose(protocol_version),
             },
-            bounded_record=protocol_version >= 9,
+            bounded_record=protocol_version == 9,
         ),
     ]
 
@@ -105,7 +108,7 @@ def case_identity(hypothesis, head_sha: str) -> str:
 
 def decision_tools(hypothesis, head_sha: str, *, protocol_version=5):
     case = (Literal[case_identity(hypothesis, head_sha)], ...)
-    refs = (list[str], Field(min_length=1, max_length=8))
+    refs = (list[str], Field(min_length=1, **({"max_length": 8} if protocol_version < 10 else {})))
     common = {"case_id": case, "reason": prose(protocol_version)}
     return [
         result_tool(
@@ -118,7 +121,7 @@ def decision_tools(hypothesis, head_sha: str, *, protocol_version=5):
                 "expected_evidence": refs,
                 "actual_evidence": refs,
             },
-            bounded_record=protocol_version >= 9,
+            bounded_record=protocol_version == 9,
         ),
         result_tool(
             "submit_refuted",
@@ -129,7 +132,7 @@ def decision_tools(hypothesis, head_sha: str, *, protocol_version=5):
                 "statement": prose(protocol_version),
                 "evidence": refs,
             },
-            bounded_record=protocol_version >= 9,
+            bounded_record=protocol_version == 9,
         ),
         result_tool(
             "submit_unknown",
@@ -138,7 +141,7 @@ def decision_tools(hypothesis, head_sha: str, *, protocol_version=5):
                 **common,
                 "missing_fact": prose(protocol_version),
             },
-            bounded_record=protocol_version >= 9,
+            bounded_record=protocol_version == 9,
         ),
     ]
 

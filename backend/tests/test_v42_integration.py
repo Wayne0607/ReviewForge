@@ -79,7 +79,7 @@ def working_state():
     return {
         "question": "Does the changed result preserve its contract?",
         "observations": [],
-        "open_questions": ["Compare base and head source"],
+        "open_questions": [],
         "next_step": "Read the fixed source revision",
     }
 
@@ -144,7 +144,7 @@ async def test_native_product_path_persists_report_and_resumes_without_model_cal
 
     def review(messages, turn):
         if turn == 1:
-            return tool("read_source", {"path": "a.py", "side": "head", "review_state": working_state()})
+            return tool("read_source", {"path": "a.py", "side": "head"})
         if turn == 2:
             receipt = json.loads(next(m.content for m in reversed(messages) if isinstance(m, ToolMessage)))
             return tool(
@@ -194,12 +194,34 @@ async def test_native_product_path_persists_report_and_resumes_without_model_cal
 
     with sqlite3.connect(Path(summary["report_path"]).parent / "board.sqlite") as db:
         binding = json.loads(db.execute("SELECT payload FROM run WHERE id=1").fetchone()[0])
-        assert binding["policy"] == binding["metadata"]["execution_policy"] == "v42-stateful-2"
+        assert binding["policy"] == binding["metadata"]["execution_policy"] == "v42-workspace-3"
         assert db.execute("SELECT count(*) FROM turn_audit").fetchone()[0] >= 3
     again = await obj.run(state())
     assert again["status"] == "completed" and again["run_id"] == summary["run_id"]
     assert len(reviewer._inputs) == 3 and len(verifier._inputs) == 1
     assert obj._gateway.cleaned == 2 and events[-1][0] == "review.completed"
+
+
+async def test_product_retains_open_navigation_and_does_not_report_clean(tmp_path, monkeypatch):
+    import sqlite3
+
+    region = changed_regions(state())[0]["id"]
+
+    def review(messages, turn):
+        if turn == 1:
+            note = {**working_state(), "open_questions": ["Does the result preserve its existing contract?"]}
+            return tool("read_source", {"path": "a.py", "side": "head", "review_state": note})
+        return tool("finish_scope", {"checked_regions": [region]})
+
+    reviewer = NativeModel(review)
+    verifier = NativeModel(lambda *_: pytest.fail("no candidate requires verification"))
+    obj, _ = product(tmp_path, monkeypatch, reviewer, verifier)
+    summary = await obj.run(state())
+    assert summary["status"] == "partial" and summary["comments_sent"] == 0
+    board = Path(summary["report_path"]).parent / "board.sqlite"
+    with sqlite3.connect(board) as db:
+        notes = [json.loads(row[0]) for row in db.execute("SELECT payload FROM objects WHERE kind='NavigationItem'")]
+    assert any(note["kind"] == "question" and "existing contract" in note["text"] for note in notes)
 
 
 async def test_incomplete_workspace_fails_before_any_model_request(tmp_path, monkeypatch):

@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from .contracts import Case, EvidenceRef, Question, ReviewScope
+from .contracts import Case, EvidenceRef, NavigationItem, Question, ReviewScope
 from .verifier import POLICY, validate_result
 
 
@@ -173,10 +173,20 @@ class Publication:
                         {"case_id": case.id, "claim_id": claim_id, "reason": "invalid verification: " + str(exc)}
                     )
         active_scopes = [s for s in scopes if s.status != "superseded"]
-        unreviewed = [s.id for s in active_scopes if s.status != "reviewed"]
+        workspace = self.store.run.policy == "v42-workspace-3"
+        unreviewed = [s.id for s in active_scopes if s.status != "reviewed" or (workspace and bool(s.unresolved))]
         open_questions = [q.id for q in questions if q.status in {"open", "disputed", "unresolved"}]
+        open_navigation = []
+        if workspace:
+            active_scope_ids = {scope.id for scope in active_scopes}
+            open_navigation = [
+                {"id": item.id, "scope_id": item.scope_id, "text": item.text, "revision": item.revision}
+                for item in self.store.list(NavigationItem)
+                if item.scope_id in active_scope_ids and item.kind == "question" and item.status == "open"
+            ]
+            unresolved.extend({"kind": "navigation_question", **item} for item in open_navigation)
         status = "complete" if active_scopes and not unreviewed and not unresolved and not open_questions else "partial"
-        return {
+        report = {
             "run": asdict(self.store.run),
             "status": status,
             "scopes": [asdict(s) for s in scopes],
@@ -187,6 +197,9 @@ class Publication:
             "open_questions": open_questions,
             "duplicates": duplicates,
         }
+        if workspace:
+            report["open_navigation_questions"] = open_navigation
+        return report
 
 
 def local_report(store: Any) -> dict[str, Any]:

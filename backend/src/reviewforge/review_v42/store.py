@@ -15,10 +15,21 @@ from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
-from .contracts import BindingError, Case, EvidenceRef, LeaseError, Question, ReviewScope, RevisionConflict, Run, Task
+from .contracts import (
+    BindingError,
+    Case,
+    EvidenceRef,
+    LeaseError,
+    NavigationItem,
+    Question,
+    ReviewScope,
+    RevisionConflict,
+    Run,
+    Task,
+)
 
-T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef)
-_TYPES = {c.__name__: c for c in (ReviewScope, Question, Case, Task, EvidenceRef)}
+T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)
+_TYPES = {c.__name__: c for c in (ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)}
 
 
 def _json(value: Any) -> str:
@@ -55,12 +66,18 @@ class ReviewStore:
                 db.execute("INSERT INTO run VALUES (1, ?)", (_json(asdict(run)),))
             elif row[0] != _json(asdict(run)):
                 raise BindingError("store is bound to a different run or snapshot")
-            if run.policy == "v42-stateful-2":
+            if run.policy in {"v42-stateful-2", "v42-workspace-3"}:
                 self.audit_dir.mkdir(parents=True, exist_ok=True)
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS turn_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, phase TEXT NOT NULL, "
                     "content_hash TEXT NOT NULL, UNIQUE(task_id,turn_id,phase))"
+                )
+            if run.policy == "v42-workspace-3":
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS navigation_aliases ("
+                    "scope_id TEXT NOT NULL, fingerprint TEXT NOT NULL, item_id TEXT NOT NULL, "
+                    "PRIMARY KEY(scope_id,fingerprint))"
                 )
 
     def _connect(self) -> sqlite3.Connection:
@@ -81,8 +98,8 @@ class ReviewStore:
             if not isinstance(state, dict):
                 raise ValueError("working_state must be an object")
             if state:
-                if self.run.policy != "v42-stateful-2":
-                    raise ValueError("working_state requires v42-stateful-2")
+                if self.run.policy not in {"v42-stateful-2", "v42-workspace-3"}:
+                    raise ValueError("working_state requires a stateful policy")
                 if set(state) != {"question", "observations", "open_questions", "next_step"}:
                     raise ValueError("working_state requires question, observations, open_questions and next_step")
                 if any(not isinstance(state[key], str) or not state[key].strip() for key in ("question", "next_step")):
@@ -256,6 +273,10 @@ class ReviewStore:
             raise BindingError("object is not bound to this run")
         if isinstance(obj, EvidenceRef):
             raise BindingError("use put_evidence to create evidence")
+        if isinstance(obj, NavigationItem):
+            raise BindingError("navigation identities are controller-managed")
+        if isinstance(obj, ReviewScope) and self.run.policy == "v42-workspace-3" and obj.working_state:
+            raise ValueError("policy3 working state must be added through merge_working_states")
         if isinstance(obj, Task) and (
             obj.status != "pending" or obj.owner or obj.lease_token or obj.lease_expires or obj.result
         ):
@@ -309,6 +330,8 @@ class ReviewStore:
     ) -> T:
         if cls not in (ReviewScope, Question, Case):
             raise TypeError("updates are only supported for scopes, questions and cases")
+        if cls is ReviewScope and self.run.policy == "v42-workspace-3" and "working_state" in changes:
+            raise ValueError("policy3 working state must be added through merge_working_states")
         if {"id", "run_id", "revision"} & changes.keys():
             raise ValueError("identity and revision are controller-managed")
         valid = {f.name for f in fields(cls)}
@@ -710,6 +733,8 @@ class ReviewStore:
         self, task_id: str, token: str, expected_revision: int, *, now: float | None = None, **changes: Any
     ) -> ReviewScope:
         """Advance the scope and its review-task input together under the same lease."""
+        if self.run.policy == "v42-workspace-3" and "working_state" in changes:
+            raise ValueError("policy3 working state must be added through merge_working_states")
         if {"id", "run_id", "revision"} & changes.keys() or changes.keys() - {f.name for f in fields(ReviewScope)}:
             raise ValueError("invalid scope update fields")
         now = time.time() if now is None else now
@@ -1060,8 +1085,8 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Append one complete visible exchange, bound to the current review lease."""
-        if self.run.policy != "v42-stateful-2":
-            raise ValueError("turn audit requires v42-stateful-2")
+        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3"}:
+            raise ValueError("turn audit requires a stateful policy")
         if not isinstance(turn_id, str) or not turn_id or not isinstance(phase, str) or not phase:
             raise ValueError("turn_id and phase are required")
         if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
@@ -1151,8 +1176,8 @@ class ReviewStore:
 
     def read_turn_audit(self, task_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
         """Explicitly retrieve complete, hash-checked visible history in append order."""
-        if self.run.policy != "v42-stateful-2":
-            raise ValueError("turn audit requires v42-stateful-2")
+        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3"}:
+            raise ValueError("turn audit requires a stateful policy")
         with self._connect() as db:
             if db.execute("SELECT 1 FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone() is None:
                 raise KeyError(task_id)
@@ -1178,3 +1203,271 @@ class ReviewStore:
                 }
             )
         return result
+
+    @staticmethod
+    def _navigation_fingerprint(scope_id: str, kind: str, text: str, refs: list[str]) -> str:
+        return hashlib.sha256(_json([scope_id, kind, text, sorted(set(refs))]).encode("utf-8")).hexdigest()
+
+    def merge_working_states(
+        self,
+        task_id: str,
+        token: str,
+        expected_scope_revision: int,
+        states: list[dict[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Merge independent untrusted navigation updates without replacing siblings."""
+        if self.run.policy != "v42-workspace-3":
+            raise ValueError("navigation requires v42-workspace-3")
+        if not isinstance(states, list):
+            raise ValueError("states must be a list")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            if task.run_id != self.run.id:
+                raise BindingError("task belongs to a different run")
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            row = db.execute(
+                "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (task.object_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task.object_id)
+            scope = ReviewScope(**json.loads(row[0]))
+            if scope.revision != expected_scope_revision or task.input_revision != expected_scope_revision:
+                raise RevisionConflict("scope revision changed before navigation merge")
+            errors: list[dict[str, Any]] = []
+            accepted = []
+            for index, state in enumerate(states):
+                try:
+                    if not isinstance(state, dict) or not state:
+                        raise ValueError("review_state must have the required fields")
+                    self._validate_refs(db, replace(scope, working_state=state))
+                    accepted.append((index, state))
+                except (ValueError, BindingError, TypeError) as exc:
+                    errors.append({"index": index, "error": str(exc)})
+            matched: dict[str, NavigationItem] = {}
+            created = False
+            focus = scope.working_state
+            for index, state in accepted:
+                focus = {
+                    "question": state["question"],
+                    "observations": [],
+                    "open_questions": [],
+                    "next_step": state["next_step"],
+                }
+                updates = [("question", question, []) for question in state["open_questions"]]
+                for observation in state["observations"]:
+                    if not observation["evidence_refs"]:
+                        errors.append(
+                            {"index": index, "error": "observation ignored because it has no evidence reference"}
+                        )
+                        continue
+                    updates.append(("observation", observation["statement"], observation["evidence_refs"]))
+                for kind, text, refs in updates:
+                    refs = sorted(set(refs))
+                    fingerprint = self._navigation_fingerprint(scope.id, kind, text, refs)
+                    row = db.execute(
+                        "SELECT item_id FROM navigation_aliases WHERE scope_id=? AND fingerprint=?",
+                        (scope.id, fingerprint),
+                    ).fetchone()
+                    if row:
+                        entry = db.execute(
+                            "SELECT payload FROM objects WHERE kind='NavigationItem' AND id=?", (row[0],)
+                        ).fetchone()
+                        if entry is None:
+                            raise BindingError("navigation alias references a missing item")
+                        item = NavigationItem(**json.loads(entry[0]))
+                        if (
+                            item.run_id != self.run.id
+                            or item.scope_id != scope.id
+                            or item.kind != kind
+                            or item.status not in {"open", "resolved", "retracted"}
+                        ):
+                            raise BindingError("navigation alias belongs to a different identity")
+                        if (
+                            self._navigation_fingerprint(scope.id, item.kind, item.text, item.evidence_refs)
+                            != fingerprint
+                        ):
+                            errors.append(
+                                {
+                                    "index": index,
+                                    "error": f"navigation {item.id} was explicitly corrected; prior wording ignored",
+                                }
+                            )
+                    else:
+                        item = NavigationItem(
+                            id="nav_" + uuid.uuid4().hex,
+                            run_id=self.run.id,
+                            scope_id=scope.id,
+                            kind=kind,
+                            text=text,
+                            evidence_refs=refs,
+                        )
+                        db.execute(
+                            "INSERT INTO objects VALUES ('NavigationItem',?,?,?)", (item.id, 0, _json(asdict(item)))
+                        )
+                        db.execute("INSERT INTO navigation_aliases VALUES (?,?,?)", (scope.id, fingerprint, item.id))
+                        self._event(db, "NavigationItem", item.id, "add", {"task_id": task_id, "item": asdict(item)})
+                        created = True
+                    matched[item.id] = item
+            if created or focus != scope.working_state:
+                updated = replace(scope, working_state=focus, revision=scope.revision + 1)
+                self._validate_refs(db, updated)
+                task = replace(task, input_revision=updated.revision, revision=task.revision + 1)
+                db.execute(
+                    "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
+                    (updated.revision, _json(asdict(updated)), updated.id),
+                )
+                db.execute(
+                    "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                    (task.revision, _json(asdict(task)), task.id),
+                )
+                self._event(
+                    db,
+                    "ReviewScope",
+                    scope.id,
+                    "navigation_merge",
+                    {
+                        "task_id": task_id,
+                        "before": asdict(scope),
+                        "after": asdict(updated),
+                        "item_ids": list(matched),
+                    },
+                )
+                scope = updated
+            db.commit()
+            return {"scope": scope, "items": list(matched.values()), "errors": errors}
+
+    def update_navigation_for_task(
+        self,
+        task_id: str,
+        token: str,
+        item_id: str,
+        expected_revision: int,
+        *,
+        reason: str,
+        text: str | None = None,
+        evidence_refs: list[str] | None = None,
+        status: str | None = None,
+        now: float | None = None,
+    ) -> NavigationItem:
+        """Explicitly revise, resolve, retract or reopen one untrusted navigation item."""
+        if self.run.policy != "v42-workspace-3":
+            raise ValueError("navigation requires v42-workspace-3")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("navigation updates require a reason")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            row = db.execute("SELECT payload FROM objects WHERE kind='NavigationItem' AND id=?", (item_id,)).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            item = NavigationItem(**json.loads(row[0]))
+            if item.run_id != self.run.id or item.scope_id != task.object_id:
+                raise BindingError("navigation item belongs to another run or scope")
+            if item.revision != expected_revision:
+                raise RevisionConflict("navigation item revision changed")
+            new_text = item.text if text is None else text
+            new_refs = item.evidence_refs if evidence_refs is None else evidence_refs
+            new_status = item.status if status is None else status
+            if not isinstance(new_text, str) or not new_text.strip():
+                raise ValueError("navigation text must be nonempty")
+            if not isinstance(new_refs, list) or any(not isinstance(ref, str) or not ref for ref in new_refs):
+                raise ValueError("navigation evidence_refs must be a list of IDs")
+            new_refs = sorted(set(new_refs))
+            if item.kind == "observation" and not new_refs:
+                raise ValueError("an observation needs at least one evidence reference")
+            if new_status not in {"open", "resolved", "retracted"}:
+                raise ValueError("invalid navigation status")
+            for ref in new_refs:
+                if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref,)).fetchone() is None:
+                    raise BindingError(f"unknown evidence reference: {ref}")
+            fingerprint = self._navigation_fingerprint(item.scope_id, item.kind, new_text, new_refs)
+            alias = db.execute(
+                "SELECT item_id FROM navigation_aliases WHERE scope_id=? AND fingerprint=?",
+                (item.scope_id, fingerprint),
+            ).fetchone()
+            if alias and alias[0] != item.id:
+                raise RevisionConflict("corrected navigation duplicates another item")
+            if (new_text, new_refs, new_status) == (item.text, item.evidence_refs, item.status):
+                return item
+            updated = replace(
+                item,
+                text=new_text,
+                evidence_refs=new_refs,
+                status=new_status,
+                reason=reason,
+                revision=item.revision + 1,
+            )
+            row = db.execute(
+                "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (item.scope_id,)
+            ).fetchone()
+            scope = ReviewScope(**json.loads(row[0]))
+            updated_scope = replace(scope, revision=scope.revision + 1)
+            updated_task = replace(task, input_revision=updated_scope.revision, revision=task.revision + 1)
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='NavigationItem' AND id=?",
+                (updated.revision, _json(asdict(updated)), item.id),
+            )
+            db.execute("INSERT OR IGNORE INTO navigation_aliases VALUES (?,?,?)", (item.scope_id, fingerprint, item.id))
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
+                (updated_scope.revision, _json(asdict(updated_scope)), item.scope_id),
+            )
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                (updated_task.revision, _json(asdict(updated_task)), task.id),
+            )
+            self._event(
+                db,
+                "NavigationItem",
+                item.id,
+                "update",
+                {"task_id": task_id, "reason": reason, "before": asdict(item), "after": asdict(updated)},
+            )
+            self._event(db, "ReviewScope", item.scope_id, "navigation_update", {"task_id": task_id, "item_id": item.id})
+            db.commit()
+            return updated
+
+    def list_navigation(
+        self, scope_id: str, *, status: str | None = "open", cursor: str | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        """Explicit, lossless pagination; None returns the entire current set."""
+        if self.run.policy != "v42-workspace-3":
+            raise ValueError("navigation requires v42-workspace-3")
+        self.get(ReviewScope, scope_id)
+        if status not in {None, "open", "resolved", "retracted"}:
+            raise ValueError("invalid navigation status")
+        if cursor is not None and not isinstance(cursor, str):
+            raise ValueError("cursor must be a string")
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("page size must be a positive integer")
+        items = [
+            item
+            for item in self.list(NavigationItem)
+            if item.scope_id == scope_id
+            and (status is None or item.status == status)
+            and (cursor is None or item.id > cursor)
+        ]
+        if limit is None or len(items) <= limit:
+            return {"items": items, "next_cursor": None}
+        return {"items": items[:limit], "next_cursor": items[limit - 1].id}
+
+    def list_evidence_page(self, *, cursor: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        """Page a complete evidence directory without changing source storage."""
+        if cursor is not None and not isinstance(cursor, str):
+            raise ValueError("cursor must be a string")
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("page size must be a positive integer")
+        items = [item for item in self.list(EvidenceRef) if cursor is None or item.id > cursor]
+        if limit is None or len(items) <= limit:
+            return {"items": items, "next_cursor": None}
+        return {"items": items[:limit], "next_cursor": items[limit - 1].id}

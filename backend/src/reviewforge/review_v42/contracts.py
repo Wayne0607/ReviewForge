@@ -56,6 +56,21 @@ class Question:
 
 
 @dataclass
+class NavigationItem:
+    """Untrusted investigation navigation; never evidence or a case verdict."""
+
+    id: str
+    run_id: str
+    scope_id: str
+    kind: str
+    text: str
+    evidence_refs: list[str] = field(default_factory=list)
+    status: str = "open"
+    revision: int = 0
+    reason: str = ""
+
+
+@dataclass
 class Case:
     id: str
     run_id: str

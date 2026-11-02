@@ -39,7 +39,7 @@ def evidence_directory(store: Any) -> list[dict[str, Any]]:
     The source bodies remain in immutable storage. Entries include the original
     tool invocation to distinguish searches and support explicit full rereads.
     """
-    if store.run.policy == "v42-stateful-2":
+    if store.run.policy in {"v42-stateful-2", "v42-workspace-3"}:
         return [evidence_summary(ref) for ref in store.list(EvidenceRef)]
     return [asdict(ref) for ref in store.list(EvidenceRef)]
 

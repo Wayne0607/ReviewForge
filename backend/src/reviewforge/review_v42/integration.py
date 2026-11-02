@@ -13,6 +13,7 @@ import json
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -400,6 +401,14 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
     unit_scheduler = os.environ.get("REVIEWFORGE_V42_UNIT_SCHEDULER", "").strip()
     if unit_scheduler and (unit_scheduler != "cooperative-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 unit scheduler")
+    unit_plan = os.environ.get("REVIEWFORGE_V42_UNIT_PLAN", "").strip()
+    if unit_plan and (unit_plan != "single-owner-1" or EXECUTION_POLICY != "v42-units-6"):
+        raise ValueError("unsupported v4.2 unit plan")
+    shared_investigation = os.environ.get("REVIEWFORGE_V42_SHARED_INVESTIGATION", "").strip()
+    if shared_investigation and (shared_investigation != "shared-1" or EXECUTION_POLICY != "v42-units-6"):
+        raise ValueError("unsupported v4.2 shared investigation")
+    line_policy = "git-lf-1"
+    line_run = SimpleNamespace(metadata={"source_line_policy": line_policy})
     database = getattr(orchestrator, "_db", None)
     directory = _state_directory(orchestrator)
     workspace = await orchestrator._gateway.workspace_for(state)
@@ -418,7 +427,7 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             )
             if base_workspace.head_sha != review_base or workspace.head_sha != state.head_sha:
                 raise ValueError("comparison workspace identity mismatch")
-            fixed = await pinned_regions(base_workspace, workspace)
+            fixed = await pinned_regions(base_workspace, workspace, run=line_run)
             regions, source_identity, base_identity = fixed["regions"], fixed["head_identity"], fixed["base_identity"]
             state.files_changed = list(dict.fromkeys(region["path"] for region in regions))
             state.file_diffs = {
@@ -428,7 +437,7 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         else:
             # Only explicitly injected offline adapters bypass GitHub snapshot capture.
             await _load_bound_diff(orchestrator, state)
-            regions = changed_regions(state)
+            regions = changed_regions(state, run=line_run)
             source_identity = await snapshot_identity(workspace)
         knowledge = await _freeze_knowledge(directory, state, github)
         router = orchestrator._model_router
@@ -473,10 +482,16 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             "knowledge": knowledge,
             "kernel_digest": kernel,
             "execution_policy": EXECUTION_POLICY,
+            "source_line_policy": line_policy,
         }
         if unit_scheduler:
             # Scheduler semantics are part of the immutable run identity.
             metadata["unit_scheduler"] = unit_scheduler
+        if unit_plan:
+            # Ownership semantics are also bound to the immutable run identity.
+            metadata["unit_plan"] = unit_plan
+        if shared_investigation:
+            metadata["shared_investigation"] = shared_investigation
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],
@@ -515,7 +530,7 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             )
             meter.requests()  # Reject foreign receipts before any new model call.
             reviewer, verifier_model = _models(orchestrator, run, meter, raw_models)
-            gateway = PinnedToolGateway(workspace, state, github, base_workspace=base_workspace)
+            gateway = PinnedToolGateway(workspace, state, github, base_workspace=base_workspace, run=run)
             verifier = Verifier(store, verifier_model, EvidenceGateway(store, gateway))
             orchestrator._events.emit(
                 "review.started", {"repo": state.repo, "pr": state.pr_number, "mode": "review_v42"}

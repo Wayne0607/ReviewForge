@@ -31,6 +31,7 @@ from .contracts import (
     Task,
     UnitPlan,
 )
+from .line_semantics import source_lines, source_slice
 
 T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)
 _TYPES = {c.__name__: c for c in (ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)}
@@ -52,6 +53,22 @@ def _unit_source_identity(ref: EvidenceRef) -> tuple:
         ref.environment,
         ref.metadata.get("source_url") if ref.side == "external" else None,
     )
+
+
+def _install_verified_blob(temp: Path, destination: Path, digest: str, *, label: str) -> None:
+    """Atomically install without replacing a reader's existing immutable blob."""
+    try:
+        os.link(temp, destination)
+    except OSError as install_error:
+        try:
+            current = destination.read_bytes()
+        except OSError:
+            raise install_error
+        if hashlib.sha256(current).hexdigest() != digest:
+            raise BindingError(f"{label} blob hash mismatch") from install_error
+        return
+    if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+        raise BindingError(f"{label} blob hash mismatch")
 
 
 class ReviewStore:
@@ -128,6 +145,17 @@ class ReviewStore:
                     CREATE TABLE IF NOT EXISTS unit_pending_cases (
                         case_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, obligation_id TEXT NOT NULL);
                 """)
+                if run.metadata.get("shared_investigation") == "shared-1":
+                    db.execute(
+                        "CREATE TABLE IF NOT EXISTS case_counterevidence_links ("
+                        "case_id TEXT NOT NULL, source_identity TEXT NOT NULL, payload TEXT NOT NULL, "
+                        "PRIMARY KEY(case_id,source_identity))"
+                    )
+                    db.execute(
+                        "CREATE TABLE IF NOT EXISTS unit_aborted_read_batches ("
+                        "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, scope_id TEXT NOT NULL, payload TEXT NOT NULL, "
+                        "PRIMARY KEY(task_id,turn_id))"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -173,6 +201,400 @@ class ReviewStore:
                 "SELECT case_id,scope_id,obligation_id FROM unit_pending_cases ORDER BY case_id"
             )
         ]
+
+    def pending_shared_batches(
+        self,
+        scope_id: str,
+        *,
+        db: sqlite3.Connection | None = None,
+        exclude_task_id: str | None = None,
+        exclude_turn_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List visible model responses whose complete native exchange was not persisted.
+
+        No prior action is re-executed or attributed to a replacement lease.
+        Exclusion is solely for the current finish operation; all sibling calls
+        must already have durable receipts and there must be exactly one finish.
+        """
+        if self.run.policy != "v42-units-6" or self.run.metadata.get("shared_investigation") != "shared-1":
+            return []
+        if (exclude_task_id is None) != (exclude_turn_id is None):
+            raise ValueError("task and turn must both identify the current finish")
+        if db is None:
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                return self.pending_shared_batches(
+                    scope_id, db=connection, exclude_task_id=exclude_task_id, exclude_turn_id=exclude_turn_id
+                )
+        plan = self._unit_plan_db(db)
+        if scope_id not in {*plan.primary_scope_ids, plan.integration_scope_id}:
+            raise BindingError("scope is outside the current unit plan")
+
+        def audit(digest: str) -> list[dict[str, Any]]:
+            raw = (self.audit_dir / digest).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise BindingError("turn audit blob hash mismatch")
+            value = json.loads(raw)
+            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+                raise BindingError("turn audit has invalid visible messages")
+            return value
+
+        result = []
+        tasks = [Task(**json.loads(row[0])) for row in db.execute("SELECT payload FROM objects WHERE kind='Task'")]
+        for task in tasks:
+            if task.run_id != self.run.id or task.kind != "review" or task.object_id != scope_id:
+                continue
+            turns: dict[str, dict[str, str]] = {}
+            for turn_id, phase, digest in db.execute(
+                "SELECT turn_id,phase,content_hash FROM turn_audit WHERE task_id=? ORDER BY seq", (task.id,)
+            ):
+                turns.setdefault(turn_id, {})[phase] = digest
+            for turn_id, phases in turns.items():
+                if "response" not in phases:
+                    continue
+                entry: dict[str, Any] = {
+                    "scope_id": scope_id,
+                    "task_id": task.id,
+                    "turn_id": turn_id,
+                    "calls": [],
+                    "reason": "native exchange not fully persisted",
+                }
+                try:
+                    response = audit(phases["response"])
+                    if "exchange" in phases:
+                        audit(phases["exchange"])
+                        continue
+                    aborted = db.execute(
+                        "SELECT scope_id,payload FROM unit_aborted_read_batches WHERE task_id=? AND turn_id=?",
+                        (task.id, turn_id),
+                    ).fetchone()
+                    if aborted:
+                        marker = json.loads(aborted[1])
+                        current_scope = db.execute(
+                            "SELECT revision FROM objects WHERE kind='ReviewScope' AND id=?", (scope_id,)
+                        ).fetchone()
+                        if (
+                            not isinstance(marker, dict)
+                            or aborted[0] != scope_id
+                            or marker.get("phases") != phases
+                            or marker.get("input_revision") != task.input_revision
+                            or current_scope is None
+                            or current_scope[0] == task.input_revision
+                        ):
+                            raise BindingError("aborted read batch binding changed")
+                        for digest in phases.values():
+                            audit(digest)
+                        continue
+                    calls = []
+                    if len(response) != 1 or response[0].get("type") not in {
+                        "ai",
+                        "AIMessage",
+                        "ai_chunk",
+                        "AIMessageChunk",
+                    }:
+                        raise BindingError("native response is incomplete or ambiguous")
+                    for message in response:
+                        if message.get("type") not in {"ai", "AIMessage", "ai_chunk", "AIMessageChunk"}:
+                            continue
+                        body = message.get("data")
+                        if not isinstance(body, dict):
+                            raise BindingError("invalid visible assistant response")
+                        tool_calls = body.get("tool_calls", [])
+                        if not isinstance(tool_calls, list):
+                            raise BindingError("invalid visible tool calls")
+                        for call in tool_calls:
+                            if not isinstance(call, dict):
+                                raise BindingError("invalid visible tool call")
+                            calls.append({"id": call.get("id"), "name": call.get("name"), "args": call.get("args")})
+                    from reviewforge.engine.native_submission import strict_tool_call
+
+                    ids = [call["id"] for call in calls]
+                    if any(not isinstance(ident, str) or not ident.strip() for ident in ids) or len(ids) != len(
+                        set(ids)
+                    ):
+                        raise BindingError("ambiguous native tool identities")
+                    raw_calls = None
+                    if "native" in phases:
+                        native = audit(phases["native"])
+                        if (
+                            len(native) != 1
+                            or not isinstance(native[0].get("invalid_tool_calls"), list)
+                            or native[0]["invalid_tool_calls"]
+                            or native[0].get("protocol_errors")
+                        ):
+                            raise BindingError("invalid native tool calls")
+                        raw_calls = native[0].get("raw_tool_calls")
+                        if raw_calls is not None and (not isinstance(raw_calls, list) or len(raw_calls) != len(calls)):
+                            raise BindingError("native call count differs")
+                    for call in calls:
+                        raw = None
+                        if raw_calls is not None:
+                            matches = [
+                                item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]
+                            ]
+                            if len(matches) != 1:
+                                raise BindingError("ambiguous native tool identities")
+                            raw = matches[0]
+                        strict_tool_call(call, raw)
+                    receipts = set()
+                    failed_receipts = set()
+                    for phase, digest in phases.items():
+                        if not phase.startswith("tool:"):
+                            continue
+                        parts = phase.split(":", 2)
+                        if len(parts) != 3 or not parts[1].isdigit() or not parts[2]:
+                            raise BindingError("invalid tool receipt identity")
+                        messages = audit(digest)
+                        matched = [
+                            message
+                            for message in messages
+                            if message.get("type") == "tool"
+                            and isinstance(message.get("data"), dict)
+                            and message["data"].get("tool_call_id") == parts[2]
+                        ]
+                        if not matched:
+                            raise BindingError("tool receipt does not match its identity")
+                        for message in matched:
+                            data = message["data"]
+                            content = data.get("content")
+                            try:
+                                content = json.loads(content) if isinstance(content, str) else content
+                            except ValueError:
+                                content = None
+                            if (
+                                data.get("status") == "error"
+                                or not isinstance(content, dict)
+                                or (
+                                    isinstance(content, dict)
+                                    and (
+                                        "error" in content
+                                        or "review_state_error" in content
+                                        or content.get("status") in {"error", "failed", "unavailable"}
+                                        or (
+                                            isinstance(content.get("metadata"), dict)
+                                            and content["metadata"].get("status") in {"error", "failed", "unavailable"}
+                                        )
+                                    )
+                                )
+                            ):
+                                failed_receipts.add(parts[2])
+                        receipts.add(parts[2])
+                    entry["calls"] = [
+                        {**call, "receipt": "recorded" if call["id"] in receipts else "outcome_unknown"}
+                        for call in calls
+                    ]
+                    if task.id == exclude_task_id and turn_id == exclude_turn_id:
+                        terminal = [
+                            call
+                            for call in calls
+                            if (scope_id == plan.integration_scope_id and call["name"] == "finish_integration")
+                            or (
+                                scope_id != plan.integration_scope_id
+                                and call["name"] == "submit_unit_decision"
+                                and isinstance(call["args"], dict)
+                                and call["args"].get("finish") is True
+                            )
+                        ]
+                        if (
+                            len(terminal) == 1
+                            and all(isinstance(ident, str) and ident for ident in ids)
+                            and len(set(ids)) == len(ids)
+                            and not failed_receipts
+                            and all(call["id"] in receipts for call in calls if call is not terminal[0])
+                        ):
+                            continue
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    entry["reason"] = "turn audit unavailable or invalid: " + str(exc)
+                result.append(entry)
+        return result
+
+    def abort_fenced_read_batch(self, task_id: str, turn_id: str) -> dict[str, Any]:
+        """Controller records a fenced, exclusively read-only batch as not adopted.
+
+        This is not a tool receipt or a source-delivery permit. The replacement
+        reviewer must obtain its own source bodies in a successful model turn.
+        """
+        if self.run.policy != "v42-units-6" or self.run.metadata.get("shared_investigation") != "shared-1":
+            raise BindingError("fenced read recovery requires shared-1")
+        if not isinstance(task_id, str) or not task_id or not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("task and turn IDs are required")
+        # Do not include run_check: executing tests can have external effects.
+        readonly = {
+            "read_source",
+            "read_diff",
+            "search_code",
+            "find_references",
+            "read_knowledge",
+            "search_knowledge",
+            "read_evidence",
+            "query_shared",
+            "read_search_section",
+            "list_navigation",
+            "get_shared_investigation",
+            "query_shared_investigations",
+            "query_shared_cases",
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            if task.run_id != self.run.id or task.kind != "review":
+                raise BindingError("batch task is not a review in this run")
+            scope = db.execute(
+                "SELECT revision FROM objects WHERE kind='ReviewScope' AND id=?", (task.object_id,)
+            ).fetchone()
+            if scope is None or scope[0] == task.input_revision:
+                raise BindingError("task input has not been fenced")
+            plan = self._unit_plan_db(db)
+            if task.object_id not in {*plan.primary_scope_ids, plan.integration_scope_id}:
+                raise BindingError("batch scope is not in this run's plan")
+            if not db.execute(
+                "SELECT 1 FROM unit_turn_owners WHERE task_id=? AND turn_id=?", (task_id, turn_id)
+            ).fetchone():
+                raise BindingError("turn lacks its original lease identity")
+            phases = dict(
+                db.execute(
+                    "SELECT phase,content_hash FROM turn_audit WHERE task_id=? AND turn_id=?", (task_id, turn_id)
+                ).fetchall()
+            )
+            if "request" not in phases or "response" not in phases or "exchange" in phases:
+                raise BindingError("batch does not have an incomplete audited response")
+
+            def load(phase: str) -> list[dict[str, Any]]:
+                raw = (self.audit_dir / phases[phase]).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != phases[phase]:
+                    raise BindingError("turn audit blob hash mismatch")
+                messages = json.loads(raw)
+                if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
+                    raise BindingError("invalid turn audit")
+                return messages
+
+            for phase in phases:
+                if phase not in {"request", "response", "native"} and not phase.startswith("tool:"):
+                    raise BindingError("unknown turn audit phase")
+                load(phase)
+            response = load("response")
+            if len(response) != 1 or response[0].get("type") not in {"ai", "AIMessage", "ai_chunk", "AIMessageChunk"}:
+                raise BindingError("response is not one native assistant message")
+            body = response[0].get("data")
+            if isinstance(body, dict) and body.get("invalid_tool_calls"):
+                raise BindingError("response contains invalid native calls")
+            calls = body.get("tool_calls") if isinstance(body, dict) else None
+            if not isinstance(calls, list) or not calls or any(not isinstance(call, dict) for call in calls):
+                raise BindingError("response has no complete native read calls")
+            ids = [call.get("id") for call in calls]
+            if any(not isinstance(ident, str) or not ident.strip() for ident in ids) or len(ids) != len(set(ids)):
+                raise BindingError("ambiguous native call IDs")
+            native = load("native") if "native" in phases else []
+            raw_calls = None
+            if "native" in phases:
+                if (
+                    len(native) != 1
+                    or set(native[0]) != {"raw_tool_calls", "invalid_tool_calls"}
+                    or native[0].get("invalid_tool_calls")
+                    or not isinstance(native[0].get("invalid_tool_calls"), list)
+                ):
+                    raise BindingError("invalid native calls")
+                raw_calls = native[0].get("raw_tool_calls")
+                if raw_calls is not None and (not isinstance(raw_calls, list) or len(raw_calls) != len(calls)):
+                    raise BindingError("native call count differs")
+            from reviewforge.engine.native_submission import strict_tool_call
+
+            for call in calls:
+                if call.get("name") not in readonly or not isinstance(call.get("args"), dict):
+                    raise BindingError("batch includes a potentially mutating or unknown call")
+                if "review_state" in call["args"]:
+                    raise BindingError("read call also carried a mutable review state")
+                json.dumps(call["args"], allow_nan=False)
+                raw = None
+                if raw_calls is not None:
+                    matches = [item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]]
+                    if len(matches) != 1:
+                        raise BindingError("native call identity is ambiguous")
+                    raw = matches[0]
+                strict_tool_call(call, raw)
+                failure = (
+                    "Tool unavailable: "
+                    + call["name"]
+                    + " "
+                    + json.dumps(call["args"], sort_keys=True, ensure_ascii=False)
+                )
+                for (payload,) in db.execute("SELECT payload FROM objects WHERE kind='Question'"):
+                    question = Question(**json.loads(payload))
+                    if (
+                        question.scope_id == task.object_id
+                        and question.owner == "tool_controller"
+                        and question.statement == failure
+                    ):
+                        raise BindingError("read may have changed a tool-failure question")
+            receipt_ids = set()
+            receipt_indices = set()
+            for phase in phases:
+                if not phase.startswith("tool:"):
+                    continue
+                parts = phase.split(":", 2)
+                if (
+                    len(parts) != 3
+                    or not parts[1].isdigit()
+                    or parts[2] not in ids
+                    or parts[2] in receipt_ids
+                    or int(parts[1]) in receipt_indices
+                    or int(parts[1]) >= len(ids)
+                    or ids[int(parts[1])] != parts[2]
+                ):
+                    raise BindingError("invalid or duplicated read receipt")
+                messages = load(phase)
+                if (
+                    len(messages) != 1
+                    or messages[0].get("type") != "tool"
+                    or not isinstance(messages[0].get("data"), dict)
+                    or messages[0]["data"].get("tool_call_id") != parts[2]
+                ):
+                    raise BindingError("read receipt does not match the response")
+                content = messages[0]["data"].get("content")
+                if not isinstance(content, str) or not isinstance(json.loads(content), dict):
+                    raise BindingError("read receipt is incomplete")
+                receipt_ids.add(parts[2])
+                receipt_indices.add(int(parts[1]))
+            if receipt_indices != set(range(len(receipt_indices))):
+                raise BindingError("read receipt sequence is incomplete")
+            marker = {
+                "task_id": task_id,
+                "turn_id": turn_id,
+                "scope_id": task.object_id,
+                "input_revision": task.input_revision,
+                "fenced_revision": scope[0],
+                "phases": phases,
+                "calls": [
+                    {
+                        "id": call["id"],
+                        "name": call["name"],
+                        "receipt": "recorded" if call["id"] in receipt_ids else "not_adopted",
+                    }
+                    for call in calls
+                ],
+                "reason": "fenced read batch; results not adopted",
+            }
+            row = db.execute(
+                "SELECT payload FROM unit_aborted_read_batches WHERE task_id=? AND turn_id=?", (task_id, turn_id)
+            ).fetchone()
+            if row:
+                existing = json.loads(row[0])
+                if any(
+                    existing.get(key) != marker[key]
+                    for key in ("task_id", "turn_id", "scope_id", "input_revision", "phases")
+                ):
+                    raise RevisionConflict("aborted batch identity changed")
+                return existing
+            db.execute(
+                "INSERT INTO unit_aborted_read_batches VALUES (?,?,?,?)",
+                (task_id, turn_id, task.object_id, _json(marker)),
+            )
+            self._event(db, "Task", task_id, "fenced_read_batch_aborted", marker)
+            db.commit()
+            return marker
 
     def install_unit_plan(self, primary_scopes: list[ReviewScope], integration_scope: ReviewScope) -> UnitPlan:
         if self.run.policy != "v42-units-6":
@@ -512,7 +934,7 @@ class ReviewStore:
 
         def record(ref: EvidenceRef, content: bytes, start: int | None, end: int | None) -> None:
             first = start if start is not None else (ref.start_line or 1)
-            last = end if end is not None else first + len(content.decode("utf-8").splitlines()) - 1
+            last = end if end is not None else first + len(source_lines(self.run, content.decode("utf-8"))) - 1
             delivered.setdefault(ref.id, []).append((first, last))
 
         for message in payloads["request"]:
@@ -536,7 +958,7 @@ class ReviewStore:
                 raw = (self.blob_dir / ref.content_hash).read_bytes()
                 start, end = obj.get("start_line"), obj.get("end_line")
                 try:
-                    actual = self._frontier_content(ref, raw, start, end).decode("utf-8")
+                    actual = self._frontier_content(ref, raw, start, end, run=self.run).decode("utf-8")
                 except (ValueError, UnicodeError):
                     continue
                 if obj["content"] == actual:
@@ -566,6 +988,7 @@ class ReviewStore:
                                 raw,
                                 entry.start_line if entry.is_page else None,
                                 entry.end_line if entry.is_page else None,
+                                run=self.run,
                             )
                             if (
                                 hashlib.sha256(actual).hexdigest() == entry.content_hash
@@ -596,6 +1019,226 @@ class ReviewStore:
                 (scope.revision, _json(asdict(scope)), scope.id),
             )
             self._event(db, "ReviewScope", scope.id, "integration_reopened", {"reason": "integration inputs changed"})
+
+    def _pending_shared_investigations(self, db: sqlite3.Connection, scope_id: str) -> list[str]:
+        """Return unclosed shared work affecting a unit, or all work for integration."""
+        if self.run.policy != "v42-units-6" or self.run.metadata.get("shared_investigation") != "shared-1":
+            return []
+        if (
+            db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shared_investigations'").fetchone()
+            is None
+        ):
+            return ["shared-investigation-store-unavailable"]
+        plan = self._unit_plan_db(db)
+        pending = []
+        for investigation_id, payload in db.execute("SELECT id,payload FROM shared_investigations"):
+            try:
+                item = json.loads(payload)
+                scopes = item["scope_ids"]
+                if (
+                    item.get("run_id") != self.run.id
+                    or item.get("id") != investigation_id
+                    or not isinstance(scopes, list)
+                    or not scopes
+                    or not all(isinstance(sid, str) for sid in scopes)
+                    or len(set(scopes)) != len(scopes)
+                    or not set(scopes) <= {*plan.primary_scope_ids, plan.integration_scope_id}
+                ):
+                    raise ValueError("invalid shared investigation binding")
+                status = item["status"]
+                if status not in {"open", "partial", "unavailable", "resolved", "retracted"}:
+                    raise ValueError("invalid shared investigation status")
+                if status in {"open", "partial", "unavailable"} and (
+                    scope_id == plan.integration_scope_id or scope_id in scopes
+                ):
+                    pending.append(investigation_id)
+            except (KeyError, TypeError, ValueError):
+                pending.append(investigation_id)
+        return sorted(pending)
+
+    def _invalidate_scopes_for_shared(
+        self,
+        db: sqlite3.Connection,
+        scope_ids: list[str],
+        investigation_id: str,
+        reason: str,
+        *,
+        current_task_id: str | None = None,
+    ) -> None:
+        """Fence affected responsibilities within the investigation's transaction.
+
+        The caller must validate the creating task's lease in this same transaction.
+        Only the investigation's explicitly associated region checks are cleared.
+        Unrelated case verdicts remain unchanged.
+        """
+        if self.run.policy != "v42-units-6" or self.run.metadata.get("shared_investigation") != "shared-1":
+            raise BindingError("shared investigation requires the shared-1 opt-in")
+        plan = self._unit_plan_db(db)
+        if (
+            not isinstance(scope_ids, list)
+            or not scope_ids
+            or len(set(scope_ids)) != len(scope_ids)
+            or not set(scope_ids) <= {*plan.primary_scope_ids, plan.integration_scope_id}
+            or not isinstance(investigation_id, str)
+            or not investigation_id
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise BindingError("invalid shared investigation responsibilities")
+        row = db.execute("SELECT payload FROM shared_investigations WHERE id=?", (investigation_id,)).fetchone()
+        if row is None:
+            raise BindingError("shared investigation is missing")
+        item = json.loads(row[0])
+        region_ids = item.get("region_ids")
+        if (
+            item.get("run_id") != self.run.id
+            or item.get("id") != investigation_id
+            or item.get("scope_ids") != sorted(scope_ids)
+            or not isinstance(region_ids, list)
+            or not region_ids
+            or not all(isinstance(rid, str) and rid for rid in region_ids)
+            or len(set(region_ids)) != len(region_ids)
+        ):
+            raise BindingError("invalid shared investigation region binding")
+        affected = set(scope_ids) | {plan.integration_scope_id}
+        current = None
+        if current_task_id is not None:
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (current_task_id,)).fetchone()
+            if row is None:
+                raise LeaseError("creating review task does not exist")
+            current = Task(**json.loads(row[0]))
+            if current.kind != "review" or current.status != "leased" or current.run_id != self.run.id:
+                raise LeaseError("creating review task must retain its valid lease")
+        for sid in sorted(affected):
+            row = db.execute("SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (sid,)).fetchone()
+            if row is None:
+                raise BindingError("shared investigation scope does not exist")
+            scope = ReviewScope(**json.loads(row[0]))
+            if scope.run_id != self.run.id or scope.status == "superseded":
+                raise BindingError("shared investigation scope is not active")
+            creator = current is not None and current.object_id == sid
+            if creator and current.input_revision != scope.revision:
+                raise RevisionConflict("creating task scope revision is stale")
+            updated = replace(
+                scope,
+                status="pending",
+                checked_regions=[r for r in scope.checked_regions if r.get("id") not in region_ids],
+                revision=scope.revision + 1,
+            )
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
+                (updated.revision, _json(asdict(updated)), sid),
+            )
+            if sid in plan.primary_scope_ids:
+                db.execute("UPDATE unit_epochs SET revision=revision+1 WHERE scope_id=?", (sid,))
+            if creator:
+                current = replace(current, input_revision=updated.revision, revision=current.revision + 1)
+                db.execute(
+                    "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                    (current.revision, _json(asdict(current)), current.id),
+                )
+            self._event(
+                db,
+                "ReviewScope",
+                sid,
+                "shared_investigation_changed",
+                {"investigation_id": investigation_id, "reason": reason},
+            )
+
+    def _apply_shared_resolution(
+        self, db: sqlite3.Connection, investigation_id: str, *, current_task_id: str | None = None
+    ) -> None:
+        """Bind resolved raw sources to the affected regions before closing the work."""
+        if self.run.policy != "v42-units-6" or self.run.metadata.get("shared_investigation") != "shared-1":
+            raise BindingError("shared investigation requires the shared-1 opt-in")
+        row = db.execute("SELECT payload FROM shared_investigations WHERE id=?", (investigation_id,)).fetchone()
+        if row is None:
+            raise BindingError("shared investigation is missing")
+        item = json.loads(row[0])
+        if item.get("status") not in {"resolved", "retracted"}:
+            raise BindingError("only a closed investigation can be applied")
+        refs = []
+        if item["status"] == "resolved":
+            observations = item.get("observations")
+            if not isinstance(observations, list) or not observations:
+                raise BindingError("resolved investigation requires source observations")
+            identities = set()
+            for observation in observations:
+                if not isinstance(observation, dict) or not observation.get("evidence_refs"):
+                    raise BindingError("resolved investigation requires source observations")
+                if observation.get("delivered_task_id") != current_task_id or not observation.get("delivered_turn_id"):
+                    raise BindingError("resolved source must be delivered to the closing task")
+                source_refs = self._unit_refs(db, observation["evidence_refs"])
+                delivered = self._require_delivered(
+                    db, current_task_id or "", None, observation["delivered_turn_id"], {ref.id for ref in source_refs}
+                )
+                found_source = False
+                for ref in source_refs:
+                    if (
+                        ref.kind.casefold()
+                        in {
+                            "search",
+                            "search_index",
+                            "search_section",
+                            "diff",
+                            "query",
+                            "navigation",
+                            "frontier",
+                            "shared_investigation",
+                        }
+                        or ref.metadata.get("navigation_only") is True
+                        or ref.metadata.get("complete") is False
+                        or ref.metadata.get("status", "available") not in {"available", "success", "ok", "executed"}
+                    ):
+                        raise BindingError("resolved investigation cannot cite navigation or unavailable material")
+                    if ref.kind != "source":
+                        continue
+                    if (
+                        ref.side not in {"head", "base"}
+                        or not ref.path
+                        or ref.metadata.get("tool_name") not in (None, "read_source")
+                    ):
+                        raise BindingError("resolved investigation requires original available source")
+                    found_source = True
+                    try:
+                        lines = source_lines(self.run, (self.blob_dir / ref.content_hash).read_bytes().decode("utf-8"))
+                    except UnicodeDecodeError as exc:
+                        raise BindingError("resolved source is not readable") from exc
+                    if (
+                        not lines
+                        or type(ref.start_line) is not int
+                        or type(ref.end_line) is not int
+                        or (ref.end_line - ref.start_line + 1 != len(lines))
+                    ):
+                        raise BindingError("resolved source requires an exact original range")
+                    cursor = ref.start_line
+                    for first, last in sorted(delivered.get(ref.id, [])):
+                        if first <= cursor <= last:
+                            cursor = last + 1
+                    if cursor <= ref.end_line:
+                        raise BindingError("resolved source was not fully delivered")
+                    identity = _unit_source_identity(ref)
+                    if identity not in identities:
+                        identities.add(identity)
+                        refs.append(ref.id)
+                if not found_source:
+                    raise BindingError("each resolved observation requires original source")
+        self._invalidate_scopes_for_shared(
+            db,
+            item["scope_ids"],
+            investigation_id,
+            "shared investigation " + item["status"],
+            current_task_id=current_task_id,
+        )
+        for sid in item["scope_ids"]:
+            row = db.execute("SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (sid,)).fetchone()
+            scope = ReviewScope(**json.loads(row[0]))
+            for region in scope.regions:
+                if region.get("id") in item["region_ids"]:
+                    for ref_id in refs:
+                        db.execute(
+                            "INSERT OR IGNORE INTO unit_pending_sources VALUES (?,?,?)", (sid, region["id"], ref_id)
+                        )
 
     def commit_unit_decision(
         self,
@@ -644,6 +1287,10 @@ class ReviewStore:
             if integration and (checked_region_ids or observations or finish):
                 raise BindingError("integration decisions may submit only cases or questions")
             self._guard_review_task(db, task_id, token, task.object_id, now)
+            if finish and self.pending_shared_batches(
+                task.object_id, db=db, exclude_task_id=task_id, exclude_turn_id=turn_id
+            ):
+                raise BindingError("unit has an unfinished native tool batch")
             old_decision = db.execute(
                 "SELECT scope_id,request,result FROM unit_decisions WHERE decision_id=?", (decision_id,)
             ).fetchone()
@@ -720,7 +1367,7 @@ class ReviewStore:
             for ref in self._unit_refs(db, list(pending_refs)):
                 raw = (self.blob_dir / ref.content_hash).read_bytes()
                 try:
-                    lines = raw.decode("utf-8").splitlines()
+                    lines = source_lines(self.run, raw.decode("utf-8"))
                 except UnicodeDecodeError as exc:
                     raise BindingError("new source is not readable UTF-8") from exc
                 first = ref.start_line or 1
@@ -816,6 +1463,7 @@ class ReviewStore:
                     current_unresolved.append(unresolved_id)
             blocked = (
                 current_unresolved
+                or self._pending_shared_investigations(db, scope.id)
                 or any(
                     q.scope_id == scope.id and q.status in {"open", "disputed", "unresolved"} for q in open_questions
                 )
@@ -1122,6 +1770,184 @@ class ReviewStore:
             db.commit()
             return updated
 
+    def register_case_counterevidence(
+        self,
+        task_id: str,
+        token: str,
+        case_id: str,
+        evidence_refs: list[str],
+        *,
+        turn_id: str,
+        reason: str,
+        expected_revision: int | None = None,
+        now: float | None = None,
+    ) -> Case:
+        """Record a possible conflict and invalidate only its explicitly named case.
+
+        The submitting reviewer's description is a lead, not a semantic verdict.
+        Every original source must have been delivered to this lease in full.
+        """
+        if self.run.policy != "v42-units-6" or self.run.metadata.get("shared_investigation") != "shared-1":
+            raise BindingError("cross-unit counterevidence requires the shared-1 opt-in")
+        if not isinstance(case_id, str) or not case_id or not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a case and a reason for the possible conflict are required")
+        if (
+            not isinstance(evidence_refs, list)
+            or not evidence_refs
+            or any(not isinstance(ref, str) or not ref for ref in evidence_refs)
+        ):
+            raise ValueError("original evidence references are required")
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+            raise ValueError("expected revision must be a nonnegative integer")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            plan = self._unit_plan_db(db)
+            task_row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if task_row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(task_row[0]))
+            if task.object_id not in {*plan.primary_scope_ids, plan.integration_scope_id}:
+                raise BindingError("review task is outside the current unit plan")
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            row = db.execute("SELECT payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
+            if row is None:
+                raise KeyError(case_id)
+            case = Case(**json.loads(row[0]))
+            if case.run_id != self.run.id or case.scope_id not in {*plan.primary_scope_ids, plan.integration_scope_id}:
+                raise BindingError("case is outside the current unit plan")
+            if case.scope_id == task.object_id:
+                raise BindingError("case must belong to another responsibility")
+            row = db.execute(
+                "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (case.scope_id,)
+            ).fetchone()
+            if row is None:
+                raise BindingError("case responsibility is missing")
+            scope = ReviewScope(**json.loads(row[0]))
+            if scope.run_id != self.run.id or scope.status == "superseded":
+                raise BindingError("case responsibility is not active")
+            refs = self._unit_refs(db, list(dict.fromkeys(evidence_refs)))
+            for ref in refs:
+                if (
+                    ref.kind != "source"
+                    or ref.side not in {"base", "head"}
+                    or not ref.path
+                    or ref.metadata.get("navigation_only") is True
+                    or ref.metadata.get("complete") is False
+                    or ref.metadata.get("status", "available") not in {"available", "success", "ok"}
+                    or ref.metadata.get("tool_name") not in (None, "read_source")
+                ):
+                    raise BindingError("possible counterevidence requires original fixed source")
+                try:
+                    lines = source_lines(self.run, (self.blob_dir / ref.content_hash).read_bytes().decode("utf-8"))
+                except UnicodeDecodeError as exc:
+                    raise BindingError("possible counterevidence must be readable") from exc
+                if (
+                    not lines
+                    or type(ref.start_line) is not int
+                    or type(ref.end_line) is not int
+                    or (ref.end_line - ref.start_line + 1 != len(lines))
+                ):
+                    raise BindingError("possible counterevidence requires a complete original source range")
+            if not {ref.id for ref in refs} <= self._task_frontier_refs(db, task_id):
+                raise BindingError("possible counterevidence requires explicit reads by the reporting task")
+            delivered = self._require_delivered(db, task_id, token, turn_id, {ref.id for ref in refs})
+            for ref in refs:
+                cursor = ref.start_line
+                for first, last in sorted(delivered.get(ref.id, [])):
+                    if first <= cursor <= last:
+                        cursor = last + 1
+                if cursor <= ref.end_line:
+                    raise BindingError("possible counterevidence was not fully delivered")
+            existing = {_unit_source_identity(ref) for ref in self._unit_refs(db, case.counter_evidence_refs)}
+            new_refs = []
+            for ref in refs:
+                identity = _unit_source_identity(ref)
+                if identity not in existing:
+                    existing.add(identity)
+                    new_refs.append(ref.id)
+            if new_refs and expected_revision is not None and case.revision != expected_revision:
+                raise RevisionConflict("case revision changed before counterevidence registration")
+            for ref in refs:
+                identity = hashlib.sha256(_json(_unit_source_identity(ref)).encode()).hexdigest()
+                payload = {
+                    "case_id": case.id,
+                    "source_ref": ref.id,
+                    "source_identity": identity,
+                    "origin_task_id": task_id,
+                    "origin_turn_id": turn_id,
+                    "reason": reason,
+                }
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO case_counterevidence_links VALUES (?,?,?)",
+                    (case.id, identity, _json(payload)),
+                )
+                if cursor.rowcount:
+                    self._event(db, "Case", case.id, "possible_counterevidence_registered", payload)
+            if not new_refs:
+                db.commit()
+                return case
+            updated = replace(
+                case, counter_evidence_refs=[*case.counter_evidence_refs, *new_refs], revision=case.revision + 1
+            )
+            self._validate_refs(db, updated)
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='Case' AND id=?",
+                (updated.revision, _json(asdict(updated)), case.id),
+            )
+            self._event(
+                db, "Case", case.id, "counterevidence_changed", {"before": asdict(case), "after": asdict(updated)}
+            )
+            if case.scope_id in plan.primary_scope_ids:
+                for region in scope.regions:
+                    for ref_id in new_refs:
+                        db.execute(
+                            "INSERT OR IGNORE INTO unit_pending_sources VALUES (?,?,?)",
+                            (scope.id, region["id"], ref_id),
+                        )
+                db.execute(
+                    "INSERT INTO unit_pending_cases VALUES (?,?,?) ON CONFLICT(case_id) DO UPDATE SET "
+                    "scope_id=excluded.scope_id,obligation_id=excluded.obligation_id",
+                    (case.id, scope.id, ""),
+                )
+                scope = replace(scope, status="pending", checked_regions=[], revision=scope.revision + 1)
+                db.execute(
+                    "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
+                    (scope.revision, _json(asdict(scope)), scope.id),
+                )
+                db.execute("UPDATE unit_epochs SET revision=revision+1 WHERE scope_id=?", (scope.id,))
+                self._reopen_integration(db, plan)
+                self._event(
+                    db, "ReviewScope", scope.id, "reopen_for_counterevidence", {"case_id": case.id, "refs": new_refs}
+                )
+            else:
+                self._reopen_integration(db, plan)
+                oid = (
+                    "ob_"
+                    + hashlib.sha256(
+                        _json([self.run.id, "case_counterevidence", case.id, updated.revision]).encode()
+                    ).hexdigest()
+                )
+                obligation = IntegrationObligation(
+                    oid,
+                    self.run.id,
+                    plan.integration_scope_id,
+                    "case_followup",
+                    list(plan.primary_scope_ids),
+                    "Investigate possible counterevidence for case " + case.id,
+                    origin_evidence_refs=list(new_refs),
+                    origin_task_id=task_id,
+                    origin_turn_id=turn_id,
+                )
+                db.execute("INSERT INTO integration_obligations VALUES (?,?)", (oid, _json(asdict(obligation))))
+                db.execute(
+                    "INSERT INTO unit_pending_cases VALUES (?,?,?) ON CONFLICT(case_id) DO UPDATE SET "
+                    "scope_id=excluded.scope_id,obligation_id=excluded.obligation_id",
+                    (case.id, plan.integration_scope_id, oid),
+                )
+                self._event(db, "IntegrationObligation", oid, "case_counterevidence", asdict(obligation))
+            db.commit()
+            return updated
+
     def record_tool_failure_for_task(
         self,
         task_id: str,
@@ -1410,11 +2236,19 @@ class ReviewStore:
         token: str,
         expected_scope_revision: int,
         now: float | None = None,
+        *,
+        turn_id: str | None = None,
     ) -> ReviewScope:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             plan = self._unit_plan_db(db)
             self._guard_review_task(db, task_id, token, plan.integration_scope_id, now)
+            if self.run.metadata.get("shared_investigation") == "shared-1":
+                self._require_delivered(db, task_id, token, turn_id, set())
+                if self.pending_shared_batches(
+                    plan.integration_scope_id, db=db, exclude_task_id=task_id, exclude_turn_id=turn_id
+                ):
+                    raise BindingError("integration has an unfinished native tool batch")
             row = db.execute(
                 "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (plan.integration_scope_id,)
             ).fetchone()
@@ -1429,6 +2263,7 @@ class ReviewStore:
                 raise BindingError("integration obligations are unresolved or stale")
             if (
                 scope.unresolved
+                or self._pending_shared_investigations(db, scope.id)
                 or any(
                     Question(**json.loads(row[0])).scope_id == scope.id
                     and Question(**json.loads(row[0])).status in {"open", "disputed", "unresolved"}
@@ -1486,6 +2321,7 @@ class ReviewStore:
             "integration_tasks": [],
             "pending_sources": [],
             "pending_cases": [],
+            "pending_batches": [],
             "reasons": reasons,
         }
         try:
@@ -1494,6 +2330,10 @@ class ReviewStore:
             result["manifest_hash"] = plan.manifest_hash
             result["integration_scope_id"] = plan.integration_scope_id
             result["primary_scope_ids"] = plan.primary_scope_ids
+            for scope_id in [*plan.primary_scope_ids, plan.integration_scope_id]:
+                result["pending_batches"].extend(self.pending_shared_batches(scope_id, db=db))
+            if result["pending_batches"]:
+                reasons.append("unfinished native tool batches")
             row = db.execute("SELECT payload FROM integration_review WHERE id=1").fetchone()
             if row is None:
                 raise BindingError("independent integration review missing")
@@ -1530,6 +2370,8 @@ class ReviewStore:
                     or {r["id"] for r in scope.checked_regions} != {r["id"] for r in scope.regions}
                 ):
                     reasons.append("primary unit incomplete: " + sid)
+                if self._pending_shared_investigations(db, sid):
+                    reasons.append("primary unit has unresolved shared investigation: " + sid)
                 verified_regions = set()
                 for request_raw, result_raw in db.execute(
                     "SELECT request,result FROM unit_decisions WHERE scope_id=? ORDER BY rowid", (sid,)
@@ -1562,6 +2404,8 @@ class ReviewStore:
                 or ReviewScope(**json.loads(row[0])).unresolved
             ):
                 reasons.append("integration review incomplete")
+            if self._pending_shared_investigations(db, plan.integration_scope_id):
+                reasons.append("integration has unresolved shared investigation")
             for (payload,) in db.execute("SELECT payload FROM objects WHERE kind='Question'"):
                 question = Question(**json.loads(payload))
                 if question.scope_id == plan.integration_scope_id and question.status in {
@@ -1991,7 +2835,7 @@ class ReviewStore:
             temp = self.blob_dir / (digest + "." + uuid.uuid4().hex + ".tmp")
             try:
                 temp.write_bytes(content)
-                os.replace(temp, blob)
+                _install_verified_blob(temp, blob, digest, label="evidence")
             finally:
                 temp.unlink(missing_ok=True)
         if hashlib.sha256(blob.read_bytes()).hexdigest() != digest:
@@ -2045,7 +2889,9 @@ class ReviewStore:
             return self._frontier_generation(db, task_id)
 
     @staticmethod
-    def _frontier_content(ref: EvidenceRef, raw: bytes, start: int | None, end: int | None) -> bytes:
+    def _frontier_content(
+        ref: EvidenceRef, raw: bytes, start: int | None, end: int | None, *, run: Run | None = None
+    ) -> bytes:
         if (start is None) != (end is None):
             raise ValueError("page requires actual start and end lines")
         if start is None:
@@ -2053,14 +2899,20 @@ class ReviewStore:
         if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
             raise ValueError("page lines must be integers")
         try:
-            lines = raw.decode("utf-8").splitlines(keepends=True)
+            text = raw.decode("utf-8")
+            lines = source_lines(run, text, keepends=True) if run is not None else text.splitlines(keepends=True)
         except UnicodeDecodeError as exc:
             raise BindingError("evidence page is not UTF-8") from exc
         first = ref.start_line or 1
         last = first + len(lines) - 1
         if start < first or end < start or end > last:
             raise ValueError("page must be within the actual evidence range")
-        return "".join(lines[start - first : end - first + 1]).encode("utf-8")
+        selected = (
+            source_slice(run, text, start - first + 1, end - first + 1)
+            if run is not None
+            else "".join(lines[start - first : end - first + 1])
+        )
+        return selected.encode("utf-8")
 
     def pin_frontier_for_task(
         self,
@@ -2093,7 +2945,7 @@ class ReviewStore:
             raw = (self.blob_dir / ref.content_hash).read_bytes()
             if hashlib.sha256(raw).hexdigest() != ref.content_hash:
                 raise BindingError("evidence blob hash mismatch")
-            content = self._frontier_content(ref, raw, start_line, end_line)
+            content = self._frontier_content(ref, raw, start_line, end_line, run=self.run)
             is_page = start_line is not None
             actual_start = start_line if is_page else ref.start_line
             actual_end = end_line if is_page else ref.end_line
@@ -2196,7 +3048,11 @@ class ReviewStore:
         ref = self.get(EvidenceRef, entry.aliases[0])
         raw = self.read_evidence(ref.id)
         content = self._frontier_content(
-            ref, raw, entry.start_line if entry.is_page else None, entry.end_line if entry.is_page else None
+            ref,
+            raw,
+            entry.start_line if entry.is_page else None,
+            entry.end_line if entry.is_page else None,
+            run=self.run,
         )
         if hashlib.sha256(content).hexdigest() != entry.content_hash:
             raise BindingError("frontier content hash mismatch")
@@ -2212,7 +3068,8 @@ class ReviewStore:
         if type(start_line) is not int or type(end_line) is not int or start_line < 1 or end_line < start_line:
             raise ValueError("invalid page range")
         try:
-            lines = raw.decode("utf-8").splitlines(keepends=True)
+            text = raw.decode("utf-8")
+            lines = source_lines(self.run, text, keepends=True)
         except UnicodeDecodeError as exc:
             raise BindingError("frontier page is not UTF-8") from exc
         first = entry.start_line or 1
@@ -2221,7 +3078,7 @@ class ReviewStore:
             raise ValueError("page starts outside the pinned body")
         actual_end = min(end_line, last)
         return {
-            "content": "".join(lines[start_line - first : actual_end - first + 1]).encode("utf-8"),
+            "content": source_slice(self.run, text, start_line - first + 1, actual_end - first + 1).encode("utf-8"),
             "start_line": start_line,
             "end_line": actual_end,
             "next_line": actual_end + 1 if actual_end < last else None,
@@ -2342,6 +3199,12 @@ class ReviewStore:
             if not row:
                 raise KeyError(task_id)
             task = Task(**json.loads(row[0]))
+            if (
+                task.kind == "review"
+                and self.run.policy == "v42-units-6"
+                and self.pending_shared_batches(task.object_id, db=db)
+            ):
+                raise BindingError("review task has an unfinished native tool batch")
             if task.status == "completed" and task.lease_token == token and task.result == result:
                 return task
             if task.status != "leased" or not token or task.lease_token != token or task.lease_expires <= now:
@@ -3053,7 +3916,7 @@ class ReviewStore:
                         stream.write(payload)
                         stream.flush()
                         os.fsync(stream.fileno())
-                    os.replace(temp, blob)
+                    _install_verified_blob(temp, blob, digest, label="turn audit")
                 finally:
                     temp.unlink(missing_ok=True)
             if row:

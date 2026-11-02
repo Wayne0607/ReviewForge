@@ -11,6 +11,7 @@ from typing import Any
 from reviewforge.review_v42.contracts import (
     BindingError,
     Case,
+    EvidenceRef,
     LeaseError,
     Question,
     ReviewScope,
@@ -19,6 +20,7 @@ from reviewforge.review_v42.contracts import (
 )
 from reviewforge.review_v42.reviewer import QuestionAssistant, Reviewer, _status_code
 from reviewforge.review_v42.scope import compile_scopes
+from reviewforge.review_v42.store import _unit_source_identity
 from reviewforge.review_v42.tools import EvidenceGateway
 
 
@@ -68,9 +70,14 @@ class ReviewRuntime:
         self._enqueued: set[str] = set()
         self._blocked = False
         self._blocked_event = asyncio.Event()
-        self._errors: list[str] = []
+        self._errors_real: list[str] = []
+        self._pending_batch_errors: dict[tuple[str, str, str], str] = {}
         self._model_lane = asyncio.Lock()
         self._work_changed = asyncio.Event()
+
+    @property
+    def _errors(self) -> list[str]:
+        return [*self._errors_real, *self._pending_batch_errors.values()]
 
     def _fair_enabled(self) -> bool:
         return (
@@ -249,7 +256,7 @@ class ReviewRuntime:
             if _status_code(exc) in {401, 402, 403}:
                 self._blocked = True
                 self._blocked_event.set()
-            self._errors.append(f"question {question.id}: {type(exc).__name__}")
+            self._errors_real.append(f"question {question.id}: {type(exc).__name__}")
             try:
                 self.store.release_task(task.id, task.lease_token)
             except LeaseError:
@@ -311,7 +318,7 @@ class ReviewRuntime:
                     if _status_code(exc) in {401, 402, 403}:
                         self._blocked = True
                         self._blocked_event.set()
-                    self._errors.append(f"verification {case.id}: {type(exc).__name__}")
+                    self._errors_real.append(f"verification {case.id}: {type(exc).__name__}")
                     try:
                         self.store.release_task(task.id, task.lease_token)
                     except LeaseError:
@@ -338,6 +345,9 @@ class ReviewRuntime:
 
     async def _review_scope(self, scope_id: str, *, focus: str = "", reopen: bool = False) -> str:
         scope = self.store.get(ReviewScope, scope_id)
+        if self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("shared_investigation") == "shared-1":
+            if self._record_incomplete_shared_batches(scope_id):
+                return "partial"
         if scope.status == "reviewed" and not reopen:
             return "reviewed"
         if reopen:
@@ -370,7 +380,7 @@ class ReviewRuntime:
         try:
             task = self.store.acquire_task(task.id, "v42-reviewer", 120)
         except LeaseError:
-            self._errors.append(f"review {scope_id}: lease unavailable")
+            self._errors_real.append(f"review {scope_id}: lease unavailable")
             return "partial"
         heartbeat = asyncio.create_task(self._heartbeat(task, 120))
         reviewer = Reviewer(
@@ -393,8 +403,19 @@ class ReviewRuntime:
                 self.store.release_task(task.id, task.lease_token)
                 return "provider_blocked"
             status = await review
+            if self.store.run.metadata.get("shared_investigation") == "shared-1":
+                latest_task = self.store.get(Task, task.id)
+                latest_scope = self.store.get(ReviewScope, scope_id)
+                if latest_task.input_revision != latest_scope.revision:
+                    self.store.settle_task_stale(task.id, task.lease_token, {"status": "superseded"})
+                    return "superseded"
             if reviewer.error:
-                self._errors.append(f"review {scope_id}: {reviewer.error}")
+                if self.store.run.metadata.get("shared_investigation") == "shared-1" and reviewer.error.startswith(
+                    "incomplete_native_batches:"
+                ):
+                    self._record_incomplete_shared_batches(scope_id)
+                else:
+                    self._errors_real.append(f"review {scope_id}: {reviewer.error}")
             if status == "reviewed" or (self.store.run.policy != "v42-units-6" and reopen and status == "partial"):
                 self.store.complete_task(task.id, task.lease_token, {"status": status, "focus": focus})
             else:
@@ -420,7 +441,7 @@ class ReviewRuntime:
             try:
                 self.store.settle_task_stale(task.id, task.lease_token, {"status": "superseded"})
             except (LeaseError, RevisionConflict):
-                self._errors.append(f"review {scope_id}: could not settle stale task")
+                self._errors_real.append(f"review {scope_id}: could not settle stale task")
                 return "partial"
             return "superseded"
         finally:
@@ -540,7 +561,102 @@ class ReviewRuntime:
             if integration
             else []
         )
-        return json.dumps([cases, questions, obligations], sort_keys=True, ensure_ascii=False)
+        inputs = [cases, questions, obligations]
+        if self.store.run.metadata.get("shared_investigation") == "shared-1":
+            inputs.append(self._shared_unit_input(scope_id, integration=integration))
+        return json.dumps(inputs, sort_keys=True, ensure_ascii=False)
+
+    def _shared_unit_input(self, scope_id: str, *, integration: bool) -> dict[str, Any]:
+        """Read only relevant shared decisions and original source identities in one snapshot."""
+        with self.store._connect() as db:
+            db.execute("BEGIN")
+
+            def source_identity(ref_id: str) -> str | None:
+                row = db.execute("SELECT payload FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone()
+                if row is None:
+                    return None
+                ref = EvidenceRef(**json.loads(row[0]))
+                if (
+                    ref.run_id != self.store.run.id
+                    or ref.repo != self.store.run.repo
+                    or ref.kind != "source"
+                    or ref.side not in {"head", "base"}
+                    or ref.revision != getattr(self.store.run, ref.side)
+                    or ref.metadata.get("workspace_digest") != self.store.run.metadata.get("workspace_digest")
+                    or ref.metadata.get("navigation_only") is True
+                    or ref.metadata.get("complete", True) is not True
+                    or ref.metadata.get("status", "available") not in {"available", "success", "ok"}
+                ):
+                    return None
+                return json.dumps(_unit_source_identity(ref), sort_keys=True, ensure_ascii=False)
+
+            pending = sorted(
+                (item["scope_id"], item["region_id"], source_identity(item["ref_id"]) or "invalid-source")
+                for item in self.store.pending_unit_sources(db=db)
+                if integration or item["scope_id"] == scope_id
+            )
+            exists = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shared_investigations'"
+            ).fetchone()
+            items = []
+            if exists:
+                for ident, payload in db.execute("SELECT id,payload FROM shared_investigations ORDER BY id"):
+                    item = json.loads(payload)
+                    if not integration and scope_id not in item.get("scope_ids", []):
+                        continue
+                    refs = {
+                        ref
+                        for observation in item.get("observations", [])
+                        if isinstance(observation, dict)
+                        for ref in observation.get("evidence_refs", [])
+                        if isinstance(ref, str)
+                    }
+                    items.append(
+                        (
+                            ident,
+                            item.get("status"),
+                            sorted(item.get("scope_ids", [])),
+                            sorted(item.get("region_ids", [])),
+                            sorted({identity for ref in refs if (identity := source_identity(ref)) is not None}),
+                        )
+                    )
+            return {"investigations": items, "pending_sources": pending}
+
+    def _record_incomplete_shared_batches(self, scope_id: str) -> bool:
+        try:
+            pending = self.store.pending_shared_batches(scope_id)
+        except (BindingError, RevisionConflict, KeyError, OSError, ValueError, TypeError) as exc:
+            self._pending_batch_errors[(scope_id, "", "")] = f"review {scope_id}: native batch audit unavailable: {exc}"
+            return True
+        for batch in pending:
+            try:
+                self.store.abort_fenced_read_batch(batch["task_id"], batch["turn_id"])
+            except (BindingError, RevisionConflict, KeyError, OSError, ValueError, TypeError):
+                # Unknown or mutating actions remain explicitly pending.
+                pass
+        if pending:
+            try:
+                pending = self.store.pending_shared_batches(scope_id)
+            except (BindingError, RevisionConflict, KeyError, OSError, ValueError, TypeError) as exc:
+                self._pending_batch_errors[(scope_id, "", "")] = (
+                    f"review {scope_id}: native batch audit unavailable: {exc}"
+                )
+                return True
+        current = {}
+        for batch in pending:
+            calls = ", ".join(
+                f"{call.get('name')}({call.get('id')}):{call.get('receipt')}" for call in batch.get("calls", [])
+            )
+            detail = (
+                f"review {scope_id}: incomplete native batch {batch['task_id']}/{batch['turn_id']}: "
+                f"{batch.get('reason', 'unfinished')}" + (f"; {calls}" if calls else "")
+            )
+            current[(scope_id, batch["task_id"], batch["turn_id"])] = detail
+        self._pending_batch_errors = {
+            **{key: value for key, value in self._pending_batch_errors.items() if key[0] != scope_id},
+            **current,
+        }
+        return bool(pending)
 
     async def _run_fair_primaries(
         self, scopes: list[ReviewScope], attempted: set[tuple[str, str]], *, initial: bool
@@ -611,13 +727,20 @@ class ReviewRuntime:
             return {"status": "partial", "reason": "no changed-region manifest", "scopes": [], "errors": []}
         self._blocked = False
         self._blocked_event.clear()
-        self._errors = []
+        self._errors_real = []
+        self._pending_batch_errors = {}
+        if self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("shared_investigation") == "shared-1":
+            plan = self.store.get_unit_plan()
+            for scope_id in [*plan.primary_scope_ids, plan.integration_scope_id]:
+                self._record_incomplete_shared_batches(scope_id)
         for case in self.store.list(Case):
             self._enqueue(self._sync_case_evidence(case))
         for task in self.store.list(Task):
             if task.kind == "question" and task.status not in {"completed", "superseded"}:
                 if self.store.run.policy == "v42-units-6":
-                    self._errors.append(f"question {task.object_id}: delegated investigation requires delivery audit")
+                    self._errors_real.append(
+                        f"question {task.object_id}: delegated investigation requires delivery audit"
+                    )
                     continue
                 if task.id not in self._enqueued:
                     self._enqueued.add(task.id)
@@ -726,6 +849,9 @@ class ReviewRuntime:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
         scopes = [scope for scope in self.store.list(ReviewScope) if scope.status != "superseded"]
+        if self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("shared_investigation") == "shared-1":
+            for scope in scopes:
+                self._record_incomplete_shared_batches(scope.id)
         pending = [
             task.id
             for task in self.store.list(Task)

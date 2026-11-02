@@ -8,6 +8,7 @@ from dataclasses import asdict
 from typing import Any
 
 from .contracts import Case, EvidenceRef, NavigationItem, Question, ReviewScope
+from .line_semantics import source_line_policy, source_lines, source_quote_lines, source_slice
 from .verifier import POLICY, _citation, validate_result
 
 
@@ -15,6 +16,75 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _incomplete_batch_impact(
+    batches: dict[str, list[dict[str, Any]]], scope_ids: set[str], case_ids: set[str]
+) -> tuple[set[str], set[str], bool]:
+    """Identify possible cross-scope effects of actions without durable receipts."""
+    blocked_scopes, blocked_cases = set(batches), set()
+    local_tools = {
+        "read_source",
+        "read_diff",
+        "read_evidence",
+        "read_knowledge",
+        "read_search_section",
+        "run_check",
+        "search_code",
+        "find_references",
+        "search_knowledge",
+        "query_shared",
+        "query_shared_cases",
+        "query_shared_investigations",
+        "get_shared_investigation",
+        "claim_shared_investigation",
+        "release_shared_investigation",
+        "list_navigation",
+        "update_navigation",
+        "release_frontier",
+        "save_question",
+        "submit_case",
+        "submit_unit_decision",
+        "finish_scope",
+        "finish_integration",
+        "record_integration_receipt",
+    }
+    for entries in batches.values():
+        for entry in entries:
+            if entry.get("reason") != "native exchange not fully persisted" or not isinstance(entry.get("calls"), list):
+                return blocked_scopes, blocked_cases, True
+            for call in entry["calls"]:
+                if not isinstance(call, dict) or call.get("receipt") not in {"recorded", "outcome_unknown"}:
+                    return blocked_scopes, blocked_cases, True
+                if call["receipt"] == "recorded":
+                    continue
+                name, args = call.get("name"), call.get("args")
+                if not isinstance(name, str) or not isinstance(args, dict):
+                    return blocked_scopes, blocked_cases, True
+                if name == "register_case_counterevidence":
+                    target = args.get("case_id")
+                    if not isinstance(target, str) or target not in case_ids:
+                        return blocked_scopes, blocked_cases, True
+                    blocked_cases.add(target)
+                elif name == "create_shared_investigation":
+                    targets = args.get("scope_ids")
+                    if (
+                        not isinstance(targets, list)
+                        or not targets
+                        or any(not isinstance(target, str) for target in targets)
+                        or not set(targets) <= scope_ids
+                    ):
+                        return blocked_scopes, blocked_cases, True
+                    blocked_scopes.update(targets)
+                elif name == "register_unit_dependency":
+                    target = args.get("target_scope_id")
+                    if not isinstance(target, str) or target not in scope_ids:
+                        return blocked_scopes, blocked_cases, True
+                    blocked_scopes.add(target)
+                elif name not in local_tools:
+                    # A shared update or an unknown action may affect other scopes.
+                    return blocked_scopes, blocked_cases, True
+    return blocked_scopes, blocked_cases, False
 
 
 def _unit_manifest_errors(store: Any, scopes: list[ReviewScope]) -> list[str]:
@@ -180,7 +250,9 @@ def _unit_integration_errors(store: Any, scopes: list[ReviewScope], db: Any = No
             for ref_id in refs:
                 ref = store.get(EvidenceRef, ref_id)
                 text = store.read_evidence(ref.id).decode("utf-8")
-                nonempty = next(((i, line) for i, line in enumerate(text.splitlines()) if line.strip()), None)
+                nonempty = next(
+                    ((i, line) for i, line in enumerate(source_lines(store.run, text)) if line.strip()), None
+                )
                 if nonempty is None:
                     raise ValueError("integration source is empty")
                 index, quote = nonempty
@@ -208,6 +280,7 @@ class Publication:
         self.store, self.policy = store, policy
 
     def _anchor(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        line_policy = source_line_policy(self.store.run)
         regions = self.store.run.metadata.get("changed_regions", [])
         for citation in result["facts"]["actual"]["citations"]:
             ref = self.store.get(EvidenceRef, citation["ref"])
@@ -217,14 +290,12 @@ class Publication:
             if not isinstance(start, int) or not isinstance(end, int):
                 continue
             content = self.store.read_evidence(ref.id).decode("utf-8")
-            selected = "\n".join(content.splitlines()[start - ref.start_line : end - ref.start_line + 1])
+            if line_policy == "git-lf-1":
+                selected = source_slice(self.store.run, content, start - ref.start_line + 1, end - ref.start_line + 1)
+            else:
+                selected = "\n".join(content.splitlines()[start - ref.start_line : end - ref.start_line + 1])
             quote = citation["quote"]
-            positions = []
-            offset = selected.find(quote)
-            while offset >= 0:
-                first = start + selected[:offset].count("\n")
-                positions.append((first, first + quote.count("\n")))
-                offset = selected.find(quote, offset + 1)
+            positions = source_quote_lines(self.store.run, selected, quote, first_line=start)
             for region in regions:
                 if (
                     not isinstance(region, dict)
@@ -239,11 +310,43 @@ class Publication:
         return None
 
     def local_report(self, *, db: Any = None) -> dict[str, Any]:
+        source_line_policy(self.store.run)
         scopes = self.store.list(ReviewScope)
         cases = self.store.list(Case)
         questions = self.store.list(Question)
         comments, verified, unresolved, duplicates = [], [], [], []
         units = self.store.run.policy == "v42-units-6"
+        shared = units and self.store.run.metadata.get("shared_investigation") == "shared-1"
+        pending_batches: dict[str, list[dict[str, Any]]] | None = {}
+        integration_scope_id = ""
+        batch_blocked_scopes: set[str] = set()
+        batch_blocked_cases: set[str] = set()
+        batch_global_block = False
+        if shared:
+            try:
+                plan = self.store.get_unit_plan()
+                if plan is None:
+                    raise ValueError("shared unit plan is unavailable")
+                integration_scope_id = plan.integration_scope_id
+                for scope in scopes:
+                    if scope.status == "superseded":
+                        continue
+                    entries = self.store.pending_shared_batches(scope.id, db=db)
+                    if not isinstance(entries, list) or any(
+                        not isinstance(entry, dict) or entry.get("scope_id") != scope.id for entry in entries
+                    ):
+                        raise ValueError("invalid incomplete tool batch view")
+                    if entries:
+                        pending_batches[scope.id] = entries
+                        unresolved.extend({"kind": "incomplete_native_tool_batch", **entry} for entry in entries)
+                batch_blocked_scopes, batch_blocked_cases, batch_global_block = _incomplete_batch_impact(
+                    pending_batches,
+                    {scope.id for scope in scopes if scope.status != "superseded"},
+                    {case.id for case in cases},
+                )
+            except (AttributeError, KeyError, TypeError, ValueError, OSError):
+                pending_batches = None
+                unresolved.append({"kind": "incomplete_native_tool_batch", "reason": "tool batch audit unavailable"})
         pending_cases: set[str] | None = set()
         if units:
             try:
@@ -316,6 +419,21 @@ class Publication:
                     if units and (pending_cases is None or case.id in pending_cases):
                         unresolved.append(
                             {"case_id": case.id, "claim_id": claim_id, "reason": "new evidence awaits unit review"}
+                        )
+                        continue
+                    if shared and (
+                        pending_batches is None
+                        or batch_global_block
+                        or case.id in batch_blocked_cases
+                        or case.scope_id in batch_blocked_scopes
+                        or integration_scope_id in batch_blocked_scopes
+                    ):
+                        unresolved.append(
+                            {
+                                "case_id": case.id,
+                                "claim_id": claim_id,
+                                "reason": "an associated native tool batch did not finish",
+                            }
                         )
                         continue
                     facts = result["facts"]
@@ -410,6 +528,10 @@ class Publication:
         }
         if workspace:
             report["open_navigation_questions"] = open_navigation
+        if shared:
+            report["incomplete_tool_batches"] = (
+                None if pending_batches is None else [item for entries in pending_batches.values() for item in entries]
+            )
         return report
 
 

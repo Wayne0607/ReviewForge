@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from reviewforge.review_v42.contracts import EvidenceRef
+from reviewforge.review_v42.contracts import BindingError, EvidenceRef
+from reviewforge.review_v42.line_semantics import source_lines, source_slice
 
 
 class ToolUnavailableError(RuntimeError):
@@ -62,16 +63,17 @@ class EvidenceGateway:
                     raise InvalidEvidenceRequestError("start_line and end_line must be a valid explicit page")
                 raise ValueError("start_line and end_line must be a valid explicit page")
             first = ref.start_line or 1
-            lines = content.splitlines(keepends=True)
+            lines = source_lines(self.store.run, content, keepends=True)
             last = first + len(lines) - 1
             if start < first or start > last:
                 if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}:
                     raise InvalidEvidenceRequestError("page begins outside the stored evidence")
                 raise ValueError("page begins outside the stored evidence")
             actual_end = min(end, last)
-            return {
+            page_content = source_slice(self.store.run, content, start - first + 1, actual_end - first + 1)
+            result = {
                 "evidence_ref": ref.id,
-                "content": "".join(lines[start - first : actual_end - first + 1]),
+                "content": page_content,
                 "complete": start == first and actual_end == last,
                 "start_line": start,
                 "end_line": actual_end,
@@ -80,6 +82,44 @@ class EvidenceGateway:
                 "next_line": actual_end + 1 if actual_end < last else None,
                 "full_content_available": True,
             }
+            if (
+                self.store.run.metadata.get("shared_investigation") == "shared-1"
+                and ref.kind == "source"
+                and ref.side in {"base", "head"}
+            ):
+                info = ref.metadata
+                digest = self.store.run.metadata.get("workspace_digest")
+                if (
+                    ref.run_id != self.store.run.id
+                    or ref.repo != self.store.run.repo
+                    or ref.revision != getattr(self.store.run, ref.side)
+                    or not ref.path
+                    or not isinstance(digest, str)
+                    or not digest
+                    or info.get("workspace_digest") != digest
+                    or info.get("status", "available") not in {"available", "success", "ok"}
+                    or info.get("complete", True) is not True
+                    or info.get("navigation_only") is True
+                    or info.get("tool_name") not in {None, "read_source"}
+                    or (ref.end_line is not None and ref.end_line != last)
+                ):
+                    raise BindingError("source page requires an available, complete fixed-snapshot source")
+                page_ref = self.store.put_evidence(
+                    page_content.encode("utf-8"),
+                    revision=ref.revision,
+                    side=ref.side,
+                    kind=ref.kind,
+                    path=ref.path,
+                    start_line=start,
+                    end_line=actual_end,
+                    environment=ref.environment,
+                    metadata={**info, "parent_evidence_ref": ref.id},
+                )
+                result["evidence_ref"] = page_ref.id
+                result["original_evidence_ref"] = ref.id
+                result["requested_end_line"] = end
+                result["actual_end_line"] = actual_end
+            return result
         result = await self.gateway(name, args)
         if not isinstance(result, dict) or not all(key in result for key in ("content", "revision", "side", "kind")):
             raise ValueError("tool result missing bound evidence envelope")

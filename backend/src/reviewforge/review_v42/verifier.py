@@ -15,6 +15,7 @@ from reviewforge.engine.session_tools import result_tool
 from .context import ContextBuilder
 from .context_recovery import is_context_length_exceeded
 from .contracts import Case, EvidenceRef, Question, RevisionConflict
+from .line_semantics import source_line_policy, source_slice
 from .reviewer import reviewer_tools
 
 POLICY = "v42-independent-1"
@@ -227,6 +228,7 @@ def _unit_workspace_matches(store: Any, ref: dict[str, Any]) -> bool:
 
 
 def _citation(store: Any, cite: Any) -> str:
+    line_policy = source_line_policy(store.run)
     if (
         not isinstance(cite, dict)
         or set(cite) - {"ref", "quote", "start_line", "end_line"}
@@ -284,7 +286,10 @@ def _citation(store: Any, cite: Any) -> str:
             or end > ref.end_line
         ):
             raise ValueError("citation requires an exact range within the evidence")
-        selected = "\n".join(content.splitlines()[start - ref.start_line : end - ref.start_line + 1])
+        if line_policy == "git-lf-1":
+            selected = source_slice(run, content, start - ref.start_line + 1, end - ref.start_line + 1)
+        else:
+            selected = "\n".join(content.splitlines()[start - ref.start_line : end - ref.start_line + 1])
         if quote not in selected:
             raise ValueError("quote absent from cited lines")
     if quote not in content:
@@ -295,6 +300,7 @@ def _citation(store: Any, cite: Any) -> str:
 
 
 def validate_result(store: Any, result: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+    source_line_policy(store.run)
     verdict = result.get("verdict")
     reason, facts, gaps = result.get("reason"), result.get("facts"), result.get("gaps")
     if (
@@ -376,6 +382,7 @@ class Verifier:
         self.store, self.llm, self.gateway, self.policy = store, llm, gateway, policy
 
     async def _claim(self, context: dict[str, Any], claim: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+        source_line_policy(self.store.run)
         packet = {**context, "claims": [claim]}
         workspace = self.store.run.policy in _WORKSPACE_POLICIES
         stateful = self.store.run.policy in {"v42-stateful-2", *_WORKSPACE_POLICIES}
@@ -626,6 +633,7 @@ class Verifier:
     async def verify(
         self, case_id: str, *, task_id: str | None = None, lease_token: str | None = None
     ) -> list[dict[str, Any]]:
+        source_line_policy(self.store.run)
         case = self.store.get(Case, case_id)
         claims = case.claims
         if (

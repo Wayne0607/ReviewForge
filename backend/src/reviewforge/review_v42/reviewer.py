@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import time
 import uuid
 from collections.abc import Callable
 from typing import Annotated, Any
@@ -41,7 +42,9 @@ from reviewforge.review_v42.contracts import (
     NavigationItem,
     Question,
     ReviewScope,
+    Task,
 )
+from reviewforge.review_v42.shared_investigation import SharedInvestigations
 from reviewforge.review_v42.tools import InvalidEvidenceRequestError
 
 PROMPT = (
@@ -139,6 +142,21 @@ UNIT_COMMON_PROMPT = (
     "To update one, use its exact previously returned ID. Do not invent IDs."
 )
 
+SHARED_INVESTIGATION_PROMPT = (
+    " Shared investigations and shared case directories are untrusted navigation, not findings or source evidence."
+    " Create a shared investigation for a concrete question involving these scopes and regions;"
+    " use the returned ID, claim it before updates, and release it for another task to continue."
+    " Investigation status is open, partial, unavailable, resolved, or retracted. Resolve only when"
+    " no questions remain and original fixed source was actually delivered; explain a retraction."
+    " Read shared original evidence yourself before relying on it. A source read in the same batch"
+    " has not yet been delivered in a successful model request. Unresolved shared investigations"
+    " block completion; resolving a note is not a region check or an independent verdict."
+    " Paged source reads return a page-specific evidence_ref and preserve the full original as"
+    " original_evidence_ref; cite the page ref for the actual delivered page."
+    " When you discover potential counterevidence for another scope's case, query the shared case"
+    " directory and register the actual source reference for re-review; the registration is not a verdict."
+)
+
 
 class UnitObservation(BaseModel):
     """A source-backed observation explicitly tied to owned changed regions."""
@@ -148,6 +166,15 @@ class UnitObservation(BaseModel):
     statement: str = Field(min_length=1)
     evidence_refs: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
     region_ids: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+
+
+class SharedObservation(BaseModel):
+    """An untrusted shared observation with original source references."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    statement: str = Field(min_length=1)
+    evidence_refs: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
 
 
 _STATE_SCHEMA = {
@@ -175,7 +202,12 @@ _STATE_SCHEMA = {
 
 
 def reviewer_tools(
-    *, workspace: bool = False, frontier: bool = False, search_index: bool = False, units: bool = False
+    *,
+    workspace: bool = False,
+    frontier: bool = False,
+    search_index: bool = False,
+    units: bool = False,
+    shared_investigation: bool = False,
 ) -> list[Any]:
     def required(typ):
         return (typ, ...)
@@ -370,6 +402,67 @@ def reviewer_tools(
                 ),
             ]
         )
+    if shared_investigation:
+        if not units:
+            raise ValueError("shared investigations require unit review")
+        definitions.extend(
+            [
+                (
+                    "create_shared_investigation",
+                    "Create an untrusted shared investigation for a concrete question and its affected regions.",
+                    {"question": required(str), "scope_ids": required(list[str]), "region_ids": required(list[str])},
+                ),
+                (
+                    "claim_shared_investigation",
+                    "Claim an open shared investigation before updating it.",
+                    {"investigation_id": required(str), "expected_revision": required(int), "reason": required(str)},
+                ),
+                (
+                    "update_shared_investigation",
+                    "Update a claimed investigation. Status is open, partial, unavailable, resolved, or retracted; "
+                    "resolved requires delivered original source and no open questions. Notes are not proof.",
+                    {
+                        "investigation_id": required(str),
+                        "expected_revision": required(int),
+                        "question": required(str),
+                        "observations": required(list[SharedObservation]),
+                        "open_questions": required(list[str]),
+                        "status": required(str),
+                        "reason": required(str),
+                    },
+                ),
+                (
+                    "release_shared_investigation",
+                    "Release a claimed investigation for another task to continue.",
+                    {"investigation_id": required(str), "expected_revision": required(int), "reason": required(str)},
+                ),
+                (
+                    "get_shared_investigation",
+                    "Read one shared investigation as untrusted navigation.",
+                    {"investigation_id": required(str)},
+                ),
+                (
+                    "query_shared_investigations",
+                    "Page through shared investigations relevant to this scope; use returned cursors for more.",
+                    {"limit": required(int), "cursor": optional(str | None, None)},
+                ),
+                (
+                    "query_shared_cases",
+                    "Page through unverified case references from this run to locate a related case.",
+                    {"limit": required(int), "cursor": optional(str | None, None)},
+                ),
+                (
+                    "register_case_counterevidence",
+                    "Register potentially conflicting fixed source for another unit's case and request re-review.",
+                    {
+                        "case_id": required(str),
+                        "expected_revision": required(int),
+                        "evidence_refs": required(list[str]),
+                        "reason": required(str),
+                    },
+                ),
+            ]
+        )
     return [result_tool(name, description, fields) for name, description, fields in definitions]
 
 
@@ -508,7 +601,15 @@ def _protocol_failure(response: Any, errors: list[str]) -> tuple[str, str, str]:
             else item
             for item in invalid
         ]
-    detail = {"errors": errors, "raw": raw, "invalid": invalid}
+    visible = getattr(response, "tool_calls", None)
+    if isinstance(visible, list):
+        parsed = [
+            {"name": item.get("name"), "args": normalized_args(item.get("args"))} if isinstance(item, dict) else item
+            for item in visible
+        ]
+    else:
+        parsed = visible
+    detail = {"errors": errors, "raw": raw, "invalid": invalid, "parsed": parsed}
     return ("native_protocol", "", json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str))
 
 
@@ -524,6 +625,29 @@ def _complete_tool_exchange(messages: list[Any]) -> bool:
         elif pending:
             return False
     return not pending
+
+
+def _ambiguous_native_ids(response: Any) -> bool:
+    """Reject ambiguous provider call identities before any tool can mutate state."""
+    parsed = getattr(response, "tool_calls", None) or []
+    invalid = getattr(response, "invalid_tool_calls", None) or []
+    if not isinstance(parsed, list) or not isinstance(invalid, list):
+        return True
+    groups = [parsed + invalid]
+    extra = getattr(response, "additional_kwargs", {}) or {}
+    raw = extra.get("reviewforge_raw_tool_calls", extra.get("tool_calls"))
+    if raw is not None:
+        if not isinstance(raw, list):
+            return True
+        groups.append(raw)
+    for calls in groups:
+        ids = [call.get("id") if isinstance(call, dict) else None for call in calls]
+        if any(not isinstance(ident, str) or not ident.strip() for ident in ids) or len(ids) != len(set(ids)):
+            return True
+    return False
+
+
+_PROTOCOL_REJECTION = "Rejected native tool batch "
 
 
 class ContextCapacityExceededError(RuntimeError):
@@ -561,6 +685,100 @@ class Reviewer:
             raise ValueError("unit decision requires an audited native tool call ID")
         return "decision_" + hashlib.sha256(f"{self.task_id}:{self._call_id}".encode()).hexdigest()
 
+    def _shared_enabled(self) -> bool:
+        return (
+            self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("shared_investigation") == "shared-1"
+        )
+
+    def _shared_action(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Route a native tool call without lending this task another task's lease."""
+        if not self._shared_enabled() or not self._turn_id or not self._call_id:
+            raise ValueError("shared investigations require an audited native tool call")
+        shared = SharedInvestigations(self.store)
+        operation_id = hashlib.sha256(
+            f"{self.store.run.id}:{self.task_id}:{self._turn_id}:{self._call_id}".encode()
+        ).hexdigest()
+        try:
+            if name == "create_shared_investigation":
+                return shared.create(
+                    self.task_id,
+                    self.lease_token,
+                    args["question"],
+                    args["scope_ids"],
+                    args["region_ids"],
+                    turn_id=self._turn_id,
+                    tool_call_id=self._call_id,
+                )
+            if name == "claim_shared_investigation":
+                return shared.claim(
+                    self.task_id,
+                    self.lease_token,
+                    args["investigation_id"],
+                    args["expected_revision"],
+                    args["reason"],
+                    operation_id=operation_id,
+                )
+            if name == "update_shared_investigation":
+                return shared.update(
+                    self.task_id,
+                    self.lease_token,
+                    args["investigation_id"],
+                    args["expected_revision"],
+                    question=args["question"],
+                    observations=args["observations"],
+                    open_questions=args["open_questions"],
+                    status=args["status"],
+                    reason=args["reason"],
+                    turn_id=self._turn_id,
+                    operation_id=operation_id,
+                )
+            if name == "release_shared_investigation":
+                return shared.release(
+                    self.task_id,
+                    self.lease_token,
+                    args["investigation_id"],
+                    args["expected_revision"],
+                    args["reason"],
+                    operation_id=operation_id,
+                )
+            if name == "get_shared_investigation":
+                return shared.get(self.task_id, self.lease_token, args["investigation_id"])
+            if name == "query_shared_investigations":
+                return shared.list(self.task_id, self.lease_token, limit=args["limit"], cursor=args.get("cursor"))
+            if name == "query_shared_cases":
+                return shared.list_cases(self.task_id, self.lease_token, limit=args["limit"], cursor=args.get("cursor"))
+            if name == "register_case_counterevidence":
+                case = self.store.register_case_counterevidence(
+                    self.task_id,
+                    self.lease_token,
+                    args["case_id"],
+                    args["evidence_refs"],
+                    turn_id=self._turn_id,
+                    reason=args["reason"],
+                    expected_revision=args["expected_revision"],
+                )
+                self.on_case(case)
+                return {
+                    "case_id": case.id,
+                    "revision": case.revision,
+                    "status": "pending_recheck",
+                    "notice": "Potential counterevidence requires independent re-review; it is not a verdict.",
+                }
+            raise ValueError("unknown shared investigation tool")
+        except LeaseError as exc:
+            # A shared item may already be claimed by another live task. That is
+            # correctable feedback, unlike loss of the parent reviewer lease.
+            task = self.store.get(Task, self.task_id)
+            scope = self.store.get(ReviewScope, task.object_id)
+            if (
+                task.status == "leased"
+                and task.lease_token == self.lease_token
+                and task.lease_expires > time.time()
+                and task.input_revision == scope.revision
+            ):
+                raise ValueError(f"shared investigation lease: {exc}") from exc
+            raise
+
     def _update_scope(self, scope: ReviewScope, **changes: Any) -> ReviewScope:
         if self.task_id:
             return self.store.update_scope_for_task(self.task_id, self.lease_token, scope.revision, **changes)
@@ -571,6 +789,44 @@ class Reviewer:
             self.store.save_task_session(
                 self.task_id, self.lease_token, encode_session(messages_to_dict(chat), self.failed_contexts)
             )
+
+    def _unconsumed_protocol_feedback(self, scope_id: str) -> list[str]:
+        """Recover rejected calls until a later audited response consumed their feedback."""
+        entries = []
+        for task in self.store.list(Task):
+            if task.kind == "review" and task.object_id == scope_id and task.run_id == self.store.run.id:
+                entries.extend(self.store.read_turn_audit(task.id))
+        entries.sort(key=lambda entry: entry["seq"])
+        pending: dict[str, None] = {}
+        requests: dict[tuple[str, str], set[str]] = {}
+        for entry in entries:
+            key = (entry["task_id"], entry["turn_id"])
+            messages = entry["messages"]
+            if entry["phase"] == "exchange":
+                for message in messages:
+                    data = message.get("data", {})
+                    content = data.get("content") if isinstance(data, dict) else None
+                    if (
+                        message.get("type") == "human"
+                        and isinstance(content, str)
+                        and content.startswith(_PROTOCOL_REJECTION)
+                    ):
+                        pending[content] = None
+            elif entry["phase"] == "request":
+                contents = {
+                    message.get("data", {}).get("content")
+                    for message in messages
+                    if message.get("type") == "human"
+                    and isinstance(message.get("data"), dict)
+                    and isinstance(message["data"].get("content"), str)
+                }
+                requests[key] = set(pending).intersection(contents)
+            elif entry["phase"] == "response" and any(
+                message.get("type") in {"ai", "AIMessage", "ai_chunk", "AIMessageChunk"} for message in messages
+            ):
+                for feedback in requests.get(key, set()):
+                    pending.pop(feedback, None)
+        return list(pending)
 
     def _add(self, obj: Any) -> Any:
         if (
@@ -639,6 +895,10 @@ class Reviewer:
             state["primary_scope_ids"] = plan.primary_scope_ids
             if unit_role == "integration":
                 state["integration_obligations"] = self.store.list_integration_obligations()
+            if self._shared_enabled():
+                state["shared_investigations"] = SharedInvestigations(self.store).preview(
+                    self.task_id, self.lease_token
+                )
         context = [
             SystemMessage(
                 content=(UNIT_COMMON_PROMPT if unit_role else PROMPT)
@@ -651,6 +911,7 @@ class Reviewer:
                 + (FRONTIER_PROMPT if frontier else "")
                 + (SEARCH_INDEX_PROMPT if self.store.run.policy in {"v42-frontier-5", "v42-units-6"} else "")
                 + (INTEGRATION_PROMPT if unit_role == "integration" else UNIT_PROMPT if unit_role else "")
+                + (SHARED_INVESTIGATION_PROMPT if self._shared_enabled() else "")
                 + (" Focus: " + self.focus if self.focus else "")
             ),
             HumanMessage(content=json.dumps(state, ensure_ascii=False, default=str)),
@@ -932,7 +1193,22 @@ class Reviewer:
         if stateful and not self.task_id:
             raise ValueError(f"{self.store.run.policy} reviewer requires a leased, auditable task")
         scope = self.store.get(ReviewScope, scope_id)
-        if scope.status == "reviewed" and not reopen:
+        protocol_feedback: list[str] = []
+        if self._shared_enabled():
+            pending = self.store.pending_shared_batches(scope_id)
+            if pending:
+                self.error = "incomplete_native_batches: " + json.dumps(pending, ensure_ascii=False, default=str)
+                if scope.status != "partial":
+                    self._update_scope(scope, status="partial")
+                return "partial"
+            try:
+                protocol_feedback = self._unconsumed_protocol_feedback(scope_id)
+            except (AttributeError, KeyError, TypeError, ValueError, OSError) as exc:
+                self.error = "protocol_feedback_audit_unavailable: " + str(exc)
+                if scope.status != "partial":
+                    self._update_scope(scope, status="partial")
+                return "partial"
+        if scope.status == "reviewed" and not reopen and not protocol_feedback:
             return "reviewed"
         records = self.store.load_task_session(self.task_id) if self.task_id else []
         saved, self.failed_contexts = decode_session(records)
@@ -954,6 +1230,12 @@ class Reviewer:
                 )
                 if old_revision != self.store.frontier_revision(self.task_id):
                     chat = [*current, *recent]
+            existing = {
+                message.content
+                for message in chat
+                if isinstance(message, HumanMessage) and isinstance(message.content, str)
+            }
+            chat.extend(HumanMessage(content=feedback) for feedback in protocol_feedback if feedback not in existing)
         except FrontierUnavailableError:
             scope = self.store.get(ReviewScope, scope_id)
             self._update_scope(scope, status="partial")
@@ -964,7 +1246,14 @@ class Reviewer:
         search_index = self.store.run.policy in {"v42-frontier-5", "v42-units-6"}
         units = self.store.run.policy == "v42-units-6"
         integration = units and scope_id == self.store.get_unit_plan().integration_scope_id
-        definitions = reviewer_tools(workspace=workspace, frontier=frontier, search_index=search_index, units=units)
+        shared_investigation = self._shared_enabled()
+        definitions = reviewer_tools(
+            workspace=workspace,
+            frontier=frontier,
+            search_index=search_index,
+            units=units,
+            shared_investigation=shared_investigation,
+        )
         if units:
             hidden = {"finish_scope", "record_region_progress", "delegate_question"}
             hidden |= (
@@ -992,6 +1281,18 @@ class Reviewer:
                 }
             )
             semantic -= {"finish_scope", "record_region_progress", "delegate_question"}
+        shared_tools = {
+            "create_shared_investigation",
+            "claim_shared_investigation",
+            "update_shared_investigation",
+            "release_shared_investigation",
+            "get_shared_investigation",
+            "query_shared_investigations",
+            "query_shared_cases",
+            "register_case_counterevidence",
+        }
+        if shared_investigation:
+            semantic.update(shared_tools)
         custom = getattr(self.gateway, "tool_specs", None)
         own = [tool for tool in definitions if custom is None or tool.name in semantic]
         schemas = {tool.name: tool.args_schema for tool in own}
@@ -1016,6 +1317,14 @@ class Reviewer:
         previous_failed_batch = None
         try:
             while True:
+                if shared_investigation:
+                    pending = self.store.pending_shared_batches(scope_id)
+                    if pending:
+                        self.error = "incomplete_native_batches: " + json.dumps(
+                            pending, ensure_ascii=False, default=str
+                        )
+                        self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
+                        return "partial"
                 obligation_snapshot = {}
                 if integration:
                     try:
@@ -1053,6 +1362,7 @@ class Reviewer:
                     self._save_session(chat)
                     continue
                 calls, errors = inspect_tool_calls(response)
+                ambiguous_ids = shared_investigation and _ambiguous_native_ids(response)
                 # Do not persist or replay provider-private reasoning fields.
                 exchange_start = len(chat)
                 chat.append(_visible_message(response, calls, deep=stateful))
@@ -1060,17 +1370,56 @@ class Reviewer:
                     extra = getattr(response, "additional_kwargs", {}) or {}
                     raw_calls = extra.get("reviewforge_raw_tool_calls", extra.get("tool_calls"))
                     invalid_calls = getattr(response, "invalid_tool_calls", None)
-                    if raw_calls is not None or invalid_calls:
+                    if raw_calls is not None or invalid_calls or (shared_investigation and (errors or ambiguous_ids)):
+                        native = {"raw_tool_calls": raw_calls, "invalid_tool_calls": invalid_calls or []}
+                        if shared_investigation and (errors or ambiguous_ids):
+                            native["protocol_errors"] = [
+                                *errors,
+                                *(["ambiguous-native-tool-ids"] if ambiguous_ids else []),
+                            ]
+                            native["visible_tool_calls"] = getattr(response, "tool_calls", None)
                         self.store.append_turn_audit(
                             self.task_id,
                             self.lease_token,
                             turn_id,
                             "native",
-                            [{"raw_tool_calls": raw_calls, "invalid_tool_calls": invalid_calls or []}],
+                            [native],
                         )
                     self.store.append_turn_audit(
                         self.task_id, self.lease_token, turn_id, "response", messages_to_dict(chat[exchange_start:])
                     )
+                if shared_investigation and (ambiguous_ids or errors):
+                    protocol_errors = [*errors, *(["ambiguous-native-tool-ids"] if ambiguous_ids else [])]
+                    signature = (_semantic_board(self.store, scope_id), (_protocol_failure(response, protocol_errors),))
+                    repeated_failure = signature == previous_failed_batch
+                    previous_failed_batch = signature
+                    feedback = HumanMessage(
+                        content=_PROTOCOL_REJECTION + turn_id + ": The native tool batch was malformed or had empty "
+                        "or repeated IDs. "
+                        "No tool was executed; retry the entire batch with valid calls and distinct nonempty IDs. "
+                        + json.dumps(
+                            {
+                                "errors": protocol_errors,
+                                "calls": getattr(response, "tool_calls", None),
+                                "protocol": _protocol_failure(response, protocol_errors)[2],
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    )
+                    chat = [*self._context(scope_id), feedback]
+                    # If either write is interrupted, the response remains pending. Once
+                    # exchange exists, the correction is already in the durable session.
+                    self._save_session(chat)
+                    self.store.append_turn_audit(
+                        self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict([feedback])
+                    )
+                    if repeated_failure:
+                        scope = self.store.get(ReviewScope, scope_id)
+                        self._update_scope(scope, status="partial")
+                        self.error = "repeated_failed_batch"
+                        return "partial"
+                    continue
                 if not calls:
                     if stateful and errors:
                         signature = (_semantic_board(self.store, scope_id), (_protocol_failure(response, errors),))
@@ -1253,6 +1602,8 @@ class Reviewer:
                             result = self._question(scope, args)
                         elif name == "submit_case":
                             result = self._case(scope, args)
+                        elif shared_investigation and name in shared_tools:
+                            result = self._shared_action(name, args)
                         elif workspace and name == "update_navigation":
                             before = self.store.get(NavigationItem, args["item_id"])
                             result = self._navigation(scope, args)
@@ -1324,7 +1675,12 @@ class Reviewer:
                         elif integration and name == "finish_integration":
                             if had_error:
                                 raise ValueError("failed sibling tool call prevents a completion receipt")
-                            scope = self.store.finish_integration(self.task_id, self.lease_token, scope.revision)
+                            scope = self.store.finish_integration(
+                                self.task_id,
+                                self.lease_token,
+                                scope.revision,
+                                **({"turn_id": turn_id} if shared_investigation else {}),
+                            )
                             result = {"status": scope.status}
                         elif units and not integration and name == "submit_unit_decision":
                             if args["finish"] and had_error:
@@ -1418,7 +1774,7 @@ class Reviewer:
                                             self.task_id,
                                             self.lease_token,
                                             q.id,
-                                            result["evidence_ref"],
+                                            result.get("original_evidence_ref", result["evidence_ref"]),
                                             name=name,
                                             args=args,
                                         )

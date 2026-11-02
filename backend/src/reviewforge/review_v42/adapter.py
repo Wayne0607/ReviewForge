@@ -11,18 +11,21 @@ import fnmatch
 import hashlib
 import json
 import re
+from types import SimpleNamespace
 from typing import Any
 
 from reviewforge.engine.review_context import ReviewContext
+from reviewforge.review_v42.line_semantics import source_lines
 from reviewforge.review_v42.snapshot import read_snapshot_blob, read_snapshot_bytes, snapshot_identity
 from reviewforge.tools.workspace import WorkspaceUnavailable, _normalise_repo_path
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
 
-def changed_regions(state: Any) -> list[dict[str, Any]]:
+def changed_regions(state: Any, *, run: Any = None) -> list[dict[str, Any]]:
     """Preserve every hunk and every unsupported file; no model is consulted."""
     regions = []
+    line_run = run if run is not None else SimpleNamespace(metadata={})
     for path in dict.fromkeys([*state.files_changed, *(state.file_diffs or {})]):
         patch = (state.file_diffs or {}).get(path, "")
         hunks = list(_HUNK.finditer(patch))
@@ -47,7 +50,7 @@ def changed_regions(state: Any) -> list[dict[str, Any]]:
             base_count, head_count = int(match[2] or 1), int(match[4] or 1)
             added, right, left_count, right_count = [], head, 0, 0
             invalid = False
-            for line in text.splitlines()[1:]:
+            for line in source_lines(line_run, text)[1:]:
                 if line.startswith("+"):
                     added.append(right)
                     right += 1
@@ -98,11 +101,12 @@ def _spec(name: str, description: str, properties: dict, required: list[str]) ->
 class PinnedToolGateway:
     """Read the immutable head workspace and explicit base revision only."""
 
-    def __init__(self, workspace: Any, state: Any, github: Any = None, *, base_workspace: Any = None):
+    def __init__(self, workspace: Any, state: Any, github: Any = None, *, base_workspace: Any = None, run: Any = None):
         if workspace.head_sha != state.head_sha:
             raise ValueError("workspace does not match review head")
         self.workspace, self.state, self.github = workspace, state, github
         self.base_workspace = base_workspace
+        self.run = run if run is not None else SimpleNamespace(metadata={})
         self.base_sha = base_workspace.head_sha if base_workspace is not None else state.base_sha
         self.context = ReviewContext(workspace, state, protocol_version=13)
         self._base: dict[str, str] = {}
@@ -209,7 +213,7 @@ class PinnedToolGateway:
             content = self._base[path]
         if content is None or "\x00" in content:
             raise WorkspaceUnavailable("source unavailable or binary")
-        lines = content.splitlines(keepends=True)
+        lines = source_lines(self.run, content, keepends=True)
         start = args.get("start_line", 1)
         end = args.get("end_line", max(len(lines), start) if type(start) is int else len(lines))
         if not lines and "start_line" not in args and "end_line" not in args:
@@ -310,7 +314,7 @@ class PinnedToolGateway:
                 if text is None or "\x00" in text:
                     skipped.append(path)
                     continue
-                for line, content in enumerate(text.splitlines(), 1):
+                for line, content in enumerate(source_lines(self.run, text), 1):
                     if pattern.search(content) if pattern else query in content:
                         matches.append({"path": path, "line": line, "text": content})
             self._searches[key] = {"matches": matches, "skipped_paths": skipped}

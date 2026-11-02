@@ -8,6 +8,7 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
+from .line_semantics import source_lines
 from .snapshot import read_snapshot_blob, snapshot_identity
 
 
@@ -31,7 +32,7 @@ def _structural(path: str, change: str, reason: str, *, binary: bool = False) ->
     }
 
 
-async def pinned_regions(base_workspace: Any, head_workspace: Any) -> dict[str, Any]:
+async def pinned_regions(base_workspace: Any, head_workspace: Any, *, run: Any = None) -> dict[str, Any]:
     """Compare every fixed path; source hashes and any requested bytes are verified.
 
     Renames are represented as deletion plus addition. Non-text files and
@@ -39,6 +40,7 @@ async def pinned_regions(base_workspace: Any, head_workspace: Any) -> dict[str, 
     """
     from .adapter import changed_regions
 
+    line_run = run if run is not None else SimpleNamespace(metadata={})
     base_identity = await snapshot_identity(base_workspace)
     head_identity = await snapshot_identity(head_workspace)
     base_manifest = base_workspace._review_v42_body_manifest
@@ -59,9 +61,14 @@ async def pinned_regions(base_workspace: Any, head_workspace: Any) -> dict[str, 
         except UnicodeDecodeError:
             regions.append(_structural(path, change, "non-UTF-8 file change requires explicit inspection"))
             continue
+        git_lines = line_run.metadata.get("source_line_policy") == "git-lf-1"
         lines = list(
             difflib.unified_diff(
-                old_text.splitlines(), new_text.splitlines(), fromfile="a/" + path, tofile="b/" + path, lineterm=""
+                source_lines(line_run, old_text, keepends=git_lines),
+                source_lines(line_run, new_text, keepends=git_lines),
+                fromfile="a/" + path,
+                tofile="b/" + path,
+                lineterm="\n" if git_lines else "",
             )
         )
         if not lines:
@@ -69,8 +76,13 @@ async def pinned_regions(base_workspace: Any, head_workspace: Any) -> dict[str, 
                 _structural(path, change, "empty-file or line-ending-only change requires explicit inspection")
             )
             continue
-        patch = "\n".join(lines) + "\n"
-        parsed = changed_regions(SimpleNamespace(files_changed=[path], file_diffs={path: patch}))
+        if git_lines:
+            patch = "".join(
+                line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines
+            )
+        else:
+            patch = "\n".join(lines) + "\n"
+        parsed = changed_regions(SimpleNamespace(files_changed=[path], file_diffs={path: patch}), run=line_run)
         for region in parsed:
             region["change"] = change
             header = re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,(\d+))? @@", region["patch"])

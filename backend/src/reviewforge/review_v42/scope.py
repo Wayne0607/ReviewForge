@@ -1,8 +1,9 @@
 """Compile changed regions into explicit, non-overlapping review ownership.
 
 Earlier policies assign the whole PR to one reviewer. The units-6 policy groups
-regions by file and explicit transaction identity; separate integration reviews
-cross-unit behavior. Grouping hints are not evidence of a call path.
+regions by file and explicit transaction identity, unless its opt-in single-owner
+plan assigns the complete manifest to one primary. Integration remains separate.
+Grouping hints are not evidence of a call path.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ def compile_scopes(run: Run, regions: list[dict[str, Any]]) -> list[ReviewScope]
         ids.add(region_id)
         row["id"] = region_id
         rows.append(row)
+    if run.policy == "v42-units-6" and run.metadata.get("unit_plan") not in (None, "single-owner-1"):
+        raise ValueError("unsupported v4.2 unit plan")
     if not rows:
         return []
     if run.policy == "v42-units-6":
@@ -74,6 +77,9 @@ def compile_scopes(run: Run, regions: list[dict[str, Any]]) -> list[ReviewScope]
                     union(i, transactions[transaction])
                 else:
                     transactions[transaction] = i
+        if run.metadata.get("unit_plan") == "single-owner-1":
+            for i in range(1, len(rows)):
+                union(0, i)
         groups: dict[int, list[dict[str, Any]]] = {}
         for i, row in enumerate(rows):
             groups.setdefault(find(i), []).append(row)

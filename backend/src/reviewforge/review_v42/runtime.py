@@ -40,11 +40,14 @@ class _FairBoundModel:
                 raise asyncio.CancelledError()
             try:
                 task = self.runtime.store.get(Task, self.task_id)
-                scope = self.runtime.store.get(ReviewScope, task.object_id)
                 if task.status != "leased" or task.lease_token != self.lease_token or task.lease_expires <= time.time():
                     raise LeaseError("review lease expired while waiting for the model lane")
-                if task.input_revision != scope.revision:
-                    raise RevisionConflict("review input changed while waiting for the model lane")
+                if task.kind == "question":
+                    self.runtime.store.assert_question_task_current(task.id, self.lease_token)
+                else:
+                    scope = self.runtime.store.get(ReviewScope, task.object_id)
+                    if task.input_revision != scope.revision:
+                        raise RevisionConflict("review input changed while waiting for the model lane")
                 return await self.model.ainvoke(messages, *args, **kwargs)
             except Exception as exc:
                 if _status_code(exc) in {401, 402, 403}:
@@ -82,6 +85,13 @@ class ReviewRuntime:
     def _fair_enabled(self) -> bool:
         return (
             self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("unit_scheduler") == "cooperative-1"
+        )
+
+    def _question_enabled(self) -> bool:
+        return (
+            self.store.run.policy == "v42-units-6"
+            and self.store.run.metadata.get("shared_investigation") == "shared-1"
+            and self.store.run.metadata.get("question_assistant_policy") == "question-delivery-1"
         )
 
     def prepare(self, regions: list[dict[str, Any]]) -> list[ReviewScope]:
@@ -162,6 +172,9 @@ class ReviewRuntime:
         }
 
     def _sync_case_evidence(self, case: Case) -> Case:
+        if self._question_enabled():
+            # The audited answer transaction binds new case evidence itself.
+            return case
         refs = {
             ref
             for q in self.store.list(Question)
@@ -208,7 +221,23 @@ class ReviewRuntime:
             self._enqueued.add(task_id)
             self._queue.put_nowait(task_id)
 
-    def _enqueue_question(self, question: Question, reason: str, task_id: str, token: str) -> None:
+    def _enqueue_question(
+        self, question: Question, reason: str, task_id: str, token: str, turn_id: str = "", call_id: str = ""
+    ) -> Task:
+        if self._question_enabled():
+            task = self.store.create_question_task(
+                task_id,
+                token,
+                question.id,
+                question.revision,
+                turn_id=turn_id,
+                tool_call_id=call_id,
+                instruction=reason,
+            )
+            if task.status not in {"completed", "superseded"} and task.id not in self._enqueued:
+                self._enqueued.add(task.id)
+                self._queue.put_nowait(task.id)
+            return task
         key = f"{question.id}:{question.revision}"
         ident = "question_" + hashlib.sha256(key.encode()).hexdigest()[:24]
         try:
@@ -229,8 +258,12 @@ class ReviewRuntime:
         if task.status not in {"completed", "superseded"} and ident not in self._enqueued:
             self._enqueued.add(ident)
             self._queue.put_nowait(ident)
+        return task
 
     async def _answer_question(self, task: Task) -> None:
+        if self._question_enabled():
+            await self._answer_audited_question(task)
+            return
         question = self.store.get(Question, task.object_id)
         if question.revision != task.input_revision:
             return
@@ -257,6 +290,68 @@ class ReviewRuntime:
                 self._blocked = True
                 self._blocked_event.set()
             self._errors_real.append(f"question {question.id}: {type(exc).__name__}")
+            try:
+                self.store.release_task(task.id, task.lease_token)
+            except LeaseError:
+                pass
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _answer_audited_question(self, task: Task) -> None:
+        """A delegated assistant owns only its leased, delivery-audited question."""
+        try:
+            task = self.store.acquire_task(task.id, "v42-question-assistant", 120)
+        except RevisionConflict:
+            try:
+                self.store.supersede_stale_question_task(task.id)
+            except (LeaseError, RevisionConflict):
+                pass
+            return
+        except LeaseError:
+            return
+        heartbeat = asyncio.create_task(self._heartbeat(task, 120))
+        try:
+            initial_question = self.store.assert_question_task_current(task.id, task.lease_token)
+            case_inputs = {
+                case.id: self._case_input(case)
+                for case in self.store.list(Case)
+                if case.id == initial_question.case_id or initial_question.id in case.question_ids
+            }
+            llm = _FairModel(self.llm, self, task.id, task.lease_token) if self._fair_enabled() else self.llm
+            answer = await QuestionAssistant(self.store, llm, self.gateway).run(task)
+            if (
+                not isinstance(answer, dict)
+                or answer.get("status") not in {"answered", "unresolved"}
+                or answer.get("question_id") != task.object_id
+            ):
+                raise ValueError("question assistant did not commit a complete answer")
+            question = self.store.assert_question_task_current(task.id, task.lease_token)
+            if question.status != answer["status"] or question.evidence_refs != answer.get("evidence_refs"):
+                raise BindingError("question answer differs from its committed state")
+            self.store.complete_task(task.id, task.lease_token, answer)
+            if question.status == "answered":
+                for case in self.store.list(Case):
+                    if (case.id == question.case_id or question.id in case.question_ids) and (
+                        case_inputs.get(case.id) != self._case_input(case)
+                    ):
+                        self._enqueue(case)
+        except asyncio.CancelledError:
+            try:
+                self.store.release_task(task.id, task.lease_token)
+            except LeaseError:
+                pass
+            raise
+        except RevisionConflict:
+            try:
+                self.store.settle_question_task_stale(task.id, task.lease_token, {"status": "superseded"})
+            except (LeaseError, RevisionConflict):
+                self._errors_real.append(f"question {task.object_id}: could not settle stale task")
+        except Exception as exc:
+            if _status_code(exc) in {401, 402, 403}:
+                self._blocked = True
+                self._blocked_event.set()
+            self._errors_real.append(f"question {task.object_id}: {type(exc).__name__}")
             try:
                 self.store.release_task(task.id, task.lease_token)
             except LeaseError:
@@ -391,7 +486,9 @@ class ReviewRuntime:
             task_id=task.id,
             lease_token=task.lease_token,
             focus=focus,
-            on_question=lambda question, reason: self._enqueue_question(question, reason, task.id, task.lease_token),
+            on_question=lambda question, reason, *delivery: self._enqueue_question(
+                question, reason, task.id, task.lease_token, *delivery
+            ),
         )
         review = asyncio.create_task(reviewer.run(scope_id, reopen=reopen))
         blocked = asyncio.create_task(self._blocked_event.wait())
@@ -737,7 +834,7 @@ class ReviewRuntime:
             self._enqueue(self._sync_case_evidence(case))
         for task in self.store.list(Task):
             if task.kind == "question" and task.status not in {"completed", "superseded"}:
-                if self.store.run.policy == "v42-units-6":
+                if self.store.run.policy == "v42-units-6" and not self._question_enabled():
                     self._errors_real.append(
                         f"question {task.object_id}: delegated investigation requires delivery audit"
                     )
@@ -748,7 +845,13 @@ class ReviewRuntime:
         workers = [asyncio.create_task(self._worker()) for _ in range(2)]
         attempted: set[tuple[str, str]] = set()
         try:
-            if self._fair_enabled():
+            if self._question_enabled():
+                # Restore already delegated work before starting a new scope
+                # lease, which would otherwise fence the saved question input.
+                await self._drain()
+            if self._blocked:
+                pass
+            elif self._fair_enabled():
                 await self._run_fair_primaries(scopes, attempted, initial=True)
             else:
                 for scope in scopes:

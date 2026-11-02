@@ -407,6 +407,13 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
     shared_investigation = os.environ.get("REVIEWFORGE_V42_SHARED_INVESTIGATION", "").strip()
     if shared_investigation and (shared_investigation != "shared-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 shared investigation")
+    question_assistant = os.environ.get("REVIEWFORGE_V42_QUESTION_ASSISTANT", "").strip()
+    if question_assistant and (
+        question_assistant != "question-delivery-1"
+        or EXECUTION_POLICY != "v42-units-6"
+        or shared_investigation != "shared-1"
+    ):
+        raise ValueError("unsupported v4.2 question assistant")
     line_policy = "git-lf-1"
     line_run = SimpleNamespace(metadata={"source_line_policy": line_policy})
     database = getattr(orchestrator, "_db", None)
@@ -492,6 +499,9 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["unit_plan"] = unit_plan
         if shared_investigation:
             metadata["shared_investigation"] = shared_investigation
+        if question_assistant:
+            metadata["question_assistant_policy"] = question_assistant
+            metadata["question_fencing_policy"] = "question-input-1"
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

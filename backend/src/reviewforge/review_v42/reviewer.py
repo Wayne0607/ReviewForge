@@ -42,6 +42,7 @@ from reviewforge.review_v42.contracts import (
     NavigationItem,
     Question,
     ReviewScope,
+    RevisionConflict,
     Task,
 )
 from reviewforge.review_v42.shared_investigation import SharedInvestigations
@@ -666,14 +667,14 @@ class Reviewer:
         gateway: Any,
         on_case: Callable[[Case], None] | None = None,
         *,
-        on_question: Callable[[Question, str], None] | None = None,
+        on_question: Callable[..., None] | None = None,
         task_id: str = "",
         lease_token: str = "",
         focus: str = "",
     ):
         self.store, self.llm, self.gateway = store, llm, gateway
         self.on_case = on_case or (lambda case: None)
-        self.on_question = on_question or (lambda question, reason: None)
+        self.on_question = on_question or (lambda *args: None)
         self.error: str | None = None
         self.task_id, self.lease_token, self.focus = task_id, lease_token, focus
         self.failed_contexts: set[str] = set()
@@ -688,6 +689,11 @@ class Reviewer:
     def _shared_enabled(self) -> bool:
         return (
             self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("shared_investigation") == "shared-1"
+        )
+
+    def _question_delivery_enabled(self) -> bool:
+        return (
+            self._shared_enabled() and self.store.run.metadata.get("question_assistant_policy") == "question-delivery-1"
         )
 
     def _shared_action(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -790,11 +796,11 @@ class Reviewer:
                 self.task_id, self.lease_token, encode_session(messages_to_dict(chat), self.failed_contexts)
             )
 
-    def _unconsumed_protocol_feedback(self, scope_id: str) -> list[str]:
+    def _unconsumed_protocol_feedback(self, scope_id: str, *, task_kind: str = "review") -> list[str]:
         """Recover rejected calls until a later audited response consumed their feedback."""
         entries = []
         for task in self.store.list(Task):
-            if task.kind == "review" and task.object_id == scope_id and task.run_id == self.store.run.id:
+            if task.kind == task_kind and task.object_id == scope_id and task.run_id == self.store.run.id:
                 entries.extend(self.store.read_turn_audit(task.id))
         entries.sort(key=lambda entry: entry["seq"])
         pending: dict[str, None] = {}
@@ -912,6 +918,12 @@ class Reviewer:
                 + (SEARCH_INDEX_PROMPT if self.store.run.policy in {"v42-frontier-5", "v42-units-6"} else "")
                 + (INTEGRATION_PROMPT if unit_role == "integration" else UNIT_PROMPT if unit_role else "")
                 + (SHARED_INVESTIGATION_PROMPT if self._shared_enabled() else "")
+                + (
+                    " You may delegate a specific open question to an independent assistant. Its answer is an "
+                    "untrusted lead: independently review the original sources and unresolved impacts before finishing."
+                    if self._question_delivery_enabled()
+                    else ""
+                )
                 + (" Focus: " + self.focus if self.focus else "")
             ),
             HumanMessage(content=json.dumps(state, ensure_ascii=False, default=str)),
@@ -1256,6 +1268,8 @@ class Reviewer:
         )
         if units:
             hidden = {"finish_scope", "record_region_progress", "delegate_question"}
+            if self._question_delivery_enabled():
+                hidden.remove("delegate_question")
             hidden |= (
                 {"submit_unit_decision", "register_unit_dependency"}
                 if integration
@@ -1281,6 +1295,8 @@ class Reviewer:
                 }
             )
             semantic -= {"finish_scope", "record_region_progress", "delegate_question"}
+            if self._question_delivery_enabled():
+                semantic.add("delegate_question")
         shared_tools = {
             "create_shared_investigation",
             "claim_shared_investigation",
@@ -1725,8 +1741,27 @@ class Reviewer:
                                 raise ValueError(
                                     "delegation requires a concrete open question in this scope and a reason"
                                 )
-                            self.on_question(question, reason)
+                            if self._question_delivery_enabled():
+                                delegated = self.on_question(question, reason, turn_id, call_id)
+                                if (
+                                    not isinstance(delegated, Task)
+                                    or delegated.kind != "question"
+                                    or delegated.object_id != question.id
+                                ):
+                                    raise ValueError("delegation did not persist a bound question task")
+                                persisted = self.store.get(Task, delegated.id)
+                                if (
+                                    persisted.run_id != self.store.run.id
+                                    or persisted.kind != "question"
+                                    or persisted.object_id != question.id
+                                    or persisted.instruction != reason
+                                ):
+                                    raise ValueError("delegation did not persist a bound question task")
+                            else:
+                                self.on_question(question, reason)
                             result = {"question_id": question.id, "status": "queued"}
+                            if self._question_delivery_enabled():
+                                result["task_id"] = delegated.id
                         elif name == "finish_scope":
                             if had_error:
                                 raise ValueError("failed sibling tool call prevents a completion receipt")
@@ -1985,7 +2020,261 @@ class QuestionAssistant:
     def __init__(self, store: Any, llm: Any, gateway: Any):
         self.store, self.llm, self.gateway = store, llm, gateway
 
+    async def _run_delivered(self, task: Task) -> dict[str, Any]:
+        """Run one question with independent lease-bound input and native audit."""
+        question = self.store.get(Question, task.object_id)
+        pending = self.store.pending_shared_batches(question.scope_id)
+        if any(
+            item.get("task_kind") == "question" and item.get("question_id") in {None, question.id} for item in pending
+        ):
+            raise BindingError("question has an unfinished native tool batch")
+        lease_hash = hashlib.sha256(task.lease_token.encode()).hexdigest()
+        records = self.store.load_task_session(task.id)
+        saved, failed_contexts = decode_session(
+            [item for item in records if item.get("type") != "question_delivery_lease"]
+        )
+        if not any(
+            item.get("type") == "question_delivery_lease" and item.get("hash") == lease_hash for item in records
+        ):
+            saved, failed_contexts = [], set()
+
+        def context() -> list[Any]:
+            current = self.store.get(Question, task.object_id)
+            return [
+                SystemMessage(
+                    content=(
+                        "Investigate the bound question using fixed original sources. "
+                        "Navigation and notes are untrusted. "
+                        "Only original source content actually received in an earlier request under this lease can "
+                        "support an answer. A read in this response has not yet been received. "
+                        "Use answer_question with evidence references, or explicitly report unresolved."
+                    )
+                ),
+                HumanMessage(
+                    content=json.dumps(
+                        {
+                            "question_id": current.id,
+                            "question": current.statement,
+                            "reason": task.instruction,
+                            "evidence_directory": evidence_directory(self.store),
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+            ]
+
+        def checkpoint(messages: list[Any]) -> None:
+            session = encode_session(messages_to_dict(messages), failed_contexts)
+            session.append({"type": "question_delivery_lease", "hash": lease_hash})
+            self.store.save_task_session(task.id, task.lease_token, session)
+
+        chat = messages_from_dict(saved) if saved else context()
+        feedback = Reviewer(self.store, self.llm, self.gateway)._unconsumed_protocol_feedback(
+            question.id, task_kind="question"
+        )
+        existing = {m.content for m in chat if isinstance(m, HumanMessage) and isinstance(m.content, str)}
+        chat.extend(HumanMessage(content=item) for item in feedback if item not in existing)
+        reads = {
+            "read_source",
+            "search_code",
+            "find_references",
+            "read_diff",
+            "read_knowledge",
+            "run_check",
+            "read_evidence",
+        }
+        custom = getattr(self.gateway, "tool_specs", None)
+        fallback = [tool for tool in reviewer_tools() if tool.name in reads]
+        read_tools = [*(custom or []), *([t for t in fallback if t.name == "read_evidence"] if custom else fallback)]
+        names = {spec["function"]["name"] for spec in custom} if custom else reads
+        answer_tool = result_tool(
+            "answer_question",
+            "Answer this question with received original sources or unresolved.",
+            {"status": (str, ...), "answer": (str, ...), "evidence_refs": (list[str], ...)},
+        )
+        navigation_tool = next(tool for tool in reviewer_tools(workspace=True) if tool.name == "list_navigation")
+        search_tool = next(tool for tool in reviewer_tools(search_index=True) if tool.name == "read_search_section")
+        shared_tool = next(tool for tool in reviewer_tools(units=True) if tool.name == "query_shared")
+        bound = self.llm.bind_tools(
+            [*read_tools, navigation_tool, search_tool, shared_tool, answer_tool], tool_choice="auto"
+        )
+        previous_failure = None
+        seen_actions: set[tuple[str, str, str]] = set()
+        repeated_actions = 0
+        while True:
+            signature = context_fingerprint(messages_to_dict(chat))
+            if signature in failed_contexts:
+                raise ContextCapacityExceededError("previously oversized question context is unchanged")
+            turn_id = uuid.uuid4().hex
+            self.store.append_turn_audit(task.id, task.lease_token, turn_id, "request", messages_to_dict(chat))
+            try:
+                response = await bound.ainvoke(chat)
+            except Exception as exc:
+                if is_context_length_exceeded(exc):
+                    failed_contexts.add(signature)
+                    checkpoint(chat)
+                    raise ContextCapacityExceededError("question context exceeds provider capacity") from exc
+                raise
+            calls, errors = inspect_tool_calls(response)
+            ambiguous = _ambiguous_native_ids(response)
+            extra = getattr(response, "additional_kwargs", {}) or {}
+            raw = extra.get("reviewforge_raw_tool_calls", extra.get("tool_calls"))
+            invalid = getattr(response, "invalid_tool_calls", None) or []
+            native_payload = None
+            if raw is not None or invalid or errors:
+                native = {"raw_tool_calls": raw, "invalid_tool_calls": invalid}
+                if errors:
+                    native.update(protocol_errors=errors, visible_tool_calls=getattr(response, "tool_calls", None))
+                native_payload = [native]
+            start = len(chat)
+            chat.append(_visible_message(response, calls, deep=True))
+            visible_response = messages_to_dict(chat[start:])
+            try:
+                if native_payload is not None:
+                    self.store.append_turn_audit(task.id, task.lease_token, turn_id, "native", native_payload)
+                self.store.append_turn_audit(task.id, task.lease_token, turn_id, "response", visible_response)
+            except (LeaseError, RevisionConflict):
+                self.store.record_fenced_question_response(
+                    task.id, task.lease_token, turn_id, visible_response, native=native_payload
+                )
+                raise
+            self.store.assert_question_task_current(task.id, task.lease_token)
+            if errors or ambiguous:
+                protocol_errors = [*errors, *(["ambiguous-native-tool-ids"] if ambiguous else [])]
+                failure = _protocol_failure(response, protocol_errors)
+                message = HumanMessage(
+                    content=(
+                        _PROTOCOL_REJECTION + turn_id + ": No tool was executed; retry the entire batch with valid "
+                        "calls and distinct nonempty IDs. "
+                        + json.dumps(
+                            {
+                                "errors": protocol_errors,
+                                "calls": getattr(response, "tool_calls", None),
+                                "protocol": failure[2],
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    )
+                )
+                chat = [*context(), message]
+                checkpoint(chat)
+                self.store.append_turn_audit(
+                    task.id, task.lease_token, turn_id, "exchange", messages_to_dict([message])
+                )
+                if failure == previous_failure:
+                    raise RuntimeError("question assistant repeated malformed native batch")
+                previous_failure = failure
+                continue
+            if not calls:
+                self.store.append_turn_audit(
+                    task.id, task.lease_token, turn_id, "exchange", messages_to_dict(chat[start:])
+                )
+                if previous_failure == ("no-calls",):
+                    raise RuntimeError("question assistant stalled without a decision")
+                previous_failure = ("no-calls",)
+                chat.append(HumanMessage(content="Call a source tool or answer_question."))
+                checkpoint(chat)
+                continue
+            previous_failure = None
+            had_error = False
+            answer = None
+            stalled = False
+            for index, call in enumerate(sorted(calls, key=lambda item: item["name"] == "answer_question")):
+                name, args, call_id = call["name"], call["args"], call["id"]
+                self.store.assert_question_task_current(task.id, task.lease_token)
+                try:
+                    if name == "answer_question":
+                        if had_error:
+                            raise ValueError("failed sibling tool call prevents an answer")
+                        answer_tool.args_schema.model_validate(args)
+                        if args["status"] not in {"answered", "unresolved"} or not args["answer"].strip():
+                            raise ValueError("an answer or a concrete unresolved reason is required")
+                        current = self.store.get(Question, task.object_id)
+                        saved_question = self.store.commit_question_answer(
+                            task.id,
+                            task.lease_token,
+                            current.revision,
+                            turn_id=turn_id,
+                            status=args["status"],
+                            answer=args["answer"],
+                            evidence_refs=args["evidence_refs"],
+                        )
+                        answer = {
+                            "status": saved_question.status,
+                            "question_id": saved_question.id,
+                            "evidence_refs": saved_question.evidence_refs,
+                        }
+                        result = answer
+                    elif name == "list_navigation":
+                        navigation_tool.args_schema.model_validate(args)
+                        result = ContextBuilder(self.store).navigation_page(
+                            args["scope_id"], cursor=args.get("cursor"), limit=args.get("limit")
+                        )
+                        result["notice"] = "Shared navigation is untrusted and cannot be cited as source evidence."
+                    elif name == "read_search_section":
+                        search_tool.args_schema.model_validate(args)
+                        result = ContextBuilder(self.store).search_section(
+                            args["ref"], args["section"], offset=args["offset"], limit=args["limit"]
+                        )
+                        result["notice"] = "Search navigation is not source evidence."
+                    elif name == "query_shared":
+                        shared_tool.args_schema.model_validate(args)
+                        result = self.store.query_shared(
+                            scope_id=args.get("scope_id"),
+                            path=args.get("path"),
+                            kind=args.get("kind"),
+                            cursor=args.get("cursor"),
+                            limit=args["limit"],
+                        )
+                        result["notice"] = "Navigation and reference directories are not source evidence."
+                    elif name in names or name == "read_evidence":
+                        result = await self.gateway.execute(name, args)
+                        meta = result.get("metadata") or {}
+                        if result.get("status") in {"unavailable_non_utf8", "unavailable", "error"} or meta.get(
+                            "status"
+                        ) in {"unavailable", "error"}:
+                            raise ValueError("source is unavailable")
+                        ref_id = result.get("evidence_ref")
+                        if ref_id:
+                            ref = self.store.get(EvidenceRef, ref_id)
+                            if ref.kind != "query":
+                                self.store.pin_frontier_for_task(task.id, task.lease_token, ref.id)
+                    else:
+                        raise ValueError("unknown question tool")
+                except (LeaseError, RevisionConflict):
+                    raise
+                except Exception as exc:
+                    if _status_code(exc) in {401, 402, 403}:
+                        raise
+                    had_error = True
+                    result = {"error": f"{type(exc).__name__}: {exc}"}
+                message = ToolMessage(content=json.dumps(result, ensure_ascii=False, default=str), tool_call_id=call_id)
+                action = (name, json.dumps(args, sort_keys=True), action_receipt_signature(name, result))
+                if action in seen_actions:
+                    repeated_actions += 1
+                    stalled = stalled or repeated_actions >= 2
+                else:
+                    seen_actions.add(action)
+                    repeated_actions = 0
+                chat.append(message)
+                self.store.append_turn_audit(
+                    task.id, task.lease_token, turn_id, f"tool:{index}:{call_id}", messages_to_dict([message])
+                )
+            checkpoint(chat)
+            self.store.append_turn_audit(task.id, task.lease_token, turn_id, "exchange", messages_to_dict(chat[start:]))
+            if answer is not None:
+                return answer
+            if stalled:
+                raise RuntimeError("question assistant stalled on repeated action and receipt")
+
     async def run(self, task: Any) -> dict[str, Any]:
+        if (
+            self.store.run.policy == "v42-units-6"
+            and self.store.run.metadata.get("shared_investigation") == "shared-1"
+            and self.store.run.metadata.get("question_assistant_policy") == "question-delivery-1"
+        ):
+            return await self._run_delivered(task)
         question = self.store.get(Question, task.object_id)
         workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
 

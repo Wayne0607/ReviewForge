@@ -48,10 +48,22 @@ def _incomplete_batch_impact(
         "finish_scope",
         "finish_integration",
         "record_integration_receipt",
+        "delegate_question",
     }
     for entries in batches.values():
         for entry in entries:
             if entry.get("reason") != "native exchange not fully persisted" or not isinstance(entry.get("calls"), list):
+                return blocked_scopes, blocked_cases, True
+            question_task = entry.get("task_kind") == "question"
+            if question_task:
+                question_id, case_id = entry.get("question_id"), entry.get("case_id")
+                if not isinstance(question_id, str) or not question_id or not isinstance(case_id, str):
+                    return blocked_scopes, blocked_cases, True
+                if case_id:
+                    if case_id not in case_ids:
+                        return blocked_scopes, blocked_cases, True
+                    blocked_cases.add(case_id)
+            elif entry.get("task_kind") is not None:
                 return blocked_scopes, blocked_cases, True
             for call in entry["calls"]:
                 if not isinstance(call, dict) or call.get("receipt") not in {"recorded", "outcome_unknown"}:
@@ -61,6 +73,8 @@ def _incomplete_batch_impact(
                 name, args = call.get("name"), call.get("args")
                 if not isinstance(name, str) or not isinstance(args, dict):
                     return blocked_scopes, blocked_cases, True
+                if name == "answer_question" and question_task:
+                    continue
                 if name == "register_case_counterevidence":
                     target = args.get("case_id")
                     if not isinstance(target, str) or target not in case_ids:

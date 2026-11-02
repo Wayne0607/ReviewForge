@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -75,12 +76,17 @@ class ReviewStore:
     """A store belongs to one immutable run; operations use short SQLite transactions."""
 
     def __init__(self, path: str | Path, run: Run):
+        self.run = run
+        fencing = run.metadata.get("question_fencing_policy")
+        if "question_fencing_policy" in run.metadata and (
+            fencing != "question-input-1" or not self._question_policy_enabled()
+        ):
+            raise BindingError("unsupported question fencing policy")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.audit_dir = self.path.parent / ".review-v42-turn-audit"
-        self.run = run
         with self._connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS run (id INTEGER PRIMARY KEY CHECK (id=1), payload TEXT NOT NULL);
@@ -156,6 +162,32 @@ class ReviewStore:
                         "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, scope_id TEXT NOT NULL, payload TEXT NOT NULL, "
                         "PRIMARY KEY(task_id,turn_id))"
                     )
+                    if run.metadata.get("question_assistant_policy") == "question-delivery-1":
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS question_delegations ("
+                            "task_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, scope_revision INTEGER NOT NULL, "
+                            "creator_task_id TEXT NOT NULL, turn_id TEXT NOT NULL, call_id TEXT NOT NULL, "
+                            "request TEXT NOT NULL, UNIQUE(creator_task_id,turn_id,call_id))"
+                        )
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS question_decisions ("
+                            "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, request TEXT NOT NULL, "
+                            "result TEXT NOT NULL, PRIMARY KEY(task_id,turn_id))"
+                        )
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS question_lease_refs ("
+                            "task_id TEXT NOT NULL, lease_hash TEXT NOT NULL, ref_id TEXT NOT NULL, "
+                            "PRIMARY KEY(task_id,lease_hash,ref_id))"
+                        )
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS question_session_owners "
+                            "(task_id TEXT PRIMARY KEY, lease_hash TEXT NOT NULL)"
+                        )
+                        if fencing == "question-input-1":
+                            db.execute(
+                                "CREATE TABLE IF NOT EXISTS question_input_bindings "
+                                "(task_id TEXT PRIMARY KEY, digest TEXT NOT NULL)"
+                            )
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -242,7 +274,18 @@ class ReviewStore:
         result = []
         tasks = [Task(**json.loads(row[0])) for row in db.execute("SELECT payload FROM objects WHERE kind='Task'")]
         for task in tasks:
-            if task.run_id != self.run.id or task.kind != "review" or task.object_id != scope_id:
+            if task.run_id != self.run.id:
+                continue
+            if task.kind == "review":
+                relevant = task.object_id == scope_id
+            elif task.kind == "question" and self._question_policy_enabled():
+                delegation = db.execute(
+                    "SELECT scope_id FROM question_delegations WHERE task_id=?", (task.id,)
+                ).fetchone()
+                relevant = delegation is None or delegation[0] == scope_id
+            else:
+                relevant = False
+            if not relevant:
                 continue
             turns: dict[str, dict[str, str]] = {}
             for turn_id, phase, digest in db.execute(
@@ -251,6 +294,17 @@ class ReviewStore:
                 turns.setdefault(turn_id, {})[phase] = digest
             for turn_id, phases in turns.items():
                 if "response" not in phases:
+                    if task.kind == "question" and "native" in phases:
+                        result.append(
+                            {
+                                "scope_id": scope_id,
+                                "task_id": task.id,
+                                "task_kind": "question",
+                                "turn_id": turn_id,
+                                "calls": [],
+                                "reason": "turn audit unavailable or invalid: native phase has no response",
+                            }
+                        )
                     continue
                 entry: dict[str, Any] = {
                     "scope_id": scope_id,
@@ -259,11 +313,47 @@ class ReviewStore:
                     "calls": [],
                     "reason": "native exchange not fully persisted",
                 }
+                if task.kind == "question":
+                    entry["task_kind"] = "question"
+                    qrow = db.execute(
+                        "SELECT payload FROM objects WHERE kind='Question' AND id=?", (task.object_id,)
+                    ).fetchone()
+                    if delegation and qrow:
+                        question = Question(**json.loads(qrow[0]))
+                        if question.run_id == self.run.id and question.scope_id == delegation[0]:
+                            entry.update(question_id=question.id, case_id=question.case_id)
                 try:
                     response = audit(phases["response"])
+                    question_exchange = None
                     if "exchange" in phases:
-                        audit(phases["exchange"])
-                        continue
+                        question_exchange = audit(phases["exchange"])
+                        if task.kind != "question":
+                            continue
+                        if len(question_exchange) == 1 and question_exchange[0].get("type") == "human":
+                            data = question_exchange[0].get("data")
+                            content = data.get("content") if isinstance(data, dict) else None
+                            if (
+                                isinstance(content, str)
+                                and content.startswith("Rejected native tool batch " + turn_id + ":")
+                                and "No tool was executed" in content
+                                and not any(phase.startswith("tool:") for phase in phases)
+                            ):
+                                native = audit(phases["native"]) if "native" in phases else []
+                                recorded_error = (
+                                    len(native) == 1
+                                    and isinstance(native[0], dict)
+                                    and bool(native[0].get("invalid_tool_calls") or native[0].get("protocol_errors"))
+                                )
+                                body = response[0].get("data", {}) if len(response) == 1 else {}
+                                visible_calls = body.get("tool_calls", []) if isinstance(body, dict) else []
+                                ids = [call.get("id") for call in visible_calls if isinstance(call, dict)]
+                                ambiguous = (
+                                    len(ids) != len(visible_calls)
+                                    or any(not isinstance(ident, str) or not ident.strip() for ident in ids)
+                                    or len(ids) != len(set(ids))
+                                )
+                                if recorded_error or ambiguous:
+                                    continue
                     aborted = db.execute(
                         "SELECT scope_id,payload FROM unit_aborted_read_batches WHERE task_id=? AND turn_id=?",
                         (task.id, turn_id),
@@ -337,6 +427,7 @@ class ReviewStore:
                             raw = matches[0]
                         strict_tool_call(call, raw)
                     receipts = set()
+                    receipt_messages = {}
                     failed_receipts = set()
                     for phase, digest in phases.items():
                         if not phase.startswith("tool:"):
@@ -355,6 +446,7 @@ class ReviewStore:
                         if not matched:
                             raise BindingError("tool receipt does not match its identity")
                         for message in matched:
+                            receipt_messages.setdefault(parts[2], []).append(message)
                             data = message["data"]
                             content = data.get("content")
                             try:
@@ -383,6 +475,23 @@ class ReviewStore:
                         {**call, "receipt": "recorded" if call["id"] in receipts else "outcome_unknown"}
                         for call in calls
                     ]
+                    if question_exchange is not None:
+                        exchange_ids = {
+                            message.get("data", {}).get("tool_call_id")
+                            for message in question_exchange
+                            if message.get("type") == "tool" and isinstance(message.get("data"), dict)
+                        }
+                        if not all(call["id"] in receipts and call["id"] in exchange_ids for call in calls) or not any(
+                            message.get("type") in {"ai", "AIMessage", "ai_chunk", "AIMessageChunk"}
+                            for message in question_exchange
+                        ):
+                            raise BindingError("question exchange is missing native calls or receipts")
+                        if response[0] not in question_exchange:
+                            raise BindingError("question exchange differs from its native response")
+                        for call in calls:
+                            if not all(message in question_exchange for message in receipt_messages[call["id"]]):
+                                raise BindingError("question exchange differs from its durable receipt")
+                        continue
                     if task.id == exclude_task_id and turn_id == exclude_turn_id:
                         terminal = [
                             call
@@ -2562,10 +2671,872 @@ class ReviewStore:
         if row is None or row[0] != task.input_revision:
             raise RevisionConflict("review task scope revision is stale")
 
+    def _question_policy_enabled(self) -> bool:
+        return (
+            self.run.policy == "v42-units-6"
+            and self.run.metadata.get("shared_investigation") == "shared-1"
+            and self.run.metadata.get("question_assistant_policy") == "question-delivery-1"
+        )
+
+    def _question_input_digest(self, db: sqlite3.Connection, question: Question) -> str:
+        """Fingerprint substantive delegated inputs, excluding routine scope/lease updates."""
+        plan = self._unit_plan_db(db)
+        if question.scope_id not in {*plan.primary_scope_ids, plan.integration_scope_id}:
+            raise BindingError("question scope is outside the fixed unit plan")
+        row = db.execute(
+            "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (question.scope_id,)
+        ).fetchone()
+        if row is None:
+            raise BindingError("question responsibility is missing")
+        scope = ReviewScope(**json.loads(row[0]))
+        if scope.run_id != self.run.id or scope.status == "superseded":
+            raise BindingError("question responsibility is not active")
+
+        def identities(ids: list[str]) -> list[Any]:
+            return sorted({_json(_unit_source_identity(ref)) for ref in self._unit_refs(db, ids)})
+
+        cases = []
+        for (payload,) in db.execute("SELECT payload FROM objects WHERE kind='Case'"):
+            case = Case(**json.loads(payload))
+            if question.id not in case.question_ids and case.id != question.case_id:
+                continue
+            if case.run_id != self.run.id or case.scope_id not in {*plan.primary_scope_ids, plan.integration_scope_id}:
+                raise BindingError("question case binding is invalid")
+            cases.append(
+                {
+                    "id": case.id,
+                    "scope_id": case.scope_id,
+                    "trigger": case.trigger,
+                    "mechanism": case.mechanism,
+                    "claims": case.claims,
+                    "status": case.status,
+                    "question_ids": sorted(case.question_ids),
+                    "evidence": identities(case.evidence_refs),
+                    "counter_evidence": identities(case.counter_evidence_refs),
+                }
+            )
+        if question.case_id and not any(case["id"] == question.case_id for case in cases):
+            raise BindingError("question's linked case is missing")
+        pending = []
+        for sid, rid, ref_id in db.execute("SELECT scope_id,region_id,ref_id FROM unit_pending_sources"):
+            if sid == question.scope_id or question.scope_id == plan.integration_scope_id:
+                pending.append([sid, rid, *identities([ref_id])])
+        pending = sorted({_json(item) for item in pending})
+        if (
+            db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shared_investigations'").fetchone()
+            is None
+        ):
+            raise BindingError("shared investigation directory is unavailable")
+        investigations = []
+        for (payload,) in db.execute("SELECT payload FROM shared_investigations"):
+            item = json.loads(payload)
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("scope_ids"), list)
+                or not item["scope_ids"]
+                or any(
+                    not isinstance(sid, str) or sid not in {*plan.primary_scope_ids, plan.integration_scope_id}
+                    for sid in item["scope_ids"]
+                )
+            ):
+                raise BindingError("shared investigation association is unknown")
+            if question.scope_id != plan.integration_scope_id and question.scope_id not in item["scope_ids"]:
+                continue
+            status = item.get("status")
+            if status not in {"open", "partial", "unavailable", "resolved", "retracted"}:
+                raise BindingError("shared investigation status is unknown")
+            observations = item.get("observations")
+            regions = item.get("region_ids")
+            if (
+                not isinstance(item.get("id"), str)
+                or not isinstance(regions, list)
+                or not regions
+                or any(not isinstance(region, str) or not region for region in regions)
+                or not isinstance(observations, list)
+                or any(
+                    not isinstance(observation, dict) or not isinstance(observation.get("evidence_refs"), list)
+                    for observation in observations
+                )
+            ):
+                raise BindingError("shared investigation dependencies are unknown")
+            permitted_regions = set()
+            for sid in item["scope_ids"]:
+                scope_row = db.execute(
+                    "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (sid,)
+                ).fetchone()
+                if scope_row is None:
+                    raise BindingError("shared investigation responsibility is missing")
+                related_scope = ReviewScope(**json.loads(scope_row[0]))
+                if related_scope.run_id != self.run.id or not isinstance(related_scope.regions, list):
+                    raise BindingError("shared investigation responsibility is invalid")
+                for region in related_scope.regions:
+                    if not isinstance(region, dict) or not isinstance(region.get("id"), str):
+                        raise BindingError("shared investigation region is invalid")
+                    permitted_regions.add(region["id"])
+            if not set(regions) <= permitted_regions:
+                raise BindingError("shared investigation region is outside its responsibilities")
+            refs = [ref for observation in observations for ref in observation["evidence_refs"]]
+            investigations.append(
+                {
+                    "id": item["id"],
+                    "scope_ids": sorted(item["scope_ids"]),
+                    "region_ids": sorted(regions),
+                    "status": status,
+                    "evidence": identities(refs),
+                }
+            )
+        obligations = []
+        for (payload,) in db.execute("SELECT payload FROM integration_obligations"):
+            item = json.loads(payload)
+            unit_ids = item.get("unit_ids") if isinstance(item, dict) else None
+            if not isinstance(unit_ids, list) or any(
+                not isinstance(sid, str) or sid not in plan.primary_scope_ids for sid in unit_ids
+            ):
+                raise BindingError("integration obligation association is unknown")
+            if question.scope_id != plan.integration_scope_id and unit_ids and question.scope_id not in unit_ids:
+                continue
+            if (
+                not isinstance(item.get("id"), str)
+                or item.get("disposition") not in {"open", "checked", "unresolved"}
+                or not isinstance(item.get("evidence_refs"), list)
+                or not isinstance(item.get("origin_evidence_refs"), list)
+            ):
+                raise BindingError("integration obligation state is unknown")
+            obligations.append(
+                {
+                    "id": item["id"],
+                    "kind": item.get("kind"),
+                    "unit_ids": sorted(unit_ids),
+                    "disposition": item["disposition"],
+                    "evidence": identities(item["evidence_refs"]),
+                    "origin_evidence": identities(item["origin_evidence_refs"]),
+                }
+            )
+        binding = {
+            "run": [self.run.id, self.run.repo, self.run.base, self.run.head],
+            "plan": asdict(plan),
+            "scope": {"id": scope.id, "regions": scope.regions, "dependencies": scope.dependencies},
+            "question": asdict(question),
+            "cases": sorted(cases, key=lambda item: item["id"]),
+            "pending_sources": pending,
+            "investigations": sorted(investigations, key=lambda item: item["id"]),
+            "obligations": sorted(obligations, key=lambda item: item["id"]),
+        }
+        return hashlib.sha256(_json(binding).encode("utf-8")).hexdigest()
+
+    def _guard_question_task(
+        self, db: sqlite3.Connection, task_id: str, token: str, now: float | None
+    ) -> tuple[Task, Question, str]:
+        if not self._question_policy_enabled():
+            raise BindingError("audited question delegation is not enabled")
+        now = time.time() if now is None else now
+        if not math.isfinite(now):
+            raise ValueError("time must be finite")
+        row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        task = Task(**json.loads(row[0]))
+        if (
+            task.run_id != self.run.id
+            or task.kind != "question"
+            or task.status != "leased"
+            or not token
+            or task.lease_token != token
+            or task.lease_expires <= now
+        ):
+            raise LeaseError("a current delegated question lease is required")
+        row = db.execute(
+            "SELECT scope_id,scope_revision FROM question_delegations WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise BindingError("question task has no audited delegation")
+        scope_id, scope_revision = row
+        qrow = db.execute("SELECT payload FROM objects WHERE kind='Question' AND id=?", (task.object_id,)).fetchone()
+        srow = db.execute("SELECT revision FROM objects WHERE kind='ReviewScope' AND id=?", (scope_id,)).fetchone()
+        if qrow is None or srow is None:
+            raise BindingError("question delegation target is missing")
+        question = Question(**json.loads(qrow[0]))
+        if question.run_id != self.run.id or question.scope_id != scope_id:
+            raise BindingError("question delegation scope or run changed")
+        if question.revision != task.input_revision:
+            raise RevisionConflict("question delegation inputs are stale")
+        if self.run.metadata.get("question_fencing_policy") == "question-input-1":
+            expected = db.execute("SELECT digest FROM question_input_bindings WHERE task_id=?", (task_id,)).fetchone()
+            try:
+                actual = self._question_input_digest(db, question)
+            except (BindingError, KeyError, OSError, ValueError, TypeError) as exc:
+                raise RevisionConflict("question delegation dependencies are unavailable") from exc
+            if expected is None or expected[0] != actual:
+                raise RevisionConflict("question delegation inputs are stale")
+        elif srow[0] != scope_revision:
+            raise RevisionConflict("question delegation inputs are stale")
+        return task, question, scope_id
+
+    def _guard_frontier_or_audit_task(self, db: sqlite3.Connection, task: Task, token: str, now: float | None) -> str:
+        if task.kind == "question":
+            return self._guard_question_task(db, task.id, token, now)[2]
+        self._guard_review_task(db, task.id, token, task.object_id, now)
+        return task.object_id
+
+    def assert_question_task_current(self, task_id: str, token: str, *, now: float | None = None) -> Question:
+        with self._connect() as db:
+            return self._guard_question_task(db, task_id, token, now)[1]
+
+    def settle_question_task_stale(
+        self, task_id: str, token: str, result: dict[str, Any], *, now: float | None = None
+    ) -> Task:
+        if not self._question_policy_enabled():
+            raise BindingError("audited question delegation is not enabled")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            clock = time.time() if now is None else now
+            if (
+                not math.isfinite(clock)
+                or task.kind != "question"
+                or task.status != "leased"
+                or not token
+                or task.lease_token != token
+                or task.lease_expires <= clock
+            ):
+                raise LeaseError("a current question lease is required")
+            try:
+                self._guard_question_task(db, task_id, token, now)
+            except RevisionConflict:
+                pass
+            else:
+                raise RevisionConflict("question task is not stale")
+            task = replace(task, status="superseded", result=result, revision=task.revision + 1)
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                (task.revision, _json(asdict(task)), task.id),
+            )
+            self._event(db, "Task", task.id, "supersede", result)
+            db.commit()
+            return task
+
+    def supersede_stale_question_task(self, task_id: str, *, now: float | None = None) -> Task:
+        """Settle an unowned stale delegation; its unfinished audit remains visible."""
+        if not self._question_policy_enabled():
+            raise BindingError("audited question delegation is not enabled")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            clock = time.time() if now is None else now
+            if not math.isfinite(clock) or task.kind != "question" or task.run_id != self.run.id:
+                raise BindingError("invalid question task")
+            if task.status == "leased" and task.lease_expires > clock:
+                raise LeaseError("question task is still leased")
+            if task.status not in {"pending", "leased"}:
+                raise LeaseError("question task is already settled")
+            delegation = db.execute(
+                "SELECT scope_id,scope_revision FROM question_delegations WHERE task_id=?", (task_id,)
+            ).fetchone()
+            qrow = db.execute(
+                "SELECT revision FROM objects WHERE kind='Question' AND id=?", (task.object_id,)
+            ).fetchone()
+            if delegation is None or qrow is None:
+                raise BindingError("question delegation binding is missing")
+            scope = db.execute(
+                "SELECT revision FROM objects WHERE kind='ReviewScope' AND id=?", (delegation[0],)
+            ).fetchone()
+            if scope is None:
+                raise BindingError("question scope is missing")
+            inputs_current = qrow[0] == task.input_revision and scope[0] == delegation[1]
+            if self.run.metadata.get("question_fencing_policy") == "question-input-1":
+                payload = db.execute(
+                    "SELECT payload FROM objects WHERE kind='Question' AND id=?", (task.object_id,)
+                ).fetchone()
+                expected = db.execute(
+                    "SELECT digest FROM question_input_bindings WHERE task_id=?", (task.id,)
+                ).fetchone()
+                inputs_current = (
+                    qrow[0] == task.input_revision
+                    and expected is not None
+                    and expected[0] == self._question_input_digest(db, Question(**json.loads(payload[0])))
+                )
+            if inputs_current:
+                raise RevisionConflict("question task is not stale")
+            task = replace(
+                task,
+                status="superseded",
+                lease_token="",
+                lease_expires=0,
+                revision=task.revision + 1,
+                result={"reason": "delegation inputs changed"},
+            )
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                (task.revision, _json(asdict(task)), task.id),
+            )
+            self._event(db, "Task", task.id, "supersede", task.result)
+            db.commit()
+            return task
+
+    def create_question_task(
+        self,
+        review_task_id: str,
+        token: str,
+        question_id: str,
+        expected_revision: int,
+        *,
+        turn_id: str,
+        tool_call_id: str,
+        instruction: str,
+        now: float | None = None,
+    ) -> Task:
+        """Create exactly one task for a controller-identified native delegation call."""
+        if not self._question_policy_enabled():
+            raise BindingError("audited question delegation is not enabled")
+        if not all(isinstance(x, str) and x.strip() for x in (question_id, turn_id, tool_call_id, instruction)):
+            raise ValueError("question, turn, call and instruction are required")
+        request = {"question_id": question_id, "reason": instruction}
+        task_id = (
+            "question_"
+            + hashlib.sha256(_json([self.run.id, review_task_id, turn_id, tool_call_id]).encode()).hexdigest()
+        )
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Question' AND id=?", (question_id,)).fetchone()
+            if row is None:
+                raise KeyError(question_id)
+            question = Question(**json.loads(row[0]))
+            self._guard_review_task(db, review_task_id, token, question.scope_id, now)
+            self._require_delivered(db, review_task_id, token, turn_id, set())
+            digest = db.execute(
+                "SELECT content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase='response'",
+                (review_task_id, turn_id),
+            ).fetchone()[0]
+            raw = (self.audit_dir / digest).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise BindingError("turn audit blob hash mismatch")
+            response = json.loads(raw)
+            calls = [
+                call
+                for message in response
+                if isinstance(message, dict) and isinstance(message.get("data"), dict)
+                for call in message["data"].get("tool_calls", [])
+                if isinstance(call, dict)
+            ]
+            ids = [call.get("id") for call in calls]
+            matching = [
+                call for call in calls if call.get("id") == tool_call_id and call.get("name") == "delegate_question"
+            ]
+            if (
+                any(not isinstance(i, str) or not i.strip() for i in ids)
+                or len(ids) != len(set(ids))
+                or len(matching) != 1
+                or not isinstance(matching[0].get("args"), dict)
+                or {k: v for k, v in matching[0]["args"].items() if k != "review_state"} != request
+            ):
+                raise BindingError("delegation must match an unambiguous native call")
+            if "review_state" in matching[0]["args"]:
+                state = matching[0]["args"]["review_state"]
+                scope_row = db.execute(
+                    "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (question.scope_id,)
+                ).fetchone()
+                scope = ReviewScope(**json.loads(scope_row[0]))
+                self._validate_refs(db, replace(scope, working_state=state))
+                updates = [("question", text, []) for text in state["open_questions"]]
+                for observation in state["observations"]:
+                    if not observation["evidence_refs"]:
+                        raise BindingError("unmerged review_state observation")
+                    updates.append(("observation", observation["statement"], observation["evidence_refs"]))
+                for kind, value, refs in updates:
+                    fingerprint = self._navigation_fingerprint(scope.id, kind, value, refs)
+                    item = db.execute(
+                        "SELECT o.payload FROM navigation_aliases n JOIN objects o "
+                        "ON o.kind='NavigationItem' AND o.id=n.item_id WHERE n.scope_id=? AND n.fingerprint=?",
+                        (scope.id, fingerprint),
+                    ).fetchone()
+                    if item is None:
+                        raise BindingError("review_state has not been merged")
+                    navigation = NavigationItem(**json.loads(item[0]))
+                    if (
+                        self._navigation_fingerprint(
+                            scope.id, navigation.kind, navigation.text, navigation.evidence_refs
+                        )
+                        != fingerprint
+                    ):
+                        raise BindingError("review_state navigation was corrected")
+            native_row = db.execute(
+                "SELECT content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase='native'",
+                (review_task_id, turn_id),
+            ).fetchone()
+            raw_calls = None
+            if native_row:
+                native_raw = (self.audit_dir / native_row[0]).read_bytes()
+                if hashlib.sha256(native_raw).hexdigest() != native_row[0]:
+                    raise BindingError("turn audit blob hash mismatch")
+                native = json.loads(native_raw)
+                if (
+                    not isinstance(native, list)
+                    or len(native) != 1
+                    or not isinstance(native[0], dict)
+                    or not isinstance(native[0].get("invalid_tool_calls"), list)
+                    or native[0]["invalid_tool_calls"]
+                    or native[0].get("protocol_errors")
+                ):
+                    raise BindingError("invalid native calls")
+                raw_calls = native[0].get("raw_tool_calls")
+                if raw_calls is not None and (not isinstance(raw_calls, list) or len(raw_calls) != len(calls)):
+                    raise BindingError("native call count differs")
+            from reviewforge.engine.native_submission import strict_tool_call
+
+            for call in calls:
+                raw_call = None
+                if raw_calls is not None:
+                    matches = [item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]]
+                    if len(matches) != 1:
+                        raise BindingError("ambiguous native call identities")
+                    raw_call = matches[0]
+                strict_tool_call(call, raw_call)
+            existing = db.execute("SELECT request FROM question_delegations WHERE task_id=?", (task_id,)).fetchone()
+            if existing:
+                if existing[0] != _json({**request, "expected_revision": expected_revision}):
+                    raise RevisionConflict("delegation call already has different inputs")
+                return Task(
+                    **json.loads(
+                        db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()[0]
+                    )
+                )
+            if question.run_id != self.run.id or question.status != "open" or question.revision != expected_revision:
+                raise RevisionConflict("delegated question is not open at the expected revision")
+            scope_revision = db.execute(
+                "SELECT revision FROM objects WHERE kind='ReviewScope' AND id=?", (question.scope_id,)
+            ).fetchone()[0]
+            other = db.execute(
+                "SELECT o.payload FROM question_delegations d JOIN objects o "
+                "ON o.kind='Task' AND o.id=d.task_id WHERE o.id<>? AND d.scope_id=?",
+                (task_id, question.scope_id),
+            ).fetchall()
+            if any(
+                (t := Task(**json.loads(row[0]))).object_id == question_id
+                and t.input_revision == expected_revision
+                and t.status not in {"completed", "superseded"}
+                for row in other
+            ):
+                raise RevisionConflict("question already has an active delegation")
+            task = Task(task_id, self.run.id, "question", question_id, expected_revision, instruction=instruction)
+            db.execute("INSERT INTO objects VALUES ('Task',?,0,?)", (task.id, _json(asdict(task))))
+            db.execute(
+                "INSERT INTO question_delegations VALUES (?,?,?,?,?,?,?)",
+                (
+                    task.id,
+                    question.scope_id,
+                    scope_revision,
+                    review_task_id,
+                    turn_id,
+                    tool_call_id,
+                    _json({**request, "expected_revision": expected_revision}),
+                ),
+            )
+            if self.run.metadata.get("question_fencing_policy") == "question-input-1":
+                db.execute(
+                    "INSERT INTO question_input_bindings VALUES (?,?)",
+                    (task.id, self._question_input_digest(db, question)),
+                )
+            self._event(
+                db,
+                "Task",
+                task.id,
+                "delegate",
+                {
+                    "question_id": question_id,
+                    "scope_id": question.scope_id,
+                    "turn_id": turn_id,
+                    "tool_call_id": tool_call_id,
+                },
+            )
+            self._guard_review_task(db, review_task_id, token, question.scope_id, now)
+            db.commit()
+            return task
+
+    def _validate_question_original(self, ref: EvidenceRef) -> None:
+        """Accept only provenance shapes emitted by the fixed-source gateway."""
+        metadata = ref.metadata
+        expected_tools = {
+            "source": "read_source",
+            "documentation": "read_knowledge",
+            "issue": "read_knowledge",
+            "test": "run_check",
+        }
+        if (
+            ref.kind not in expected_tools
+            or metadata.get("tool_name") != expected_tools[ref.kind]
+            or ("navigation_only" in metadata and metadata["navigation_only"] is not False)
+            or metadata.get("complete", True) is not True
+            or metadata.get("status", "available")
+            not in (
+                {"available", "success", "ok", "executed"} if ref.kind == "test" else {"available", "success", "ok"}
+            )
+        ):
+            raise BindingError("answers require available original sources")
+        args = metadata.get("tool_args")
+        if not isinstance(args, dict) or args.get("path") != ref.path or not ref.path:
+            raise BindingError("original source tool and path do not match")
+        if ref.kind != "issue" and (
+            ref.path.startswith("/")
+            or "\\" in ref.path
+            or ":" in ref.path
+            or any(part in {"", ".", ".."} for part in ref.path.split("/"))
+        ):
+            raise BindingError("invalid fixed source path")
+        if ref.kind == "source":
+            if ref.side not in {"base", "head"} or args.get("side", "head") != ref.side:
+                raise BindingError("source must bind its selected fixed snapshot")
+            return
+        receipt = metadata.get("original_receipt")
+        if not isinstance(receipt, dict) or receipt.get("path") != ref.path or receipt.get("head_sha") != self.run.head:
+            raise BindingError("original source receipt binding is missing")
+        if ref.kind == "documentation":
+            if (
+                ref.side != "head"
+                or receipt.get("status") != "success"
+                or receipt.get("revision") != self.run.head
+                or receipt.get("content_sha256") != ref.content_hash
+            ):
+                raise BindingError("documentation receipt does not match fixed original content")
+        elif ref.kind == "issue":
+            source_url = metadata.get("source_url")
+            captured_at = metadata.get("captured_at")
+            if not isinstance(source_url, str) or not isinstance(captured_at, str):
+                raise BindingError("external issue provenance is invalid")
+            try:
+                parsed = urlsplit(source_url)
+                captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise BindingError("external issue provenance is invalid") from exc
+            if (
+                ref.side != "external"
+                or not ref.revision
+                or ref.path != "issue:" + source_url
+                or receipt.get("revision") != ref.revision
+                or receipt.get("status") != "success"
+                or receipt.get("content_sha256") != ref.content_hash
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username
+                or parsed.password
+                or captured.tzinfo is None
+                or captured.utcoffset() is None
+                or metadata.get("historical_head_time") is not False
+                or metadata.get("external_snapshot") is not True
+            ):
+                raise BindingError("external issue receipt is not independently bound")
+        else:
+            if ref.side != "head":
+                raise BindingError("test receipt must use the fixed head")
+            try:
+                raw = json.loads((self.blob_dir / ref.content_hash).read_bytes())
+            except (OSError, ValueError, UnicodeError) as exc:
+                raise BindingError("test receipt is unavailable") from exc
+            if (
+                not isinstance(raw, dict)
+                or raw.get("status") not in {"success", "executed"}
+                or raw.get("head_sha") != self.run.head
+                or raw.get("path") != ref.path
+                or raw.get("runtime") != args.get("runtime")
+                or raw.get("runtime") not in {"python-unittest", "node-test"}
+                or type(raw.get("exit_code")) is not int
+                or receipt.get("exit_code") != raw.get("exit_code")
+                or receipt.get("runtime") != raw.get("runtime")
+                or not isinstance(raw.get("source_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", raw["source_sha256"]) is None
+                or receipt.get("source_sha256") != raw["source_sha256"]
+                or not isinstance(raw.get("image_id"), str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", raw["image_id"]) is None
+                or receipt.get("image_id") != raw["image_id"]
+                or not isinstance(raw.get("started_at"), str)
+                or not raw["started_at"].strip()
+                or not isinstance(raw.get("finished_at"), str)
+                or not raw["finished_at"].strip()
+            ):
+                raise BindingError("test receipt does not prove a fixed-snapshot execution")
+
+    def commit_question_answer(
+        self,
+        task_id: str,
+        token: str,
+        expected_revision: int,
+        *,
+        turn_id: str,
+        status: str,
+        answer: str,
+        evidence_refs: list[str],
+        now: float | None = None,
+    ) -> Question:
+        """Commit an untrusted answer only after this lease received its original sources."""
+        if status not in {"answered", "unresolved"} or not isinstance(answer, str):
+            raise ValueError("invalid question answer")
+        if not answer.strip():
+            raise ValueError("question answer or unresolved reason is required")
+        if (
+            not isinstance(evidence_refs, list)
+            or any(not isinstance(ref, str) or not ref for ref in evidence_refs)
+            or len(set(evidence_refs)) != len(evidence_refs)
+        ):
+            raise ValueError("invalid evidence references")
+        if status == "answered" and (not answer.strip() or not evidence_refs):
+            raise ValueError("answered questions need an answer and original sources")
+        request = {
+            "expected_revision": expected_revision,
+            "status": status,
+            "answer": answer,
+            "evidence_refs": evidence_refs,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task, old, scope_id = self._guard_question_task(db, task_id, token, now)
+            previous = db.execute(
+                "SELECT request,result FROM question_decisions WHERE task_id=? AND turn_id=?", (task_id, turn_id)
+            ).fetchone()
+            if previous:
+                if previous[0] != _json(request):
+                    raise RevisionConflict("question decision already has different inputs")
+                self._require_delivered(db, task_id, token, turn_id, set())
+                return Question(**json.loads(previous[1]))
+            if old.revision != expected_revision:
+                raise RevisionConflict("question revision changed")
+            refs = self._unit_refs(db, evidence_refs)
+            for ref in refs:
+                self._validate_question_original(ref)
+            delivered = self._require_delivered(db, task_id, token, turn_id, set(evidence_refs))
+            if not set(evidence_refs) <= self._task_frontier_refs(db, task_id):
+                raise BindingError("sources require explicit reads by this question task")
+            lease_hash = hashlib.sha256(token.encode()).hexdigest()
+            pinned = {
+                row[0]
+                for row in db.execute(
+                    "SELECT ref_id FROM question_lease_refs WHERE task_id=? AND lease_hash=?", (task_id, lease_hash)
+                )
+            }
+            if not set(evidence_refs) <= pinned:
+                raise BindingError("sources were not pinned under this question lease")
+            for ref in refs:
+                raw = (self.blob_dir / ref.content_hash).read_bytes()
+                try:
+                    count = len(source_lines(self.run, raw.decode("utf-8")))
+                except UnicodeError as exc:
+                    raise BindingError("source is not UTF-8") from exc
+                first = ref.start_line or 1
+                if not any(start <= first and end >= first + count - 1 for start, end in delivered[ref.id]):
+                    raise BindingError("entire evidence reference must be delivered")
+            phases = dict(
+                db.execute(
+                    "SELECT phase,content_hash FROM turn_audit WHERE task_id=? AND turn_id=?", (task_id, turn_id)
+                )
+            )
+
+            def audit(phase: str) -> Any:
+                digest = phases[phase]
+                raw = (self.audit_dir / digest).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    raise BindingError("turn audit blob hash mismatch")
+                return json.loads(raw)
+
+            response = audit("response")
+            if not isinstance(response, list) or len(response) != 1 or not isinstance(response[0].get("data"), dict):
+                raise BindingError("invalid native question response")
+            calls = response[0]["data"].get("tool_calls", [])
+            if not isinstance(calls, list) or not calls or any(not isinstance(call, dict) for call in calls):
+                raise BindingError("invalid native question calls")
+            ids = [call.get("id") for call in calls]
+            if any(not isinstance(i, str) or not i.strip() for i in ids) or len(ids) != len(set(ids)):
+                raise BindingError("ambiguous native call identities")
+            if sum(call.get("name") == "answer_question" for call in calls) != 1:
+                raise BindingError("exactly one question answer is required")
+            calls = sorted(calls, key=lambda call: call.get("name") == "answer_question")
+            terminal = calls[-1]
+            if terminal.get("name") != "answer_question" or terminal.get("args") != {
+                "status": status,
+                "answer": answer,
+                "evidence_refs": evidence_refs,
+            }:
+                raise BindingError("question answer must be the final matching native call")
+            raw_calls = None
+            if "native" in phases:
+                native = audit("native")
+                if (
+                    not isinstance(native, list)
+                    or len(native) != 1
+                    or not isinstance(native[0], dict)
+                    or not isinstance(native[0].get("invalid_tool_calls"), list)
+                    or native[0]["invalid_tool_calls"]
+                    or native[0].get("protocol_errors")
+                ):
+                    raise BindingError("invalid native calls")
+                raw_calls = native[0].get("raw_tool_calls")
+                if raw_calls is not None and (not isinstance(raw_calls, list) or len(raw_calls) != len(calls)):
+                    raise BindingError("native call count differs")
+            from reviewforge.engine.native_submission import strict_tool_call
+
+            for call in calls:
+                raw = None
+                if raw_calls is not None:
+                    matches = [item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]]
+                    if len(matches) != 1:
+                        raise BindingError("ambiguous native call identities")
+                    raw = matches[0]
+                strict_tool_call(call, raw)
+            if any(
+                batch["task_id"] == task_id and batch["turn_id"] != turn_id
+                for batch in self.pending_shared_batches(scope_id, db=db)
+            ):
+                raise BindingError("previous question tool batch remains unfinished")
+            for index, call in enumerate(calls[:-1]):
+                phase = f"tool:{index}:{call['id']}"
+                if phase not in phases:
+                    raise BindingError("preceding call has no durable receipt")
+                messages = audit(phase)
+                matched = [
+                    m.get("data")
+                    for m in messages
+                    if isinstance(m, dict)
+                    and m.get("type") == "tool"
+                    and isinstance(m.get("data"), dict)
+                    and m["data"].get("tool_call_id") == call["id"]
+                ]
+                if not matched:
+                    raise BindingError("preceding receipt identity mismatch")
+                for data in matched:
+                    try:
+                        content = (
+                            json.loads(data.get("content"))
+                            if isinstance(data.get("content"), str)
+                            else data.get("content")
+                        )
+                    except ValueError:
+                        content = None
+                    if (
+                        data.get("status") == "error"
+                        or not isinstance(content, dict)
+                        or "error" in content
+                        or content.get("status") in {"error", "failed", "unavailable"}
+                    ):
+                        raise BindingError("preceding call failed")
+            updated = replace(old, status=status, answer=answer, evidence_refs=evidence_refs, revision=old.revision + 1)
+            self._validate_refs(db, updated)
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='Question' AND id=?",
+                (updated.revision, _json(asdict(updated)), old.id),
+            )
+            plan = self._unit_plan_db(db)
+            old_source_identities = {_unit_source_identity(ref) for ref in self._unit_refs(db, old.evidence_refs)}
+            pending_refs = {ref.id for ref in refs if _unit_source_identity(ref) not in old_source_identities}
+            affected_case_ids = []
+            scope = ReviewScope(
+                **json.loads(
+                    db.execute("SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (scope_id,)).fetchone()[
+                        0
+                    ]
+                )
+            )
+            scope = replace(scope, status="pending", checked_regions=[], revision=scope.revision + 1)
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
+                (scope.revision, _json(asdict(scope)), scope_id),
+            )
+            db.execute("UPDATE question_delegations SET scope_revision=? WHERE task_id=?", (scope.revision, task_id))
+            task = replace(task, input_revision=updated.revision, revision=task.revision + 1)
+            db.execute(
+                "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                (task.revision, _json(asdict(task)), task_id),
+            )
+            if scope_id in plan.primary_scope_ids:
+                db.execute("UPDATE unit_epochs SET revision=revision+1 WHERE scope_id=?", (scope_id,))
+                self._reopen_integration(db, plan)
+            for case_id, payload in db.execute("SELECT id,payload FROM objects WHERE kind='Case'").fetchall():
+                case = Case(**json.loads(payload))
+                if old.id in case.question_ids or case_id == old.case_id:
+                    known = {_unit_source_identity(ref) for ref in self._unit_refs(db, case.evidence_refs)}
+                    additions = []
+                    for ref in refs:
+                        identity = _unit_source_identity(ref)
+                        if identity not in known:
+                            additions.append(ref.id)
+                            known.add(identity)
+                    if additions:
+                        pending_refs.update(additions)
+                        affected_case_ids.append(case_id)
+                        case = replace(case, evidence_refs=case.evidence_refs + additions, revision=case.revision + 1)
+                        db.execute(
+                            "UPDATE objects SET revision=?,payload=? WHERE kind='Case' AND id=?",
+                            (case.revision, _json(asdict(case)), case_id),
+                        )
+                        db.execute(
+                            "INSERT INTO unit_pending_cases VALUES (?,?,?) ON CONFLICT(case_id) "
+                            "DO UPDATE SET scope_id=excluded.scope_id,obligation_id=excluded.obligation_id",
+                            (case_id, scope_id, ""),
+                        )
+                        self._event(
+                            db, "Case", case_id, "question_sources", {"question_id": old.id, "evidence_refs": additions}
+                        )
+            if scope_id in plan.primary_scope_ids:
+                for region in scope.regions:
+                    for ref_id in pending_refs:
+                        db.execute(
+                            "INSERT OR IGNORE INTO unit_pending_sources VALUES (?,?,?)",
+                            (scope_id, region["id"], ref_id),
+                        )
+            elif pending_refs:
+                obligation_id = (
+                    "ob_"
+                    + hashlib.sha256(
+                        _json([self.run.id, "question_followup", old.id, updated.revision]).encode()
+                    ).hexdigest()
+                )
+                obligation = IntegrationObligation(
+                    obligation_id,
+                    self.run.id,
+                    plan.integration_scope_id,
+                    "case_followup",
+                    list(plan.primary_scope_ids),
+                    "Review new original sources for question " + old.id,
+                    origin_evidence_refs=sorted(pending_refs),
+                    origin_task_id=task_id,
+                    origin_turn_id=turn_id,
+                )
+                db.execute(
+                    "INSERT INTO integration_obligations VALUES (?,?)", (obligation.id, _json(asdict(obligation)))
+                )
+                for case_id in affected_case_ids:
+                    db.execute(
+                        "UPDATE unit_pending_cases SET obligation_id=? WHERE case_id=?", (obligation_id, case_id)
+                    )
+                self._event(db, "IntegrationObligation", obligation.id, "question_followup", asdict(obligation))
+            db.execute(
+                "INSERT INTO question_decisions VALUES (?,?,?,?)",
+                (task_id, turn_id, _json(request), _json(asdict(updated))),
+            )
+            if self.run.metadata.get("question_fencing_policy") == "question-input-1":
+                db.execute(
+                    "UPDATE question_input_bindings SET digest=? WHERE task_id=?",
+                    (self._question_input_digest(db, updated), task_id),
+                )
+            self._event(
+                db,
+                "Question",
+                old.id,
+                "delegated_answer",
+                {"before": asdict(old), "after": asdict(updated), "task_id": task_id, "turn_id": turn_id},
+            )
+            self._guard_question_task(db, task_id, token, now)
+            db.commit()
+            return updated
+
     def add_for_task(self, task_id: str, token: str, obj: T, *, now: float | None = None) -> T:
         if self.run.policy == "v42-units-6" and isinstance(obj, (Question, Case)):
             raise BindingError("unit decisions must use audited commit_unit_decision")
         if isinstance(obj, Task):
+            if self._question_policy_enabled():
+                raise BindingError("question tasks require audited create_question_task")
             if (
                 obj.kind != "question"
                 or obj.run_id != self.run.id
@@ -2866,7 +3837,14 @@ class ReviewStore:
         if row is None:
             raise KeyError(task_id)
         task = Task(**json.loads(row[0]))
-        if task.run_id != self.run.id or task.kind != "review":
+        if task.run_id != self.run.id or not (
+            task.kind == "review"
+            or (
+                task.kind == "question"
+                and self._question_policy_enabled()
+                and db.execute("SELECT 1 FROM question_delegations WHERE task_id=?", (task.id,)).fetchone()
+            )
+        ):
             raise BindingError("frontier requires a review task in this run")
         return task
 
@@ -2928,7 +3906,7 @@ class ReviewStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             task = self._frontier_task(db, task_id)
-            self._guard_review_task(db, task_id, token, task.object_id, now)
+            scope_id = self._guard_frontier_or_audit_task(db, task, token, now)
             generation = self._frontier_generation(db, task_id)
             if expected_revision is not None and expected_revision != generation:
                 raise RevisionConflict("frontier revision is stale")
@@ -2960,7 +3938,7 @@ class ReviewStore:
             identity = {
                 "run_id": self.run.id,
                 "task_id": task_id,
-                "scope_id": task.object_id,
+                "scope_id": scope_id,
                 "repo": ref.repo,
                 "source_revision": ref.revision,
                 "side": ref.side,
@@ -2996,6 +3974,12 @@ class ReviewStore:
                 )
                 self._event(db, "FrontierEntry", entry_id, "pin", asdict(entry))
                 self._bump_frontier(db, task_id, generation)
+            if task.kind == "question":
+                db.execute(
+                    "INSERT OR IGNORE INTO question_lease_refs VALUES (?,?,?)",
+                    (task_id, hashlib.sha256(token.encode()).hexdigest(), ref.id),
+                )
+                self._guard_question_task(db, task_id, token, now)
             db.commit()
             return entry
 
@@ -3104,7 +4088,7 @@ class ReviewStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             task = self._frontier_task(db, task_id)
-            self._guard_review_task(db, task_id, token, task.object_id, now)
+            self._guard_frontier_or_audit_task(db, task, token, now)
             generation = self._frontier_generation(db, task_id)
             if expected_revision != generation:
                 raise RevisionConflict("frontier revision is stale")
@@ -3190,6 +4174,7 @@ class ReviewStore:
         return task
 
     def complete_task(self, task_id: str, token: str, result: dict[str, Any], now: float | None = None) -> Task:
+        requested_now = now
         now = time.time() if now is None else now
         if not math.isfinite(now):
             raise ValueError("time must be finite")
@@ -3199,12 +4184,26 @@ class ReviewStore:
             if not row:
                 raise KeyError(task_id)
             task = Task(**json.loads(row[0]))
-            if (
-                task.kind == "review"
-                and self.run.policy == "v42-units-6"
-                and self.pending_shared_batches(task.object_id, db=db)
+            if task.kind == "question" and self._question_policy_enabled() and task.status != "completed":
+                _, question, _ = self._guard_question_task(db, task_id, token, requested_now)
+                decisions = db.execute("SELECT result FROM question_decisions WHERE task_id=?", (task.id,)).fetchall()
+                if not any(json.loads(row[0]) == asdict(question) for row in decisions):
+                    raise BindingError("question task has no committed answer")
+            if self.run.policy == "v42-units-6" and (
+                task.kind == "review" or (task.kind == "question" and self._question_policy_enabled())
             ):
-                raise BindingError("review task has an unfinished native tool batch")
+                scope_id = (
+                    task.object_id
+                    if task.kind == "review"
+                    else db.execute("SELECT scope_id FROM question_delegations WHERE task_id=?", (task.id,)).fetchone()[
+                        0
+                    ]
+                )
+                pending = self.pending_shared_batches(scope_id, db=db)
+                if task.kind == "question":
+                    pending = [batch for batch in pending if batch["task_id"] == task.id]
+                if pending:
+                    raise BindingError("task has an unfinished native tool batch")
             if task.status == "completed" and task.lease_token == token and task.result == result:
                 return task
             if task.status != "leased" or not token or task.lease_token != token or task.lease_expires <= now:
@@ -3229,6 +4228,11 @@ class ReviewStore:
                 (task.revision, _json(asdict(task)), task.id),
             )
             self._event(db, "Task", task.id, "complete", asdict(task))
+            if task.kind == "question" and self._question_policy_enabled():
+                # Recheck the lease after lock-held validation and before commit.
+                current = time.time() if requested_now is None else requested_now
+                if task.lease_expires <= current:
+                    raise LeaseError("question lease expired during completion")
             db.commit()
         return task
 
@@ -3470,6 +4474,7 @@ class ReviewStore:
         """Checkpoint visible messages; a session never authorizes a semantic result."""
         if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
             raise ValueError("messages must be a list of visible message objects")
+        requested_now = now
         now = time.time() if now is None else now
         if not math.isfinite(now):
             raise ValueError("time must be finite")
@@ -3479,6 +4484,13 @@ class ReviewStore:
             if row is None:
                 raise KeyError(task_id)
             task = Task(**json.loads(row[0]))
+            if task.kind == "question" and self._question_policy_enabled():
+                self._guard_question_task(db, task_id, token, requested_now)
+                db.execute(
+                    "INSERT INTO question_session_owners VALUES (?,?) "
+                    "ON CONFLICT(task_id) DO UPDATE SET lease_hash=excluded.lease_hash",
+                    (task_id, hashlib.sha256(token.encode()).hexdigest()),
+                )
             if task.status != "leased" or not token or task.lease_token != token or task.lease_expires <= now:
                 raise LeaseError("a current task lease is required")
             target_kind = {"review": "ReviewScope", "question": "Question"}.get(task.kind)
@@ -3492,6 +4504,8 @@ class ReviewStore:
                 "input_revision=excluded.input_revision, messages=excluded.messages",
                 (task.id, task.input_revision, _json(messages)),
             )
+            if task.kind == "question" and self._question_policy_enabled():
+                self._guard_question_task(db, task_id, token, requested_now)
             db.commit()
 
     def load_task_session(self, task_id: str) -> list[dict[str, Any]]:
@@ -3504,6 +4518,16 @@ class ReviewStore:
             if row is None:
                 return []
             task = Task(**json.loads(row[0]))
+            if task.kind == "question" and self._question_policy_enabled():
+                owner = db.execute(
+                    "SELECT lease_hash FROM question_session_owners WHERE task_id=?", (task_id,)
+                ).fetchone()
+                if (
+                    owner is None
+                    or not task.lease_token
+                    or owner[0] != hashlib.sha256(task.lease_token.encode()).hexdigest()
+                ):
+                    return []
             target_kind = {"review": "ReviewScope", "question": "Question"}.get(task.kind)
             scope = db.execute(
                 "SELECT revision FROM objects WHERE kind=? AND id=?", (target_kind, task.object_id)
@@ -3887,7 +4911,7 @@ class ReviewStore:
             task = Task(**json.loads(row[0]))
             if task.run_id != self.run.id:
                 raise BindingError("task belongs to a different run")
-            self._guard_review_task(db, task_id, token, task.object_id, now)
+            self._guard_frontier_or_audit_task(db, task, token, now)
             if self.run.policy == "v42-units-6":
                 lease_hash = hashlib.sha256(token.encode()).hexdigest()
                 owner = db.execute(
@@ -3925,6 +4949,8 @@ class ReviewStore:
                 "INSERT INTO turn_audit (task_id,turn_id,phase,content_hash) VALUES (?,?,?,?)",
                 (task_id, turn_id, phase, digest),
             )
+            if task.kind == "question":
+                self._guard_question_task(db, task_id, token, now)
             result = {
                 "seq": cursor.lastrowid,
                 "task_id": task_id,
@@ -3934,6 +4960,138 @@ class ReviewStore:
             }
             db.commit()
             return result
+
+    def record_fenced_question_response(
+        self,
+        task_id: str,
+        token: str,
+        turn_id: str,
+        response: list[dict[str, Any]],
+        native: list[dict[str, Any]] | None = None,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Retain a response received after a question lease or its input was fenced.
+
+        This records no tool receipt, execution or evidence-delivery permission.
+        """
+        if not self._question_policy_enabled() or not isinstance(turn_id, str) or not turn_id or not token:
+            raise BindingError("fenced question response is not enabled or bound")
+        if not isinstance(response, list) or len(response) != 1 or not isinstance(response[0], dict):
+            raise ValueError("a single visible native response is required")
+        if response[0].get("type") not in {"ai", "AIMessage", "ai_chunk", "AIMessageChunk"}:
+            raise ValueError("response must be an assistant message")
+        if native is not None and (not isinstance(native, list) or any(not isinstance(item, dict) for item in native)):
+            raise ValueError("native protocol metadata must be a list of objects")
+        data = response[0].get("data")
+        if not isinstance(data, dict):
+            raise ValueError("response data must be visible")
+        private = {
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "thinking",
+            "thinking_blocks",
+            "redacted_thinking",
+        }
+        for container in (response[0], data, data.get("additional_kwargs"), data.get("response_metadata")):
+            if isinstance(container, dict) and any(isinstance(k, str) and k.lower() in private for k in container):
+                raise ValueError("provider reasoning is not a visible audit message")
+        content = data.get("content")
+        for block in content if isinstance(content, list) else [content]:
+            if isinstance(block, dict) and str(block.get("type", "")).lower() in private:
+                raise ValueError("provider reasoning is not a visible audit message")
+        phases = {"response": response}
+        if native is not None:
+            phases["native"] = native
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task_row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            binding = db.execute(
+                "SELECT scope_id,scope_revision FROM question_delegations WHERE task_id=?", (task_id,)
+            ).fetchone()
+            owner = db.execute(
+                "SELECT lease_hash FROM unit_turn_owners WHERE task_id=? AND turn_id=?", (task_id, turn_id)
+            ).fetchone()
+            request = db.execute(
+                "SELECT content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase='request'",
+                (task_id, turn_id),
+            ).fetchone()
+            if (
+                not task_row
+                or not binding
+                or not owner
+                or not request
+                or owner[0] != hashlib.sha256(token.encode()).hexdigest()
+            ):
+                raise BindingError("fenced response lacks its original task, turn or lease binding")
+            task = Task(**json.loads(task_row[0]))
+            qrow = db.execute(
+                "SELECT payload FROM objects WHERE kind='Question' AND id=?", (task.object_id,)
+            ).fetchone()
+            scope = db.execute(
+                "SELECT revision FROM objects WHERE kind='ReviewScope' AND id=?", (binding[0],)
+            ).fetchone()
+            if task.run_id != self.run.id or task.kind != "question" or not qrow or not scope:
+                raise BindingError("fenced response has no valid question binding")
+            question = Question(**json.loads(qrow[0]))
+            if question.run_id != self.run.id or question.scope_id != binding[0]:
+                raise BindingError("fenced response belongs to a different scope")
+            clock = time.time() if now is None else now
+            if not math.isfinite(clock):
+                raise ValueError("time must be finite")
+            current_inputs = task.input_revision == question.revision and scope[0] == binding[1]
+            if self.run.metadata.get("question_fencing_policy") == "question-input-1":
+                expected = db.execute(
+                    "SELECT digest FROM question_input_bindings WHERE task_id=?", (task_id,)
+                ).fetchone()
+                try:
+                    actual = self._question_input_digest(db, question)
+                except (BindingError, KeyError, OSError, ValueError, TypeError):
+                    actual = None
+                current_inputs = (
+                    task.input_revision == question.revision and expected is not None and expected[0] == actual
+                )
+            if task.status == "leased" and task.lease_token == token and task.lease_expires > clock and current_inputs:
+                raise RevisionConflict("question turn is not fenced")
+            request_blob = (self.audit_dir / request[0]).read_bytes()
+            if hashlib.sha256(request_blob).hexdigest() != request[0]:
+                raise BindingError("turn audit blob hash mismatch")
+            changed = False
+            for phase, messages in phases.items():
+                payload = _json(messages).encode("utf-8")
+                digest = hashlib.sha256(payload).hexdigest()
+                existing = db.execute(
+                    "SELECT content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase=?",
+                    (task_id, turn_id, phase),
+                ).fetchone()
+                if existing and existing[0] != digest:
+                    raise RevisionConflict("turn phase already has different visible content")
+                blob = self.audit_dir / digest
+                if blob.exists():
+                    if hashlib.sha256(blob.read_bytes()).hexdigest() != digest:
+                        raise BindingError("turn audit blob hash mismatch")
+                else:
+                    temp = self.audit_dir / (digest + "." + uuid.uuid4().hex + ".tmp")
+                    try:
+                        with temp.open("wb") as stream:
+                            stream.write(payload)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        _install_verified_blob(temp, blob, digest, label="turn audit")
+                    finally:
+                        temp.unlink(missing_ok=True)
+                if not existing:
+                    changed = True
+                    db.execute(
+                        "INSERT INTO turn_audit (task_id,turn_id,phase,content_hash) VALUES (?,?,?,?)",
+                        (task_id, turn_id, phase, digest),
+                    )
+            if changed:
+                self._event(
+                    db, "Task", task_id, "fenced_question_response", {"scope_id": binding[0], "turn_id": turn_id}
+                )
+            db.commit()
 
     def read_turn_audit(self, task_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
         """Explicitly retrieve complete, hash-checked visible history in append order."""

@@ -31,6 +31,7 @@ from benchmark_support import (
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 from pydantic import PrivateAttr
+from source_cache import read_cached_tarball
 
 REPO_ROOT = Path(os.environ.get("REVIEWFORGE_REPO_ROOT", "/opt/reviewforge"))
 BACKEND_ROOT = REPO_ROOT / "backend"
@@ -189,6 +190,7 @@ class ReadOnlyGitHub:
 
     def __init__(self, client: GitHubClient) -> None:
         self._client = client
+        self._source_cache_attempts: set[tuple[str, str]] = set()
         self.comments: dict[tuple[str, int], list[dict[str, Any]]] = {}
         self.bodies: dict[tuple[str, int], list[str]] = {}
 
@@ -196,9 +198,21 @@ class ReadOnlyGitHub:
         return getattr(self._client, name)
 
     async def get_repo_tarball(self, repo: str, sha: str) -> bytes:
+        cache_dir = os.environ.get("REVIEWFORGE_SOURCE_CACHE_DIR")
+        if cache_dir:
+            self._source_cache_attempts.add((repo, sha))
+            return await asyncio.to_thread(read_cached_tarball, cache_dir, repo, sha)
         response = await self._client._client.get(f"/repos/{repo}/tarball/{sha}")
         response.raise_for_status()
         return response.content
+
+    async def get_file_content(self, repo: str, sha: str, file_path: str) -> str:
+        # The workspace may try a contents API fallback after tarball errors.
+        # A configured cache entry must never silently switch source channels,
+        # even if its hash matches but archive extraction later fails.
+        if (repo, sha) in self._source_cache_attempts:
+            raise RuntimeError("source cache is in use; contents fallback is disabled")
+        return await self._client.get_file_content(repo, sha, file_path)
 
     async def search_code(self, repo: str, pattern: str, file_glob: str = "") -> str:
         for attempt in range(5):

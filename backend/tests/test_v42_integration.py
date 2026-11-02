@@ -9,11 +9,36 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import PrivateAttr
 
-from reviewforge.core.config import PipelineV4Config
+from reviewforge.core.config import LLMConfig, PipelineV4Config
 from reviewforge.core.state import StateStore
+from reviewforge.engine.model_router import ModelRouter
 from reviewforge.engine.orchestrator import Orchestrator
 from reviewforge.review_v42.adapter import changed_regions
-from reviewforge.review_v42.integration import PhysicalMeter
+from reviewforge.review_v42.integration import PhysicalMeter, _model_signature, _raw_models
+
+
+@pytest.mark.parametrize(
+    ("base_url", "model", "stream"),
+    [("https://compatible.example/v1", "review-model", True), ("https://api.minimax.io/v1", "MiniMax-M2", False)],
+)
+def test_transport_selection_preserves_native_anthropic_route(base_url, model, stream, monkeypatch):
+    router = ModelRouter(LLMConfig(base_url=base_url, model=model, api_key="test"))
+    calls = []
+
+    def get_llm(name, **options):
+        calls.append((name, options))
+        return object()
+
+    monkeypatch.setattr(router, "get_llm", get_llm)
+    assert set(_raw_models(router)) == {"v42_reviewer", "v42_verifier"}
+    assert all(options == {"max_retries": 0, "stream_transport": stream} for _, options in calls)
+
+
+def test_stream_and_idle_timeout_are_part_of_run_binding():
+    original = SimpleNamespace(model_name="model", streaming=False, stream_usage=False, request_timeout=120)
+    for key, value in (("streaming", True), ("stream_usage", True), ("request_timeout", 180)):
+        changed = SimpleNamespace(**{**vars(original), key: value})
+        assert _model_signature(original) != _model_signature(changed)
 
 
 class NativeModel(BaseChatModel):

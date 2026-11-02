@@ -20,7 +20,7 @@ from langchain_core.messages import messages_to_dict
 from pydantic import PrivateAttr
 
 from reviewforge.core.state import StateStore
-from reviewforge.engine.model_router import ModelRouter
+from reviewforge.engine.model_router import ModelRouter, _is_minimax
 from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy, current_retry_attempt
 from reviewforge.engine.request_budget import _actual_usage
 from reviewforge.review_v42.adapter import PinnedToolGateway, changed_regions
@@ -205,10 +205,17 @@ class MeteredModel(BaseChatModel):
 
 
 def _raw_models(router):
-    return {
-        name: router.get_llm(name, max_retries=0) if isinstance(router, ModelRouter) else router.get_llm(name)
-        for name in ("v42_reviewer", "v42_verifier")
-    }
+    result = {}
+    for name in ("v42_reviewer", "v42_verifier"):
+        if isinstance(router, ModelRouter):
+            effective = router.effective(name)
+            # The existing MiniMax route uses Anthropic's native protocol.
+            # OpenAI SSE assembly must only be selected for compatible routes.
+            stream = not _is_minimax(effective["base_url"], effective["model"])
+            result[name] = router.get_llm(name, max_retries=0, stream_transport=stream)
+        else:
+            result[name] = router.get_llm(name)
+    return result
 
 
 def _model_signature(model):
@@ -233,6 +240,10 @@ def _model_signature(model):
                         "seed",
                         "stop",
                         "timeout",
+                        "request_timeout",
+                        "streaming",
+                        "stream_usage",
+                        "v42_stream_transport",
                         "base_url",
                         "openai_api_base",
                     )

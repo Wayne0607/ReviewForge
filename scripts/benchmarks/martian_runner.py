@@ -373,7 +373,7 @@ async def _build_runtime(
             _atomic_json(directory / filename, event)
 
         def traced_llm(name, *args, **kwargs):
-            cache_key = (name, kwargs.get("max_retries"))
+            cache_key = (name, kwargs.get("max_retries"), kwargs.get("stream_transport", False))
             if cache_key in traced:
                 return traced[cache_key]
             llm = original_get_llm(name, *args, **kwargs)

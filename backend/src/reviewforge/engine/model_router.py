@@ -17,7 +17,10 @@ from langchain_core.language_models import BaseChatModel
 
 from reviewforge.core.config import ROLE_NAMES, LLMConfig, RoleOverride
 from reviewforge.core.reviewer_catalog import REVIEWER_CATALOG
-from reviewforge.engine.openai_compat import ReasoningContentChatOpenAI as ChatOpenAI
+from reviewforge.engine.openai_compat import (
+    ReasoningContentChatOpenAI as ChatOpenAI,
+)
+from reviewforge.engine.openai_compat import V42StreamingChatOpenAI
 from reviewforge.engine.wire_audit import client_options
 
 logger = logging.getLogger(__name__)
@@ -85,6 +88,7 @@ def _build_llm(
     temperature: float,
     max_tokens: int | None = None,
     max_retries: int = 2,
+    stream_transport: bool = False,
 ) -> BaseChatModel:
     common = {
         "model": model,
@@ -94,6 +98,8 @@ def _build_llm(
     if max_tokens is not None:
         common["max_tokens"] = max_tokens
     if _is_minimax(base_url, model):
+        if stream_transport:
+            raise ValueError("v4.2 OpenAI streaming transport does not support the Anthropic endpoint")
         # MiniMax recommends Anthropic compatibility for M-series models. It
         # preserves native tool calls and lets M3 return final text without
         # spending the response budget on OpenAI-style <think> content.
@@ -102,7 +108,8 @@ def _build_llm(
             anthropic_api_key=api_key,
             **common,
         )
-    return ChatOpenAI(
+    adapter = V42StreamingChatOpenAI if stream_transport else ChatOpenAI
+    return adapter(
         base_url=base_url,
         api_key=api_key,
         streaming=False,
@@ -180,6 +187,7 @@ class ModelRouter:
         self._max_retries = max_retries
         self._cache: dict[str, BaseChatModel] = {}
         self._retry_override_cache: dict[tuple[str, int], BaseChatModel] = {}
+        self._stream_cache: dict[tuple[str, str, int | None], BaseChatModel] = {}
         # Seed an empty role_overrides dict so legacy configs still index safely.
         if not getattr(config, "role_overrides", None):
             config.role_overrides = {name: RoleOverride() for name in ROLE_NAMES}
@@ -234,13 +242,25 @@ class ModelRouter:
             None,
         )
 
-    def get_llm(self, agent_name: str, *, max_retries: int | None = None) -> BaseChatModel:
+    def get_llm(
+        self, agent_name: str, *, max_retries: int | None = None, stream_transport: bool = False
+    ) -> BaseChatModel:
         """Get an LLM, isolating explicit SDK retry settings from legacy clients."""
         if max_retries is not None and (type(max_retries) is not int or max_retries < 0):
             raise ValueError("SDK max_retries must be a nonnegative integer")
+        if type(stream_transport) is not bool:
+            raise ValueError("stream_transport must be a boolean")
+        if stream_transport and agent_name not in {"v42_reviewer", "v42_verifier"}:
+            raise ValueError("streaming transport is restricted to v4.2 roles")
         key, effective, profile_name, temperature, max_tokens = self._resolve(agent_name)
-        cache = self._cache if max_retries is None else self._retry_override_cache
-        cache_key = key if max_retries is None else (key, max_retries)
+        cache = (
+            self._stream_cache
+            if stream_transport
+            else (self._cache if max_retries is None else self._retry_override_cache)
+        )
+        cache_key = (
+            (agent_name, key, max_retries) if stream_transport else (key if max_retries is None else (key, max_retries))
+        )
         if cache_key in cache:
             return cache[cache_key]
 
@@ -251,6 +271,7 @@ class ModelRouter:
             temperature=temperature,
             max_tokens=max_tokens,
             max_retries=self._max_retries if max_retries is None else max_retries,
+            **({"stream_transport": True} if stream_transport else {}),
         )
         cache[cache_key] = llm
         if key.startswith("role:"):
@@ -287,3 +308,4 @@ class ModelRouter:
         """Drop cached LLM instances (used by admin hot-reload)."""
         self._cache.clear()
         self._retry_override_cache.clear()
+        self._stream_cache.clear()

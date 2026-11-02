@@ -45,9 +45,14 @@ class RetryPolicy:
     max_delay_seconds: float = 4.0
     retry_404: bool = False
     retry_after_max_seconds: float = 60.0
+    extended_attempts: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 3:
+        if type(self.extended_attempts) is not bool:
+            raise ValueError("Extended relay retry policy must be explicit")
+        if type(self.max_attempts) is not int or self.max_attempts < 1:
+            raise ValueError("Provider requests require a positive finite attempt count")
+        if not self.extended_attempts and self.max_attempts > 3:
             raise ValueError("Provider requests require one to three attempts")
         if type(self.retry_404) is not bool:
             raise ValueError("404 recovery requires an explicit boolean policy")
@@ -62,6 +67,7 @@ class RetryPolicy:
             "max_delay_seconds": self.max_delay_seconds,
             "retry_404": self.retry_404,
             "retry_after_max_seconds": self.retry_after_max_seconds,
+            **({"extended_attempts": True} if self.extended_attempts else {}),
         }
 
 
@@ -215,6 +221,7 @@ class RetryChatLLM(BaseChatModel):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         request_id = uuid.uuid4().hex
+        backoff = min(self._policy.max_delay_seconds, self._policy.base_delay_seconds)
         for attempt in range(1, self._policy.max_attempts + 1):
             identity = {"logical_request_id": request_id, "attempt": attempt, "max_attempts": self._policy.max_attempts}
             await self._record({**identity, "phase": "started", "usage_status": "unknown"})
@@ -238,7 +245,7 @@ class RetryChatLLM(BaseChatModel):
                 provider, retryable, status = _failure(exc, self._policy)
                 diagnostics = safe_provider_diagnostics(exc)
                 retry = retryable and attempt < self._policy.max_attempts
-                delay = min(self._policy.max_delay_seconds, self._policy.base_delay_seconds * 2 ** (attempt - 1))
+                delay = backoff
                 suppression = None
                 server_delay = diagnostics.get("retry_after_seconds")
                 if retry and (
@@ -284,6 +291,7 @@ class RetryChatLLM(BaseChatModel):
                 _attempt_var.reset(token)
             # No thread or SDK retry survives cancellation during backoff.
             await asyncio.sleep(delay)
+            backoff = min(self._policy.max_delay_seconds, backoff * 2)
         raise AssertionError("Provider retry loop exhausted without an outcome")
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):

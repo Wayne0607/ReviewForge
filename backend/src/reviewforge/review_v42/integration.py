@@ -204,7 +204,7 @@ class MeteredModel(BaseChatModel):
         return result
 
 
-def _raw_models(router):
+def _raw_models(router, *, request_timeout=None):
     result = {}
     for name in ("v42_reviewer", "v42_verifier"):
         if isinstance(router, ModelRouter):
@@ -212,7 +212,8 @@ def _raw_models(router):
             # The existing MiniMax route uses Anthropic's native protocol.
             # OpenAI SSE assembly must only be selected for compatible routes.
             stream = not _is_minimax(effective["base_url"], effective["model"])
-            result[name] = router.get_llm(name, max_retries=0, stream_transport=stream)
+            options = {"request_timeout": request_timeout} if request_timeout is not None else {}
+            result[name] = router.get_llm(name, max_retries=0, stream_transport=stream, **options)
         else:
             result[name] = router.get_llm(name)
     return result
@@ -268,9 +269,10 @@ def _models(orchestrator, run: Run, meter: PhysicalMeter, raw_models):
             RetryChatLLM(
                 MeteredModel(raw, meter, getattr(orchestrator, "_db", None), run.id, agent),
                 policy=RetryPolicy(
-                    max_attempts=config.provider_max_attempts,
+                    max_attempts=config.v42_provider_max_attempts,
                     retry_404=config.provider_retry_404,
-                    retry_after_max_seconds=config.provider_retry_after_max_seconds,
+                    retry_after_max_seconds=config.v42_retry_after_max_seconds,
+                    extended_attempts=True,
                 ),
                 attempt_sink=attempt,
             )
@@ -435,10 +437,15 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             else {}
         )
         # Endpoint identity affects binding but endpoint strings/credentials are not saved.
-        raw_models = _raw_models(router)
+        raw_models = _raw_models(router, request_timeout=orchestrator._pipeline_v4_config.v42_request_timeout_seconds)
         retry = {
             key: getattr(orchestrator._pipeline_v4_config, key)
-            for key in ("provider_max_attempts", "provider_retry_404", "provider_retry_after_max_seconds")
+            for key in (
+                "v42_provider_max_attempts",
+                "provider_retry_404",
+                "v42_retry_after_max_seconds",
+                "v42_request_timeout_seconds",
+            )
         }
         model_binding = hashlib.sha256(
             json.dumps(

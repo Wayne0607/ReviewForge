@@ -10,6 +10,7 @@ fast/accurate profiles continue to work as before.
 from __future__ import annotations
 
 import logging
+import math
 from urllib.parse import urlsplit, urlunsplit
 
 from langchain_anthropic import ChatAnthropic
@@ -89,6 +90,7 @@ def _build_llm(
     max_tokens: int | None = None,
     max_retries: int = 2,
     stream_transport: bool = False,
+    request_timeout: float | None = None,
 ) -> BaseChatModel:
     common = {
         "model": model,
@@ -106,6 +108,7 @@ def _build_llm(
         return ChatAnthropic(
             base_url=_minimax_anthropic_url(base_url),
             anthropic_api_key=api_key,
+            **({"timeout": request_timeout} if request_timeout is not None else {}),
             **common,
         )
     adapter = V42StreamingChatOpenAI if stream_transport else ChatOpenAI
@@ -113,7 +116,7 @@ def _build_llm(
         base_url=base_url,
         api_key=api_key,
         streaming=False,
-        timeout=120,
+        timeout=120 if request_timeout is None else request_timeout,
         **client_options(),
         **common,
     )
@@ -187,7 +190,8 @@ class ModelRouter:
         self._max_retries = max_retries
         self._cache: dict[str, BaseChatModel] = {}
         self._retry_override_cache: dict[tuple[str, int], BaseChatModel] = {}
-        self._stream_cache: dict[tuple[str, str, int | None], BaseChatModel] = {}
+        self._stream_cache: dict[tuple[str, str, int | None, float | None], BaseChatModel] = {}
+        self._timeout_cache: dict[tuple[str, str, int | None, float], BaseChatModel] = {}
         # Seed an empty role_overrides dict so legacy configs still index safely.
         if not getattr(config, "role_overrides", None):
             config.role_overrides = {name: RoleOverride() for name in ROLE_NAMES}
@@ -227,7 +231,7 @@ class ModelRouter:
                 effective,
                 profile_name,
                 profile.temperature,
-                profile.max_tokens,
+                None if agent_name in {"v42_reviewer", "v42_verifier"} else profile.max_tokens,
             )
         # 3) Plain global config.
         return (
@@ -243,24 +247,45 @@ class ModelRouter:
         )
 
     def get_llm(
-        self, agent_name: str, *, max_retries: int | None = None, stream_transport: bool = False
+        self,
+        agent_name: str,
+        *,
+        max_retries: int | None = None,
+        stream_transport: bool = False,
+        request_timeout: float | None = None,
     ) -> BaseChatModel:
         """Get an LLM, isolating explicit SDK retry settings from legacy clients."""
         if max_retries is not None and (type(max_retries) is not int or max_retries < 0):
             raise ValueError("SDK max_retries must be a nonnegative integer")
         if type(stream_transport) is not bool:
             raise ValueError("stream_transport must be a boolean")
-        if stream_transport and agent_name not in {"v42_reviewer", "v42_verifier"}:
+        is_v42 = agent_name in {"v42_reviewer", "v42_verifier"}
+        if stream_transport and not is_v42:
             raise ValueError("streaming transport is restricted to v4.2 roles")
+        if request_timeout is not None:
+            if not is_v42:
+                raise ValueError("request_timeout override is restricted to v4.2 roles")
+            try:
+                valid_timeout = (
+                    type(request_timeout) in (int, float) and math.isfinite(request_timeout) and request_timeout > 0
+                )
+            except OverflowError:
+                valid_timeout = False
+            if not valid_timeout:
+                raise ValueError("request_timeout must be a finite positive number")
         key, effective, profile_name, temperature, max_tokens = self._resolve(agent_name)
-        cache = (
-            self._stream_cache
-            if stream_transport
-            else (self._cache if max_retries is None else self._retry_override_cache)
-        )
-        cache_key = (
-            (agent_name, key, max_retries) if stream_transport else (key if max_retries is None else (key, max_retries))
-        )
+        # v4.2 never shares an instance with legacy: the same provider/profile
+        # has different output semantics even without streaming or timeout overrides.
+        scoped_key = f"v42:{agent_name}:{key}" if is_v42 else key
+        if stream_transport:
+            cache = self._stream_cache
+            cache_key = (agent_name, key, max_retries, request_timeout)
+        elif request_timeout is not None:
+            cache = self._timeout_cache
+            cache_key = (agent_name, key, max_retries, request_timeout)
+        else:
+            cache = self._cache if max_retries is None else self._retry_override_cache
+            cache_key = scoped_key if max_retries is None else (scoped_key, max_retries)
         if cache_key in cache:
             return cache[cache_key]
 
@@ -272,6 +297,7 @@ class ModelRouter:
             max_tokens=max_tokens,
             max_retries=self._max_retries if max_retries is None else max_retries,
             **({"stream_transport": True} if stream_transport else {}),
+            **({"request_timeout": request_timeout} if request_timeout is not None else {}),
         )
         cache[cache_key] = llm
         if key.startswith("role:"):
@@ -309,3 +335,4 @@ class ModelRouter:
         self._cache.clear()
         self._retry_override_cache.clear()
         self._stream_cache.clear()
+        self._timeout_cache.clear()

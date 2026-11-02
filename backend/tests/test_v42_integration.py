@@ -32,6 +32,11 @@ def test_transport_selection_preserves_native_anthropic_route(base_url, model, s
     monkeypatch.setattr(router, "get_llm", get_llm)
     assert set(_raw_models(router)) == {"v42_reviewer", "v42_verifier"}
     assert all(options == {"max_retries": 0, "stream_transport": stream} for _, options in calls)
+    calls.clear()
+    _raw_models(router, request_timeout=900)
+    assert all(
+        options == {"max_retries": 0, "stream_transport": stream, "request_timeout": 900} for _, options in calls
+    )
 
 
 def test_stream_and_idle_timeout_are_part_of_run_binding():
@@ -120,7 +125,7 @@ def product(tmp_path, monkeypatch, reviewer, verifier, workspace=None):
     obj._db = None
     obj._gateway = Gateway()
     obj._events = SimpleNamespace(set_run_id=lambda run: None, emit=lambda name, data: events.append((name, data)))
-    obj._pipeline_v4_config = PipelineV4Config(mode="review_v42", provider_max_attempts=1)
+    obj._pipeline_v4_config = PipelineV4Config(mode="review_v42", v42_provider_max_attempts=1)
     obj._model_router = SimpleNamespace(get_llm=lambda name: reviewer if name == "v42_reviewer" else verifier)
     return obj, events
 

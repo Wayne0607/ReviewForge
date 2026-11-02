@@ -323,7 +323,9 @@ async def _build_runtime(
     llm_max_attempts: int = 1,
     llm_retry_404: bool = False,
 ) -> tuple[Orchestrator, Database, GitHubClient]:
-    retry_policy = RetryPolicy(max_attempts=llm_max_attempts, retry_404=llm_retry_404)
+    retry_policy = RetryPolicy(
+        max_attempts=llm_max_attempts, retry_404=llm_retry_404, extended_attempts=pipeline == "review_v42"
+    )
     if investigator_thinking not in {"default", "enabled", "disabled"}:
         raise ValueError("investigator thinking must be default, enabled, or disabled")
     os.environ["REVIEWFORGE_PIPELINE"] = pipeline
@@ -338,6 +340,8 @@ async def _build_runtime(
     if protocol_version >= 3:
         cfg.pipeline_v4.provider_max_attempts = retry_policy.max_attempts
         cfg.pipeline_v4.provider_retry_404 = retry_policy.retry_404
+    if pipeline == "review_v42":
+        cfg.pipeline_v4.v42_provider_max_attempts = retry_policy.max_attempts
     if generator_max_input_chars < 0:
         raise ValueError("generator input budget must be nonnegative")
     if generator_max_input_chars:
@@ -373,7 +377,12 @@ async def _build_runtime(
             _atomic_json(directory / filename, event)
 
         def traced_llm(name, *args, **kwargs):
-            cache_key = (name, kwargs.get("max_retries"), kwargs.get("stream_transport", False))
+            cache_key = (
+                name,
+                kwargs.get("max_retries"),
+                kwargs.get("stream_transport", False),
+                kwargs.get("request_timeout"),
+            )
             if cache_key in traced:
                 return traced[cache_key]
             llm = original_get_llm(name, *args, **kwargs)
@@ -684,7 +693,11 @@ async def _main_async(args: argparse.Namespace) -> None:
         "reasoning_effort": args.reasoning_effort or "provider-default",
         "llm_min_interval": args.llm_min_interval,
         "sdk_max_retries": 0,
-        "provider_retry": RetryPolicy(max_attempts=args.llm_max_attempts, retry_404=args.llm_retry_404).to_dict(),
+        "provider_retry": RetryPolicy(
+            max_attempts=args.llm_max_attempts,
+            retry_404=args.llm_retry_404,
+            extended_attempts=args.pipeline == "review_v42",
+        ).to_dict(),
         "thinking": args.thinking,
         "investigator_thinking": args.investigator_thinking,
         "reviewer_concurrency": args.reviewer_concurrency,
@@ -717,11 +730,19 @@ async def _main_async(args: argparse.Namespace) -> None:
         metadata["effective_model"] = effective.model
         metadata["effective_generator_max_input_chars"] = orchestrator._pipeline_v4_config.generator_max_input_chars
         if args.pipeline == "review_v42":
+            transport = orchestrator._pipeline_v4_config
+            metadata["provider_retry"] = RetryPolicy(
+                max_attempts=transport.v42_provider_max_attempts,
+                retry_404=transport.provider_retry_404,
+                retry_after_max_seconds=transport.v42_retry_after_max_seconds,
+                extended_attempts=True,
+            ).to_dict()
             metadata["review_v42"] = {
                 "schema": "review-v42/1",
                 "token_policy": "usage-only",
                 "external_knowledge": "excluded-historical-leakage",
                 "delivery": "local-only",
+                "request_timeout_seconds": transport.v42_request_timeout_seconds,
             }
         if args.pipeline in {"hypothesis", "shadow"}:
             metadata["v4_protocol"] = {
@@ -828,9 +849,10 @@ def main() -> None:
     parser.add_argument(
         "--llm-max-attempts",
         type=int,
-        choices=(1, 2, 3),
         default=1,
-        help="Finite attempts of the same provider request; SDK retries remain disabled",
+        help=(
+            "Finite attempts of the same request; legacy protocols allow 1–3; review_v42 accepts explicit larger counts"
+        ),
     )
     parser.add_argument(
         "--llm-retry-404",

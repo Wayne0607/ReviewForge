@@ -59,6 +59,34 @@ def test_repository_yaml_matches_the_library_new_run_protocol_default():
     assert config.mode == "legacy"
 
 
+def test_v42_relay_transport_settings_do_not_change_historical_limits():
+    config = _pipeline_v4_from_dict(
+        {
+            "v42_provider_max_attempts": 12,
+            "v42_request_timeout_seconds": 1200,
+            "v42_retry_after_max_seconds": 600,
+            "provider_max_attempts": 999,
+        }
+    )
+    assert config.v42_provider_max_attempts == 12
+    assert config.v42_request_timeout_seconds == 1200
+    assert config.v42_retry_after_max_seconds == 600
+    assert config.provider_max_attempts == 3
+    assert config.provider_retry_after_max_seconds == 60
+    for invalid in (0, -1, True, float("inf"), float("nan"), "1200"):
+        invalid_config = _pipeline_v4_from_dict(
+            {
+                "v42_provider_max_attempts": invalid,
+                "v42_request_timeout_seconds": invalid,
+                "v42_retry_after_max_seconds": invalid,
+            }
+        )
+        assert invalid_config.v42_provider_max_attempts == 10
+        assert invalid_config.v42_request_timeout_seconds == 900
+        assert invalid_config.v42_retry_after_max_seconds == 900
+    assert _pipeline_v4_from_dict({"v42_request_timeout_seconds": 10**1000}).v42_request_timeout_seconds == 900
+
+
 def test_pipeline_v4_environment_overrides_yaml(monkeypatch, tmp_path) -> None:
     path = tmp_path / "reviewforge.yaml"
     path.write_text("pipeline_v4:\n  mode: legacy\n", encoding="utf-8")

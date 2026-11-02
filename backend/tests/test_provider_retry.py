@@ -386,3 +386,38 @@ def test_nested_retry_wrappers_are_rejected():
     inner = RetryChatLLM(SequenceLLM([response()]))
     with pytest.raises(ValueError, match="cannot be stacked"):
         RetryChatLLM(TrackedChatLLM(inner, RunContext(), "test"))
+
+
+@pytest.mark.asyncio
+async def test_explicit_extended_relay_policy_preserves_one_request_and_all_attempt_receipts(monkeypatch):
+    from reviewforge.engine import provider_retry
+
+    audit, delays = [], []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    async def sink(event):
+        audit.append(event)
+
+    monkeypatch.setattr(provider_retry.asyncio, "sleep", sleep)
+    inner = SequenceLLM([status_error(503) for _ in range(4)] + [response()])
+    policy = RetryPolicy(max_attempts=10, extended_attempts=True, retry_after_max_seconds=900)
+    result = await RetryChatLLM(inner, policy, attempt_sink=sink).ainvoke("fixed input", max_tokens=17000)
+    assert result.content == "ok" and len(inner._calls) == 5
+    assert all(call[:3] == inner._calls[0][:3] for call in inner._calls)
+    assert delays == [1, 2, 4, 4]
+    finished = [row for row in audit if row["phase"] == "finished"]
+    assert [row["attempt"] for row in finished] == [1, 2, 3, 4, 5]
+    assert [row["usage_status"] for row in finished] == ["unknown"] * 4 + ["reported"]
+    assert len({row["logical_request_id"] for row in audit}) == 1
+    assert policy.to_dict()["extended_attempts"] is True
+    assert "extended_attempts" not in RetryPolicy().to_dict()
+    with pytest.raises(ValueError):
+        RetryPolicy(max_attempts=10)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("inf"), 1.5])
+def test_extended_relay_policy_still_requires_positive_integer_attempts(value):
+    with pytest.raises(ValueError):
+        RetryPolicy(max_attempts=value, extended_attempts=True)

@@ -168,6 +168,10 @@ class PipelineV4Config:
     provider_max_attempts: int = 3
     provider_retry_404: bool = False
     provider_retry_after_max_seconds: float = 60.0
+    # v4.2 relay transport policy; historical protocol settings stay frozen.
+    v42_provider_max_attempts: int = 10
+    v42_request_timeout_seconds: float = 900.0
+    v42_retry_after_max_seconds: float = 900.0
 
 
 def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
@@ -198,6 +202,16 @@ def _pipeline_v4_from_dict(data: dict[str, Any]) -> PipelineV4Config:
         cfg.provider_max_attempts = data["provider_max_attempts"]
     if isinstance(data.get("provider_retry_404"), bool):
         cfg.provider_retry_404 = data["provider_retry_404"]
+    if type(data.get("v42_provider_max_attempts")) is int and data["v42_provider_max_attempts"] > 0:
+        cfg.v42_provider_max_attempts = data["v42_provider_max_attempts"]
+    for name in ("v42_request_timeout_seconds", "v42_retry_after_max_seconds"):
+        value = data.get(name)
+        try:
+            valid = type(value) in {int, float} and math.isfinite(value) and value > 0
+        except OverflowError:
+            valid = False
+        if valid:
+            setattr(cfg, name, float(value))
     if "provider_retry_after_max_seconds" in data and not isinstance(data["provider_retry_after_max_seconds"], bool):
         try:
             retry_after_cap = float(data["provider_retry_after_max_seconds"])

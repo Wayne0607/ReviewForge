@@ -13,7 +13,7 @@ async def test_benchmark_uses_one_retry_owner_and_native_v42_models(runner, monk
     monkeypatch.setenv("LLM_API_KEY", "test-placeholder")
     monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
     obj, db, github = await runner._build_runtime(
-        tmp_path, "test-model", "en", "review_v42", llm_min_interval=0, llm_max_attempts=3
+        tmp_path, "test-model", "en", "review_v42", llm_min_interval=0, llm_max_attempts=10
     )
     try:
         raw = _raw_models(obj._model_router)
@@ -21,6 +21,8 @@ async def test_benchmark_uses_one_retry_owner_and_native_v42_models(runner, monk
         bound = _models(obj, Run("run", "a/b", "base", "head"), PhysicalMeter(tmp_path / "meter"), raw)
         assert all(isinstance(model, RetryChatLLM) for model in bound)
         assert all(model._inner._inner._inner.root_async_client.max_retries == 0 for model in bound)
+        assert all(model._policy.max_attempts == 10 and model._policy.extended_attempts for model in bound)
+        assert all(model._policy.retry_after_max_seconds == 900 for model in bound)
     finally:
         await db.close()
         await github.close()

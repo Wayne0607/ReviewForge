@@ -22,7 +22,7 @@ class ContextBuilder:
         questions = [q for q in self.store.list(Question) if q.scope_id == scope_id]
         cases = [c for c in self.store.list(Case) if c.scope_id == scope_id]
         scope_view = asdict(scope)
-        if self.store.run.policy in {"v42-stateful-2", "v42-workspace-3"}:
+        if self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
             for key in ("regions", "checked_regions"):
                 for row in scope_view.get(key, []):
                     if "patch" in row:
@@ -44,12 +44,12 @@ class ContextBuilder:
             "cases": [asdict(c) for c in cases],
             "evidence": (
                 [evidence_summary(ref) for ref in self.store.list(EvidenceRef)]
-                if self.store.run.policy in {"v42-stateful-2", "v42-workspace-3"}
+                if self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}
                 else [asdict(self.store.get(EvidenceRef, r)) for r in sorted(refs)]
             ),
             "scope_index": [{"id": s.id, "title": s.title, "status": s.status} for s in self.store.list(ReviewScope)],
         }
-        if self.store.run.policy == "v42-workspace-3":
+        if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4"}:
             result["navigation"] = [
                 {key: getattr(item, key) for key in ("id", "kind", "text", "status", "evidence_refs", "revision")}
                 for item in self.store.list(NavigationItem)

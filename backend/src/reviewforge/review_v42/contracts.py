@@ -71,6 +71,30 @@ class NavigationItem:
 
 
 @dataclass
+class FrontierEntry:
+    """A task's retained original source; this is not itself an evidence reference."""
+
+    id: str
+    run_id: str
+    task_id: str
+    scope_id: str
+    repo: str
+    source_revision: str
+    side: str
+    path: str
+    start_line: int | None
+    end_line: int | None
+    kind: str
+    environment: str
+    content_hash: str
+    aliases: list[str] = field(default_factory=list)
+    status: str = "active"
+    item_revision: int = 0
+    release_reason: str = ""
+    is_page: bool = False
+
+
+@dataclass
 class Case:
     id: str
     run_id: str

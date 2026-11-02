@@ -173,7 +173,7 @@ class Publication:
                         {"case_id": case.id, "claim_id": claim_id, "reason": "invalid verification: " + str(exc)}
                     )
         active_scopes = [s for s in scopes if s.status != "superseded"]
-        workspace = self.store.run.policy == "v42-workspace-3"
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4"}
         unreviewed = [s.id for s in active_scopes if s.status != "reviewed" or (workspace and bool(s.unresolved))]
         open_questions = [q.id for q in questions if q.status in {"open", "disputed", "unresolved"}]
         open_navigation = []

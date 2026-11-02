@@ -19,6 +19,7 @@ from .contracts import (
     BindingError,
     Case,
     EvidenceRef,
+    FrontierEntry,
     LeaseError,
     NavigationItem,
     Question,
@@ -66,18 +67,29 @@ class ReviewStore:
                 db.execute("INSERT INTO run VALUES (1, ?)", (_json(asdict(run)),))
             elif row[0] != _json(asdict(run)):
                 raise BindingError("store is bound to a different run or snapshot")
-            if run.policy in {"v42-stateful-2", "v42-workspace-3"}:
+            if run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
                 self.audit_dir.mkdir(parents=True, exist_ok=True)
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS turn_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, phase TEXT NOT NULL, "
                     "content_hash TEXT NOT NULL, UNIQUE(task_id,turn_id,phase))"
                 )
-            if run.policy == "v42-workspace-3":
+            if run.policy in {"v42-workspace-3", "v42-frontier-4"}:
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS navigation_aliases ("
                     "scope_id TEXT NOT NULL, fingerprint TEXT NOT NULL, item_id TEXT NOT NULL, "
                     "PRIMARY KEY(scope_id,fingerprint))"
+                )
+
+            if run.policy == "v42-frontier-4":
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS frontier_entries ("
+                    "seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+                    "entry_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL)"
+                )
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS frontier_generations ("
+                    "task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL)"
                 )
 
     def _connect(self) -> sqlite3.Connection:
@@ -98,7 +110,7 @@ class ReviewStore:
             if not isinstance(state, dict):
                 raise ValueError("working_state must be an object")
             if state:
-                if self.run.policy not in {"v42-stateful-2", "v42-workspace-3"}:
+                if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
                     raise ValueError("working_state requires a stateful policy")
                 if set(state) != {"question", "observations", "open_questions", "next_step"}:
                     raise ValueError("working_state requires question, observations, open_questions and next_step")
@@ -275,7 +287,11 @@ class ReviewStore:
             raise BindingError("use put_evidence to create evidence")
         if isinstance(obj, NavigationItem):
             raise BindingError("navigation identities are controller-managed")
-        if isinstance(obj, ReviewScope) and self.run.policy == "v42-workspace-3" and obj.working_state:
+        if (
+            isinstance(obj, ReviewScope)
+            and self.run.policy in {"v42-workspace-3", "v42-frontier-4"}
+            and obj.working_state
+        ):
             raise ValueError("policy3 working state must be added through merge_working_states")
         if isinstance(obj, Task) and (
             obj.status != "pending" or obj.owner or obj.lease_token or obj.lease_expires or obj.result
@@ -330,7 +346,11 @@ class ReviewStore:
     ) -> T:
         if cls not in (ReviewScope, Question, Case):
             raise TypeError("updates are only supported for scopes, questions and cases")
-        if cls is ReviewScope and self.run.policy == "v42-workspace-3" and "working_state" in changes:
+        if (
+            cls is ReviewScope
+            and self.run.policy in {"v42-workspace-3", "v42-frontier-4"}
+            and "working_state" in changes
+        ):
             raise ValueError("policy3 working state must be added through merge_working_states")
         if {"id", "run_id", "revision"} & changes.keys():
             raise ValueError("identity and revision are controller-managed")
@@ -478,6 +498,262 @@ class ReviewStore:
         if hashlib.sha256(content).hexdigest() != ref.content_hash:
             raise BindingError("evidence blob hash mismatch")
         return content
+
+    def _frontier_task(self, db: sqlite3.Connection, task_id: str) -> Task:
+        if self.run.policy != "v42-frontier-4":
+            raise ValueError("frontier requires v42-frontier-4")
+        row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        task = Task(**json.loads(row[0]))
+        if task.run_id != self.run.id or task.kind != "review":
+            raise BindingError("frontier requires a review task in this run")
+        return task
+
+    @staticmethod
+    def _frontier_generation(db: sqlite3.Connection, task_id: str) -> int:
+        row = db.execute("SELECT revision FROM frontier_generations WHERE task_id=?", (task_id,)).fetchone()
+        return row[0] if row else 0
+
+    @staticmethod
+    def _bump_frontier(db: sqlite3.Connection, task_id: str, revision: int) -> None:
+        db.execute(
+            "INSERT INTO frontier_generations VALUES (?,?) "
+            "ON CONFLICT(task_id) DO UPDATE SET revision=excluded.revision",
+            (task_id, revision + 1),
+        )
+
+    def frontier_revision(self, task_id: str) -> int:
+        with self._connect() as db:
+            self._frontier_task(db, task_id)
+            return self._frontier_generation(db, task_id)
+
+    @staticmethod
+    def _frontier_content(ref: EvidenceRef, raw: bytes, start: int | None, end: int | None) -> bytes:
+        if (start is None) != (end is None):
+            raise ValueError("page requires actual start and end lines")
+        if start is None:
+            return raw
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError("page lines must be integers")
+        try:
+            lines = raw.decode("utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError as exc:
+            raise BindingError("evidence page is not UTF-8") from exc
+        first = ref.start_line or 1
+        last = first + len(lines) - 1
+        if start < first or end < start or end > last:
+            raise ValueError("page must be within the actual evidence range")
+        return "".join(lines[start - first : end - first + 1]).encode("utf-8")
+
+    def pin_frontier_for_task(
+        self,
+        task_id: str,
+        token: str,
+        ref_id: str,
+        *,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        expected_revision: int | None = None,
+        now: float | None = None,
+    ) -> FrontierEntry:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task = self._frontier_task(db, task_id)
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            generation = self._frontier_generation(db, task_id)
+            if expected_revision is not None and expected_revision != generation:
+                raise RevisionConflict("frontier revision is stale")
+            row = db.execute("SELECT payload FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone()
+            if row is None:
+                raise BindingError("unknown evidence reference")
+            ref = EvidenceRef(**json.loads(row[0]))
+            if ref.run_id != self.run.id or ref.repo != self.run.repo or ref.side not in {"head", "base", "external"}:
+                raise BindingError("evidence belongs to a different run or snapshot")
+            if ref.side != "external" and ref.revision != getattr(self.run, ref.side):
+                raise BindingError("evidence belongs to a different snapshot")
+            if ref.metadata.get("status") in {"unavailable", "error", "failed", "unavailable_non_utf8"}:
+                raise BindingError("unavailable evidence cannot be pinned")
+            raw = (self.blob_dir / ref.content_hash).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != ref.content_hash:
+                raise BindingError("evidence blob hash mismatch")
+            content = self._frontier_content(ref, raw, start_line, end_line)
+            is_page = start_line is not None
+            actual_start = start_line if is_page else ref.start_line
+            actual_end = end_line if is_page else ref.end_line
+            digest = hashlib.sha256(content).hexdigest()
+            # Query/test results need their invocation identity: equal output does not
+            # make two different searches or executions the same source.
+            extra = {"workspace_digest": ref.metadata.get("workspace_digest")}
+            if ref.kind not in {"source", "diff", "documentation"}:
+                extra.update({key: ref.metadata.get(key) for key in ("tool_name", "tool_args")})
+            if ref.side == "external":
+                extra.update({key: ref.metadata.get(key) for key in ("source_url", "captured_at")})
+            identity = {
+                "run_id": self.run.id,
+                "task_id": task_id,
+                "scope_id": task.object_id,
+                "repo": ref.repo,
+                "source_revision": ref.revision,
+                "side": ref.side,
+                "path": ref.path,
+                "start_line": actual_start,
+                "end_line": actual_end,
+                "kind": ref.kind,
+                "environment": ref.environment,
+                "content_hash": digest,
+                "source_identity": extra,
+            }
+            entry_id = "frontier_" + hashlib.sha256(_json(identity).encode()).hexdigest()
+            row = db.execute("SELECT payload FROM frontier_entries WHERE entry_id=?", (entry_id,)).fetchone()
+            if row:
+                entry = FrontierEntry(**json.loads(row[0]))
+                changed = ref.id not in entry.aliases or entry.status != "active"
+                if changed:
+                    if ref.id not in entry.aliases:
+                        entry.aliases.append(ref.id)
+                    entry.status, entry.release_reason = "active", ""
+                    entry.item_revision += 1
+                    db.execute(
+                        "UPDATE frontier_entries SET payload=? WHERE entry_id=?", (_json(asdict(entry)), entry_id)
+                    )
+                    self._event(db, "FrontierEntry", entry_id, "pin", asdict(entry))
+                    self._bump_frontier(db, task_id, generation)
+            else:
+                identity.pop("source_identity")
+                entry = FrontierEntry(id=entry_id, aliases=[ref.id], is_page=is_page, **identity)
+                db.execute(
+                    "INSERT INTO frontier_entries(task_id,entry_id,payload) VALUES (?,?,?)",
+                    (task_id, entry_id, _json(asdict(entry))),
+                )
+                self._event(db, "FrontierEntry", entry_id, "pin", asdict(entry))
+                self._bump_frontier(db, task_id, generation)
+            db.commit()
+            return entry
+
+    def list_frontier(self, task_id: str) -> list[FrontierEntry]:
+        with self._connect() as db:
+            self._frontier_task(db, task_id)
+            rows = db.execute(
+                "SELECT payload FROM frontier_entries WHERE task_id=? ORDER BY seq", (task_id,)
+            ).fetchall()
+        entries = [FrontierEntry(**json.loads(row[0])) for row in rows]
+        return [entry for entry in entries if entry.status == "active"]
+
+    def list_frontier_page(self, task_id: str, *, cursor: str | None = None, limit: int) -> dict[str, Any]:
+        """Caller-sized, resumable directory page; a released cursor remains valid."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._connect() as db:
+            self._frontier_task(db, task_id)
+            seq = 0
+            if cursor is not None:
+                row = db.execute(
+                    "SELECT seq FROM frontier_entries WHERE task_id=? AND entry_id=?", (task_id, cursor)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("invalid frontier cursor")
+                seq = row[0]
+            rows = db.execute(
+                "SELECT payload FROM frontier_entries WHERE task_id=? AND seq>? ORDER BY seq", (task_id, seq)
+            )
+            selected = []
+            for row in rows:
+                entry = FrontierEntry(**json.loads(row[0]))
+                if entry.status == "active":
+                    selected.append(entry)
+                    if len(selected) > limit:
+                        break
+        return {"items": selected[:limit], "next_cursor": selected[limit - 1].id if len(selected) > limit else None}
+
+    def read_frontier_entry(self, task_id: str, entry_id: str) -> bytes:
+        with self._connect() as db:
+            self._frontier_task(db, task_id)
+            row = db.execute(
+                "SELECT payload FROM frontier_entries WHERE task_id=? AND entry_id=?", (task_id, entry_id)
+            ).fetchone()
+        if row is None:
+            raise KeyError(entry_id)
+        entry = FrontierEntry(**json.loads(row[0]))
+        if entry.status != "active" or not entry.aliases:
+            raise KeyError(entry_id)
+        ref = self.get(EvidenceRef, entry.aliases[0])
+        raw = self.read_evidence(ref.id)
+        content = self._frontier_content(
+            ref, raw, entry.start_line if entry.is_page else None, entry.end_line if entry.is_page else None
+        )
+        if hashlib.sha256(content).hexdigest() != entry.content_hash:
+            raise BindingError("frontier content hash mismatch")
+        return content
+
+    def read_frontier_page(self, task_id: str, entry_id: str, *, start_line: int, end_line: int) -> dict[str, Any]:
+        """Return an explicit page within the pinned body, never outside it."""
+        entries = {entry.id: entry for entry in self.list_frontier(task_id)}
+        if entry_id not in entries:
+            raise KeyError(entry_id)
+        entry = entries[entry_id]
+        raw = self.read_frontier_entry(task_id, entry_id)
+        if type(start_line) is not int or type(end_line) is not int or start_line < 1 or end_line < start_line:
+            raise ValueError("invalid page range")
+        try:
+            lines = raw.decode("utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError as exc:
+            raise BindingError("frontier page is not UTF-8") from exc
+        first = entry.start_line or 1
+        last = first + len(lines) - 1
+        if start_line < first or start_line > last:
+            raise ValueError("page starts outside the pinned body")
+        actual_end = min(end_line, last)
+        return {
+            "content": "".join(lines[start_line - first : actual_end - first + 1]).encode("utf-8"),
+            "start_line": start_line,
+            "end_line": actual_end,
+            "next_line": actual_end + 1 if actual_end < last else None,
+            "complete": start_line == first and actual_end == last,
+        }
+
+    def release_frontier_for_task(
+        self,
+        task_id: str,
+        token: str,
+        entry_ids: list[str],
+        reason: str,
+        *,
+        expected_revision: int,
+        now: float | None = None,
+    ) -> list[FrontierEntry]:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("release requires a reason")
+        if not isinstance(entry_ids, list) or not entry_ids or any(not isinstance(x, str) or not x for x in entry_ids):
+            raise ValueError("release requires entry ids")
+        if len(set(entry_ids)) != len(entry_ids):
+            raise ValueError("duplicate entry ids")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task = self._frontier_task(db, task_id)
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            generation = self._frontier_generation(db, task_id)
+            if expected_revision != generation:
+                raise RevisionConflict("frontier revision is stale")
+            entries = []
+            for entry_id in entry_ids:
+                row = db.execute(
+                    "SELECT payload FROM frontier_entries WHERE task_id=? AND entry_id=?", (task_id, entry_id)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(entry_id)
+                entry = FrontierEntry(**json.loads(row[0]))
+                if entry.status != "active":
+                    raise RevisionConflict("frontier entry is already released")
+                entries.append(entry)
+            for entry in entries:
+                entry.status, entry.release_reason = "released", reason
+                entry.item_revision += 1
+                db.execute("UPDATE frontier_entries SET payload=? WHERE entry_id=?", (_json(asdict(entry)), entry.id))
+                self._event(db, "FrontierEntry", entry.id, "release", asdict(entry))
+            self._bump_frontier(db, task_id, generation)
+            db.commit()
+            return entries
 
     def history(self, kind: str | None = None, object_id: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT seq,kind,object_id,action,payload FROM events WHERE 1=1"
@@ -733,7 +1009,7 @@ class ReviewStore:
         self, task_id: str, token: str, expected_revision: int, *, now: float | None = None, **changes: Any
     ) -> ReviewScope:
         """Advance the scope and its review-task input together under the same lease."""
-        if self.run.policy == "v42-workspace-3" and "working_state" in changes:
+        if self.run.policy in {"v42-workspace-3", "v42-frontier-4"} and "working_state" in changes:
             raise ValueError("policy3 working state must be added through merge_working_states")
         if {"id", "run_id", "revision"} & changes.keys() or changes.keys() - {f.name for f in fields(ReviewScope)}:
             raise ValueError("invalid scope update fields")
@@ -1085,7 +1361,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Append one complete visible exchange, bound to the current review lease."""
-        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3"}:
+        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
             raise ValueError("turn audit requires a stateful policy")
         if not isinstance(turn_id, str) or not turn_id or not isinstance(phase, str) or not phase:
             raise ValueError("turn_id and phase are required")
@@ -1176,7 +1452,7 @@ class ReviewStore:
 
     def read_turn_audit(self, task_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
         """Explicitly retrieve complete, hash-checked visible history in append order."""
-        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3"}:
+        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
             raise ValueError("turn audit requires a stateful policy")
         with self._connect() as db:
             if db.execute("SELECT 1 FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone() is None:
@@ -1218,7 +1494,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Merge independent untrusted navigation updates without replacing siblings."""
-        if self.run.policy != "v42-workspace-3":
+        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4"}:
             raise ValueError("navigation requires v42-workspace-3")
         if not isinstance(states, list):
             raise ValueError("states must be a list")
@@ -1356,7 +1632,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> NavigationItem:
         """Explicitly revise, resolve, retract or reopen one untrusted navigation item."""
-        if self.run.policy != "v42-workspace-3":
+        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4"}:
             raise ValueError("navigation requires v42-workspace-3")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("navigation updates require a reason")
@@ -1441,7 +1717,7 @@ class ReviewStore:
         self, scope_id: str, *, status: str | None = "open", cursor: str | None = None, limit: int | None = None
     ) -> dict[str, Any]:
         """Explicit, lossless pagination; None returns the entire current set."""
-        if self.run.policy != "v42-workspace-3":
+        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4"}:
             raise ValueError("navigation requires v42-workspace-3")
         self.get(ReviewScope, scope_id)
         if status not in {None, "open", "resolved", "retracted"}:

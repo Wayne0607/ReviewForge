@@ -94,6 +94,45 @@ class FrontierEntry:
     is_page: bool = False
 
 
+@dataclass(frozen=True)
+class UnitPlan:
+    run_id: str
+    manifest_hash: str
+    workspace_digest: str
+    base_workspace_digest: str
+    primary_scope_ids: list[str]
+    integration_scope_id: str
+    revision: int = 0
+
+
+@dataclass(frozen=True)
+class IntegrationReview:
+    id: str
+    run_id: str
+    scope_id: str
+    revision: int = 0
+
+
+@dataclass
+class IntegrationObligation:
+    id: str
+    run_id: str
+    integration_scope_id: str
+    kind: str
+    unit_ids: list[str]
+    description: str
+    evidence_refs: list[str] = field(default_factory=list)
+    disposition: str = "open"
+    reason: str = ""
+    receipt_digest: str = ""
+    revision: int = 0
+    task_id: str = ""
+    turn_id: str = ""
+    origin_evidence_refs: list[str] = field(default_factory=list)
+    origin_task_id: str = ""
+    origin_turn_id: str = ""
+
+
 @dataclass
 class Case:
     id: str

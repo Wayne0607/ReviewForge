@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -89,6 +90,22 @@ SEARCH_INDEX_PROMPT = (
     "is incomplete. Search results are not source proof."
 )
 
+UNIT_PROMPT = (
+    " This is one owned work unit. Investigate its changed behavior and read related files and base/head sources "
+    "as needed. Submit source-backed unit decisions as work is completed; record unresolved questions and "
+    "candidates separately. Reading a source alone does not establish coverage."
+    " When original sources reveal a concrete relationship with another work unit, call "
+    "register_unit_dependency with that unit ID, the relationship and the original source references. "
+    "It creates a separate integration obligation; source reads never require a progress form."
+)
+
+INTEGRATION_PROMPT = (
+    " This is the separate cross-unit integration review. Investigate each listed obligation and relevant "
+    "cross-file calls, data and contracts using original sources. A missing graph edge does not prove independence. "
+    "For each obligation record a checked assessment with supporting sources or an unresolved gap; discover "
+    "additional obligations when needed. Finish integration only after all duties are resolved."
+)
+
 _STATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -113,7 +130,9 @@ _STATE_SCHEMA = {
 }
 
 
-def reviewer_tools(*, workspace: bool = False, frontier: bool = False, search_index: bool = False) -> list[Any]:
+def reviewer_tools(
+    *, workspace: bool = False, frontier: bool = False, search_index: bool = False, units: bool = False
+) -> list[Any]:
     def required(typ):
         return (typ, ...)
 
@@ -234,6 +253,62 @@ def reviewer_tools(*, workspace: bool = False, frontier: bool = False, search_in
                 {"ref": required(str), "section": required(str), "offset": required(int), "limit": required(int)},
             )
         )
+    if units:
+        definitions.extend(
+            [
+                (
+                    "submit_unit_decision",
+                    "Deliver work for this unit. Observations have statement, evidence_refs and region_ids; "
+                    "unresolved_refs are IDs of unresolved questions or navigation questions.",
+                    {
+                        "checked_region_ids": required(list[str]),
+                        "observations": required(list[dict]),
+                        "unresolved_refs": required(list[str]),
+                        "finish": required(bool),
+                    },
+                ),
+                (
+                    "record_integration_receipt",
+                    "Record a source-backed assessment or unresolved gap for a specific integration obligation.",
+                    {
+                        "obligation_id": required(str),
+                        "disposition": required(str),
+                        "evidence_refs": required(list[str]),
+                        "reason": required(str),
+                    },
+                ),
+                (
+                    "add_integration_obligation",
+                    "Record an additional observed cross-unit relationship requiring investigation.",
+                    {
+                        "unit_ids": required(list[str]),
+                        "description": required(str),
+                        "evidence_refs": required(list[str]),
+                    },
+                ),
+                (
+                    "register_unit_dependency",
+                    "Register an observed cross-unit relationship for independent integration review.",
+                    {
+                        "target_scope_id": required(str),
+                        "description": required(str),
+                        "evidence_refs": required(list[str]),
+                    },
+                ),
+                ("finish_integration", "Finish only after all integration obligations are resolved.", {}),
+                (
+                    "query_shared",
+                    "Find shared source references and untrusted navigation; read originals before using them.",
+                    {
+                        "scope_id": optional(str | None, None),
+                        "path": optional(str | None, None),
+                        "kind": optional(str | None, None),
+                        "cursor": optional(str | None, None),
+                        "limit": required(int),
+                    },
+                ),
+            ]
+        )
     return [result_tool(name, description, fields) for name, description, fields in definitions]
 
 
@@ -312,7 +387,7 @@ def _validate_review_state(state: Any) -> list[str]:
 def _semantic_board(store: Any, scope_id: str) -> str:
     board = ContextBuilder(store).reviewer(scope_id)
     board["scope"].pop("working_state", None)
-    if store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
+    if store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}:
         # Untrusted notes, including newly worded questions, cannot make a repeated failure progress.
         # Explicit navigation decisions are separate successful actions and reset the failure batch.
         board.pop("navigation", None)
@@ -417,6 +492,13 @@ class Reviewer:
         self.error: str | None = None
         self.task_id, self.lease_token, self.focus = task_id, lease_token, focus
         self.failed_contexts: set[str] = set()
+        self._turn_id = ""
+        self._call_id = ""
+
+    def _decision_id(self) -> str:
+        if not self._turn_id or not self._call_id:
+            raise ValueError("unit decision requires an audited native tool call ID")
+        return "decision_" + hashlib.sha256(f"{self.task_id}:{self._call_id}".encode()).hexdigest()
 
     def _update_scope(self, scope: ReviewScope, **changes: Any) -> ReviewScope:
         if self.task_id:
@@ -430,11 +512,36 @@ class Reviewer:
             )
 
     def _add(self, obj: Any) -> Any:
+        if (
+            self.store.run.policy == "v42-units-6"
+            and isinstance(obj, (Case, Question))
+            and not (isinstance(obj, Question) and obj.owner == "tool_controller")
+        ):
+            scope = self.store.get(ReviewScope, obj.scope_id)
+            self.store.commit_unit_decision(
+                self.task_id,
+                self.lease_token,
+                scope.revision,
+                self._decision_id(),
+                checked_region_ids=[],
+                observations=[],
+                questions=[obj] if isinstance(obj, Question) else [],
+                cases=[obj] if isinstance(obj, Case) else [],
+                unresolved=[],
+                turn_id=self._turn_id,
+            )
+            return self.store.get(type(obj), obj.id)
         if self.task_id:
             return self.store.add_for_task(self.task_id, self.lease_token, obj)
         return self.store.add(obj)
 
     def _update(self, cls: type, object_id: str, revision: int, **changes: Any) -> Any:
+        if self.store.run.policy == "v42-units-6" and cls in {Case, Question}:
+            obj = self.store.get(cls, object_id)
+            if not (isinstance(obj, Question) and obj.owner == "tool_controller"):
+                return self.store.update_unit_object(
+                    self.task_id, self.lease_token, cls, object_id, revision, turn_id=self._turn_id, **changes
+                )
         if self.task_id:
             return self.store.update_for_task(self.task_id, self.lease_token, cls, object_id, revision, **changes)
         return self.store.update(cls, object_id, revision, **changes)
@@ -462,18 +569,27 @@ class Reviewer:
 
     def _context(self, scope_id: str, *, recent: list[Any] | None = None) -> list[Any]:
         state = reviewer_context(self.store, scope_id)
-        frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
+        frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}
+        unit_role = ""
+        if self.store.run.policy == "v42-units-6":
+            plan = self.store.get_unit_plan()
+            unit_role = "integration" if scope_id == plan.integration_scope_id else "primary"
+            state["unit_role"] = unit_role
+            state["primary_scope_ids"] = plan.primary_scope_ids
+            if unit_role == "integration":
+                state["integration_obligations"] = self.store.list_integration_obligations()
         context = [
             SystemMessage(
                 content=PROMPT
                 + (STATEFUL_PROMPT if self.store.run.policy == "v42-stateful-2" else "")
                 + (
                     WORKSPACE_PROMPT
-                    if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+                    if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
                     else ""
                 )
                 + (FRONTIER_PROMPT if frontier else "")
-                + (SEARCH_INDEX_PROMPT if self.store.run.policy == "v42-frontier-5" else "")
+                + (SEARCH_INDEX_PROMPT if self.store.run.policy in {"v42-frontier-5", "v42-units-6"} else "")
+                + (INTEGRATION_PROMPT if unit_role == "integration" else UNIT_PROMPT if unit_role else "")
                 + (" Focus: " + self.focus if self.focus else "")
             ),
             HumanMessage(content=json.dumps(state, ensure_ascii=False, default=str)),
@@ -494,7 +610,7 @@ class Reviewer:
                         continue
                     index = (
                         ContextBuilder(self.store).search_index(item)
-                        if self.store.run.policy == "v42-frontier-5"
+                        if self.store.run.policy in {"v42-frontier-5", "v42-units-6"}
                         else None
                     )
                     if index is not None:
@@ -539,7 +655,7 @@ class Reviewer:
         return context
 
     def _checkpoint_context(self, scope_id: str, prior: list[Any]) -> list[Any]:
-        if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}:
+        if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}:
             recent = self._last_exchange(prior)
             return [*self._context(scope_id, recent=recent), *recent]
         return [*self._context(scope_id), *prior[2:]]
@@ -636,8 +752,9 @@ class Reviewer:
                 question_ids=questions,
             )
             self._add(case)
-            current = self.store.get(ReviewScope, scope.id)
-            self._update_scope(current, case_ids=[*current.case_ids, case.id])
+            if self.store.run.policy != "v42-units-6":
+                current = self.store.get(ReviewScope, scope.id)
+                self._update_scope(current, case_ids=[*current.case_ids, case.id])
         self.on_case(case)
         return {"case_id": case.id, "revision": case.revision}
 
@@ -670,7 +787,7 @@ class Reviewer:
         return {"checked_regions": sorted(checked), "scope_status": scope.status}
 
     def _finish(self, scope: ReviewScope, args: dict[str, Any]) -> dict[str, Any]:
-        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
         ids = {region["id"] for region in scope.regions}
         checked = set(args["checked_regions"])
         if workspace:
@@ -726,9 +843,15 @@ class Reviewer:
         return result
 
     async def run(self, scope_id: str, *, reopen: bool = False) -> str:
-        frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
-        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
-        stateful = self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+        frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
+        stateful = self.store.run.policy in {
+            "v42-stateful-2",
+            "v42-workspace-3",
+            "v42-frontier-4",
+            "v42-frontier-5",
+            "v42-units-6",
+        }
         if stateful and not self.task_id:
             raise ValueError(f"{self.store.run.policy} reviewer requires a leased, auditable task")
         scope = self.store.get(ReviewScope, scope_id)
@@ -761,8 +884,18 @@ class Reviewer:
             if saved:
                 self._save_session(messages_from_dict(saved))
             return "partial"
-        search_index = self.store.run.policy == "v42-frontier-5"
-        definitions = reviewer_tools(workspace=workspace, frontier=frontier, search_index=search_index)
+        search_index = self.store.run.policy in {"v42-frontier-5", "v42-units-6"}
+        units = self.store.run.policy == "v42-units-6"
+        integration = units and scope_id == self.store.get_unit_plan().integration_scope_id
+        definitions = reviewer_tools(workspace=workspace, frontier=frontier, search_index=search_index, units=units)
+        if units:
+            hidden = {"finish_scope", "record_region_progress", "delegate_question"}
+            hidden |= (
+                {"submit_unit_decision", "register_unit_dependency"}
+                if integration
+                else {"record_integration_receipt", "add_integration_obligation", "finish_integration"}
+            )
+            definitions = [tool for tool in definitions if tool.name not in hidden]
         semantic = {"save_question", "submit_case", "finish_scope", "read_evidence", "delegate_question"}
         if workspace:
             semantic.update({"update_navigation", "record_region_progress", "list_navigation"})
@@ -770,6 +903,18 @@ class Reviewer:
             semantic.add("release_frontier")
         if search_index:
             semantic.add("read_search_section")
+        if units:
+            semantic.update(
+                {
+                    "submit_unit_decision",
+                    "record_integration_receipt",
+                    "add_integration_obligation",
+                    "register_unit_dependency",
+                    "finish_integration",
+                    "query_shared",
+                }
+            )
+            semantic -= {"finish_scope", "record_region_progress", "delegate_question"}
         custom = getattr(self.gateway, "tool_specs", None)
         own = [tool for tool in definitions if custom is None or tool.name in semantic]
         schemas = {tool.name: tool.args_schema for tool in own}
@@ -794,6 +939,13 @@ class Reviewer:
         previous_failed_batch = None
         try:
             while True:
+                obligation_snapshot = {}
+                if integration:
+                    try:
+                        board = json.loads(chat[1].content)
+                        obligation_snapshot = {item["id"]: item for item in board["integration_obligations"]}
+                    except (IndexError, KeyError, TypeError, ValueError) as exc:
+                        raise ValueError("integration obligations missing from sent context") from exc
                 current_input = context_fingerprint(messages_to_dict(chat))
                 if current_input in self.failed_contexts:
                     if frontier:
@@ -956,8 +1108,17 @@ class Reviewer:
                 finished = None
                 batch_failures = [_protocol_failure(response, errors)] if stateful and errors else []
                 batch_only_failures = True
-                for call_index, call in enumerate(sorted(calls, key=lambda item: item["name"] == "finish_scope")):
+                for call_index, call in enumerate(
+                    sorted(
+                        calls,
+                        key=lambda item: (
+                            item["name"] in {"finish_scope", "finish_integration"}
+                            or (item["name"] == "submit_unit_decision" and item["args"].get("finish") is True)
+                        ),
+                    )
+                ):
                     name, call_id = call["name"], call.get("id") or ""
+                    self._turn_id, self._call_id = turn_id, call_id
                     args = {k: v for k, v in call["args"].items() if not stateful or k != "review_state"}
                     scope = self.store.get(ReviewScope, scope_id)
                     # Snapshot current semantics before the action; tool bytes alone are not progress.
@@ -1041,6 +1202,77 @@ class Reviewer:
                             except (BindingError, OSError) as exc:
                                 raise FrontierUnavailableError("saved search is unavailable") from exc
                             result["notice"] = "Search navigation is not source evidence."
+                        elif units and name == "query_shared":
+                            result = self.store.query_shared(
+                                scope_id=args.get("scope_id"),
+                                path=args.get("path"),
+                                kind=args.get("kind"),
+                                cursor=args.get("cursor"),
+                                limit=args["limit"],
+                            )
+                            result["notice"] = "Navigation and reference directories are not source evidence."
+                        elif integration and name == "record_integration_receipt":
+                            obligation = obligation_snapshot.get(args["obligation_id"])
+                            if obligation is None:
+                                raise ValueError("obligation was not present in the supplied context; refresh it")
+                            result = self.store.record_integration_receipt(
+                                self.task_id,
+                                self.lease_token,
+                                args["obligation_id"],
+                                obligation["revision"],
+                                obligation["input_digest"],
+                                disposition=args["disposition"],
+                                evidence_refs=args["evidence_refs"],
+                                reason=args["reason"],
+                                turn_id=turn_id,
+                            )
+                        elif integration and name == "add_integration_obligation":
+                            result = self.store.add_integration_obligation(
+                                self.task_id,
+                                self.lease_token,
+                                args["unit_ids"],
+                                args["description"],
+                                args["evidence_refs"],
+                                turn_id=turn_id,
+                            )
+                        elif units and not integration and name == "register_unit_dependency":
+                            result = self.store.register_unit_dependency(
+                                self.task_id,
+                                self.lease_token,
+                                args["target_scope_id"],
+                                args["description"],
+                                args["evidence_refs"],
+                                turn_id=turn_id,
+                            )
+                        elif integration and name == "finish_integration":
+                            if had_error:
+                                raise ValueError("failed sibling tool call prevents a completion receipt")
+                            scope = self.store.finish_integration(self.task_id, self.lease_token, scope.revision)
+                            result = {"status": scope.status}
+                        elif units and not integration and name == "submit_unit_decision":
+                            if args["finish"] and had_error:
+                                raise ValueError("failed sibling tool call prevents a completion receipt")
+                            decision_id = self._decision_id()
+                            self.store.commit_unit_decision(
+                                self.task_id,
+                                self.lease_token,
+                                scope.revision,
+                                decision_id,
+                                checked_region_ids=args["checked_region_ids"],
+                                observations=args["observations"],
+                                questions=[],
+                                cases=[],
+                                unresolved=args["unresolved_refs"],
+                                finish=args["finish"],
+                                turn_id=turn_id,
+                            )
+                            updated = self.store.get(ReviewScope, scope_id)
+                            result = {
+                                "decision_id": decision_id,
+                                "checked_regions": [region["id"] for region in updated.checked_regions],
+                                "unresolved": updated.unresolved,
+                                **({"status": updated.status} if args["finish"] else {}),
+                            }
                         elif frontier and name == "release_frontier":
                             released = self.store.release_frontier_for_task(
                                 self.task_id,
@@ -1104,14 +1336,24 @@ class Reviewer:
                                     and q.statement == failure_statement
                                     and q.status == "unresolved"
                                 ):
-                                    self._update(
-                                        Question,
-                                        q.id,
-                                        q.revision,
-                                        status="answered",
-                                        answer="Tool became available",
-                                        evidence_refs=[result["evidence_ref"]],
-                                    )
+                                    if units:
+                                        self.store.resolve_tool_failure_for_task(
+                                            self.task_id,
+                                            self.lease_token,
+                                            q.id,
+                                            result["evidence_ref"],
+                                            name=name,
+                                            args=args,
+                                        )
+                                    else:
+                                        self._update(
+                                            Question,
+                                            q.id,
+                                            q.revision,
+                                            status="answered",
+                                            answer="Tool became available",
+                                            evidence_refs=[result["evidence_ref"]],
+                                        )
                         else:
                             raise ValueError("unknown tool")
                         if workspace and name in {"update_navigation", "record_region_progress", "release_frontier"}:
@@ -1125,7 +1367,7 @@ class Reviewer:
                             raise
                         result = {"error": f"{type(exc).__name__}: {exc}"}
                         bad_evidence_request = (
-                            self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
+                            self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}
                             and name == "read_evidence"
                             and (isinstance(exc, InvalidEvidenceRequestError) or id(call) in invalid)
                         )
@@ -1143,7 +1385,11 @@ class Reviewer:
                                 ),
                                 None,
                             )
-                            if existing is None:
+                            if units:
+                                existing = self.store.record_tool_failure_for_task(
+                                    self.task_id, self.lease_token, name, args
+                                )
+                            elif existing is None:
                                 existing = self._add(
                                     Question(
                                         id="q_" + uuid.uuid4().hex,
@@ -1207,7 +1453,7 @@ class Reviewer:
                             f"tool:{call_index}:{call_id}",
                             messages_to_dict(chat[-1:]),
                         )
-                    if name == "finish_scope" and "status" in result:
+                    if name in {"finish_scope", "finish_integration", "submit_unit_decision"} and "status" in result:
                         if not stateful:
                             return result["status"]
                         finished = result["status"]
@@ -1308,7 +1554,7 @@ class QuestionAssistant:
 
     async def run(self, task: Any) -> dict[str, Any]:
         question = self.store.get(Question, task.object_id)
-        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
 
         records = self.store.load_task_session(task.id)
         failed_reads = {
@@ -1400,7 +1646,12 @@ class QuestionAssistant:
         )
         search_tool = (
             next(tool for tool in reviewer_tools(search_index=True) if tool.name == "read_search_section")
-            if self.store.run.policy == "v42-frontier-5"
+            if self.store.run.policy in {"v42-frontier-5", "v42-units-6"}
+            else None
+        )
+        shared_tool = (
+            next(tool for tool in reviewer_tools(units=True) if tool.name == "query_shared")
+            if self.store.run.policy == "v42-units-6"
             else None
         )
         bound = self.llm.bind_tools(
@@ -1408,6 +1659,7 @@ class QuestionAssistant:
                 *read_tools,
                 *([navigation_tool] if workspace else []),
                 *([search_tool] if search_tool else []),
+                *([shared_tool] if shared_tool else []),
                 answer_tool,
             ],
             tool_choice="auto",
@@ -1510,6 +1762,19 @@ class QuestionAssistant:
                         result = {"error": f"{type(exc).__name__}: {exc}"}
                     except (ValueError, KeyError, TypeError) as exc:
                         result = {"error": str(exc)}
+                elif shared_tool and name == "query_shared":
+                    try:
+                        shared_tool.args_schema.model_validate(args)
+                        result = self.store.query_shared(
+                            scope_id=args.get("scope_id"),
+                            path=args.get("path"),
+                            kind=args.get("kind"),
+                            cursor=args.get("cursor"),
+                            limit=args["limit"],
+                        )
+                        result["notice"] = "Navigation and reference directories are not source evidence."
+                    except (ValueError, KeyError, TypeError) as exc:
+                        result = {"error": str(exc)}
                 elif name in names or name == "read_evidence":
                     try:
                         result = await self.gateway.execute(name, args)
@@ -1521,7 +1786,7 @@ class QuestionAssistant:
                         if _status_code(exc) in {401, 402, 403}:
                             raise
                         if not (
-                            self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
+                            self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}
                             and name == "read_evidence"
                             and isinstance(exc, InvalidEvidenceRequestError)
                         ):

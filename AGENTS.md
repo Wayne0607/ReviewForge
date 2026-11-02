@@ -3,6 +3,7 @@
 ## 当前开发状态
 
 - v4 在 `dev` 开发；`main` 保留现有生产版本与自动部署。未经验收不向 `main` 推送 v4。
+- 独立 `review_v42` 新运行使用 `v42-units-6`：固定区域有唯一主责，共享原始来源和不可信导航，另有逐项跨单元整合与独立核验；正文送达审计不能证明模型理解或发现全部关联，真实 PR 与 holdout 未验收。QuestionAssistant 委派在该策略暂不可用；旧策略与 checkpoint 不升级，生产默认仍为 legacy。详见 [v4.2 设计](docs/v4.2-architecture.md#1913-工作单元与跨单元整合实现边界)。
 - 用户已授权统一使用 `dev`，替代旧任务卡的 `hp/<卡号>` 分支约定。
 - 新流水线事实源：[hypothesis-pipeline-spec.md](docs/hypothesis-pipeline-spec.md)。进度与待验收项：[v4-development.md](docs/v4-development.md)。
 - 默认仍是 `legacy`；`shadow` 与 `hypothesis` 是尚待真实基准验收的 v4 路径。下述 Planner/Reviewer/Verifier/Commenter 描述适用于 legacy。

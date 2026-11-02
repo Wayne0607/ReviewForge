@@ -39,7 +39,7 @@ from reviewforge.tools.github_api import validate_pr_issue_context
 from reviewforge.tools.workspace import PRHeadWorkspace
 
 _LOCKS: dict[str, asyncio.Lock] = {}
-EXECUTION_POLICY = "v42-frontier-5"
+EXECUTION_POLICY = "v42-units-6"
 
 
 @contextmanager

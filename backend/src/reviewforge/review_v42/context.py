@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from .contracts import Case, EvidenceRef, FrontierEntry, NavigationItem, Question, ReviewScope
+from .contracts import Case, EvidenceRef, FrontierEntry, NavigationItem, Question, ReviewScope, Task
 from .store import ReviewStore
 
 
@@ -23,7 +23,13 @@ class ContextBuilder:
         questions = [q for q in self.store.list(Question) if q.scope_id == scope_id]
         cases = [c for c in self.store.list(Case) if c.scope_id == scope_id]
         scope_view = asdict(scope)
-        if self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
+        if self.store.run.policy in {
+            "v42-stateful-2",
+            "v42-workspace-3",
+            "v42-frontier-4",
+            "v42-frontier-5",
+            "v42-units-6",
+        }:
             for key in ("regions", "checked_regions"):
                 for row in scope_view.get(key, []):
                     if "patch" in row:
@@ -45,17 +51,53 @@ class ContextBuilder:
             "cases": [asdict(c) for c in cases],
             "evidence": (
                 [evidence_summary(ref) for ref in self.store.list(EvidenceRef)]
-                if self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+                if self.store.run.policy
+                in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
                 else [asdict(self.store.get(EvidenceRef, r)) for r in sorted(refs)]
             ),
             "scope_index": [{"id": s.id, "title": s.title, "status": s.status} for s in self.store.list(ReviewScope)],
         }
-        if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
+        if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}:
             result["navigation"] = [
                 {key: getattr(item, key) for key in ("id", "kind", "text", "status", "evidence_refs", "revision")}
                 for item in self.store.list(NavigationItem)
                 if item.scope_id == scope_id and item.status == "open"
             ]
+        if self.store.run.policy == "v42-units-6":
+            plan = self.store.get_unit_plan()
+            if plan is not None:
+                task_ids = [t.id for t in self.store.list(Task) if t.kind == "review" and t.object_id == scope_id]
+                local_refs = {
+                    ref for task_id in task_ids for entry in self.store.list_frontier(task_id) for ref in entry.aliases
+                }
+                local_refs.update(r for question in questions for r in question.evidence_refs)
+                local_refs.update(
+                    r
+                    for question in questions
+                    for item in question.interpretations
+                    for r in item.get("evidence_refs", [])
+                )
+                local_refs.update(r for case in cases for r in case.evidence_refs + case.counter_evidence_refs)
+                result["evidence"] = [
+                    evidence_summary(ref) for ref in self.store.list(EvidenceRef) if ref.id in local_refs
+                ]
+                result["unit_plan"] = {
+                    "primary_scope_ids": plan.primary_scope_ids,
+                    "integration_scope_id": plan.integration_scope_id,
+                    "manifest_hash": plan.manifest_hash,
+                }
+                if scope_id == plan.integration_scope_id:
+                    result["integration_obligations"] = self.store.list_integration_obligations()
+                    result["primary_units"] = [
+                        {
+                            "id": unit.id,
+                            "title": unit.title,
+                            "status": unit.status,
+                            "region_ids": [r["id"] for r in unit.regions],
+                        }
+                        for unit in self.store.list(ReviewScope)
+                        if unit.id in plan.primary_scope_ids
+                    ]
         return result
 
     def navigation_page(self, scope_id: str, *, cursor: str | None = None, limit: int | None = None) -> dict:
@@ -74,7 +116,7 @@ class ContextBuilder:
 
     def _search_document(self, ref_id: str) -> tuple[EvidenceRef, dict] | None:
         """Recognize only the fixed repository-search envelope; unknown forms stay raw."""
-        if self.store.run.policy != "v42-frontier-5":
+        if self.store.run.policy not in {"v42-frontier-5", "v42-units-6"}:
             return None
         ref = self.store.get(EvidenceRef, ref_id)
         meta = ref.metadata
@@ -171,7 +213,7 @@ class ContextBuilder:
 
     def search_index(self, entry: FrontierEntry) -> dict | None:
         """Project a complete pinned search as untrusted navigation, or keep it raw."""
-        if self.store.run.policy != "v42-frontier-5" or entry.kind != "search":
+        if self.store.run.policy not in {"v42-frontier-5", "v42-units-6"} or entry.kind != "search":
             return None
         current = next((item for item in self.store.list_frontier(entry.task_id) if item.id == entry.id), None)
         if current is None or asdict(current) != asdict(entry) or not entry.aliases:

@@ -39,7 +39,7 @@ def evidence_directory(store: Any) -> list[dict[str, Any]]:
     The source bodies remain in immutable storage. Entries include the original
     tool invocation to distinguish searches and support explicit full rereads.
     """
-    if store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
+    if store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}:
         return [evidence_summary(ref) for ref in store.list(EvidenceRef)]
     return [asdict(ref) for ref in store.list(EvidenceRef)]
 
@@ -55,13 +55,19 @@ def reviewer_context(store: Any, scope_id: str) -> dict[str, Any]:
             if "patch" in row:
                 row["patch_available_via_read_diff"] = True
                 del row["patch"]
-    state["evidence"] = evidence_directory(store)
+    if store.run.policy != "v42-units-6":
+        state["evidence"] = evidence_directory(store)
     state["context_recovery"] = {
         "patches": "Complete changed-region patches are available via read_diff(path).",
         "evidence": "All saved observations are indexed above. read_evidence(ref) returns the complete original; "
         "optional start_line/end_line return explicit pages with continuation metadata.",
         "coverage": "The index is navigation, not evidence that its contents were read or reviewed.",
     }
+    if store.run.policy == "v42-units-6":
+        state["context_recovery"]["evidence"] = (
+            "The index contains local and related references. Query the shared directory for other units; "
+            "read_evidence returns the original or an explicitly requested page."
+        )
     return state
 
 

@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from typing import Any
 
-from reviewforge.review_v42.contracts import Case, LeaseError, Question, ReviewScope, RevisionConflict, Task
+from reviewforge.review_v42.contracts import (
+    BindingError,
+    Case,
+    LeaseError,
+    Question,
+    ReviewScope,
+    RevisionConflict,
+    Task,
+)
 from reviewforge.review_v42.reviewer import QuestionAssistant, Reviewer, _status_code
 from reviewforge.review_v42.scope import compile_scopes
 from reviewforge.review_v42.tools import EvidenceGateway
@@ -25,6 +34,21 @@ class ReviewRuntime:
     def prepare(self, regions: list[dict[str, Any]]) -> list[ReviewScope]:
         """Persist or validate the complete manifest before optional scope partitioning."""
         compiled = compile_scopes(self.store.run, regions)
+        if self.store.run.policy == "v42-units-6":
+            if not compiled:
+                return []
+            identity = hashlib.sha256((self.store.run.id + ":units-6:integration").encode()).hexdigest()[:20]
+            integration = ReviewScope(
+                id="integration_" + identity,
+                run_id=self.store.run.id,
+                title="Cross-unit integration",
+                regions=[],
+                dependencies=sorted(scope.id for scope in compiled),
+            )
+            plan = self.store.install_unit_plan(compiled, integration)
+            if sorted(plan.primary_scope_ids) != sorted(scope.id for scope in compiled):
+                raise ValueError("work-unit plan differs from the fixed manifest")
+            return [self.store.get(ReviewScope, ident) for ident in plan.primary_scope_ids]
         existing = self.store.list(ReviewScope)
         if not existing:
             for scope in compiled:
@@ -323,7 +347,7 @@ class ReviewRuntime:
             status = await review
             if reviewer.error:
                 self._errors.append(f"review {scope_id}: {reviewer.error}")
-            if status == "reviewed" or (reopen and status == "partial"):
+            if status == "reviewed" or (self.store.run.policy != "v42-units-6" and reopen and status == "partial"):
                 self.store.complete_task(task.id, task.lease_token, {"status": status, "focus": focus})
             else:
                 self.store.release_task(task.id, task.lease_token)
@@ -336,12 +360,27 @@ class ReviewRuntime:
             except LeaseError:
                 pass
             raise
+        except (BindingError, RevisionConflict):
+            if self.store.run.policy != "v42-units-6":
+                raise
+            latest_task = self.store.get(Task, task.id)
+            latest_scope = self.store.get(ReviewScope, scope_id)
+            if latest_task.input_revision == latest_scope.revision:
+                raise
+            # Verifier evidence can invalidate a running unit while the model is
+            # responding. Its expired input must never commit as a completed review.
+            try:
+                self.store.settle_task_stale(task.id, task.lease_token, {"status": "superseded"})
+            except (LeaseError, RevisionConflict):
+                self._errors.append(f"review {scope_id}: could not settle stale task")
+                return "partial"
+            return "superseded"
         finally:
             blocked.cancel()
             heartbeat.cancel()
             await asyncio.gather(blocked, heartbeat, return_exceptions=True)
 
-    async def _follow_up(self) -> bool:
+    async def _follow_up(self, *, attempted_inputs: set[str] | None = None) -> bool:
         """Return actionable verifier gaps to their original case once per frozen input."""
         policy = getattr(self.verifier, "policy", "v42-independent-1")
         progressed = False
@@ -349,6 +388,19 @@ class ReviewRuntime:
             decisions = [self.store.get_verdict(case.id, claim["id"], policy) for claim in case.claims]
             if not any(d and d["verdict"] == "needs_evidence" for d in decisions):
                 continue
+            if attempted_inputs is not None:
+                key = json.dumps(
+                    [
+                        case.id,
+                        self._case_input(case),
+                        sorted(q.id for q in self.store.list(Question) if q.case_id == case.id),
+                    ],
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                if key in attempted_inputs:
+                    continue
+                attempted_inputs.add(key)
             follow_id = "follow_" + hashlib.sha256(f"{case.id}:{case.revision}".encode()).hexdigest()[:24]
             try:
                 follow = self.store.get(Task, follow_id)
@@ -424,6 +476,24 @@ class ReviewRuntime:
                 await asyncio.gather(follow_heartbeat, return_exceptions=True)
         return progressed
 
+    def _unit_reopen_input(self, scope_id: str, *, integration: bool = False) -> str:
+        """Identify substantive work, excluding lease, timestamps and note wording."""
+        cases = sorted(
+            ((case.id, self._case_input(case)) for case in self.store.list(Case) if case.scope_id == scope_id),
+            key=lambda item: item[0],
+        )
+        questions = sorted(
+            (q.id, q.case_id, q.status, sorted(q.evidence_refs))
+            for q in self.store.list(Question)
+            if q.scope_id == scope_id
+        )
+        obligations = (
+            sorted((o["id"], o["input_digest"]) for o in self.store.list_integration_obligations())
+            if integration
+            else []
+        )
+        return json.dumps([cases, questions, obligations], sort_keys=True, ensure_ascii=False)
+
     async def run(self, regions: list[dict[str, Any]]) -> dict[str, Any]:
         """Run or resume against an identical complete changed-region manifest."""
         scopes = self.prepare(regions)
@@ -436,14 +506,20 @@ class ReviewRuntime:
             self._enqueue(self._sync_case_evidence(case))
         for task in self.store.list(Task):
             if task.kind == "question" and task.status not in {"completed", "superseded"}:
+                if self.store.run.policy == "v42-units-6":
+                    self._errors.append(f"question {task.object_id}: delegated investigation requires delivery audit")
+                    continue
                 if task.id not in self._enqueued:
                     self._enqueued.add(task.id)
                     self._queue.put_nowait(task.id)
         workers = [asyncio.create_task(self._worker()) for _ in range(2)]
+        attempted: set[tuple[str, str]] = set()
         try:
             for scope in scopes:
                 if self._blocked:
                     break
+                if self.store.run.policy == "v42-units-6":
+                    attempted.add((scope.id, self._unit_reopen_input(scope.id)))
                 status = await self._review_scope(scope.id)
                 for case in self.store.list(Case):
                     self._enqueue(self._sync_case_evidence(case))
@@ -482,11 +558,47 @@ class ReviewRuntime:
                                 self._blocked_event.set()
                                 break
                     await self._drain()
-                if not self._blocked:
+                if not self._blocked and self.store.run.policy != "v42-units-6":
                     while await self._follow_up():
                         await self._drain()
                         if self._blocked:
                             break
+                if not self._blocked and self.store.run.policy == "v42-units-6":
+                    plan = self.store.get_unit_plan()
+                    followup_inputs: set[str] = set()
+                    while not self._blocked:
+                        await self._drain()
+                        if self._blocked:
+                            break
+                        if await self._follow_up(attempted_inputs=followup_inputs):
+                            continue
+                        if self._blocked:
+                            break
+                        primaries = [self.store.get(ReviewScope, ident) for ident in plan.primary_scope_ids]
+                        reopened = next(
+                            (
+                                scope
+                                for scope in primaries
+                                if scope.status == "pending"
+                                and (scope.id, self._unit_reopen_input(scope.id)) not in attempted
+                            ),
+                            None,
+                        )
+                        if reopened is not None:
+                            attempted.add((reopened.id, self._unit_reopen_input(reopened.id)))
+                            status = await self._review_scope(reopened.id)
+                        elif primaries and all(scope.status == "reviewed" for scope in primaries):
+                            integration = self.store.get(ReviewScope, plan.integration_scope_id)
+                            key = (integration.id, self._unit_reopen_input(integration.id, integration=True))
+                            if integration.status != "pending" or key in attempted:
+                                break
+                            attempted.add(key)
+                            status = await self._review_scope(integration.id)
+                        else:
+                            break
+                        if status == "provider_blocked":
+                            self._blocked = True
+                            self._blocked_event.set()
         except asyncio.CancelledError:
             for worker in workers:
                 worker.cancel()

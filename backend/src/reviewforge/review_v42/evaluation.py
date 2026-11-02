@@ -37,6 +37,39 @@ def summarize_run(report: dict[str, Any], requests: list[dict[str, Any]]) -> dic
             if isinstance(value, int) and value >= 0:
                 known[key] += value
     scopes = [scope for scope in report.get("scopes", []) if scope.get("status") != "superseded"]
+    run = report.get("run") or {}
+    manifest = (run.get("metadata") or {}).get("changed_regions")
+    if run.get("policy") == "v42-units-6" and isinstance(manifest, list):
+        # The integration scope is not a primary unit and cannot add coverage.
+        # A duplicated or altered receipt cannot count as coverage either.
+        scopes = [scope for scope in scopes if scope.get("regions")]
+        expected = {
+            region["id"]: region
+            for region in manifest
+            if isinstance(region, dict) and isinstance(region.get("id"), str) and region["id"]
+        }
+        manifest_counts: dict[str, int] = {}
+        for region in manifest:
+            if isinstance(region, dict) and isinstance(region.get("id"), str) and region["id"]:
+                manifest_counts[region["id"]] = manifest_counts.get(region["id"], 0) + 1
+        owners: dict[str, int] = {}
+        checked: dict[str, int] = {}
+        for scope in scopes:
+            for region in scope.get("regions", []):
+                if isinstance(region, dict) and expected.get(region.get("id")) == region:
+                    owners[region["id"]] = owners.get(region["id"], 0) + 1
+            for region in scope.get("checked_regions", []):
+                if isinstance(region, dict) and expected.get(region.get("id")) == region and region in scope["regions"]:
+                    checked[region["id"]] = checked.get(region["id"], 0) + 1
+        region_count = len(manifest)
+        checked_count = sum(
+            manifest_counts[identity] == owners.get(identity) == checked.get(identity) == 1
+            and not any(expected[identity].get(key) for key in ("unsupported", "unavailable", "binary", "parse_failed"))
+            for identity in expected
+        )
+    else:
+        region_count = sum(len(s.get("regions", [])) for s in scopes)
+        checked_count = sum(len(s.get("checked_regions", [])) for s in scopes)
     verified = report.get("verified", [])
     verdicts = {
         key: sum(v.get("verdict") == key for v in verified)
@@ -47,8 +80,8 @@ def summarize_run(report: dict[str, Any], requests: list[dict[str, Any]]) -> dic
         "coverage": {
             "scopes": len(scopes),
             "reviewed": sum(s.get("status") == "reviewed" for s in scopes),
-            "regions": sum(len(s.get("regions", [])) for s in scopes),
-            "checked_regions": sum(len(s.get("checked_regions", [])) for s in scopes),
+            "regions": region_count,
+            "checked_regions": checked_count,
         },
         "funnel": {
             "candidates": report.get("candidates"),

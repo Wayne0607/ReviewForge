@@ -113,8 +113,10 @@ def state():
     )
 
 
-def product(tmp_path, monkeypatch, reviewer, verifier, workspace=None):
+def product(tmp_path, monkeypatch, reviewer, verifier, workspace=None, policy="v42-frontier-5"):
     monkeypatch.setenv("REVIEWFORGE_V42_STATE_DIR", str(tmp_path))
+    if policy is not None:
+        monkeypatch.setattr("reviewforge.review_v42.integration.EXECUTION_POLICY", policy)
     events = []
 
     class Gateway:

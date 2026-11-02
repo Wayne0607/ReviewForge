@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from typing import Any
 
 from reviewforge.review_v42.contracts import (
@@ -21,6 +22,44 @@ from reviewforge.review_v42.scope import compile_scopes
 from reviewforge.review_v42.tools import EvidenceGateway
 
 
+class _FairBoundModel:
+    """Share one FIFO model-call lane while reviewers retain their own sessions."""
+
+    def __init__(self, model: Any, runtime: ReviewRuntime, task_id: str, lease_token: str):
+        self.model, self.runtime = model, runtime
+        self.task_id, self.lease_token = task_id, lease_token
+
+    async def ainvoke(self, messages: Any, *args: Any, **kwargs: Any) -> Any:
+        # Give all newly started reviewers a chance to enter the FIFO lock,
+        # including when a test or cached provider responds synchronously.
+        await asyncio.sleep(0)
+        async with self.runtime._model_lane:
+            if self.runtime._blocked:
+                raise asyncio.CancelledError()
+            try:
+                task = self.runtime.store.get(Task, self.task_id)
+                scope = self.runtime.store.get(ReviewScope, task.object_id)
+                if task.status != "leased" or task.lease_token != self.lease_token or task.lease_expires <= time.time():
+                    raise LeaseError("review lease expired while waiting for the model lane")
+                if task.input_revision != scope.revision:
+                    raise RevisionConflict("review input changed while waiting for the model lane")
+                return await self.model.ainvoke(messages, *args, **kwargs)
+            except Exception as exc:
+                if _status_code(exc) in {401, 402, 403}:
+                    self.runtime._blocked = True
+                    self.runtime._blocked_event.set()
+                raise
+
+
+class _FairModel:
+    def __init__(self, model: Any, runtime: ReviewRuntime, task_id: str, lease_token: str):
+        self.model, self.runtime = model, runtime
+        self.task_id, self.lease_token = task_id, lease_token
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> _FairBoundModel:
+        return _FairBoundModel(self.model.bind_tools(*args, **kwargs), self.runtime, self.task_id, self.lease_token)
+
+
 class ReviewRuntime:
     def __init__(self, store: Any, llm: Any, gateway: Any, verifier: Any):
         self.store, self.llm, self.verifier = store, llm, verifier
@@ -30,6 +69,13 @@ class ReviewRuntime:
         self._blocked = False
         self._blocked_event = asyncio.Event()
         self._errors: list[str] = []
+        self._model_lane = asyncio.Lock()
+        self._work_changed = asyncio.Event()
+
+    def _fair_enabled(self) -> bool:
+        return (
+            self.store.run.policy == "v42-units-6" and self.store.run.metadata.get("unit_scheduler") == "cooperative-1"
+        )
 
     def prepare(self, regions: list[dict[str, Any]]) -> list[ReviewScope]:
         """Persist or validate the complete manifest before optional scope partitioning."""
@@ -276,6 +322,8 @@ class ReviewRuntime:
             finally:
                 self._enqueued.discard(task_id)
                 self._queue.task_done()
+                if self._fair_enabled():
+                    self._work_changed.set()
 
     async def _drain(self) -> None:
         """Wait for queued work, but wake immediately on an account-level failure."""
@@ -327,7 +375,7 @@ class ReviewRuntime:
         heartbeat = asyncio.create_task(self._heartbeat(task, 120))
         reviewer = Reviewer(
             self.store,
-            self.llm,
+            _FairModel(self.llm, self, task.id, task.lease_token) if self._fair_enabled() else self.llm,
             self.gateway,
             self._enqueue,
             task_id=task.id,
@@ -494,6 +542,68 @@ class ReviewRuntime:
         )
         return json.dumps([cases, questions, obligations], sort_keys=True, ensure_ascii=False)
 
+    async def _run_fair_primaries(
+        self, scopes: list[ReviewScope], attempted: set[tuple[str, str]], *, initial: bool
+    ) -> None:
+        """Keep independent leased reviewers runnable while serializing their model calls."""
+        active: dict[str, asyncio.Task[str]] = {}
+        first = {scope.id for scope in scopes} if initial else set()
+
+        def start(scope: ReviewScope) -> None:
+            attempted.add((scope.id, self._unit_reopen_input(scope.id)))
+            active[scope.id] = asyncio.create_task(self._review_scope(scope.id))
+
+        try:
+            while not self._blocked:
+                self._work_changed.clear()
+                for ident, job in list(active.items()):
+                    if not job.done():
+                        continue
+                    status = await job
+                    del active[ident]
+                    for case in self.store.list(Case):
+                        self._enqueue(self._sync_case_evidence(case))
+                    if status == "provider_blocked":
+                        self._blocked = True
+                        self._blocked_event.set()
+                        break
+                if self._blocked:
+                    break
+                for original in scopes:
+                    scope = self.store.get(ReviewScope, original.id)
+                    if scope.id in active or scope.status == "reviewed":
+                        first.discard(scope.id)
+                        continue
+                    key = (scope.id, self._unit_reopen_input(scope.id))
+                    if scope.id in first or (scope.status == "pending" and key not in attempted):
+                        first.discard(scope.id)
+                        start(scope)
+                if not active:
+                    await self._drain()
+                    if self._blocked:
+                        break
+                    # A verifier may have reopened a unit while the queue drained.
+                    reopened = any(
+                        (scope := self.store.get(ReviewScope, original.id)).status == "pending"
+                        and (scope.id, self._unit_reopen_input(scope.id)) not in attempted
+                        for original in scopes
+                    )
+                    if not reopened:
+                        break
+                    continue
+                changed = asyncio.create_task(self._work_changed.wait())
+                blocked = asyncio.create_task(self._blocked_event.wait())
+                try:
+                    await asyncio.wait([*active.values(), changed, blocked], return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    changed.cancel()
+                    blocked.cancel()
+                    await asyncio.gather(changed, blocked, return_exceptions=True)
+        finally:
+            for job in active.values():
+                job.cancel()
+            await asyncio.gather(*active.values(), return_exceptions=True)
+
     async def run(self, regions: list[dict[str, Any]]) -> dict[str, Any]:
         """Run or resume against an identical complete changed-region manifest."""
         scopes = self.prepare(regions)
@@ -515,17 +625,20 @@ class ReviewRuntime:
         workers = [asyncio.create_task(self._worker()) for _ in range(2)]
         attempted: set[tuple[str, str]] = set()
         try:
-            for scope in scopes:
-                if self._blocked:
-                    break
-                if self.store.run.policy == "v42-units-6":
-                    attempted.add((scope.id, self._unit_reopen_input(scope.id)))
-                status = await self._review_scope(scope.id)
-                for case in self.store.list(Case):
-                    self._enqueue(self._sync_case_evidence(case))
-                if status == "provider_blocked":
-                    self._blocked = True
-                    break
+            if self._fair_enabled():
+                await self._run_fair_primaries(scopes, attempted, initial=True)
+            else:
+                for scope in scopes:
+                    if self._blocked:
+                        break
+                    if self.store.run.policy == "v42-units-6":
+                        attempted.add((scope.id, self._unit_reopen_input(scope.id)))
+                    status = await self._review_scope(scope.id)
+                    for case in self.store.list(Case):
+                        self._enqueue(self._sync_case_evidence(case))
+                    if status == "provider_blocked":
+                        self._blocked = True
+                        break
             if self._blocked:
                 for worker in workers:
                     worker.cancel()
@@ -585,8 +698,12 @@ class ReviewRuntime:
                             None,
                         )
                         if reopened is not None:
-                            attempted.add((reopened.id, self._unit_reopen_input(reopened.id)))
-                            status = await self._review_scope(reopened.id)
+                            if self._fair_enabled():
+                                await self._run_fair_primaries(primaries, attempted, initial=False)
+                                continue
+                            else:
+                                attempted.add((reopened.id, self._unit_reopen_input(reopened.id)))
+                                status = await self._review_scope(reopened.id)
                         elif primaries and all(scope.status == "reviewed" for scope in primaries):
                             integration = self.store.get(ReviewScope, plan.integration_scope_id)
                             key = (integration.id, self._unit_reopen_input(integration.id, integration=True))

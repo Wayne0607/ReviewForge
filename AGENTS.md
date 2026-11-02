@@ -4,7 +4,7 @@
 
 - v4 在 `dev` 开发；`main` 保留现有生产版本与自动部署。未经验收不向 `main` 推送 v4。
 - 独立 `review_v42` 新运行使用 `v42-units-6`：固定区域有唯一主责，共享原始来源和不可信导航，另有逐项跨单元整合与独立核验；正文送达审计不能证明模型理解或发现全部关联，真实 PR 与 holdout 未验收。QuestionAssistant 委派在该策略暂不可用；旧策略与 checkpoint 不升级，生产默认仍为 legacy。详见 [v4.2 设计](docs/v4.2-architecture.md#1913-工作单元与跨单元整合实现边界)。
-- `7c644de` 同 PR 首轮 12 成功、478544 已知 tokens、3 失败和 1 中断请求未知、0/24 区域回执，确认提示引用隐藏工具且未讲清源码交付条件后停止；新角色提示与决策 schema 已修正，须新冻结运行验收。v4.2 开发诊断累计 11854233 已知 tokens、117 请求未知，不含历史协议诊断，非供应商账单。[记录](docs/v4.2-architecture.md#1914-首轮工作单元实测与交付契约修正)。
+- `5826b79` 同 PR 复测因 4 次候选提交使用模型自造 ID、接口按未知更新拒绝且反馈不清而停止；2149178 已知 tokens、5 失败及 1 中断请求未知、0 持久 Case/0 评论，未判分。新 ID 契约已修正，可选公平调度仍需真实验收。v4.2 开发诊断累计 14003411 已知 tokens、123 请求未知，不含历史协议，非供应商账单。[记录](docs/v4.2-architecture.md#1916-候选交付失败与可选公平调度)。
 - 用户已授权统一使用 `dev`，替代旧任务卡的 `hp/<卡号>` 分支约定。
 - 新流水线事实源：[hypothesis-pipeline-spec.md](docs/hypothesis-pipeline-spec.md)。进度与待验收项：[v4-development.md](docs/v4-development.md)。
 - 默认仍是 `legacy`；`shadow` 与 `hypothesis` 是尚待真实基准验收的 v4 路径。下述 Planner/Reviewer/Verifier/Commenter 描述适用于 legacy。

@@ -397,6 +397,9 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         raise ValueError("v4.2 requires fixed repo/base/head")
     if orchestrator._model_router is None:
         raise ValueError("v4.2 requires an explicit model router")
+    unit_scheduler = os.environ.get("REVIEWFORGE_V42_UNIT_SCHEDULER", "").strip()
+    if unit_scheduler and (unit_scheduler != "cooperative-1" or EXECUTION_POLICY != "v42-units-6"):
+        raise ValueError("unsupported v4.2 unit scheduler")
     database = getattr(orchestrator, "_db", None)
     directory = _state_directory(orchestrator)
     workspace = await orchestrator._gateway.workspace_for(state)
@@ -471,6 +474,9 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             "kernel_digest": kernel,
             "execution_policy": EXECUTION_POLICY,
         }
+        if unit_scheduler:
+            # Scheduler semantics are part of the immutable run identity.
+            metadata["unit_scheduler"] = unit_scheduler
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

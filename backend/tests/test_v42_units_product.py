@@ -83,8 +83,21 @@ def last_receipt(messages):
 
 
 @pytest.mark.asyncio
-async def test_product_reviews_each_file_and_requires_source_backed_integration(tmp_path, monkeypatch):
+async def test_product_rejects_unknown_unit_scheduler_before_model_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("REVIEWFORGE_V42_UNIT_SCHEDULER", "not-a-scheduler")
+    model = NativeModel(lambda *_: pytest.fail("invalid configuration must not call the model"))
+    obj, _ = product(tmp_path, monkeypatch, model, model, TwoFileWorkspace(), policy=None)
+    with pytest.raises(ValueError, match="unsupported v4.2 unit scheduler"):
+        await obj.run(two_file_state())
+    assert not model._inputs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheduler", [None, "cooperative-1"])
+async def test_product_reviews_each_file_and_requires_source_backed_integration(tmp_path, monkeypatch, scheduler):
     """Coverage and the cross-file check are separate responsibilities."""
+    if scheduler:
+        monkeypatch.setenv("REVIEWFORGE_V42_UNIT_SCHEDULER", scheduler)
     phases = defaultdict(int)
     refs = {}
     primary_units = set()
@@ -156,6 +169,7 @@ async def test_product_reviews_each_file_and_requires_source_backed_integration(
     assert result["status"] == "completed", result
     assert len(primary_units) == 2 and integration_calls
     report = result["review_v42_report"]
+    assert report["run"]["metadata"].get("unit_scheduler") == scheduler
     assert report["metrics"]["coverage"]["regions"] == 2
     assert report["metrics"]["coverage"]["checked_regions"] == 2
     assert report["comments"] == [] and result["comments_sent"] == 0

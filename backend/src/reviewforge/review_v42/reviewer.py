@@ -134,7 +134,9 @@ UNIT_COMMON_PROMPT = (
     "without review_state and never require a progress form. When an observation or concrete open "
     "question changes, use review_state, save_question or update_navigation as appropriate; shared "
     "navigation is untrusted and source can be found via query_shared and reread by reference. "
-    "Never treat an unavailable source or failed tool as a clean result."
+    "Never treat an unavailable source or failed tool as a clean result. "
+    "For a new case or question, omit case_id or question_id; the controller returns its ID. "
+    "To update one, use its exact previously returned ID. Do not invent IDs."
 )
 
 
@@ -212,10 +214,18 @@ def reviewer_tools(
         ),
         (
             "save_question",
-            "Record a specific question or update its answer.",
+            (
+                "Record a new question by omitting question_id, or update one using its exact previously returned ID."
+                if units
+                else "Record a specific question or update its answer."
+            ),
             {
                 "statement": required(str),
-                "question_id": optional(str, ""),
+                "question_id": (
+                    (str, Field(default="", description="Omit for a new question; use the returned ID to update."))
+                    if units
+                    else optional(str, "")
+                ),
                 "answer": optional(str, ""),
                 "status": optional(str, "open"),
                 "evidence_refs": optional(list[str], []),
@@ -223,13 +233,21 @@ def reviewer_tools(
         ),
         (
             "submit_case",
-            "Submit or update one concrete case for independent verification.",
+            (
+                "Submit a new case by omitting case_id, or update one using its exact previously returned ID."
+                if units
+                else "Submit or update one concrete case for independent verification."
+            ),
             {
                 "trigger": required(str),
                 "behavior": required(str),
                 "impact": required(str),
                 "evidence_refs": required(list[str]),
-                "case_id": optional(str, ""),
+                "case_id": (
+                    (str, Field(default="", description="Omit for a new case; use the returned ID to update."))
+                    if units
+                    else optional(str, "")
+                ),
                 "open_questions": optional(list[str], []),
             },
         ),
@@ -714,7 +732,15 @@ class Reviewer:
         self._refs(refs)
         ident = args.get("question_id", "")
         if ident:
-            question = self.store.get(Question, ident)
+            try:
+                question = self.store.get(Question, ident)
+            except KeyError:
+                if self.store.run.policy == "v42-units-6":
+                    raise ValueError(
+                        "Unknown question_id. Omit question_id to create a new question, "
+                        "or use the exact ID returned for an existing question."
+                    ) from None
+                raise
             if question.scope_id != scope.id:
                 raise ValueError("question belongs to another scope")
             if question.owner == "tool_controller":
@@ -753,7 +779,15 @@ class Reviewer:
                 raise ValueError("question belongs to another scope")
         ident = args.get("case_id", "")
         if ident:
-            case = self.store.get(Case, ident)
+            try:
+                case = self.store.get(Case, ident)
+            except KeyError:
+                if self.store.run.policy == "v42-units-6":
+                    raise ValueError(
+                        "Unknown case_id. Omit case_id to create a new case, "
+                        "or use the exact ID returned for an existing case."
+                    ) from None
+                raise
             if case.scope_id != scope.id:
                 raise ValueError("case belongs to another scope")
             if case.trigger != trigger:

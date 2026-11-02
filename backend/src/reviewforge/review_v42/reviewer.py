@@ -31,7 +31,15 @@ from reviewforge.review_v42.context_recovery import (
     is_context_length_exceeded,
     reviewer_context,
 )
-from reviewforge.review_v42.contracts import Case, EvidenceRef, LeaseError, NavigationItem, Question, ReviewScope
+from reviewforge.review_v42.contracts import (
+    BindingError,
+    Case,
+    EvidenceRef,
+    LeaseError,
+    NavigationItem,
+    Question,
+    ReviewScope,
+)
 from reviewforge.review_v42.tools import InvalidEvidenceRequestError
 
 PROMPT = (
@@ -75,6 +83,12 @@ FRONTIER_PROMPT = (
     "an entry is no longer needed; the original evidence remains available for complete rereading."
 )
 
+SEARCH_INDEX_PROMPT = (
+    " Older validated search results appear as navigation indexes; use read_search_section for matches or skipped "
+    "paths and read_evidence for the complete original receipt. Skipped paths and remaining pages mean the search "
+    "is incomplete. Search results are not source proof."
+)
+
 _STATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -99,7 +113,7 @@ _STATE_SCHEMA = {
 }
 
 
-def reviewer_tools(*, workspace: bool = False, frontier: bool = False) -> list[Any]:
+def reviewer_tools(*, workspace: bool = False, frontier: bool = False, search_index: bool = False) -> list[Any]:
     def required(typ):
         return (typ, ...)
 
@@ -212,6 +226,14 @@ def reviewer_tools(*, workspace: bool = False, frontier: bool = False) -> list[A
                 {"entry_ids": required(list[str]), "reason": required(str), "expected_revision": required(int)},
             )
         )
+    if search_index:
+        definitions.append(
+            (
+                "read_search_section",
+                "Read a page of saved search matches or skipped paths. Search results are navigation, not proof.",
+                {"ref": required(str), "section": required(str), "offset": required(int), "limit": required(int)},
+            )
+        )
     return [result_tool(name, description, fields) for name, description, fields in definitions]
 
 
@@ -290,7 +312,7 @@ def _validate_review_state(state: Any) -> list[str]:
 def _semantic_board(store: Any, scope_id: str) -> str:
     board = ContextBuilder(store).reviewer(scope_id)
     board["scope"].pop("working_state", None)
-    if store.run.policy in {"v42-workspace-3", "v42-frontier-4"}:
+    if store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
         # Untrusted notes, including newly worded questions, cannot make a repeated failure progress.
         # Explicit navigation decisions are separate successful actions and reset the failure batch.
         board.pop("navigation", None)
@@ -440,13 +462,18 @@ class Reviewer:
 
     def _context(self, scope_id: str, *, recent: list[Any] | None = None) -> list[Any]:
         state = reviewer_context(self.store, scope_id)
-        frontier = self.store.run.policy == "v42-frontier-4"
+        frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
         context = [
             SystemMessage(
                 content=PROMPT
                 + (STATEFUL_PROMPT if self.store.run.policy == "v42-stateful-2" else "")
-                + (WORKSPACE_PROMPT if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4"} else "")
+                + (
+                    WORKSPACE_PROMPT
+                    if self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+                    else ""
+                )
                 + (FRONTIER_PROMPT if frontier else "")
+                + (SEARCH_INDEX_PROMPT if self.store.run.policy == "v42-frontier-5" else "")
                 + (" Focus: " + self.focus if self.focus else "")
             ),
             HumanMessage(content=json.dumps(state, ensure_ascii=False, default=str)),
@@ -464,6 +491,14 @@ class Reviewer:
                 for item in self.store.list_frontier(self.task_id):
                     raw = self.store.read_frontier_entry(self.task_id, item.id)
                     if item.id in latest_ids:
+                        continue
+                    index = (
+                        ContextBuilder(self.store).search_index(item)
+                        if self.store.run.policy == "v42-frontier-5"
+                        else None
+                    )
+                    if index is not None:
+                        entries.append(index)
                         continue
                     entries.append(
                         {
@@ -504,7 +539,7 @@ class Reviewer:
         return context
 
     def _checkpoint_context(self, scope_id: str, prior: list[Any]) -> list[Any]:
-        if self.store.run.policy == "v42-frontier-4":
+        if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}:
             recent = self._last_exchange(prior)
             return [*self._context(scope_id, recent=recent), *recent]
         return [*self._context(scope_id), *prior[2:]]
@@ -635,7 +670,7 @@ class Reviewer:
         return {"checked_regions": sorted(checked), "scope_status": scope.status}
 
     def _finish(self, scope: ReviewScope, args: dict[str, Any]) -> dict[str, Any]:
-        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4"}
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
         ids = {region["id"] for region in scope.regions}
         checked = set(args["checked_regions"])
         if workspace:
@@ -691,9 +726,9 @@ class Reviewer:
         return result
 
     async def run(self, scope_id: str, *, reopen: bool = False) -> str:
-        frontier = self.store.run.policy == "v42-frontier-4"
-        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4"}
-        stateful = self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}
+        frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
+        stateful = self.store.run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
         if stateful and not self.task_id:
             raise ValueError(f"{self.store.run.policy} reviewer requires a leased, auditable task")
         scope = self.store.get(ReviewScope, scope_id)
@@ -726,12 +761,15 @@ class Reviewer:
             if saved:
                 self._save_session(messages_from_dict(saved))
             return "partial"
-        definitions = reviewer_tools(workspace=workspace, frontier=frontier)
+        search_index = self.store.run.policy == "v42-frontier-5"
+        definitions = reviewer_tools(workspace=workspace, frontier=frontier, search_index=search_index)
         semantic = {"save_question", "submit_case", "finish_scope", "read_evidence", "delegate_question"}
         if workspace:
             semantic.update({"update_navigation", "record_region_progress", "list_navigation"})
         if frontier:
             semantic.add("release_frontier")
+        if search_index:
+            semantic.add("read_search_section")
         custom = getattr(self.gateway, "tool_specs", None)
         own = [tool for tool in definitions if custom is None or tool.name in semantic]
         schemas = {tool.name: tool.args_schema for tool in own}
@@ -995,6 +1033,14 @@ class Reviewer:
                                 args["scope_id"], cursor=args.get("cursor"), limit=args.get("limit")
                             )
                             result["notice"] = "Shared navigation is untrusted and cannot be cited as source evidence."
+                        elif search_index and name == "read_search_section":
+                            try:
+                                result = ContextBuilder(self.store).search_section(
+                                    args["ref"], args["section"], offset=args["offset"], limit=args["limit"]
+                                )
+                            except (BindingError, OSError) as exc:
+                                raise FrontierUnavailableError("saved search is unavailable") from exc
+                            result["notice"] = "Search navigation is not source evidence."
                         elif frontier and name == "release_frontier":
                             released = self.store.release_frontier_for_task(
                                 self.task_id,
@@ -1072,14 +1118,14 @@ class Reviewer:
                             checkpoint = self._checkpoint_context(scope_id, chat[:exchange_start])
                             if _complete_tool_exchange(checkpoint):
                                 self._save_session(checkpoint)
-                    except LeaseError:
+                    except (LeaseError, FrontierUnavailableError):
                         raise
                     except Exception as exc:
                         if _status_code(exc) in {401, 402, 403}:
                             raise
                         result = {"error": f"{type(exc).__name__}: {exc}"}
                         bad_evidence_request = (
-                            self.store.run.policy == "v42-frontier-4"
+                            self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
                             and name == "read_evidence"
                             and (isinstance(exc, InvalidEvidenceRequestError) or id(call) in invalid)
                         )
@@ -1262,7 +1308,7 @@ class QuestionAssistant:
 
     async def run(self, task: Any) -> dict[str, Any]:
         question = self.store.get(Question, task.object_id)
-        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4"}
+        workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
 
         records = self.store.load_task_session(task.id)
         failed_reads = {
@@ -1352,8 +1398,19 @@ class QuestionAssistant:
             if workspace
             else None
         )
+        search_tool = (
+            next(tool for tool in reviewer_tools(search_index=True) if tool.name == "read_search_section")
+            if self.store.run.policy == "v42-frontier-5"
+            else None
+        )
         bound = self.llm.bind_tools(
-            [*read_tools, *([navigation_tool] if workspace else []), answer_tool], tool_choice="auto"
+            [
+                *read_tools,
+                *([navigation_tool] if workspace else []),
+                *([search_tool] if search_tool else []),
+                answer_tool,
+            ],
+            tool_choice="auto",
         )
         previous = None
         repeated = 0
@@ -1440,6 +1497,19 @@ class QuestionAssistant:
                         result["notice"] = "Shared navigation is untrusted and cannot be cited as source evidence."
                     except (ValueError, KeyError, TypeError) as exc:
                         result = {"error": str(exc)}
+                elif search_tool and name == "read_search_section":
+                    try:
+                        search_tool.args_schema.model_validate(args)
+                        result = ContextBuilder(self.store).search_section(
+                            args["ref"], args["section"], offset=args["offset"], limit=args["limit"]
+                        )
+                        failed_reads.discard((name, json.dumps(args, sort_keys=True)))
+                        result["notice"] = "Search navigation is not source evidence."
+                    except (BindingError, OSError) as exc:
+                        failed_reads.add((name, json.dumps(args, sort_keys=True)))
+                        result = {"error": f"{type(exc).__name__}: {exc}"}
+                    except (ValueError, KeyError, TypeError) as exc:
+                        result = {"error": str(exc)}
                 elif name in names or name == "read_evidence":
                     try:
                         result = await self.gateway.execute(name, args)
@@ -1451,7 +1521,7 @@ class QuestionAssistant:
                         if _status_code(exc) in {401, 402, 403}:
                             raise
                         if not (
-                            self.store.run.policy == "v42-frontier-4"
+                            self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
                             and name == "read_evidence"
                             and isinstance(exc, InvalidEvidenceRequestError)
                         ):

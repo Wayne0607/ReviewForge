@@ -196,7 +196,7 @@ async def test_native_product_path_persists_report_and_resumes_without_model_cal
 
     with sqlite3.connect(Path(summary["report_path"]).parent / "board.sqlite") as db:
         binding = json.loads(db.execute("SELECT payload FROM run WHERE id=1").fetchone()[0])
-        assert binding["policy"] == binding["metadata"]["execution_policy"] == "v42-frontier-4"
+        assert binding["policy"] == binding["metadata"]["execution_policy"] == "v42-frontier-5"
         assert db.execute("SELECT count(*) FROM turn_audit").fetchone()[0] >= 3
     again = await obj.run(state())
     assert again["status"] == "completed" and again["run_id"] == summary["run_id"]
@@ -242,6 +242,41 @@ async def test_product_invalid_evidence_reference_is_correctable(tmp_path, monke
     summary = await obj.run(state())
     assert summary["status"] == "completed"
     assert not summary["review_v42_report"]["open_questions"]
+
+
+async def test_product_search_index_preserves_full_receipt_and_allows_paged_read(tmp_path, monkeypatch):
+    region = changed_regions(state())[0]["id"]
+    search_ref = None
+
+    def review(messages, turn):
+        nonlocal search_ref
+        if turn == 1:
+            return tool("search_code", {"query": "result"})
+        if turn == 2:
+            receipt = json.loads(next(m.content for m in reversed(messages) if isinstance(m, ToolMessage)))
+            search_ref = receipt["evidence_ref"]
+            original = json.loads(receipt["content"])
+            assert original["matches"][0]["text"] == "result = 0"
+            return tool("read_source", {"path": "a.py", "side": "head"})
+        if turn == 3:
+            projections = [
+                json.loads(message.content)
+                for message in messages
+                if isinstance(message, HumanMessage) and "frontier_revision" in message.content
+            ]
+            index = next(entry for entry in projections[0]["entries"] if entry["kind"] == "search_index")
+            assert index["sources"][0]["ref"] == search_ref
+            assert index["sources"][0]["tool_args"]["query"] == "result"
+            return tool("read_search_section", {"ref": search_ref, "section": "matches", "offset": 0, "limit": 1})
+        page = json.loads(next(m.content for m in reversed(messages) if isinstance(m, ToolMessage)))
+        assert page["items"][0]["text"] == "result = 0" and page["navigation_only"]
+        return tool("finish_scope", {"checked_regions": [region]})
+
+    reviewer = NativeModel(review)
+    verifier = NativeModel(lambda *_: pytest.fail("no candidate requires verification"))
+    obj, _ = product(tmp_path, monkeypatch, reviewer, verifier)
+    summary = await obj.run(state())
+    assert summary["status"] == "completed"
 
 
 async def test_incomplete_workspace_fails_before_any_model_request(tmp_path, monkeypatch):

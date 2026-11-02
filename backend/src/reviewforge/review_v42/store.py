@@ -67,21 +67,21 @@ class ReviewStore:
                 db.execute("INSERT INTO run VALUES (1, ?)", (_json(asdict(run)),))
             elif row[0] != _json(asdict(run)):
                 raise BindingError("store is bound to a different run or snapshot")
-            if run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
+            if run.policy in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
                 self.audit_dir.mkdir(parents=True, exist_ok=True)
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS turn_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, phase TEXT NOT NULL, "
                     "content_hash TEXT NOT NULL, UNIQUE(task_id,turn_id,phase))"
                 )
-            if run.policy in {"v42-workspace-3", "v42-frontier-4"}:
+            if run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS navigation_aliases ("
                     "scope_id TEXT NOT NULL, fingerprint TEXT NOT NULL, item_id TEXT NOT NULL, "
                     "PRIMARY KEY(scope_id,fingerprint))"
                 )
 
-            if run.policy == "v42-frontier-4":
+            if run.policy in {"v42-frontier-4", "v42-frontier-5"}:
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS frontier_entries ("
                     "seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
@@ -110,7 +110,7 @@ class ReviewStore:
             if not isinstance(state, dict):
                 raise ValueError("working_state must be an object")
             if state:
-                if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
+                if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
                     raise ValueError("working_state requires a stateful policy")
                 if set(state) != {"question", "observations", "open_questions", "next_step"}:
                     raise ValueError("working_state requires question, observations, open_questions and next_step")
@@ -289,7 +289,7 @@ class ReviewStore:
             raise BindingError("navigation identities are controller-managed")
         if (
             isinstance(obj, ReviewScope)
-            and self.run.policy in {"v42-workspace-3", "v42-frontier-4"}
+            and self.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
             and obj.working_state
         ):
             raise ValueError("policy3 working state must be added through merge_working_states")
@@ -348,7 +348,7 @@ class ReviewStore:
             raise TypeError("updates are only supported for scopes, questions and cases")
         if (
             cls is ReviewScope
-            and self.run.policy in {"v42-workspace-3", "v42-frontier-4"}
+            and self.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}
             and "working_state" in changes
         ):
             raise ValueError("policy3 working state must be added through merge_working_states")
@@ -500,7 +500,7 @@ class ReviewStore:
         return content
 
     def _frontier_task(self, db: sqlite3.Connection, task_id: str) -> Task:
-        if self.run.policy != "v42-frontier-4":
+        if self.run.policy not in {"v42-frontier-4", "v42-frontier-5"}:
             raise ValueError("frontier requires v42-frontier-4")
         row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
         if row is None:
@@ -1009,7 +1009,7 @@ class ReviewStore:
         self, task_id: str, token: str, expected_revision: int, *, now: float | None = None, **changes: Any
     ) -> ReviewScope:
         """Advance the scope and its review-task input together under the same lease."""
-        if self.run.policy in {"v42-workspace-3", "v42-frontier-4"} and "working_state" in changes:
+        if self.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"} and "working_state" in changes:
             raise ValueError("policy3 working state must be added through merge_working_states")
         if {"id", "run_id", "revision"} & changes.keys() or changes.keys() - {f.name for f in fields(ReviewScope)}:
             raise ValueError("invalid scope update fields")
@@ -1361,7 +1361,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Append one complete visible exchange, bound to the current review lease."""
-        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
+        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
             raise ValueError("turn audit requires a stateful policy")
         if not isinstance(turn_id, str) or not turn_id or not isinstance(phase, str) or not phase:
             raise ValueError("turn_id and phase are required")
@@ -1452,7 +1452,7 @@ class ReviewStore:
 
     def read_turn_audit(self, task_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
         """Explicitly retrieve complete, hash-checked visible history in append order."""
-        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4"}:
+        if self.run.policy not in {"v42-stateful-2", "v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
             raise ValueError("turn audit requires a stateful policy")
         with self._connect() as db:
             if db.execute("SELECT 1 FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone() is None:
@@ -1494,7 +1494,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Merge independent untrusted navigation updates without replacing siblings."""
-        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4"}:
+        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
             raise ValueError("navigation requires v42-workspace-3")
         if not isinstance(states, list):
             raise ValueError("states must be a list")
@@ -1632,7 +1632,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> NavigationItem:
         """Explicitly revise, resolve, retract or reopen one untrusted navigation item."""
-        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4"}:
+        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
             raise ValueError("navigation requires v42-workspace-3")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("navigation updates require a reason")
@@ -1717,7 +1717,7 @@ class ReviewStore:
         self, scope_id: str, *, status: str | None = "open", cursor: str | None = None, limit: int | None = None
     ) -> dict[str, Any]:
         """Explicit, lossless pagination; None returns the entire current set."""
-        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4"}:
+        if self.run.policy not in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5"}:
             raise ValueError("navigation requires v42-workspace-3")
         self.get(ReviewScope, scope_id)
         if status not in {None, "open", "resolved", "retracted"}:

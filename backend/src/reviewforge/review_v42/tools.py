@@ -38,14 +38,14 @@ class EvidenceGateway:
             try:
                 ref = self.store.get(EvidenceRef, args["ref"])
             except KeyError as exc:
-                if self.store.run.policy == "v42-frontier-4":
+                if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}:
                     raise InvalidEvidenceRequestError(
                         "unknown evidence reference; consult the evidence directory"
                     ) from exc
                 raise
             start, end = args.get("start_line"), args.get("end_line")
             if (
-                self.store.run.policy == "v42-frontier-4"
+                self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}
                 and (start is not None or end is not None)
                 and (type(start) is not int or type(end) is not int or start < 1 or end < start)
             ):
@@ -58,14 +58,14 @@ class EvidenceGateway:
             if start is None and end is None:
                 return {"evidence_ref": ref.id, "content": content, "complete": True}
             if type(start) is not int or type(end) is not int or start < 1 or end < start:
-                if self.store.run.policy == "v42-frontier-4":
+                if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}:
                     raise InvalidEvidenceRequestError("start_line and end_line must be a valid explicit page")
                 raise ValueError("start_line and end_line must be a valid explicit page")
             first = ref.start_line or 1
             lines = content.splitlines(keepends=True)
             last = first + len(lines) - 1
             if start < first or start > last:
-                if self.store.run.policy == "v42-frontier-4":
+                if self.store.run.policy in {"v42-frontier-4", "v42-frontier-5"}:
                     raise InvalidEvidenceRequestError("page begins outside the stored evidence")
                 raise ValueError("page begins outside the stored evidence")
             actual_end = min(end, last)

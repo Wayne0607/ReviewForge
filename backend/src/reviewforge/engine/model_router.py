@@ -61,6 +61,8 @@ ROLE_MAP: dict[str, str] = {
     "lens_dependency": "fast_review",
     "investigator": "verifier",
     "editor": "publication_gate",
+    "v42_reviewer": "deep_review",
+    "v42_verifier": "publication_gate",
 }
 
 
@@ -122,7 +124,7 @@ def _temperature_for(config: LLMConfig, agent_name: str) -> float:
         "evidence_arbiter",
         "investigator",
     }
-    if agent_name in verifier_agents or agent_name in {"publication_gate", "editor"}:
+    if agent_name in verifier_agents or agent_name in {"publication_gate", "editor", "v42_verifier"}:
         return config.temperature_verifier
     return config.temperature_reviewer
 

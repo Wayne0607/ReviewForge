@@ -16,7 +16,7 @@ import yaml
 _VALID_EVIDENCE_MODES = frozenset({"off", "shadow", "enforce"})
 _VALID_PUBLICATION_POLICY_MODES = _VALID_EVIDENCE_MODES
 _VALID_OUTPUT_LANGUAGES = frozenset({"auto", "en", "zh-CN"})
-_VALID_PIPELINE_MODES = frozenset({"legacy", "shadow", "hypothesis"})
+_VALID_PIPELINE_MODES = frozenset({"legacy", "shadow", "hypothesis", "review_v42"})
 
 
 def _normalize_int(value: Any, default: int, minimum: int = 1) -> int:

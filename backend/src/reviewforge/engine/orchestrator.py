@@ -791,6 +791,10 @@ class Orchestrator:
             return await self._run_legacy(state)
         if mode == "hypothesis":
             return await self._run_hypothesis(state)
+        if mode == "review_v42":
+            from reviewforge.review_v42.integration import run_review_v42
+
+            return await run_review_v42(self, state)
         if mode != "shadow":
             raise ValueError(f"unsupported pipeline mode: {mode!r}")
 

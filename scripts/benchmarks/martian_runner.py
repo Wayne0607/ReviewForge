@@ -385,7 +385,9 @@ async def _build_runtime(
                 "investigator",
                 "editor",
             } or name.startswith("lens_")
-            product_retry = pipeline in {"hypothesis", "shadow"} and protocol_version >= 3 and v4_agent
+            product_retry = (pipeline in {"hypothesis", "shadow"} and protocol_version >= 3 and v4_agent) or (
+                pipeline == "review_v42" and name in {"v42_reviewer", "v42_verifier"}
+            )
             if not product_retry and (retry_policy.max_attempts > 1 or retry_policy.retry_404):
                 wrapped = RetryChatLLM(wrapped, retry_policy, attempt_sink=record_attempt)
             traced[cache_key] = wrapped
@@ -502,6 +504,17 @@ async def _run_one(
     )
     populate_file_changes(state, files)
     config = getattr(orchestrator, "_pipeline_v4_config", None)
+    if getattr(config, "mode", "legacy") == "review_v42":
+        # These historical PRs have no authenticated head-time issue snapshots.
+        # Current cross-references may reveal their eventual bug/fix; exclude them.
+        state.linked_issue_context = {
+            "schema": "review-v42-no-external-context",
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": state.head_sha,
+            "status": "excluded-historical-leakage",
+            "issues": [],
+        }
     if getattr(config, "protocol_version", 0) >= 11 and getattr(config, "mode", "legacy") in {"hypothesis", "shadow"}:
         context = item.get("linked_issue_context")
         snapshot_path = None
@@ -557,21 +570,42 @@ async def _run_one(
     runs = await db.get_runs(repo=repo, limit=5)
     run = next((row for row in runs if row.get("head_sha") == state.head_sha), {})
     token_rows = await db.get_token_usage(run_id=str(run.get("run_id") or "")) if run else []
+    local = summary.get("review_v42_report") if summary.get("mode") == "review_v42" else None
+    local_comments = (
+        [
+            {
+                "path": comment["anchor"]["path"],
+                "line": comment["anchor"]["line"],
+                "side": comment["anchor"]["side"],
+                "body": comment["body"],
+            }
+            for comment in local.get("comments", [])
+        ]
+        if local
+        else None
+    )
     result = {
         **item,
         "head_sha": state.head_sha,
         "base_sha": state.base_sha,
         "changed_files": len(files),
-        "review_comments": orchestrator._gateway._github.comments.get((repo, pr_number), []),
+        "review_comments": local_comments
+        if local_comments is not None
+        else orchestrator._gateway._github.comments.get((repo, pr_number), []),
         "review_bodies": orchestrator._gateway._github.bodies.get((repo, pr_number), []),
         "ledger": state.ledger.to_dict() if state.ledger else None,
         "summary": summary,
         "run_id": run.get("run_id", ""),
-        "tokens": sum(int(row.get("total_tokens", 0) or 0) for row in token_rows),
+        "tokens": (
+            local["metrics"]["usage"]["input_tokens"] + local["metrics"]["usage"]["output_tokens"]
+            if local
+            else sum(int(row.get("total_tokens", 0) or 0) for row in token_rows)
+        ),
         "tokens_by_agent": token_rows,
         "duration_seconds": round(time.monotonic() - started, 3),
         "status": "completed",
         **({"linked_issue_context": state.linked_issue_context} if state.linked_issue_context else {}),
+        **({"review_v42_metrics": local["metrics"], "comment_delivery": "local-only"} if local else {}),
     }
     if not is_complete_result(result):
         result["status"] = "partial"
@@ -668,6 +702,13 @@ async def _main_async(args: argparse.Namespace) -> None:
         metadata["provider"] = {"host": endpoint.hostname, "path": endpoint.path}
         metadata["effective_model"] = effective.model
         metadata["effective_generator_max_input_chars"] = orchestrator._pipeline_v4_config.generator_max_input_chars
+        if args.pipeline == "review_v42":
+            metadata["review_v42"] = {
+                "schema": "review-v42/1",
+                "token_policy": "usage-only",
+                "external_knowledge": "excluded-historical-leakage",
+                "delivery": "local-only",
+            }
         if args.pipeline in {"hypothesis", "shadow"}:
             metadata["v4_protocol"] = {
                 "version": getattr(orchestrator._pipeline_v4_config, "protocol_version", 2),
@@ -763,7 +804,11 @@ def main() -> None:
         default=0,
         help="Dev ablation; 0 keeps the YAML budget",
     )
-    parser.add_argument("--pipeline", choices=("legacy", "shadow", "hypothesis"), default="legacy")
+    parser.add_argument(
+        "--pipeline",
+        choices=("legacy", "shadow", "hypothesis", "review_v42"),
+        default="legacy",
+    )
     parser.add_argument("--reasoning-effort", choices=("", "low", "high", "max"), default="")
     parser.add_argument("--llm-min-interval", type=float, default=30.0)
     parser.add_argument(

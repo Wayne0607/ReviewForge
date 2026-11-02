@@ -104,6 +104,16 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.text
 
+    async def get_file_bytes(self, repo: str, ref: str, file_path: str) -> bytes:
+        """Read original bytes for evidence without decoding or newline changes."""
+        resp = await self._client.get(
+            f"/repos/{repo}/contents/{_encode_path(file_path)}",
+            params={"ref": ref},
+            headers={"Accept": "application/vnd.github.v3.raw"},
+        )
+        resp.raise_for_status()
+        return resp.content
+
     async def search_code(self, repo: str, pattern: str, file_glob: str = "") -> str:
         """Search code in a repository."""
         query = f"{pattern} repo:{repo}"

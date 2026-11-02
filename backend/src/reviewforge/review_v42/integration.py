@@ -39,6 +39,7 @@ from reviewforge.tools.github_api import validate_pr_issue_context
 from reviewforge.tools.workspace import PRHeadWorkspace
 
 _LOCKS: dict[str, asyncio.Lock] = {}
+EXECUTION_POLICY = "v42-stateful-2"
 
 
 @contextmanager
@@ -468,6 +469,7 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             "model_binding": model_binding,
             "knowledge": knowledge,
             "kernel_digest": kernel,
+            "execution_policy": EXECUTION_POLICY,
         }
         identity = hashlib.sha256(
             json.dumps(
@@ -482,6 +484,7 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             base=review_base,
             head=state.head_sha,
             environment=source_identity,
+            policy=EXECUTION_POLICY,
             model=json.dumps({k: v.get("model", "") for k, v in models.items()}, sort_keys=True),
             metadata=metadata,
         )

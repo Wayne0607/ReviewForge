@@ -75,6 +75,15 @@ def tool(name, args):
     return AIMessage(content="", tool_calls=[{"id": "call", "name": name, "args": args}])
 
 
+def working_state():
+    return {
+        "question": "Does the changed result preserve its contract?",
+        "observations": [],
+        "open_questions": ["Compare base and head source"],
+        "next_step": "Read the fixed source revision",
+    }
+
+
 class Workspace:
     head_sha = "head"
     digest = "workspace-digest"
@@ -135,7 +144,7 @@ async def test_native_product_path_persists_report_and_resumes_without_model_cal
 
     def review(messages, turn):
         if turn == 1:
-            return tool("read_source", {"path": "a.py", "side": "head"})
+            return tool("read_source", {"path": "a.py", "side": "head", "review_state": working_state()})
         if turn == 2:
             receipt = json.loads(next(m.content for m in reversed(messages) if isinstance(m, ToolMessage)))
             return tool(
@@ -180,6 +189,13 @@ async def test_native_product_path_persists_report_and_resumes_without_model_cal
     schemas = reviewer._inputs[0][1]["tools"]
     read = next(t for t in schemas if t["function"]["name"] == "read_source")
     assert "side" in read["function"]["parameters"]["properties"]
+    assert "review_state" in read["function"]["parameters"]["properties"]
+    import sqlite3
+
+    with sqlite3.connect(Path(summary["report_path"]).parent / "board.sqlite") as db:
+        binding = json.loads(db.execute("SELECT payload FROM run WHERE id=1").fetchone()[0])
+        assert binding["policy"] == binding["metadata"]["execution_policy"] == "v42-stateful-2"
+        assert db.execute("SELECT count(*) FROM turn_audit").fetchone()[0] >= 3
     again = await obj.run(state())
     assert again["status"] == "completed" and again["run_id"] == summary["run_id"]
     assert len(reviewer._inputs) == 3 and len(verifier._inputs) == 1
@@ -247,11 +263,11 @@ async def test_product_derives_diff_from_fixed_snapshots_and_reads_merge_base(tm
 
     def review(messages, turn):
         if turn == 1:
-            return tool("read_source", {"path": "a.py", "side": "base"})
+            return tool("read_source", {"path": "a.py", "side": "base", "review_state": working_state()})
         if turn == 2:
             receipt = json.loads(next(m.content for m in reversed(messages) if isinstance(m, ToolMessage)))
             assert receipt["content"] == "result = 1\n"
-            return tool("read_source", {"path": "a.py", "side": "head"})
+            return tool("read_source", {"path": "a.py", "side": "head", "review_state": working_state()})
         receipt = json.loads(next(m.content for m in reversed(messages) if isinstance(m, ToolMessage)))
         assert receipt["content"] == "result = 0\n"
         context = json.loads(next(m.content for m in messages if isinstance(m, HumanMessage)))

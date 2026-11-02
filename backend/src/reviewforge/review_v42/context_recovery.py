@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from reviewforge.review_v42.context import ContextBuilder
+from reviewforge.review_v42.context import ContextBuilder, evidence_summary
 from reviewforge.review_v42.contracts import EvidenceRef
 
 
@@ -39,6 +39,8 @@ def evidence_directory(store: Any) -> list[dict[str, Any]]:
     The source bodies remain in immutable storage. Entries include the original
     tool invocation to distinguish searches and support explicit full rereads.
     """
+    if store.run.policy == "v42-stateful-2":
+        return [evidence_summary(ref) for ref in store.list(EvidenceRef)]
     return [asdict(ref) for ref in store.list(EvidenceRef)]
 
 

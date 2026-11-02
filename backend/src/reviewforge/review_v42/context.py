@@ -8,6 +8,11 @@ from .contracts import Case, EvidenceRef, Question, ReviewScope
 from .store import ReviewStore
 
 
+def evidence_summary(ref: EvidenceRef) -> dict:
+    """A navigation index, never a substitute for reading an evidence body."""
+    return {name: getattr(ref, name) for name in ("id", "path", "side", "revision", "start_line", "end_line", "kind")}
+
+
 class ContextBuilder:
     def __init__(self, store: ReviewStore):
         self.store = store
@@ -16,6 +21,15 @@ class ContextBuilder:
         scope = self.store.get(ReviewScope, scope_id)
         questions = [q for q in self.store.list(Question) if q.scope_id == scope_id]
         cases = [c for c in self.store.list(Case) if c.scope_id == scope_id]
+        scope_view = asdict(scope)
+        if self.store.run.policy == "v42-stateful-2":
+            for key in ("regions", "checked_regions"):
+                for row in scope_view.get(key, []):
+                    if "patch" in row:
+                        row["patch_available_via_read_diff"] = True
+                        del row["patch"]
+        else:
+            scope_view.pop("working_state", None)
         refs = {r for q in questions for r in q.evidence_refs}
         refs.update(r for q in questions for item in q.interpretations for r in item.get("evidence_refs", []))
         refs.update(r for c in cases for r in c.evidence_refs + c.counter_evidence_refs)
@@ -25,10 +39,14 @@ class ContextBuilder:
                 for key in ("title", "description", "output_language")
                 if key in self.store.run.metadata
             },
-            "scope": asdict(scope),
+            "scope": scope_view,
             "questions": [asdict(q) for q in questions],
             "cases": [asdict(c) for c in cases],
-            "evidence": [asdict(self.store.get(EvidenceRef, r)) for r in sorted(refs)],
+            "evidence": (
+                [evidence_summary(ref) for ref in self.store.list(EvidenceRef)]
+                if self.store.run.policy == "v42-stateful-2"
+                else [asdict(self.store.get(EvidenceRef, r)) for r in sorted(refs)]
+            ),
             "scope_index": [{"id": s.id, "title": s.title, "status": s.status} for s in self.store.list(ReviewScope)],
         }
 

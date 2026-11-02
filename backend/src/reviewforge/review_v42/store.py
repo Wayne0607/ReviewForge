@@ -33,6 +33,7 @@ class ReviewStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
         self.blob_dir.mkdir(parents=True, exist_ok=True)
+        self.audit_dir = self.path.parent / ".review-v42-turn-audit"
         self.run = run
         with self._connect() as db:
             db.executescript("""
@@ -54,6 +55,13 @@ class ReviewStore:
                 db.execute("INSERT INTO run VALUES (1, ?)", (_json(asdict(run)),))
             elif row[0] != _json(asdict(run)):
                 raise BindingError("store is bound to a different run or snapshot")
+            if run.policy == "v42-stateful-2":
+                self.audit_dir.mkdir(parents=True, exist_ok=True)
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS turn_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, phase TEXT NOT NULL, "
+                    "content_hash TEXT NOT NULL, UNIQUE(task_id,turn_id,phase))"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -68,6 +76,39 @@ class ReviewStore:
         )
 
     def _validate_refs(self, db: sqlite3.Connection, obj: Any) -> None:
+        if isinstance(obj, ReviewScope):
+            state = obj.working_state
+            if not isinstance(state, dict):
+                raise ValueError("working_state must be an object")
+            if state:
+                if self.run.policy != "v42-stateful-2":
+                    raise ValueError("working_state requires v42-stateful-2")
+                if set(state) != {"question", "observations", "open_questions", "next_step"}:
+                    raise ValueError("working_state requires question, observations, open_questions and next_step")
+                if any(not isinstance(state[key], str) or not state[key].strip() for key in ("question", "next_step")):
+                    raise ValueError("working_state question and next_step must be nonempty strings")
+                if not isinstance(state["open_questions"], list) or any(
+                    not isinstance(item, str) or not item.strip() for item in state["open_questions"]
+                ):
+                    raise ValueError("open_questions must be nonempty strings")
+                if not isinstance(state["observations"], list):
+                    raise ValueError("observations must be a list")
+                for item in state["observations"]:
+                    if (
+                        not isinstance(item, dict)
+                        or set(item) != {"statement", "evidence_refs"}
+                        or not isinstance(item["statement"], str)
+                        or not item["statement"].strip()
+                        or not isinstance(item["evidence_refs"], list)
+                        or any(not isinstance(ref, str) or not ref for ref in item["evidence_refs"])
+                    ):
+                        raise ValueError("each observation requires a statement and evidence reference list")
+                    for ref in item["evidence_refs"]:
+                        if (
+                            db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref,)).fetchone()
+                            is None
+                        ):
+                            raise BindingError(f"unknown evidence reference: {ref}")
         if isinstance(obj, Case):
             ids = []
             for claim in obj.claims:
@@ -712,6 +753,7 @@ class ReviewStore:
             if all(getattr(old, key) == value for key, value in changes.items()):
                 return old
             updated = replace(old, **changes, revision=old.revision + 1)
+            self._validate_refs(db, updated)
             task = replace(task, input_revision=updated.revision, revision=task.revision + 1)
             db.execute(
                 "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
@@ -952,7 +994,13 @@ class ReviewStore:
             parent = ReviewScope(**json.loads(row[0]))
             if parent.revision != expected_revision:
                 raise RevisionConflict("scope revision changed before partition")
-            if parent.status != "pending" or parent.checked_regions or parent.case_ids or parent.unresolved:
+            if (
+                parent.status != "pending"
+                or parent.checked_regions
+                or parent.case_ids
+                or parent.unresolved
+                or parent.working_state
+            ):
                 raise ValueError("only an untouched pending scope can be partitioned")
             for kind in ("Task", "Question", "Case"):
                 rows = db.execute("SELECT payload FROM objects WHERE kind=?", (kind,)).fetchall()
@@ -976,6 +1024,7 @@ class ReviewStore:
                     or child.checked_regions
                     or child.case_ids
                     or child.unresolved
+                    or child.working_state
                 ):
                     raise ValueError("invalid child scope")
                 child_ids.add(child.id)
@@ -999,3 +1048,133 @@ class ReviewStore:
                 self._event(db, "ReviewScope", child.id, "add", asdict(child))
             db.commit()
             return children
+
+    def append_turn_audit(
+        self,
+        task_id: str,
+        token: str,
+        turn_id: str,
+        phase: str,
+        messages: list[dict[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Append one complete visible exchange, bound to the current review lease."""
+        if self.run.policy != "v42-stateful-2":
+            raise ValueError("turn audit requires v42-stateful-2")
+        if not isinstance(turn_id, str) or not turn_id or not isinstance(phase, str) or not phase:
+            raise ValueError("turn_id and phase are required")
+        if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
+            raise ValueError("visible messages must be a list of objects")
+
+        private_fields = {
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "thinking",
+            "thinking_blocks",
+            "redacted_thinking",
+        }
+        private_blocks = {"reasoning", "reasoning_content", "thinking", "redacted_thinking"}
+        for message in messages:
+            data = message.get("data")
+            body = data if isinstance(data, dict) else message
+            if (
+                message.get("type") not in ("ai", "AIMessage", "AIMessageChunk", "ai_chunk")
+                and message.get("role") != "assistant"
+                and body.get("type") not in ("ai", "AIMessage", "AIMessageChunk", "ai_chunk")
+                and body.get("role") != "assistant"
+            ):
+                continue
+            # Inspect only protocol metadata positions. Tool arguments and
+            # arbitrary visible payloads may legitimately use these names.
+            for container in (message, body, body.get("additional_kwargs"), body.get("response_metadata")):
+                if isinstance(container, dict) and any(
+                    isinstance(key, str) and key.lower() in private_fields for key in container
+                ):
+                    raise ValueError("provider reasoning is not a visible audit message")
+            content = body.get("content")
+            blocks = content if isinstance(content, list) else [content]
+            if any(
+                isinstance(block, dict)
+                and isinstance(block.get("type"), str)
+                and block["type"].lower() in private_blocks
+                for block in blocks
+            ):
+                raise ValueError("provider reasoning is not a visible audit message")
+        payload = _json(messages).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            if task.run_id != self.run.id:
+                raise BindingError("task belongs to a different run")
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            row = db.execute(
+                "SELECT seq,content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase=?",
+                (task_id, turn_id, phase),
+            ).fetchone()
+            if row and row[1] != digest:
+                raise RevisionConflict("turn phase already has different visible content")
+            blob = self.audit_dir / digest
+            if blob.exists():
+                if hashlib.sha256(blob.read_bytes()).hexdigest() != digest:
+                    raise BindingError("turn audit blob hash mismatch")
+            else:
+                temp = self.audit_dir / (digest + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    with temp.open("wb") as stream:
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temp, blob)
+                finally:
+                    temp.unlink(missing_ok=True)
+            if row:
+                return {"seq": row[0], "task_id": task_id, "turn_id": turn_id, "phase": phase, "content_hash": digest}
+            cursor = db.execute(
+                "INSERT INTO turn_audit (task_id,turn_id,phase,content_hash) VALUES (?,?,?,?)",
+                (task_id, turn_id, phase, digest),
+            )
+            result = {
+                "seq": cursor.lastrowid,
+                "task_id": task_id,
+                "turn_id": turn_id,
+                "phase": phase,
+                "content_hash": digest,
+            }
+            db.commit()
+            return result
+
+    def read_turn_audit(self, task_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
+        """Explicitly retrieve complete, hash-checked visible history in append order."""
+        if self.run.policy != "v42-stateful-2":
+            raise ValueError("turn audit requires v42-stateful-2")
+        with self._connect() as db:
+            if db.execute("SELECT 1 FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone() is None:
+                raise KeyError(task_id)
+            sql = "SELECT seq,turn_id,phase,content_hash FROM turn_audit WHERE task_id=?"
+            args = [task_id]
+            if turn_id is not None:
+                sql += " AND turn_id=?"
+                args.append(turn_id)
+            rows = db.execute(sql + " ORDER BY seq", args).fetchall()
+        result = []
+        for seq, ident, phase, digest in rows:
+            payload = (self.audit_dir / digest).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise BindingError("turn audit blob hash mismatch")
+            result.append(
+                {
+                    "seq": seq,
+                    "task_id": task_id,
+                    "turn_id": ident,
+                    "phase": phase,
+                    "content_hash": digest,
+                    "messages": json.loads(payload),
+                }
+            )
+        return result

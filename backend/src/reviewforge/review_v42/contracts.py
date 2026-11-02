@@ -35,6 +35,7 @@ class ReviewScope:
     case_ids: list[str] = field(default_factory=list)
     unresolved: list[str] = field(default_factory=list)
     revision: int = 0
+    working_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

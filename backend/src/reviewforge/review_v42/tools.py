@@ -8,6 +8,14 @@ from typing import Any
 from reviewforge.review_v42.contracts import EvidenceRef
 
 
+class ToolUnavailableError(RuntimeError):
+    """A tool reported an unavailable result, with its safe diagnostic reason."""
+
+    def __init__(self, name: str, status: str, reason: str = ""):
+        self.name, self.status, self.reason = name, status, reason
+        super().__init__(f"tool {name}: {status}" + (f": {reason}" if reason else ""))
+
+
 class EvidenceGateway:
     """Adapt an async callable(name, args) returning a bound evidence envelope.
 
@@ -54,9 +62,18 @@ class EvidenceGateway:
         result = await self.gateway(name, args)
         if not isinstance(result, dict) or not all(key in result for key in ("content", "revision", "side", "kind")):
             raise ValueError("tool result missing bound evidence envelope")
-        status = (result.get("metadata") or {}).get("status", "available")
+        metadata = result.get("metadata") or {}
+        status = metadata.get("status", "available")
         if status in {"unavailable", "error", "failed"}:
-            raise RuntimeError(f"tool {name}: {status}")
+            receipt = metadata.get("original_receipt") or {}
+            reason = metadata.get("reason") or (receipt.get("reason") if isinstance(receipt, dict) else "")
+            if not reason and result["kind"] == "failure":
+                reason = result["content"]
+            raise ToolUnavailableError(name, status, reason if isinstance(reason, str) else "")
+        if status in {"not_found", "not_changed", "out_of_range"} and (
+            result["kind"] != "query" or metadata.get("navigation_only") is not True
+        ):
+            raise ValueError("negative query result requires navigation-only query provenance")
         content = result["content"]
         if not isinstance(content, (str, bytes)):
             content = json.dumps(content, ensure_ascii=False, sort_keys=True)
@@ -81,4 +98,4 @@ class EvidenceGateway:
                 "status": "unavailable_non_utf8",
                 "metadata": result.get("metadata") or {},
             }
-        return {"evidence_ref": ref.id, "content": visible, "metadata": result.get("metadata") or {}}
+        return {**result, "evidence_ref": ref.id, "content": visible, "metadata": metadata}

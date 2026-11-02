@@ -59,9 +59,68 @@ async def test_sources_are_exact_and_base_never_becomes_head():
     assert before["content"] == "base\n" and before["revision"] == "base" and before["side"] == "base"
     with pytest.raises(ValueError):
         await gateway("read_source", {"path": "../secret"})
-    with pytest.raises(ValueError):
-        await gateway("read_source", {"path": "a.py", "end_line": 99})
-    assert (await gateway("read_source", {"path": "missing"}))["metadata"]["status"] == "unavailable"
+    tail = await gateway("read_source", {"path": "a.py", "end_line": 99})
+    assert tail["content"] == "new\nhead\n" and tail["end_line"] == 2
+    assert tail["metadata"]["at_eof"] and tail["metadata"]["requested_end_line"] == 99
+    missing = await gateway("read_source", {"path": "missing"})
+    assert missing["metadata"]["status"] == "not_found" and missing["kind"] == "query"
+    assert missing["metadata"]["navigation_only"]
+
+
+async def test_negative_diff_requires_both_complete_snapshots_and_actual_equal_bytes():
+    before = Workspace({"same.ts": "export {};\r\n", "deleted.ts": "old", "changed.ts": "old"})
+    before.head_sha = "base"
+    after = Workspace({"same.ts": "export {};\r\n", "added.ts": "new", "changed.ts": "new"})
+    gateway = PinnedToolGateway(after, state({}), base_workspace=before)
+    same = await gateway("read_diff", {"path": "same.ts"})
+    assert same["kind"] == "query" and same["metadata"]["status"] == "not_changed"
+    payload = json.loads(same["content"])
+    assert payload["base_revision"] == "base" and payload["head_revision"] == "head"
+    assert payload["present"] == {"base": True, "head": True}
+    missing = await gateway("read_diff", {"path": "missing.ts"})
+    assert json.loads(missing["content"])["present"] == {"base": False, "head": False}
+    assert missing["metadata"]["status"] == "not_found"
+    for path in ("added.ts", "deleted.ts", "changed.ts"):
+        result = await gateway("read_diff", {"path": path})
+        assert result["metadata"]["status"] == "unavailable"
+    without_base = PinnedToolGateway(Workspace({"same.ts": "x"}), state({}))
+    assert (await without_base("read_diff", {"path": "same.ts"}))["metadata"]["status"] == "unavailable"
+
+
+async def test_source_negative_results_keep_side_and_precise_eof_ranges():
+    before = Workspace({"deleted.ts": "old\n"})
+    before.head_sha = "base"
+    gateway = PinnedToolGateway(Workspace({"a.ts": "first\r\nlast\r\n"}), state({}), base_workspace=before)
+    tail = await gateway("read_source", {"path": "a.ts", "start_line": 2, "end_line": 80})
+    assert tail["content"] == "last\r\n" and tail["start_line"] == tail["end_line"] == 2
+    beyond = await gateway("read_source", {"path": "a.ts", "start_line": 4, "end_line": 80})
+    assert beyond["kind"] == "query" and beyond["metadata"]["status"] == "out_of_range"
+    assert json.loads(beyond["content"])["file_lines"] == 2
+    beyond_without_end = await gateway("read_source", {"path": "a.ts", "start_line": 4})
+    assert beyond_without_end["metadata"]["status"] == "out_of_range"
+    deleted = await gateway("read_source", {"path": "deleted.ts"})
+    assert deleted["side"] == "head" and deleted["revision"] == "head"
+    old = await gateway("read_source", {"path": "deleted.ts", "side": "base"})
+    assert old["content"] == "old\n" and old["side"] == "base"
+
+
+async def test_snapshot_failures_cannot_become_negative_query_success():
+    before = Workspace({"same.ts": "old"})
+    before.head_sha = "base"
+    after = Workspace({"same.ts": "old", "binary": "\x00x"})
+    gateway = PinnedToolGateway(after, state({}), base_workspace=before)
+    await gateway("read_source", {"path": "same.ts"})
+    after.content["same.ts"] = "corrupt"
+    failed = await gateway("read_diff", {"path": "same.ts"})
+    assert failed["metadata"]["status"] == "unavailable"
+    assert failed["metadata"]["reason"] == "fixed workspace contents changed"
+    after.content["same.ts"] = "old"
+    binary = await gateway("read_source", {"path": "binary"})
+    assert binary["metadata"]["status"] == "unavailable"
+    after._closed = True
+    missing = await gateway("read_source", {"path": "not_there"})
+    assert missing["metadata"]["status"] == "unavailable"
+    assert missing["kind"] == "failure"
 
 
 async def test_search_pagination_is_navigation_and_full_results_remain_accessible():

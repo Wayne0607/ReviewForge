@@ -645,3 +645,120 @@ async def test_output_language_is_whitelisted_and_drives_comment_labels(tmp_path
 
     await Verifier(store, CaptureModel(accepted(ref)), None).verify("case")
     assert f"**{label}:**" in Publication(store).local_report()["comments"][0]["body"]
+
+
+@pytest.mark.parametrize("status", ["not_found", "not_changed", "out_of_range"])
+@pytest.mark.parametrize("fact", ["trigger", "actual", "expected", "change", "impact", "counterexample"])
+def test_query_receipts_are_never_factual_or_counterevidence(tmp_path, status, fact):
+    from reviewforge.review_v42.verifier import validate_result
+
+    store, source = setup(tmp_path)
+    query = store.put_evidence(
+        b'{"result": "no match"}',
+        revision="head",
+        side="head",
+        kind="query",
+        metadata={"status": status, "navigation_only": True, "complete": True},
+    )
+    citation = {"ref": query.id, "quote": "no match"}
+    if fact == "counterexample":
+        result = {
+            "verdict": "reject",
+            "reason": "purported counterexample",
+            "gaps": [],
+            "facts": {"counterexample": {"statement": "not reachable", "citations": [citation]}},
+        }
+    else:
+        result = accepted(source)
+        result["facts"][fact]["citations"] = [citation]
+    with pytest.raises(ValueError, match="navigation-only"):
+        validate_result(store, result, {source.id, query.id})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["not_found", "not_changed", "out_of_range"])
+async def test_known_query_receipt_is_navigation_not_tool_failure(tmp_path, status):
+    from reviewforge.review_v42.context import ContextBuilder
+    from reviewforge.review_v42.tools import EvidenceGateway
+
+    store, source = setup(tmp_path)
+
+    class Gateway:
+        async def __call__(self, name, args):
+            return {
+                "content": '{"result":"no match"}',
+                "revision": "head",
+                "side": "head",
+                "kind": "query",
+                "metadata": {"status": status, "navigation_only": True, "complete": True},
+            }
+
+    class QueryModel:
+        calls = 0
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="", tool_calls=[{"name": "read_source", "args": {"path": "missing.py"}, "id": "1"}]
+                )
+            return AIMessage(content="", tool_calls=[{"name": "submit_verdict", "args": accepted(source), "id": "2"}])
+
+    verifier = Verifier(store, QueryModel(), EvidenceGateway(store, Gateway()))
+    case_context = ContextBuilder(store).verifier("case")
+    result, _ = await verifier._claim(case_context, case_context["claims"][0])
+    assert result["verdict"] == "accept" and result["tool_failures"] == []
+
+
+def test_query_kind_cannot_be_laundered_as_successful_source(tmp_path):
+    from reviewforge.review_v42.verifier import validate_result
+
+    store, source = setup(tmp_path)
+    query = store.put_evidence(b"no match", revision="head", side="head", kind="query", metadata={"status": "success"})
+    result = accepted(source)
+    result["facts"]["expected"]["citations"] = [{"ref": query.id, "quote": "no match"}]
+    with pytest.raises(ValueError, match="navigation-only"):
+        validate_result(store, result, {source.id, query.id})
+
+
+@pytest.mark.asyncio
+async def test_actual_unavailable_is_preserved_as_unresolved_gap(tmp_path):
+    from reviewforge.review_v42.context import ContextBuilder
+    from reviewforge.review_v42.tools import EvidenceGateway
+
+    store, source = setup(tmp_path)
+
+    class Gateway:
+        async def __call__(self, name, args):
+            return {
+                "content": "network failure",
+                "revision": "head",
+                "side": "head",
+                "kind": "failure",
+                "metadata": {"status": "unavailable", "reason": "network failure"},
+            }
+
+    class UnavailableModel:
+        calls = 0
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="", tool_calls=[{"name": "read_source", "args": {"path": "needed.py"}, "id": "1"}]
+                )
+            return AIMessage(
+                content="", tool_calls=[{"name": "submit_verdict", "args": accepted(source), "id": str(self.calls)}]
+            )
+
+    verifier = Verifier(store, UnavailableModel(), EvidenceGateway(store, Gateway()))
+    case_context = ContextBuilder(store).verifier("case")
+    result, _ = await verifier._claim(case_context, case_context["claims"][0])
+    assert result["verdict"] == "unresolved"
+    assert result["tool_failures"] and "needed.py" in result["gaps"][0]

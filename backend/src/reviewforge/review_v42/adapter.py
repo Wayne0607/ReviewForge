@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 from reviewforge.engine.review_context import ReviewContext
-from reviewforge.review_v42.snapshot import read_snapshot_bytes, snapshot_identity
+from reviewforge.review_v42.snapshot import read_snapshot_blob, read_snapshot_bytes, snapshot_identity
 from reviewforge.tools.workspace import WorkspaceUnavailable, _normalise_repo_path
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
@@ -124,7 +124,7 @@ class PinnedToolGateway:
             ),
             _spec(
                 "read_diff",
-                "Read the complete captured diff for one changed path; not head source.",
+                "Read a captured diff or a verified not_changed/not_found query receipt; not head source.",
                 {"path": string},
                 ["path"],
             ),
@@ -190,10 +190,15 @@ class PinnedToolGateway:
         path, side = args["path"], args.get("side", "head")
         if not isinstance(path, str) or _normalise_repo_path(path) != path or side not in {"head", "base"}:
             raise ValueError("invalid pinned source path or side")
-        if side == "head":
-            content = (await read_snapshot_bytes(self.workspace, path)).decode("utf-8")
-        elif self.base_workspace is not None:
-            content = (await read_snapshot_bytes(self.base_workspace, path)).decode("utf-8")
+        selected = self.workspace if side == "head" else self.base_workspace
+        if selected is not None:
+            if getattr(selected, "_review_v42_body_manifest", None) is None:
+                await snapshot_identity(selected)
+            if path not in selected._review_v42_body_manifest:
+                # Absence is only known in a complete, still valid snapshot.
+                digest = await snapshot_identity(selected)
+                return self._query("not_found", path, side=side, snapshot_digest=digest)
+            content = (await read_snapshot_bytes(selected, path)).decode("utf-8")
         else:
             if not self.github or not self.state.base_sha:
                 raise WorkspaceUnavailable("base source provider unavailable")
@@ -205,14 +210,81 @@ class PinnedToolGateway:
         if content is None or "\x00" in content:
             raise WorkspaceUnavailable("source unavailable or binary")
         lines = content.splitlines(keepends=True)
-        start, end = args.get("start_line", 1), args.get("end_line", len(lines))
+        start = args.get("start_line", 1)
+        end = args.get("end_line", max(len(lines), start) if type(start) is int else len(lines))
         if not lines and "start_line" not in args and "end_line" not in args:
             return self._result(content, side=side, path=path, empty=True)
-        if type(start) is not int or type(end) is not int or start < 1 or start > end or end > len(lines):
-            raise ValueError("requested source range outside file")
+        if type(start) is not int or type(end) is not int or start < 1 or start > end:
+            raise ValueError("invalid requested source range")
+        if start > len(lines):
+            return self._query(
+                "out_of_range",
+                path,
+                side=side,
+                file_lines=len(lines),
+                requested_start_line=start,
+                requested_end_line=end,
+            )
+        actual_end = min(end, len(lines))
         return self._result(
-            "".join(lines[start - 1 : end]), side=side, path=path, start_line=start, end_line=end, file_lines=len(lines)
+            "".join(lines[start - 1 : actual_end]),
+            side=side,
+            path=path,
+            start_line=start,
+            end_line=actual_end,
+            file_lines=len(lines),
+            requested_start_line=start,
+            requested_end_line=end,
+            at_eof=actual_end == len(lines),
         )
+
+    def _query(self, status: str, path: str, *, side: str = "head", **facts: Any) -> dict:
+        """A version-bound query result is navigation, never executable source."""
+        payload = {"status": status, "path": path, "side": side, **facts}
+        return self._result(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            side=side,
+            kind="query",
+            path=path,
+            status=status,
+            navigation_only=True,
+            **facts,
+        )
+
+    async def _diff(self, path: str) -> dict:
+        if not isinstance(path, str) or _normalise_repo_path(path) != path:
+            raise ValueError("invalid pinned diff path")
+        if path in (self.state.file_diffs or {}):
+            return self._result(self.state.file_diffs[path], kind="diff", path=path, navigation_only=True)
+        if self.base_workspace is None:
+            raise WorkspaceUnavailable("diff absence requires complete fixed base and head snapshots")
+        head_digest = await snapshot_identity(self.workspace)
+        base_digest = await snapshot_identity(self.base_workspace)
+        present = {
+            "base": path in self.base_workspace._review_v42_body_manifest,
+            "head": path in self.workspace._review_v42_body_manifest,
+        }
+        facts = {
+            "snapshots": {"base": base_digest, "head": head_digest},
+            "present": present,
+            "base_revision": self.base_sha,
+            "head_revision": self.state.head_sha,
+        }
+        if not any(present.values()):
+            return self._query("not_found", path, **facts)
+        if all(present.values()):
+            before = await read_snapshot_blob(self.base_workspace, path)
+            after = await read_snapshot_blob(self.workspace, path)
+            if before == after:
+                return self._query(
+                    "not_changed",
+                    path,
+                    comparison="file_content",
+                    content_sha256=hashlib.sha256(after).hexdigest(),
+                    **facts,
+                )
+        # A missing entry alone cannot prove no change, even in offline adapters.
+        raise WorkspaceUnavailable("fixed snapshots differ but the captured diff is missing")
 
     async def _search(self, args: dict, *, references: bool = False) -> dict:
         query, glob = args["symbol" if references else "query"], args.get("glob", "")
@@ -271,10 +343,7 @@ class PinnedToolGateway:
             if name in {"search_code", "find_references"}:
                 return await self._search(args, references=name == "find_references")
             if name == "read_diff":
-                path = args["path"]
-                if path not in (self.state.file_diffs or {}):
-                    raise WorkspaceUnavailable("no captured diff for this path")
-                return self._result(self.state.file_diffs[path], kind="diff", path=path, navigation_only=True)
+                return await self._diff(args["path"])
             mapping = {
                 "read_knowledge": "read_review_knowledge",
                 "search_knowledge": "query_review_knowledge",
@@ -337,9 +406,11 @@ class PinnedToolGateway:
                 complete=available,
             )
         except (OSError, UnicodeError, WorkspaceUnavailable) as exc:
+            reason = str(exc) if isinstance(exc, WorkspaceUnavailable) else type(exc).__name__
             return self._result(
-                str(exc) if isinstance(exc, WorkspaceUnavailable) else type(exc).__name__,
+                reason,
                 kind="failure",
                 status="unavailable",
                 complete=False,
+                reason=reason,
             )

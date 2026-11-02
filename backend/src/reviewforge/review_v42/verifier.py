@@ -133,7 +133,8 @@ def _citation(store: Any, cite: Any) -> str:
     ):
         raise ValueError("issue snapshot is missing its external provenance or time boundary")
     if (
-        ref.metadata.get("status", "success") not in {"success", "available", "ok", "executed"}
+        ref.kind == "query"
+        or ref.metadata.get("status", "success") not in {"success", "available", "ok", "executed"}
         or ref.metadata.get("complete") is False
         or ref.metadata.get("navigation_only") is True
     ):
@@ -353,16 +354,26 @@ class Verifier:
                         if signature in seen_actions:
                             raise ValueError("no progress: repeated evidence receipt")
                         seen_actions.add(signature)
+                        metadata = result.get("metadata", {})
+                        status = metadata.get("status", "available")
+                        known_query = (
+                            status in {"not_found", "not_changed", "out_of_range"}
+                            and result.get("kind") == "query"
+                            and metadata.get("navigation_only") is True
+                        )
                         if (
                             result.get("error")
                             or result.get("status") == "unavailable_non_utf8"
-                            or result.get("metadata", {}).get("status", "available")
-                            not in {
-                                "available",
-                                "success",
-                                "ok",
-                                "executed",
-                            }
+                            or (
+                                not known_query
+                                and status
+                                not in {
+                                    "available",
+                                    "success",
+                                    "ok",
+                                    "executed",
+                                }
+                            )
                         ):
                             failures[key] = {"name": name, "args": args, "receipt": result}
                         else:
@@ -400,12 +411,20 @@ class Verifier:
             status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
             if status in {401, 402, 403}:
                 raise
+            unresolved_failures = list(failures.values())
+            gaps = [
+                "Unresolved tool failure: " + json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+                for item in unresolved_failures
+            ]
+            gaps.append(str(exc) or type(exc).__name__)
             return {
                 "verdict": "unresolved",
                 "reason": "Verification did not complete",
                 "facts": {},
-                "gaps": [str(exc) or type(exc).__name__],
+                "gaps": gaps,
                 "cited_refs": [],
+                "tool_failures": unresolved_failures,
+                "failure_explanation": "",
             }, allowed
 
     async def verify(

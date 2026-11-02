@@ -4,6 +4,8 @@
 
 ## 当前实施：独立 v4.2 内核
 
+最新诊断（2026-11-02）：用户再次切换控制台至`deepseek-v4.1-flash-free`。新路由同输入探针首尝试返回4条有效工具调用；完整Cal.com诊断暴露普通EOF窗口、未变更diff与已知不存在路径被混为工具不可用，以及发现任务契约表达不足。已修正并用真实固定快照/工具/工作板/Reviewer串测验收，真实故障仍partial，query不能作为独立核验证据；全套合计3360 passed、1 skipped。旧冻结诊断人工停止，1635356已知tokens、6失败+1中断未知、0Case/0评论，未判分。此前本轮开发合计3026559已知tokens、23未知，后续新版本单独评测，尚不宣称质量或成本改善。细节见方案19.4–19.5节。
+
 用户授权三名 GPT-6.1 Terra / xhigh 按 [v4.2 方案](v4.2-architecture.md) 编码，主代理完成产品与基准入口集成。新目录 `backend/src/reviewforge/review_v42/` 不复用旧阶段控制循环；启用值为 `REVIEWFORGE_PIPELINE=review_v42`，默认仍为 `legacy`。当前只写本地报告及发布 outbox，不向 GitHub 投递。
 
 实现包括：当前工作板/原始证据/审计分离、连续 Reviewer、独立 Verifier、同案例补证、明确辅助问题、版本冲突与租约、原生会话恢复、上下文容量恢复与显式证据分页、固定 merge-base/head 字节快照对比、外部资料独立时点、逐物理请求用量与未知回执。完整后端回归 3265 passed、1 skipped（6 个既有弃用警告），严格裁判回归 2 项通过，spec-check 通过；后续增量检查见方案实施记录。

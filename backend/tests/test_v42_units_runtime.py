@@ -73,12 +73,29 @@ async def test_runtime_delivers_each_unit_then_separate_integration(tmp_path, re
             self.integration_refs = None
 
         def bind_tools(self, tools, **kwargs):
+            self.tools = {tool["function"]["name"]: tool["function"] for tool in tools}
             return self
 
         async def ainvoke(self, messages):
             board = json.loads(messages[1].content)
             role = board["unit_role"]
             scope = board["scope"]
+            system = messages[0].content
+            assert "record_region_progress" not in system
+            assert "record_region_progress" not in self.tools and "finish_scope" not in self.tools
+            if role == "primary":
+                assert {"submit_unit_decision", "register_unit_dependency"} <= self.tools.keys()
+                assert "finish_integration" not in self.tools
+                assert "entire region" in system and "same tool batch" in system
+                assert "owned region's diff" in system and "pinned source side first" in system
+                assert "current successful request" in self.tools["submit_unit_decision"]["description"]
+                nested = self.tools["submit_unit_decision"]["parameters"]["properties"]["observations"]["items"]
+                assert set(nested["required"]) == {"statement", "evidence_refs", "region_ids"}
+                assert nested["additionalProperties"] is False
+            else:
+                assert {"record_integration_receipt", "finish_integration"} <= self.tools.keys()
+                assert "submit_unit_decision" not in self.tools
+                assert "separate cross-unit integration review" in system
             previous = [json.loads(m.content) for m in messages if m.type == "tool"]
             self.calls.append((role, scope["id"]))
             if role == "primary":
@@ -921,3 +938,17 @@ async def test_integration_candidate_gap_gets_one_followup_without_new_evidence(
     result = await ReviewRuntime(store, model, PinnedGateway(), verifier).run(regions)
     assert result["status"] == "partial"
     assert model.followups == 1 and verifier.calls == 1
+
+
+def test_previous_frontier_policy_retains_original_prompt(tmp_path):
+    from test_v42_frontier_reviewer import setup_frontier
+    from test_v42_stateful_reviewer import Gateway
+
+    from reviewforge.review_v42.reviewer import FRONTIER_PROMPT, PROMPT, WORKSPACE_PROMPT, Reviewer
+    from reviewforge.review_v42.tools import EvidenceGateway
+
+    store, scope, task = setup_frontier(tmp_path)
+    reviewer = Reviewer(
+        store, object(), EvidenceGateway(store, Gateway()), task_id=task.id, lease_token=task.lease_token
+    )
+    assert reviewer._context(scope.id)[0].content == PROMPT + WORKSPACE_PROMPT + FRONTIER_PROMPT

@@ -47,10 +47,11 @@ PROMPT = (
 )
 
 STATEFUL_PROMPT = (
-    " For each batch containing source reads, attach review_state to at least one read call. "
+    " For each batch containing source reads, attach one review_state to the first read call only; "
+    "omit review_state from the other reads. "
     "Give question and next_step as nonempty strings, observations as a list of {statement, evidence_refs}, "
     "and open_questions as a list of strings. Cite only saved evidence IDs in observations. "
-    "This is brief visible navigation, not hidden reasoning. All reads in a batch must agree on the state. "
+    "This is brief visible navigation, not hidden reasoning. If multiple calls include it, their states must agree. "
     "The latest working state and evidence directory persist; previous source bodies can be reread by reference."
 )
 
@@ -235,6 +236,55 @@ def _semantic_board(store: Any, scope_id: str) -> str:
         return value
 
     return json.dumps(without_bookkeeping(board), sort_keys=True, default=str)
+
+
+def _protocol_failure(response: Any, errors: list[str]) -> tuple[str, str, str]:
+    class ObjectPairs(list):
+        pass
+
+    def normalized_args(value: Any) -> Any:
+        if not isinstance(value, str):
+            if isinstance(value, dict):
+                return {key: item for key, item in value.items() if key != "review_state"}
+            return value
+        try:
+            parsed = json.loads(value, object_pairs_hook=ObjectPairs)
+        except (TypeError, ValueError):
+            return value
+
+        def encode(item: Any, *, root: bool = False) -> Any:
+            if isinstance(item, ObjectPairs):
+                pairs = ((key, val) for key, val in item if not root or key != "review_state")
+                return {"object_pairs": [[key, encode(val)] for key, val in sorted(pairs, key=lambda pair: pair[0])]}
+            if isinstance(item, list):
+                return [encode(val) for val in item]
+            return item
+
+        return encode(parsed, root=True)
+
+    extra = getattr(response, "additional_kwargs", {}) or {}
+    raw = extra.get("reviewforge_raw_tool_calls", extra.get("tool_calls"))
+    if isinstance(raw, list):
+        raw = [
+            {
+                "type": item.get("type"),
+                "name": (item.get("function") or {}).get("name"),
+                "arguments": normalized_args((item.get("function") or {}).get("arguments")),
+            }
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+            else item
+            for item in raw
+        ]
+    invalid = getattr(response, "invalid_tool_calls", None)
+    if isinstance(invalid, list):
+        invalid = [
+            {"name": item.get("name"), "args": normalized_args(item.get("args")), "error": item.get("error")}
+            if isinstance(item, dict)
+            else item
+            for item in invalid
+        ]
+    detail = {"errors": errors, "raw": raw, "invalid": invalid}
+    return ("native_protocol", "", json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str))
 
 
 def _complete_tool_exchange(messages: list[Any]) -> bool:
@@ -479,6 +529,7 @@ class Reviewer:
         seen_actions: set[tuple[str, str, str]] = set()
         semantic_board = None
         repeated_actions = 0
+        previous_failed_batch = None
         try:
             while True:
                 current_input = context_fingerprint(messages_to_dict(chat))
@@ -526,7 +577,26 @@ class Reviewer:
                         self.task_id, self.lease_token, turn_id, "response", messages_to_dict(chat[exchange_start:])
                     )
                 if not calls:
+                    if stateful and errors:
+                        signature = (_semantic_board(self.store, scope_id), (_protocol_failure(response, errors),))
+                        feedback = HumanMessage(content="Malformed tool calls: " + ", ".join(errors))
+                        chat.append(feedback)
+                        self.store.append_turn_audit(
+                            self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict(chat[exchange_start:])
+                        )
+                        repeated_failure = signature == previous_failed_batch
+                        previous_failed_batch = signature
+                        if repeated_failure:
+                            scope = self.store.get(ReviewScope, scope_id)
+                            self._update_scope(scope, status="partial")
+                            self.error = "repeated_failed_batch"
+                        chat = [*self._context(scope_id), *chat[exchange_start:]]
+                        self._save_session(chat)
+                        if repeated_failure:
+                            return "partial"
+                        continue
                     if stateful:
+                        previous_failed_batch = None
                         self.store.append_turn_audit(
                             self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict(chat[exchange_start:])
                         )
@@ -552,9 +622,14 @@ class Reviewer:
                         if errors:
                             state_error = "malformed tool calls prevent validating the source read batch"
                         elif not proposed:
-                            state_error = "source read batch requires review_state"
+                            state_error = (
+                                "source read batch requires review_state on its first read; omit it on other reads"
+                            )
                         elif any(item != proposed[0] for item in proposed[1:]):
-                            state_error = "source read batch has conflicting review_state values"
+                            state_error = (
+                                "source read batch has conflicting review_state values; keep one on the first read "
+                                "and remove the others"
+                            )
                         else:
                             try:
                                 self._refs(_validate_review_state(proposed[0]))
@@ -583,6 +658,8 @@ class Reviewer:
                 had_read = False
                 had_error = bool(errors or invalid or state_error)
                 finished = None
+                batch_failures = [_protocol_failure(response, errors)] if stateful and errors else []
+                batch_only_failures = True
                 for call_index, call in enumerate(sorted(calls, key=lambda item: item["name"] == "finish_scope")):
                     name, call_id = call["name"], call.get("id") or ""
                     args = {k: v for k, v in call["args"].items() if not stateful or k != "review_state"}
@@ -595,7 +672,15 @@ class Reviewer:
                     )
                     signature = (name, json.dumps(args, sort_keys=True, default=str), board)
                     if state_error and (name in source_names or name == "read_evidence"):
-                        feedback = ToolMessage(content=json.dumps({"error": state_error}), tool_call_id=call_id)
+                        result = {"error": state_error}
+                        batch_failures.append(
+                            (
+                                name,
+                                json.dumps(args, sort_keys=True, default=str),
+                                action_receipt_signature(name, result),
+                            )
+                        )
+                        feedback = ToolMessage(content=json.dumps(result), tool_call_id=call_id)
                         chat.append(feedback)
                         self.store.append_turn_audit(
                             self.task_id,
@@ -692,27 +777,30 @@ class Reviewer:
                                     Question, existing.id, existing.revision, status="unresolved", answer=""
                                 )
                             result["question_id"] = existing.id
-                    # Compare all prior receipts for this same semantic state, not just
-                    # the immediately preceding action (A/B cycles are still cycles).
                     receipt = action_receipt_signature(name, result)
-                    if board != semantic_board:
-                        semantic_board, seen_actions, repeated_actions = board, set(), 0
                     action_key = (name, json.dumps(args, sort_keys=True, default=str), receipt)
                     had_error = had_error or "error" in result
-                    if action_key in seen_actions:
-                        repeated_actions += 1
-                        if repeated_actions >= 2:
-                            raise RuntimeError("stalled: repeated action and result in the same state")
-                        result = {
-                            "result": result,
-                            "warning": "Same action and result in this state. "
-                            "Finish or investigate a concrete different question.",
-                        }
+                    if stateful:
+                        if "error" in result:
+                            batch_failures.append(action_key)
+                        else:
+                            batch_only_failures = False
                     else:
-                        # A different receipt changes the observed evidence state;
-                        # it is not itself a semantic progress claim.
-                        seen_actions.add(action_key)
-                        repeated_actions = 0
+                        # Preserve the historical per-action loop semantics for old runs.
+                        if board != semantic_board:
+                            semantic_board, seen_actions, repeated_actions = board, set(), 0
+                        if action_key in seen_actions:
+                            repeated_actions += 1
+                            if repeated_actions >= 2:
+                                raise RuntimeError("stalled: repeated action and result in the same state")
+                            result = {
+                                "result": result,
+                                "warning": "Same action and result in this state. "
+                                "Finish or investigate a concrete different question.",
+                            }
+                        else:
+                            seen_actions.add(action_key)
+                            repeated_actions = 0
                     chat.append(
                         ToolMessage(content=json.dumps(result, ensure_ascii=False, default=str), tool_call_id=call_id)
                     )
@@ -736,6 +824,17 @@ class Reviewer:
                     self.store.append_turn_audit(
                         self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict(chat[exchange_start:])
                     )
+                    batch_signature = (
+                        (_semantic_board(self.store, scope_id), tuple(batch_failures))
+                        if batch_only_failures and batch_failures
+                        else None
+                    )
+                    if batch_signature is not None and batch_signature == previous_failed_batch:
+                        scope = self.store.get(ReviewScope, scope_id)
+                        self._update_scope(scope, status="partial")
+                        self.error = "repeated_failed_batch"
+                        finished = "partial"
+                    previous_failed_batch = batch_signature
                     chat = [*self._context(scope_id), *chat[exchange_start:]]
                 elif semantic_changed and not had_read and not errors and not invalid:
                     chat = self._context(scope_id)

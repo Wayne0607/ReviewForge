@@ -1,11 +1,12 @@
 import asyncio
+import copy
 import json
 
 import pytest
 from langchain_core.messages import AIMessage
 
 from reviewforge.review_v42.contracts import Case, EvidenceRef, Question, Run, Task
-from reviewforge.review_v42.reviewer import Reviewer
+from reviewforge.review_v42.reviewer import Reviewer, _protocol_failure
 from reviewforge.review_v42.scope import compile_scopes
 from reviewforge.review_v42.store import ReviewStore
 from reviewforge.review_v42.tools import EvidenceGateway
@@ -134,8 +135,12 @@ async def test_missing_and_conflicting_state_feedback_is_recoverable(tmp_path):
     assert await reviewer.run(scope.id) == "reviewed"
     assert gateway.calls == [("read_source", {"path": "ok"})]
     assert not store.list(Question)
+    assert "first read call only" in model.inputs[0][0].content
+    assert "omit review_state from the other reads" in model.inputs[0][0].content
     assert "requires review_state" in next(m.content for m in model.inputs[1] if m.type == "tool")
-    assert all("conflicting review_state" in m.content for m in model.inputs[2] if m.type == "tool")
+    assert all(
+        "keep one on the first read and remove the others" in m.content for m in model.inputs[2] if m.type == "tool"
+    )
     assert "invalid review_state" in next(m.content for m in model.inputs[3] if m.type == "tool")
 
 
@@ -313,4 +318,246 @@ async def test_failed_read_with_changing_notes_is_not_progress(tmp_path):
     )
     assert await reviewer.run(scope.id) == "partial"
     assert len(store.list(Question)) == 1
-    assert len(model.inputs) < 6
+    assert len(model.inputs) == 2 and reviewer.error == "repeated_failed_batch"
+    exchanges = [row for row in store.read_turn_audit(task.id) if row["phase"] == "exchange"]
+    assert len(exchanges) == 2 and all(len(row["messages"]) == 2 for row in exchanges)
+    assert store.load_task_session(task.id)
+
+
+async def test_interleaved_successful_rereads_do_not_abort_later_new_batch_actions(tmp_path):
+    store, scope, task = setup(tmp_path)
+    raw = Gateway()
+    diff_spec = copy.deepcopy(raw.tool_specs[0])
+    diff_spec["function"]["name"] = "read_diff"
+    raw.tool_specs.append(diff_spec)
+    gateway = EvidenceGateway(store, raw)
+    refs = {
+        name: store.put_evidence(name.encode(), revision="head", side="head", kind="source", path=name).id
+        for name in ("A", "B", "C")
+    }
+    await gateway.execute("read_diff", {"path": "P"})
+    raw.calls.clear()
+    state = review_state()
+    model = ScriptedModel(
+        [
+            [
+                call("read_evidence", {"ref": refs["A"], "review_state": state}, "first_a"),
+                call("read_evidence", {"ref": refs["B"]}, "first_b"),
+                call("read_diff", {"path": "P"}, "first_p"),
+            ],
+            [
+                call("read_evidence", {"ref": refs["A"], "review_state": state}, "again_a"),
+                call("read_evidence", {"ref": refs["C"]}, "new_c"),
+                call("read_evidence", {"ref": refs["B"]}, "again_b"),
+            ],
+            [
+                call("read_diff", {"path": "P", "review_state": state}, "again_p"),
+                call("read_diff", {"path": "Q"}, "new_q"),
+                call("read_diff", {"path": "R"}, "new_r"),
+                call("read_diff", {"path": "S"}, "new_s"),
+            ],
+            [call("finish_scope", {"checked_regions": ["one"]})],
+        ]
+    )
+    reviewer = Reviewer(store, model, gateway, task_id=task.id, lease_token=task.lease_token)
+    assert await reviewer.run(scope.id) == "reviewed"
+    assert [args["path"] for name, args in raw.calls if name == "read_diff"] == ["P", "P", "Q", "R", "S"]
+    third_exchange = [m for m in model.inputs[3] if m.type == "tool"]
+    assert [m.tool_call_id for m in third_exchange] == ["again_p", "new_q", "new_r", "new_s"]
+    assert all(json.loads(m.content)["content"].startswith("BODY_") for m in third_exchange)
+    exchanges = [row for row in store.read_turn_audit(task.id) if row["phase"] == "exchange"]
+    assert len(exchanges) == 4 and len(exchanges[2]["messages"]) == 5
+
+
+async def test_different_failure_batches_do_not_accumulate_as_a_loop(tmp_path):
+    store, scope, task = setup(tmp_path)
+
+    class SometimesUnavailable(Gateway):
+        async def __call__(self, name, args):
+            if args["path"] == "bad":
+                return {
+                    "content": "workspace unavailable",
+                    "revision": "head",
+                    "side": "head",
+                    "kind": "failure",
+                    "metadata": {"status": "unavailable"},
+                }
+            return await super().__call__(name, args)
+
+    gateway = SometimesUnavailable()
+    model = ScriptedModel(
+        [
+            [call("read_source", {"path": "bad", "review_state": review_state("one")})],
+            [call("read_source", {"path": "new", "review_state": review_state("two")})],
+            [call("read_source", {"path": "bad", "review_state": review_state("three")})],
+            [call("finish_scope", {"checked_regions": ["one"]})],
+        ]
+    )
+    reviewer = Reviewer(store, model, EvidenceGateway(store, gateway), task_id=task.id, lease_token=task.lease_token)
+    assert await reviewer.run(scope.id) == "partial"
+    assert len(model.inputs) == 4 and reviewer.error is None
+    assert len(store.list(Question)) == 1
+
+
+async def test_same_failed_batch_waits_until_all_sibling_receipts_are_audited(tmp_path):
+    store, scope, task = setup(tmp_path)
+
+    class Unavailable(Gateway):
+        async def __call__(self, name, args):
+            return {
+                "content": "workspace unavailable",
+                "revision": "head",
+                "side": "head",
+                "kind": "failure",
+                "metadata": {"status": "unavailable"},
+            }
+
+    model = ScriptedModel(
+        [
+            [
+                call("read_source", {"path": "a", "review_state": review_state(str(i))}, "a"),
+                call("read_source", {"path": "b"}, "b"),
+            ]
+            for i in range(3)
+        ]
+    )
+    reviewer = Reviewer(
+        store, model, EvidenceGateway(store, Unavailable()), task_id=task.id, lease_token=task.lease_token
+    )
+    assert await reviewer.run(scope.id) == "partial"
+    assert len(model.inputs) == 2 and reviewer.error == "repeated_failed_batch"
+    exchanges = [row for row in store.read_turn_audit(task.id) if row["phase"] == "exchange"]
+    assert len(exchanges) == 2 and all(len(row["messages"]) == 3 for row in exchanges)
+    assert len(store.list(Question)) == 2
+
+
+@pytest.mark.parametrize("failure", ["missing", "conflict", "invalid_state", "unknown_tool", "invalid_params"])
+async def test_repeated_identical_protocol_or_parameter_failures_stop_after_full_batch(tmp_path, failure):
+    store, scope, task = setup(tmp_path)
+    gateway = Gateway()
+
+    def batch(index):
+        if failure == "missing":
+            return [call("read_source", {"path": "a"}, "a"), call("read_source", {"path": "b"}, "b")]
+        if failure == "conflict":
+            return [
+                call("read_source", {"path": "a", "review_state": review_state(f"note {index}")}, "a"),
+                call("read_source", {"path": "b", "review_state": review_state(f"other {index}")}, "b"),
+            ]
+        if failure == "invalid_state":
+            return [call("read_source", {"path": "a", "review_state": {"question": str(index)}}, "a")]
+        if failure == "unknown_tool":
+            return [call("unknown_action", {"request": "same"}, "a")]
+        return [call("save_question", {"statement": ""}, "a")]
+
+    model = ScriptedModel([batch(i) for i in range(4)])
+    reviewer = Reviewer(store, model, EvidenceGateway(store, gateway), task_id=task.id, lease_token=task.lease_token)
+    assert await reviewer.run(scope.id) == "partial"
+    assert reviewer.error == "repeated_failed_batch" and len(model.inputs) == 2
+    assert not gateway.calls
+    exchanges = [row for row in store.read_turn_audit(task.id) if row["phase"] == "exchange"]
+    assert len(exchanges) == 2 and all(len(row["messages"]) == len(batch(0)) + 1 for row in exchanges)
+
+
+async def test_different_parameter_failure_then_correction_can_continue(tmp_path):
+    store, scope, task = setup(tmp_path)
+    gateway = Gateway()
+    empty_question = {**review_state(), "question": ""}
+    model = ScriptedModel(
+        [
+            [call("read_source", {"path": "a", "review_state": {}})],
+            [call("read_source", {"path": "a", "review_state": empty_question})],
+            [call("read_source", {"path": "a", "review_state": review_state()})],
+            [call("finish_scope", {"checked_regions": ["one"]})],
+        ]
+    )
+    reviewer = Reviewer(store, model, EvidenceGateway(store, gateway), task_id=task.id, lease_token=task.lease_token)
+    assert await reviewer.run(scope.id) == "reviewed"
+    assert len(model.inputs) == 4 and len(gateway.calls) == 1
+
+
+async def test_repeated_failure_with_successful_sibling_is_not_a_failed_batch(tmp_path):
+    store, scope, task = setup(tmp_path)
+    gateway = Gateway()
+    model = ScriptedModel(
+        [
+            [call("read_source", {"path": "a"}, "read")],
+            [
+                call("read_source", {"path": "a"}, "read"),
+                call("save_question", {"statement": "What is the contract?"}, "q"),
+            ],
+            [call("finish_scope", {"checked_regions": ["one"]})],
+        ]
+    )
+    reviewer = Reviewer(store, model, EvidenceGateway(store, gateway), task_id=task.id, lease_token=task.lease_token)
+    assert await reviewer.run(scope.id) == "partial"
+    assert reviewer.error is None and len(model.inputs) == 3
+    assert len(store.list(Question)) == 1 and store.list(Question)[0].owner != "tool_controller"
+    assert not gateway.calls
+
+
+async def test_repeated_malformed_native_calls_are_protocol_failure_not_provider_failure(tmp_path):
+    store, scope, task = setup(tmp_path)
+    gateway = Gateway()
+
+    class Malformed(ScriptedModel):
+        async def ainvoke(self, messages):
+            self.inputs.append(messages.copy())
+            if len(self.inputs) > 2:
+                return AIMessage(content="", tool_calls=[call("finish_scope", {"checked_regions": ["one"]})])
+            state = review_state(f"note {len(self.inputs)}")
+            ident = f"call-{len(self.inputs)}"
+            if len(self.inputs) == 1:
+                raw = '{"path":"a","path":"b","review_state":' + json.dumps(state) + ',"z":1}'
+            else:
+                raw = '{"z":1,"review_state":' + json.dumps(state) + ',"path":"a","path":"b"}'
+            return AIMessage(
+                content="",
+                tool_calls=[call("read_source", {"path": "b", "review_state": state}, ident)],
+                additional_kwargs={
+                    "reviewforge_raw_tool_calls": [
+                        {
+                            "id": ident,
+                            "type": "function",
+                            "function": {"name": "read_source", "arguments": raw},
+                        }
+                    ]
+                },
+            )
+
+    model = Malformed([])
+    reviewer = Reviewer(store, model, EvidenceGateway(store, gateway), task_id=task.id, lease_token=task.lease_token)
+    assert await reviewer.run(scope.id) == "partial"
+    assert reviewer.error == "repeated_failed_batch" and len(model.inputs) == 2
+    assert not gateway.calls
+    assert len([row for row in store.read_turn_audit(task.id) if row["phase"] == "exchange"]) == 2
+    native = [
+        row["messages"][0]["raw_tool_calls"][0]["function"]["arguments"]
+        for row in store.read_turn_audit(task.id)
+        if row["phase"] == "native"
+    ]
+    assert native[0].startswith('{"path":"a","path":"b"')
+    assert native[1].startswith('{"z":1,"review_state":')
+
+
+def test_native_failure_normalization_preserves_relative_duplicate_order():
+    def response(arguments):
+        return AIMessage(
+            content="",
+            additional_kwargs={
+                "reviewforge_raw_tool_calls": [
+                    {
+                        "id": "call",
+                        "type": "function",
+                        "function": {"name": "read_source", "arguments": arguments},
+                    }
+                ]
+            },
+        )
+
+    left = response('{"path":"a","path":"b","z":1}')
+    same = response('{"z":1,"path":"a","path":"b"}')
+    reversed_duplicates = response('{"z":1,"path":"b","path":"a"}')
+    errors = ["invalid-native-tool-call"]
+    assert _protocol_failure(left, errors) == _protocol_failure(same, errors)
+    assert _protocol_failure(left, errors) != _protocol_failure(reversed_duplicates, errors)

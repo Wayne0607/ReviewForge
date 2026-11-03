@@ -45,6 +45,7 @@ from reviewforge.review_v42.contracts import (
     RevisionConflict,
     Task,
 )
+from reviewforge.review_v42.line_semantics import source_lines
 from reviewforge.review_v42.shared_investigation import SharedInvestigations
 from reviewforge.review_v42.tools import InvalidEvidenceRequestError
 
@@ -918,6 +919,170 @@ class Reviewer:
             return content
         return None
 
+    def _source_union_enabled(self) -> bool:
+        return (
+            self._shared_enabled()
+            and self.store.run.metadata.get("source_line_policy") == "git-lf-1"
+            and self.store.run.metadata.get("frontier_projection_policy") == "source-line-union-1"
+        )
+
+    def _union_source_frontier(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project matching pinned source pages without changing their immutable references."""
+        run = self.store.run
+        groups: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = {}
+        for index, entry in enumerate(entries):
+            if entry.get("kind") != "source":
+                continue
+            identity = tuple(entry.get(key) for key in ("repo", "source_revision", "side", "path", "environment"))
+            if not all(isinstance(value, str) for value in identity):
+                continue
+            groups.setdefault(identity, []).append((index, entry))
+
+        replacements: dict[int, list[dict[str, Any]]] = {}
+        removed: set[int] = set()
+        for identity, group in groups.items():
+            if len(group) < 2:
+                continue
+            repo, revision, side, path, environment = identity
+            if repo != run.repo or side not in {"base", "head"} or revision != getattr(run, side) or not path:
+                continue
+            verified = []
+            valid = True
+            for index, entry in group:
+                aliases = entry.get("aliases")
+                if (
+                    not isinstance(aliases, list)
+                    or not aliases
+                    or any(not isinstance(ref_id, str) or not ref_id for ref_id in aliases)
+                    or len(set(aliases)) != len(aliases)
+                ):
+                    valid = False
+                    break
+                content = entry.get("content")
+                if not isinstance(content, str):
+                    valid = False
+                    break
+                lines = source_lines(run, content, keepends=True)
+                if not lines or hashlib.sha256(content.encode("utf-8")).hexdigest() != entry.get("content_hash"):
+                    valid = False
+                    break
+                entry_start = entry.get("start_line")
+                entry_end = entry.get("end_line")
+                mappings = []
+                for ref_id in aliases:
+                    if not isinstance(ref_id, str) or not ref_id:
+                        valid = False
+                        break
+                    try:
+                        ref = self.store.get(EvidenceRef, ref_id)
+                    except KeyError:
+                        valid = False
+                        break
+                    raw = self.store.read_evidence(ref_id)
+                    try:
+                        self.store._validate_question_original(ref)
+                        if (
+                            ref.run_id != run.id
+                            or ref.repo != repo
+                            or ref.revision != revision
+                            or ref.side != side
+                            or ref.kind != "source"
+                            or ref.path != path
+                            or ref.environment != environment
+                            or ref.metadata.get("workspace_digest") != run.metadata.get("workspace_digest")
+                        ):
+                            raise ValueError("source identity differs")
+                        original = source_lines(run, raw.decode("utf-8", errors="strict"), keepends=True)
+                        first = ref.start_line if ref.start_line is not None else 1
+                        if type(first) is not int or first < 1 or not original:
+                            raise ValueError("source range differs")
+                        last = first + len(original) - 1
+                        if ref.end_line is not None and ref.end_line != last:
+                            raise ValueError("source range differs")
+                        start = first if entry_start is None else entry_start
+                        end = last if entry_end is None else entry_end
+                        if (
+                            type(start) is not int
+                            or type(end) is not int
+                            or start < first
+                            or end > last
+                            or end < start
+                            or len(lines) != end - start + 1
+                            or lines != original[start - first : end - first + 1]
+                        ):
+                            raise ValueError("source page differs")
+                        if mappings and (start, end) != (mappings[0]["start_line"], mappings[0]["end_line"]):
+                            raise ValueError("source alias range differs")
+                        mappings.append(
+                            {"entry_id": entry["id"], "ref_id": ref_id, "start_line": start, "end_line": end}
+                        )
+                    except (ValueError, UnicodeError):
+                        valid = False
+                        break
+                if not valid:
+                    break
+                verified.append((index, entry, mappings[0]["start_line"], mappings[0]["end_line"], lines, mappings))
+            if not valid:
+                continue
+            ordered = sorted(verified, key=lambda item: (item[2], item[3], item[0]))
+            components: list[list[Any]] = []
+            for item in ordered:
+                if not components or item[2] > components[-1][1] + 1:
+                    components.append([item[2], item[3], [item]])
+                else:
+                    components[-1][1] = max(components[-1][1], item[3])
+                    components[-1][2].append(item)
+            projected = []
+            for start, end, component in components:
+                if len(component) == 1:
+                    projected.append(component[0][1])
+                    continue
+                physical: dict[int, str] = {}
+                mappings = []
+                for _, _, first, _, lines, aliases in component:
+                    for offset, line in enumerate(lines):
+                        number = first + offset
+                        if number in physical and physical[number] != line:
+                            valid = False
+                            break
+                        physical[number] = line
+                    mappings.extend(aliases)
+                    if not valid:
+                        break
+                if not valid or any(number not in physical for number in range(start, end + 1)):
+                    valid = False
+                    break
+                if any(not physical[number].endswith("\n") for number in range(start, end)):
+                    valid = False
+                    break
+                content = "".join(physical[number] for number in range(start, end + 1))
+                projected.append(
+                    {
+                        "kind": "source_union",
+                        "repo": repo,
+                        "source_revision": revision,
+                        "side": side,
+                        "path": path,
+                        "environment": environment,
+                        "workspace_digest": run.metadata["workspace_digest"],
+                        "start_line": start,
+                        "end_line": end,
+                        "content": content,
+                        "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                        "mappings": mappings,
+                    }
+                )
+            if valid:
+                replacements[min(index for index, _ in group)] = projected
+                removed.update(index for index, _ in group)
+        output = []
+        for index, entry in enumerate(entries):
+            if index in replacements:
+                output.extend(replacements[index])
+            elif index not in removed:
+                output.append(entry)
+        return output
+
     def _context(self, scope_id: str, *, recent: list[Any] | None = None) -> list[Any]:
         state = reviewer_context(self.store, scope_id)
         frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}
@@ -945,6 +1110,13 @@ class Reviewer:
                     else ""
                 )
                 + (FRONTIER_PROMPT if frontier else "")
+                + (
+                    " A source_union is a lossless display of fixed original source. Its mappings identify "
+                    "the exact original ref_id and line intersection for each pinned entry; cite a ref_id only "
+                    "for the mapped lines. It is not itself an evidence reference."
+                    if self._source_union_enabled()
+                    else ""
+                )
                 + (SEARCH_INDEX_PROMPT if self.store.run.policy in {"v42-frontier-5", "v42-units-6"} else "")
                 + (INTEGRATION_PROMPT if unit_role == "integration" else UNIT_PROMPT if unit_role else "")
                 + (SHARED_INVESTIGATION_PROMPT if self._shared_enabled() else "")
@@ -1014,6 +1186,8 @@ class Reviewer:
                             "content": raw.decode("utf-8", errors="strict"),
                         }
                     )
+                if self._source_union_enabled():
+                    entries = self._union_source_frontier(entries)
                 context.append(
                     HumanMessage(
                         content=json.dumps(

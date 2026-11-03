@@ -67,6 +67,14 @@ class _FairModel:
 
 class ReviewRuntime:
     def __init__(self, store: Any, llm: Any, gateway: Any, verifier: Any):
+        metadata = store.run.metadata
+        if "frontier_projection_policy" in metadata and (
+            metadata["frontier_projection_policy"] != "source-line-union-1"
+            or store.run.policy != "v42-units-6"
+            or metadata.get("shared_investigation") != "shared-1"
+            or metadata.get("source_line_policy") != "git-lf-1"
+        ):
+            raise ValueError("unsupported v4.2 frontier projection policy")
         self.store, self.llm, self.verifier = store, llm, verifier
         self.gateway = gateway if isinstance(gateway, EvidenceGateway) else EvidenceGateway(store, gateway)
         self._queue: asyncio.Queue[str] = asyncio.Queue()

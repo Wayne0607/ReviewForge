@@ -90,6 +90,14 @@ class ReviewStore:
             or run.metadata.get("shared_investigation") != "shared-1"
         ):
             raise BindingError("unsupported candidate draft policy")
+        projection = run.metadata.get("frontier_projection_policy")
+        if "frontier_projection_policy" in run.metadata and (
+            projection != "source-line-union-1"
+            or run.policy != "v42-units-6"
+            or run.metadata.get("shared_investigation") != "shared-1"
+            or run.metadata.get("source_line_policy") != "git-lf-1"
+        ):
+            raise BindingError("unsupported frontier projection policy")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
@@ -1019,6 +1027,157 @@ class ReviewStore:
             refs.update(FrontierEntry(**json.loads(payload)).aliases)
         return refs
 
+    def _source_union_delivered(
+        self, db: sqlite3.Connection, task_id: str, shown: dict[str, Any]
+    ) -> list[tuple[EvidenceRef, int, int]]:
+        """Verify each visible intersection against its immutable task-bound source."""
+        if self.run.metadata.get("frontier_projection_policy") != "source-line-union-1":
+            raise BindingError("source union projection is not enabled")
+        task = self._frontier_task(db, task_id)
+        if task.kind == "review":
+            scope_id = task.object_id
+        else:
+            qrow = db.execute(
+                "SELECT payload FROM objects WHERE kind='Question' AND id=?", (task.object_id,)
+            ).fetchone()
+            if qrow is None:
+                raise BindingError("source union question scope is missing")
+            scope_id = Question(**json.loads(qrow[0])).scope_id
+        start, end, text = shown.get("start_line"), shown.get("end_line"), shown.get("content")
+        mappings = shown.get("mappings")
+        try:
+            content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if isinstance(text, str) else None
+        except UnicodeEncodeError as exc:
+            raise BindingError("source union content is not UTF-8") from exc
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or start < 1
+            or end < start
+            or not isinstance(text, str)
+            or not isinstance(mappings, list)
+            or not mappings
+            or not isinstance(shown.get("content_hash"), str)
+            or content_digest != shown["content_hash"]
+            or len(source_lines(self.run, text, keepends=True)) != end - start + 1
+            or shown.get("repo") != self.run.repo
+            or not isinstance(shown.get("side"), str)
+            or shown["side"] not in {"base", "head"}
+            or shown.get("source_revision") != getattr(self.run, shown.get("side", ""), None)
+            or not isinstance(shown.get("path"), str)
+            or not shown["path"]
+            or not isinstance(shown.get("environment"), str)
+            or not isinstance(shown.get("workspace_digest"), str)
+            or not shown["workspace_digest"]
+            or shown["workspace_digest"] != self.run.metadata.get("workspace_digest")
+        ):
+            raise BindingError("source union segment is invalid")
+        result: list[tuple[EvidenceRef, int, int]] = []
+        seen = set()
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                raise BindingError("source union mapping is invalid")
+            entry_id, ref_id = mapping.get("entry_id"), mapping.get("ref_id")
+            a, b = mapping.get("start_line"), mapping.get("end_line")
+            if (
+                not isinstance(entry_id, str)
+                or not entry_id
+                or not isinstance(ref_id, str)
+                or not ref_id
+                or type(a) is not int
+                or type(b) is not int
+                or a < start
+                or b > end
+                or b < a
+                or (entry_id, ref_id, a, b) in seen
+            ):
+                raise BindingError("source union mapping is invalid")
+            seen.add((entry_id, ref_id, a, b))
+            row = db.execute(
+                "SELECT payload FROM frontier_entries WHERE task_id=? AND entry_id=?", (task_id, entry_id)
+            ).fetchone()
+            if row is None:
+                raise BindingError("source union entry is not owned by this task")
+            try:
+                entry = FrontierEntry(**json.loads(row[0]))
+                ref = self._unit_refs(db, [ref_id])[0]
+                self._validate_question_original(ref)
+                if (
+                    entry.id != entry_id
+                    or entry.run_id != self.run.id
+                    or entry.task_id != task_id
+                    or entry.scope_id != scope_id
+                    or ref_id not in entry.aliases
+                    or ref.kind != "source"
+                    or entry.kind != "source"
+                    or entry.repo != ref.repo
+                    or entry.side != ref.side
+                    or entry.source_revision != ref.revision
+                    or entry.path != ref.path
+                    or entry.environment != ref.environment
+                    or any(
+                        shown[key] != value
+                        for key, value in (
+                            ("repo", ref.repo),
+                            ("side", ref.side),
+                            ("source_revision", ref.revision),
+                            ("path", ref.path),
+                            ("environment", ref.environment),
+                            ("workspace_digest", ref.metadata.get("workspace_digest")),
+                        )
+                    )
+                ):
+                    raise BindingError("source union identity does not match original source")
+                raw = (self.blob_dir / ref.content_hash).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != ref.content_hash:
+                    raise BindingError("source union original blob hash mismatch")
+                if (ref.start_line is not None and (type(ref.start_line) is not int or ref.start_line < 1)) or (
+                    ref.end_line is not None and (type(ref.end_line) is not int or ref.end_line < (ref.start_line or 1))
+                ):
+                    raise BindingError("source union original range is invalid")
+                raw_text = raw.decode("utf-8")
+                raw_last = (ref.start_line or 1) + len(source_lines(self.run, raw_text, keepends=True)) - 1
+                if ref.end_line is not None and ref.end_line != raw_last:
+                    raise BindingError("source union original range does not match its content")
+                page = self._frontier_content(
+                    ref,
+                    raw,
+                    entry.start_line if entry.is_page else None,
+                    entry.end_line if entry.is_page else None,
+                    run=self.run,
+                )
+                if hashlib.sha256(page).hexdigest() != entry.content_hash:
+                    raise BindingError("source union original page hash mismatch")
+                page_text = page.decode("utf-8")
+                first = entry.start_line if entry.is_page else (ref.start_line or 1)
+                last = first + len(source_lines(self.run, page_text, keepends=True)) - 1
+                if (entry.is_page and entry.end_line != last) or (
+                    not entry.is_page
+                    and (
+                        entry.start_line != ref.start_line
+                        or entry.end_line != ref.end_line
+                        or (ref.end_line is not None and ref.end_line != last)
+                    )
+                ):
+                    raise BindingError("source union original page range mismatch")
+                if (a, b) != (max(start, first), min(end, last)):
+                    raise BindingError("source union mapping is not the actual intersection")
+                actual = source_slice(self.run, page_text, a - first + 1, b - first + 1)
+                visible = source_slice(self.run, text, a - start + 1, b - start + 1)
+                if actual.encode("utf-8") != visible.encode("utf-8"):
+                    raise BindingError("source union content differs from its original")
+                result.append((ref, a, b))
+            except (KeyError, OSError, TypeError, ValueError, UnicodeError) as exc:
+                raise BindingError("source union source is unavailable or invalid") from exc
+        next_line = start
+        for _, a, b in sorted(result, key=lambda item: (item[1], item[2])):
+            if a > next_line:
+                break
+            next_line = max(next_line, b + 1)
+        if next_line <= end:
+            raise BindingError("source union contains uncovered lines")
+        return result
+
     def _require_delivered(
         self,
         db: sqlite3.Connection,
@@ -1092,6 +1251,15 @@ class ReviewStore:
                     record(ref, actual.encode("utf-8"), start, end)
             elif message["type"] == "human" and "frontier_revision" in obj and isinstance(obj.get("entries"), list):
                 for shown in obj["entries"]:
+                    if (
+                        self.run.metadata.get("frontier_projection_policy") == "source-line-union-1"
+                        and isinstance(shown, dict)
+                        and shown.get("kind") == "source_union"
+                    ):
+                        for ref, first, last in self._source_union_delivered(db, task_id, shown):
+                            if ref.id in ref_ids:
+                                delivered.setdefault(ref.id, []).append((first, last))
+                        continue
                     if not isinstance(shown, dict) or not isinstance(shown.get("id"), str):
                         continue
                     row = db.execute(

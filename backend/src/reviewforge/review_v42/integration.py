@@ -422,6 +422,14 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
     ):
         raise ValueError("unsupported v4.2 candidate draft policy")
     line_policy = "git-lf-1"
+    frontier_projection = os.environ.get("REVIEWFORGE_V42_FRONTIER_PROJECTION", "").strip()
+    if frontier_projection and (
+        frontier_projection != "source-line-union-1"
+        or EXECUTION_POLICY != "v42-units-6"
+        or shared_investigation != "shared-1"
+        or line_policy != "git-lf-1"
+    ):
+        raise ValueError("unsupported v4.2 frontier projection policy")
     line_run = SimpleNamespace(metadata={"source_line_policy": line_policy})
     database = getattr(orchestrator, "_db", None)
     directory = _state_directory(orchestrator)
@@ -511,6 +519,8 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["question_fencing_policy"] = "question-input-1"
         if candidate_draft:
             metadata["candidate_draft_policy"] = candidate_draft
+        if frontier_projection:
+            metadata["frontier_projection_policy"] = frontier_projection
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

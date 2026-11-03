@@ -209,6 +209,7 @@ def reviewer_tools(
     search_index: bool = False,
     units: bool = False,
     shared_investigation: bool = False,
+    candidate_drafts: bool = False,
 ) -> list[Any]:
     def required(typ):
         return (typ, ...)
@@ -282,6 +283,17 @@ def reviewer_tools(
                     else optional(str, "")
                 ),
                 "open_questions": optional(list[str], []),
+                **(
+                    {
+                        "draft_id": optional(str, ""),
+                        "expected_revision": optional(int | None, None),
+                        "candidate_resolution": optional(str, ""),
+                        "target_draft_id": optional(str, ""),
+                        "target_expected_revision": optional(int | None, None),
+                    }
+                    if candidate_drafts
+                    else {}
+                ),
             },
         ),
         (
@@ -295,6 +307,14 @@ def reviewer_tools(
             {"checked_regions": required(list[str]), "unresolved_refs": optional(list[str], [])},
         ),
     ]
+    if candidate_drafts:
+        definitions.append(
+            (
+                "retract_candidate_draft",
+                "Retract an unverified candidate draft with an explicit reason.",
+                {"draft_id": required(str), "expected_revision": required(int), "reason": required(str)},
+            )
+        )
     if workspace:
         definitions.extend(
             [
@@ -684,7 +704,12 @@ class Reviewer:
     def _decision_id(self) -> str:
         if not self._turn_id or not self._call_id:
             raise ValueError("unit decision requires an audited native tool call ID")
-        return "decision_" + hashlib.sha256(f"{self.task_id}:{self._call_id}".encode()).hexdigest()
+        identity = (
+            json.dumps([self.task_id, self._turn_id, self._call_id], separators=(",", ":"))
+            if self._candidate_drafts_enabled()
+            else f"{self.task_id}:{self._call_id}"
+        )
+        return "decision_" + hashlib.sha256(identity.encode()).hexdigest()
 
     def _shared_enabled(self) -> bool:
         return (
@@ -695,6 +720,9 @@ class Reviewer:
         return (
             self._shared_enabled() and self.store.run.metadata.get("question_assistant_policy") == "question-delivery-1"
         )
+
+    def _candidate_drafts_enabled(self) -> bool:
+        return self._shared_enabled() and self.store.run.metadata.get("candidate_draft_policy") == "candidate-draft-1"
 
     def _shared_action(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Route a native tool call without lending this task another task's lease."""
@@ -905,6 +933,8 @@ class Reviewer:
                 state["shared_investigations"] = SharedInvestigations(self.store).preview(
                     self.task_id, self.lease_token
                 )
+            if self._candidate_drafts_enabled():
+                state["candidate_drafts"] = self.store.pending_candidate_drafts(scope_id)
         context = [
             SystemMessage(
                 content=(UNIT_COMMON_PROMPT if unit_role else PROMPT)
@@ -918,6 +948,18 @@ class Reviewer:
                 + (SEARCH_INDEX_PROMPT if self.store.run.policy in {"v42-frontier-5", "v42-units-6"} else "")
                 + (INTEGRATION_PROMPT if unit_role == "integration" else UNIT_PROMPT if unit_role else "")
                 + (SHARED_INVESTIGATION_PROMPT if self._shared_enabled() else "")
+                + (
+                    " Candidate drafts are unverified leads, not evidence or findings. Correct every invalid "
+                    "reference using independently read sources and submit_case with the draft_id and current "
+                    "expected_revision, or retract_candidate_draft with an explicit reason. To apply a failed "
+                    "attempt with an invalid target, select candidate_resolution=new_case or "
+                    "candidate_resolution=apply_to_draft. For apply_to_draft also provide target_draft_id and its "
+                    "current target_expected_revision. Each failed submission is retained separately; explicitly "
+                    "retract duplicate attempts if appropriate. Unresolved drafts "
+                    "remain open until promoted or retracted."
+                    if self._candidate_drafts_enabled()
+                    else ""
+                )
                 + (
                     " You may delegate a specific open question to an independent assistant. Its answer is an "
                     "untrusted lead: independently review the original sources and unresolved impacts before finishing."
@@ -1259,12 +1301,14 @@ class Reviewer:
         units = self.store.run.policy == "v42-units-6"
         integration = units and scope_id == self.store.get_unit_plan().integration_scope_id
         shared_investigation = self._shared_enabled()
+        candidate_drafts = self._candidate_drafts_enabled()
         definitions = reviewer_tools(
             workspace=workspace,
             frontier=frontier,
             search_index=search_index,
             units=units,
             shared_investigation=shared_investigation,
+            candidate_drafts=candidate_drafts,
         )
         if units:
             hidden = {"finish_scope", "record_region_progress", "delegate_question"}
@@ -1277,6 +1321,8 @@ class Reviewer:
             )
             definitions = [tool for tool in definitions if tool.name not in hidden]
         semantic = {"save_question", "submit_case", "finish_scope", "read_evidence", "delegate_question"}
+        if candidate_drafts:
+            semantic.add("retract_candidate_draft")
         if workspace:
             semantic.update({"update_navigation", "record_region_progress", "list_navigation"})
         if frontier:
@@ -1478,6 +1524,12 @@ class Reviewer:
                         ]
                         self._save_session(chat)
                     continue
+                staged_drafts = {}
+                if candidate_drafts:
+                    staged_drafts = {
+                        draft["origin_call_id"]: draft
+                        for draft in self.store.stage_candidate_batch(self.task_id, self.lease_token, turn_id)
+                    }
                 # Validate records independently before allowing a finish receipt.
                 invalid = {}
                 state_error = ""
@@ -1538,7 +1590,10 @@ class Reviewer:
                 for call in calls:
                     try:
                         args = {k: v for k, v in call["args"].items() if not stateful or k != "review_state"}
-                        if call["name"] in schemas:
+                        if candidate_drafts and call["name"] == "submit_case":
+                            # Store validates the full native arguments and records every error on the draft.
+                            pass
+                        elif call["name"] in schemas:
                             schemas[call["name"]].model_validate(args)
                         elif call["name"] not in source_names:
                             raise ValueError("unknown tool")
@@ -1617,7 +1672,47 @@ class Reviewer:
                         if name == "save_question":
                             result = self._question(scope, args)
                         elif name == "submit_case":
-                            result = self._case(scope, args)
+                            if candidate_drafts:
+                                draft = staged_drafts.get(call_id)
+                                if draft is None:
+                                    raise ValueError("candidate attempt was not durably staged")
+                                candidate_args = {
+                                    key: value
+                                    for key, value in args.items()
+                                    if key
+                                    not in {
+                                        "draft_id",
+                                        "expected_revision",
+                                        "candidate_resolution",
+                                        "target_draft_id",
+                                        "target_expected_revision",
+                                    }
+                                }
+                                result = self.store.submit_candidate_draft(
+                                    self.task_id,
+                                    self.lease_token,
+                                    draft["id"],
+                                    0,
+                                    turn_id=turn_id,
+                                    call_id=call_id,
+                                    args=candidate_args,
+                                )
+                                if result.get("status") == "promoted":
+                                    self.on_case(self.store.get(Case, result["case_id"]))
+                                else:
+                                    result["error"] = "Candidate draft requires correction; see errors."
+                            else:
+                                result = self._case(scope, args)
+                        elif candidate_drafts and name == "retract_candidate_draft":
+                            result = self.store.retract_candidate_draft(
+                                self.task_id,
+                                self.lease_token,
+                                args["draft_id"],
+                                args["expected_revision"],
+                                turn_id=turn_id,
+                                call_id=call_id,
+                                reason=args["reason"],
+                            )
                         elif shared_investigation and name in shared_tools:
                             result = self._shared_action(name, args)
                         elif workspace and name == "update_navigation":

@@ -101,6 +101,101 @@ def _incomplete_batch_impact(
     return blocked_scopes, blocked_cases, False
 
 
+def _candidate_draft_impact(
+    store: Any, scopes: list[ReviewScope], cases: list[Case], db: Any = None
+) -> tuple[list[dict[str, Any]], set[str], bool]:
+    """Classify open drafts without treating them as candidates or sources."""
+    entries = store.pending_candidate_drafts(db=db)
+    if not isinstance(entries, list):
+        raise ValueError("candidate draft view is invalid")
+    active_scopes = {scope.id for scope in scopes if scope.status != "superseded" and scope.run_id == store.run.id}
+    case_by_id = {case.id: case for case in cases}
+    pending, targets, unknown = [], set(), False
+
+    def classify(args: Any, scope_id: str) -> bool:
+        if not isinstance(args, dict):
+            return False
+        target = args.get("case_id", "")
+        if not isinstance(target, str):
+            return False
+        if target:
+            case = case_by_id.get(target)
+            if case is None or case.run_id != store.run.id or case.scope_id != scope_id:
+                return False
+            targets.add(target)
+            return True
+        # A submission without a case ID can still update an exact match.
+        trigger, behavior = args.get("trigger"), args.get("behavior")
+        if not isinstance(trigger, str) or not trigger.strip() or not isinstance(behavior, str) or not behavior.strip():
+            return False
+        targets.update(
+            case.id
+            for case in cases
+            if case.scope_id == scope_id and case.trigger == trigger.strip() and case.mechanism == behavior.strip()
+        )
+        return True
+
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("candidate draft record is invalid")
+        ident, scope_id = entry.get("id"), entry.get("scope_id")
+        args = entry.get("current_args")
+        if (
+            not isinstance(ident, str)
+            or not ident
+            or ident in seen
+            or entry.get("run_id") != store.run.id
+            or scope_id not in active_scopes
+            or entry.get("status") not in {"pending_validation", "repair_needed"}
+            or type(entry.get("revision")) is not int
+            or entry["revision"] < 0
+            or not isinstance(args, dict)
+        ):
+            raise ValueError("candidate draft identity or state is invalid")
+        seen.add(ident)
+        original = entry.get("original_args")
+        resolution = entry.get("target_resolution")
+        if entry.get("requires_resolution") is True:
+            unknown = True
+        elif not isinstance(original, dict) or resolution not in {None, "new", "known", "unknown"}:
+            unknown = True
+        elif resolution == "unknown":
+            unknown = True
+        elif resolution == "known":
+            target_id, expected = original.get("draft_id"), original.get("expected_revision")
+            try:
+                if not isinstance(target_id, str) or not target_id or type(expected) is not int or expected < 0:
+                    raise ValueError("invalid repair target")
+                target_draft = store.get_candidate_draft(target_id, db=db)
+                if (
+                    not isinstance(target_draft, dict)
+                    or target_draft.get("id") != target_id
+                    or target_id == ident
+                    or target_draft.get("run_id") != store.run.id
+                    or target_draft.get("scope_id") != scope_id
+                    or target_draft.get("status") not in {"pending_validation", "repair_needed"}
+                    or type(target_draft.get("revision")) is not int
+                    or target_draft.get("revision") != expected
+                    or target_draft.get("requires_resolution") is not False
+                ):
+                    raise ValueError("repair target is no longer bound")
+                if not classify(target_draft.get("current_args"), scope_id):
+                    raise ValueError("repair target influence is unknown")
+            except (AttributeError, KeyError, TypeError, ValueError, OSError):
+                unknown = True
+        elif any(
+            key in original for key in ("draft_id", "expected_revision", "candidate_resolution", "target_draft_id")
+        ):
+            # Older original drafts have no resolution projection, but repair
+            # attempts must never be treated as new on a missing projection.
+            unknown = True
+        if not classify(args, scope_id):
+            unknown = True
+        pending.append({"id": ident, "scope_id": scope_id, "status": entry["status"], "revision": entry["revision"]})
+    return pending, targets, unknown
+
+
 def _unit_manifest_errors(store: Any, scopes: list[ReviewScope]) -> list[str]:
     """Defensively compare unit coverage to the immutable run manifest."""
     regions = store.run.metadata.get("changed_regions")
@@ -373,6 +468,22 @@ class Publication:
                 pending_cases = {item["case_id"] for item in pending}
             except (AttributeError, KeyError, TypeError, ValueError, OSError):
                 pending_cases = None
+        draft_policy = self.store.run.metadata.get("candidate_draft_policy")
+        open_drafts: list[dict[str, Any]] | None = []
+        draft_targets: set[str] = set()
+        draft_global_block = False
+        if draft_policy is not None:
+            try:
+                if draft_policy != "candidate-draft-1" or not shared:
+                    raise ValueError("unsupported candidate draft policy")
+                open_drafts, draft_targets, draft_global_block = _candidate_draft_impact(self.store, scopes, cases, db)
+                unresolved.extend({"kind": "candidate_draft", **item} for item in open_drafts)
+                if draft_global_block:
+                    unresolved.append({"kind": "candidate_draft", "reason": "draft impact is unknown"})
+            except (AttributeError, KeyError, TypeError, ValueError, OSError):
+                open_drafts = None
+                draft_global_block = True
+                unresolved.append({"kind": "candidate_draft", "reason": "candidate draft view unavailable"})
         seen = {}
         for case in cases:
             if not case.claims:
@@ -433,6 +544,11 @@ class Publication:
                     if units and (pending_cases is None or case.id in pending_cases):
                         unresolved.append(
                             {"case_id": case.id, "claim_id": claim_id, "reason": "new evidence awaits unit review"}
+                        )
+                        continue
+                    if draft_global_block or case.id in draft_targets:
+                        unresolved.append(
+                            {"case_id": case.id, "claim_id": claim_id, "reason": "candidate draft awaits correction"}
                         )
                         continue
                     if shared and (
@@ -546,6 +662,8 @@ class Publication:
             report["incomplete_tool_batches"] = (
                 None if pending_batches is None else [item for entries in pending_batches.values() for item in entries]
             )
+        if draft_policy is not None:
+            report["open_candidate_drafts"] = open_drafts
         return report
 
 

@@ -981,6 +981,34 @@ class ReviewRuntime:
                 self.store.get_verdict(case.id, claim["id"], policy) is None for case in cases for claim in case.claims
             )
         )
+        draft_policy = self.store.run.metadata.get("candidate_draft_policy")
+        pending_drafts: list[str] | None = []
+        if draft_policy is not None:
+            try:
+                if (
+                    draft_policy != "candidate-draft-1"
+                    or self.store.run.policy != "v42-units-6"
+                    or self.store.run.metadata.get("shared_investigation") != "shared-1"
+                ):
+                    raise ValueError("unsupported candidate draft policy")
+                drafts = self.store.pending_candidate_drafts()
+                scope_ids = {scope.id for scope in scopes}
+                if not isinstance(drafts, list) or any(
+                    not isinstance(draft, dict)
+                    or not isinstance(draft.get("id"), str)
+                    or not draft["id"]
+                    or draft.get("run_id") != self.store.run.id
+                    or draft.get("scope_id") not in scope_ids
+                    or draft.get("status") not in {"pending_validation", "repair_needed"}
+                    for draft in drafts
+                ):
+                    raise ValueError("invalid pending candidate draft view")
+                pending_drafts = [draft["id"] for draft in drafts]
+                unresolved = unresolved or bool(pending_drafts)
+            except (AttributeError, KeyError, TypeError, ValueError, OSError):
+                pending_drafts = None
+                unresolved = True
+                self._errors_real.append("candidate draft state unavailable")
         status = (
             "provider_blocked"
             if self._blocked
@@ -990,7 +1018,7 @@ class ReviewRuntime:
                 else "partial"
             )
         )
-        return {
+        result = {
             "status": status,
             "scopes": [{"id": s.id, "status": s.status} for s in scopes],
             "cases": [case.id for case in cases],
@@ -998,3 +1026,6 @@ class ReviewRuntime:
             "pending_tasks": pending,
             "errors": self._errors,
         }
+        if draft_policy is not None:
+            result["pending_candidate_drafts"] = pending_drafts
+        return result

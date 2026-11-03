@@ -414,6 +414,13 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         or shared_investigation != "shared-1"
     ):
         raise ValueError("unsupported v4.2 question assistant")
+    candidate_draft = os.environ.get("REVIEWFORGE_V42_CANDIDATE_DRAFT", "").strip()
+    if candidate_draft and (
+        candidate_draft != "candidate-draft-1"
+        or EXECUTION_POLICY != "v42-units-6"
+        or shared_investigation != "shared-1"
+    ):
+        raise ValueError("unsupported v4.2 candidate draft policy")
     line_policy = "git-lf-1"
     line_run = SimpleNamespace(metadata={"source_line_policy": line_policy})
     database = getattr(orchestrator, "_db", None)
@@ -502,6 +509,8 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         if question_assistant:
             metadata["question_assistant_policy"] = question_assistant
             metadata["question_fencing_policy"] = "question-input-1"
+        if candidate_draft:
+            metadata["candidate_draft_policy"] = candidate_draft
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

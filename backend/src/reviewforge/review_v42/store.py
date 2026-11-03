@@ -10,6 +10,7 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -82,6 +83,13 @@ class ReviewStore:
             fencing != "question-input-1" or not self._question_policy_enabled()
         ):
             raise BindingError("unsupported question fencing policy")
+        candidate_policy = run.metadata.get("candidate_draft_policy")
+        if "candidate_draft_policy" in run.metadata and (
+            candidate_policy != "candidate-draft-1"
+            or run.policy != "v42-units-6"
+            or run.metadata.get("shared_investigation") != "shared-1"
+        ):
+            raise BindingError("unsupported candidate draft policy")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
@@ -162,6 +170,16 @@ class ReviewStore:
                         "task_id TEXT NOT NULL, turn_id TEXT NOT NULL, scope_id TEXT NOT NULL, payload TEXT NOT NULL, "
                         "PRIMARY KEY(task_id,turn_id))"
                     )
+                    if candidate_policy == "candidate-draft-1":
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS candidate_drafts ("
+                            "id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+                            "status TEXT NOT NULL, payload TEXT NOT NULL)"
+                        )
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS candidate_draft_operations ("
+                            "id TEXT PRIMARY KEY, request TEXT NOT NULL, result TEXT NOT NULL)"
+                        )
                     if run.metadata.get("question_assistant_policy") == "question-delivery-1":
                         db.execute(
                             "CREATE TABLE IF NOT EXISTS question_delegations ("
@@ -1364,6 +1382,7 @@ class ReviewStore:
         turn_id: str,
         finish: bool = False,
         now: float | None = None,
+        _db: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         if not isinstance(decision_id, str) or not decision_id.strip() or type(finish) is not bool:
             raise ValueError("decision requires an ID and boolean finish")
@@ -1383,8 +1402,9 @@ class ReviewStore:
             "unresolved": unresolved,
             "finish": finish,
         }
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self._connect() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute("BEGIN IMMEDIATE")
             plan = self._unit_plan_db(db)
             row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
             if row is None:
@@ -1573,6 +1593,7 @@ class ReviewStore:
             blocked = (
                 current_unresolved
                 or self._pending_shared_investigations(db, scope.id)
+                or self.pending_candidate_drafts(scope.id, db=db)
                 or any(
                     q.scope_id == scope.id and q.status in {"open", "disputed", "unresolved"} for q in open_questions
                 )
@@ -1634,7 +1655,8 @@ class ReviewStore:
                 "INSERT INTO unit_decisions VALUES (?,?,?,?)", (decision_id, scope.id, _json(request), _json(result))
             )
             self._event(db, "UnitDecision", decision_id, "commit", result)
-            db.commit()
+            if _db is None:
+                db.commit()
             result["scope"] = updated
             return result
 
@@ -1648,14 +1670,16 @@ class ReviewStore:
         *,
         turn_id: str,
         now: float | None = None,
+        _db: sqlite3.Connection | None = None,
         **changes: Any,
     ) -> Any:
         if cls not in (Question, Case) or {"id", "run_id", "scope_id", "revision"} & changes.keys():
             raise ValueError("invalid unit object update")
         if changes.keys() - {f.name for f in fields(cls)}:
             raise ValueError("unknown unit object fields")
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self._connect() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute("BEGIN IMMEDIATE")
             plan = self._unit_plan_db(db)
             row = db.execute("SELECT payload FROM objects WHERE kind=? AND id=?", (cls.__name__, object_id)).fetchone()
             if row is None:
@@ -1767,7 +1791,8 @@ class ReviewStore:
                     (old.id, plan.integration_scope_id, oid),
                 )
                 self._event(db, "IntegrationObligation", oid, "case_followup", asdict(obligation))
-            db.commit()
+            if _db is None:
+                db.commit()
             return updated
 
     def reopen_unit_for_evidence(
@@ -2373,6 +2398,7 @@ class ReviewStore:
             if (
                 scope.unresolved
                 or self._pending_shared_investigations(db, scope.id)
+                or self.pending_candidate_drafts(db=db)
                 or any(
                     Question(**json.loads(row[0])).scope_id == scope.id
                     and Question(**json.loads(row[0])).status in {"open", "disputed", "unresolved"}
@@ -2541,6 +2567,10 @@ class ReviewStore:
                 reasons.append("integration obligations are open or stale")
             result["pending_sources"] = self.pending_unit_sources(db=db)
             result["pending_cases"] = self.pending_unit_cases(db=db)
+            if self._candidate_draft_enabled():
+                result["pending_candidate_drafts"] = self.pending_candidate_drafts(db=db)
+                if result["pending_candidate_drafts"]:
+                    reasons.append("candidate drafts require repair or explicit withdrawal")
             if result["pending_sources"] or result["pending_cases"]:
                 reasons.append("new evidence still requires unit review")
         except (BindingError, LeaseError, KeyError, OSError, ValueError, TypeError) as exc:
@@ -2677,6 +2707,721 @@ class ReviewStore:
             and self.run.metadata.get("shared_investigation") == "shared-1"
             and self.run.metadata.get("question_assistant_policy") == "question-delivery-1"
         )
+
+    def _candidate_draft_enabled(self) -> bool:
+        return (
+            self.run.policy == "v42-units-6"
+            and self.run.metadata.get("shared_investigation") == "shared-1"
+            and self.run.metadata.get("candidate_draft_policy") == "candidate-draft-1"
+        )
+
+    def list_candidate_drafts(
+        self, scope_id: str | None = None, *, db: sqlite3.Connection | None = None
+    ) -> list[dict[str, Any]]:
+        if not self._candidate_draft_enabled():
+            return []
+        if db is None:
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                return self.list_candidate_drafts(scope_id, db=connection)
+        plan = self._unit_plan_db(db)
+        valid_scopes = {*plan.primary_scope_ids, plan.integration_scope_id}
+        if scope_id is not None and scope_id not in valid_scopes:
+            raise BindingError("candidate draft scope is outside the unit plan")
+        try:
+            rows = db.execute("SELECT id,scope_id,revision,status,payload FROM candidate_drafts ORDER BY id").fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise BindingError("candidate draft directory is unavailable") from exc
+        drafts = []
+        for ident, sid, revision, status, payload in rows:
+            try:
+                item = json.loads(payload)
+                if (
+                    not isinstance(item, dict)
+                    or item.get("id") != ident
+                    or item.get("run_id") != self.run.id
+                    or item.get("scope_id") != sid
+                    or sid not in valid_scopes
+                    or type(revision) is not int
+                    or item.get("revision") != revision
+                    or item.get("status") != status
+                    or status not in {"pending_validation", "repair_needed", "promoted", "retracted", "applied"}
+                    or not isinstance(item.get("original_args"), dict)
+                    or not isinstance(item.get("current_args"), dict)
+                    or not isinstance(item.get("errors"), list)
+                    or any(not isinstance(error, dict) for error in item["errors"])
+                    or any(
+                        not isinstance(item.get(key), str) or not item[key]
+                        for key in ("origin_task_id", "origin_turn_id", "origin_call_id", "response_hash")
+                    )
+                    or re.fullmatch(r"[0-9a-f]{64}", item["response_hash"]) is None
+                    or not isinstance(item.get("case_id"), str)
+                    or not isinstance(item.get("reason"), str)
+                    or type(item.get("requires_resolution")) is not bool
+                    or item.get("target_resolution") not in {"new", "unknown"}
+                    or (
+                        status == "applied"
+                        and (not isinstance(item.get("linked_draft_id"), str) or not item["linked_draft_id"])
+                    )
+                    or (status == "promoted" and (not item["case_id"] or type(item.get("case_revision")) is not int))
+                    or (status == "retracted" and not item["reason"].strip())
+                ):
+                    raise ValueError("candidate draft binding is invalid")
+            except (TypeError, ValueError) as exc:
+                raise BindingError("candidate draft directory is invalid") from exc
+            if scope_id is None or scope_id == sid:
+                drafts.append(item)
+        by_id = {item["id"]: item for item in drafts}
+        for item in drafts:
+            if item["status"] == "applied":
+                target = by_id.get(item["linked_draft_id"])
+                if target is None or target["scope_id"] != item["scope_id"] or target["id"] == item["id"]:
+                    raise BindingError("candidate attempt link is invalid")
+        return drafts
+
+    def pending_candidate_drafts(
+        self, scope_id: str | None = None, *, db: sqlite3.Connection | None = None
+    ) -> list[dict[str, Any]]:
+        if db is None:
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                return self.pending_candidate_drafts(scope_id, db=connection)
+        if scope_id is not None:
+            self.list_candidate_drafts(scope_id, db=db)
+        all_items = self.list_candidate_drafts(db=db)
+        by_id = {item["id"]: item for item in all_items}
+        pending = []
+        for item in all_items:
+            if item["status"] not in {"pending_validation", "repair_needed"} or (
+                scope_id is not None and item["scope_id"] != scope_id
+            ):
+                continue
+            args = item["original_args"]
+            target_id = args.get("draft_id")
+            if item.get("requires_resolution"):
+                state = "unknown"
+            elif target_id is None or target_id == "":
+                state = (
+                    "new"
+                    if args.get("expected_revision") is None
+                    and all(
+                        args.get(key) is None
+                        for key in ("candidate_resolution", "target_draft_id", "target_expected_revision")
+                    )
+                    else "unknown"
+                )
+            else:
+                target = by_id.get(target_id) if isinstance(target_id, str) else None
+                state = (
+                    "known"
+                    if (
+                        target is not None
+                        and target["scope_id"] == item["scope_id"]
+                        and type(args.get("expected_revision")) is int
+                        and target["revision"] == args["expected_revision"]
+                        and target["status"] in {"pending_validation", "repair_needed"}
+                        and not target.get("requires_resolution")
+                    )
+                    else "unknown"
+                )
+            pending.append({**item, "target_resolution": state})
+        return pending
+
+    def get_candidate_draft(self, draft_id: str, *, db: sqlite3.Connection | None = None) -> dict[str, Any]:
+        for item in self.list_candidate_drafts(db=db):
+            if item["id"] == draft_id:
+                return item
+        raise KeyError(draft_id)
+
+    def _candidate_turn_calls(
+        self, db: sqlite3.Connection, task_id: str, token: str, turn_id: str
+    ) -> tuple[list[dict[str, Any]], str]:
+        self._require_delivered(db, task_id, token, turn_id, set())
+        phases = dict(
+            db.execute("SELECT phase,content_hash FROM turn_audit WHERE task_id=? AND turn_id=?", (task_id, turn_id))
+        )
+
+        def audit(phase: str) -> Any:
+            digest = phases[phase]
+            raw = (self.audit_dir / digest).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise BindingError("turn audit blob hash mismatch")
+            return json.loads(raw)
+
+        response = audit("response")
+        if (
+            not isinstance(response, list)
+            or len(response) != 1
+            or not isinstance(response[0], dict)
+            or response[0].get("type") not in {"ai", "AIMessage", "ai_chunk", "AIMessageChunk"}
+            or not isinstance(response[0].get("data"), dict)
+        ):
+            raise BindingError("candidate turn response is invalid")
+        calls = response[0]["data"].get("tool_calls", [])
+        if not isinstance(calls, list) or any(not isinstance(call, dict) for call in calls):
+            raise BindingError("candidate native calls are invalid")
+        ids = [call.get("id") for call in calls]
+        if any(not isinstance(ident, str) or not ident.strip() for ident in ids) or len(ids) != len(set(ids)):
+            raise BindingError("candidate native call IDs are ambiguous")
+        raw_calls = None
+        if "native" in phases:
+            native = audit("native")
+            if (
+                not isinstance(native, list)
+                or len(native) != 1
+                or not isinstance(native[0], dict)
+                or not isinstance(native[0].get("invalid_tool_calls"), list)
+                or native[0]["invalid_tool_calls"]
+                or native[0].get("protocol_errors")
+            ):
+                raise BindingError("candidate native calls are invalid")
+            raw_calls = native[0].get("raw_tool_calls")
+            if raw_calls is not None and (not isinstance(raw_calls, list) or len(raw_calls) != len(calls)):
+                raise BindingError("candidate native call count differs")
+        from reviewforge.engine.native_submission import strict_tool_call
+
+        for call in calls:
+            raw_call = None
+            if raw_calls is not None:
+                matching = [item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]]
+                if len(matching) != 1:
+                    raise BindingError("candidate raw call identity is ambiguous")
+                raw_call = matching[0]
+            strict_tool_call(call, raw_call)
+        return calls, phases["response"]
+
+    def stage_candidate_batch(
+        self, task_id: str, token: str, turn_id: str, *, now: float | None = None
+    ) -> list[dict[str, Any]]:
+        """Persist original candidates from one valid native batch before actions run."""
+        if not self._candidate_draft_enabled():
+            raise BindingError("candidate drafts are not enabled")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            calls, response_hash = self._candidate_turn_calls(db, task_id, token, turn_id)
+            created, result = False, []
+            for call in calls:
+                args = call.get("args")
+                if call.get("name") != "submit_case" or not isinstance(args, dict):
+                    continue
+                call_id = call["id"]
+                ident = (
+                    "draft_"
+                    + hashlib.sha256(
+                        _json([self.run.id, task.object_id, task_id, turn_id, call_id]).encode()
+                    ).hexdigest()
+                )
+                original = dict(args)
+                current = {
+                    key: value
+                    for key, value in args.items()
+                    if key
+                    not in {
+                        "review_state",
+                        "draft_id",
+                        "expected_revision",
+                        "candidate_resolution",
+                        "target_draft_id",
+                        "target_expected_revision",
+                    }
+                }
+                item = {
+                    "id": ident,
+                    "run_id": self.run.id,
+                    "scope_id": task.object_id,
+                    "origin_task_id": task_id,
+                    "origin_turn_id": turn_id,
+                    "origin_call_id": call_id,
+                    "response_hash": response_hash,
+                    "original_args": original,
+                    "current_args": current,
+                    "revision": 0,
+                    "status": "pending_validation",
+                    "errors": [],
+                    "case_id": "",
+                    "reason": "",
+                    "requires_resolution": False,
+                    "target_resolution": "unknown" if args.get("draft_id") else "new",
+                }
+                row = db.execute("SELECT payload FROM candidate_drafts WHERE id=?", (ident,)).fetchone()
+                if row:
+                    existing = json.loads(row[0])
+                    if any(
+                        existing.get(k) != item[k]
+                        for k in (
+                            "run_id",
+                            "scope_id",
+                            "origin_task_id",
+                            "origin_turn_id",
+                            "origin_call_id",
+                            "response_hash",
+                            "original_args",
+                        )
+                    ):
+                        raise RevisionConflict("candidate native identity already has different input")
+                    item = existing
+                else:
+                    db.execute(
+                        "INSERT INTO candidate_drafts VALUES (?,?,0,?,?)",
+                        (ident, task.object_id, item["status"], _json(item)),
+                    )
+                    self._event(db, "CandidateDraft", ident, "stage", item)
+                    created = True
+                result.append(item)
+            if created:
+                scope_row = db.execute(
+                    "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (task.object_id,)
+                ).fetchone()
+                if scope_row is None:
+                    raise BindingError("candidate responsibility is missing")
+                scope = ReviewScope(**json.loads(scope_row[0]))
+                if scope.status == "reviewed":
+                    scope = replace(scope, status="pending", revision=scope.revision + 1)
+                    task = replace(task, input_revision=scope.revision, revision=task.revision + 1)
+                    db.execute(
+                        "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
+                        (scope.revision, _json(asdict(scope)), scope.id),
+                    )
+                    db.execute(
+                        "UPDATE objects SET revision=?,payload=? WHERE kind='Task' AND id=?",
+                        (task.revision, _json(asdict(task)), task.id),
+                    )
+                    plan = self._unit_plan_db(db)
+                    if scope.id != plan.integration_scope_id:
+                        self._reopen_integration(db, plan)
+                    self._event(
+                        db,
+                        "ReviewScope",
+                        scope.id,
+                        "candidate_draft_reopened",
+                        {"task_id": task_id, "turn_id": turn_id},
+                    )
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            db.commit()
+            return result
+
+    def submit_candidate_draft(
+        self,
+        task_id: str,
+        token: str,
+        draft_id: str,
+        expected_revision: int,
+        *,
+        turn_id: str,
+        call_id: str,
+        args: dict[str, Any],
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        if not self._candidate_draft_enabled():
+            raise BindingError("candidate drafts are not enabled")
+        if type(expected_revision) is not int or expected_revision < 0 or not isinstance(args, dict):
+            raise ValueError("candidate revision and arguments are invalid")
+        operation_id = hashlib.sha256(_json([self.run.id, task_id, turn_id, call_id]).encode()).hexdigest()
+        request = {"draft_id": draft_id, "expected_revision": expected_revision, "args": args}
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            calls, _ = self._candidate_turn_calls(db, task_id, token, turn_id)
+            matches = [call for call in calls if call.get("id") == call_id and call.get("name") == "submit_case"]
+            if len(matches) != 1 or not isinstance(matches[0].get("args"), dict):
+                raise BindingError("candidate submission does not match its native call")
+            native_args = matches[0]["args"]
+            business = {
+                key: value
+                for key, value in native_args.items()
+                if key
+                not in {
+                    "review_state",
+                    "draft_id",
+                    "expected_revision",
+                    "candidate_resolution",
+                    "target_draft_id",
+                    "target_expected_revision",
+                }
+            }
+            if business != args:
+                raise BindingError("candidate arguments differ from the native call")
+            attempt = self.get_candidate_draft(draft_id, db=db)
+            if attempt["scope_id"] != task.object_id or (
+                attempt["origin_task_id"],
+                attempt["origin_turn_id"],
+                attempt["origin_call_id"],
+            ) != (task_id, turn_id, call_id):
+                raise BindingError("candidate attempt does not match this native call")
+            previous = db.execute(
+                "SELECT request,result FROM candidate_draft_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            if previous:
+                if previous[0] != _json(request):
+                    raise RevisionConflict("candidate operation has different inputs")
+                return json.loads(previous[1])
+            if attempt["revision"] != expected_revision or attempt["status"] != "pending_validation":
+                raise RevisionConflict("candidate attempt revision or status changed")
+            item = attempt
+            source = None
+            resolution_error = None
+            force_new = False
+            requested_id = native_args.get("draft_id")
+            requested_rev = native_args.get("expected_revision")
+            if requested_id:
+                try:
+                    if not isinstance(requested_id, str) or type(requested_rev) is not int:
+                        raise ValueError("invalid_target")
+                    source = self.get_candidate_draft(requested_id, db=db)
+                    if source["scope_id"] != task.object_id or source["id"] == attempt["id"]:
+                        raise ValueError("unknown_or_wrong_scope")
+                    if source["revision"] != requested_rev or source["status"] not in {
+                        "pending_validation",
+                        "repair_needed",
+                    }:
+                        raise ValueError("target_revision_or_status_changed")
+                    item = source
+                    if source.get("requires_resolution"):
+                        resolution = native_args.get("candidate_resolution")
+                        if resolution == "new_case":
+                            if (
+                                native_args.get("target_draft_id") is not None
+                                or native_args.get("target_expected_revision") is not None
+                            ):
+                                raise ValueError("new_case_cannot_target_draft")
+                            force_new = True
+                        elif resolution == "apply_to_draft":
+                            target_id = native_args.get("target_draft_id")
+                            target_rev = native_args.get("target_expected_revision")
+                            if (
+                                not isinstance(target_id, str)
+                                or type(target_rev) is not int
+                                or target_id == source["id"]
+                            ):
+                                raise ValueError("invalid_explicit_target")
+                            item = self.get_candidate_draft(target_id, db=db)
+                            if (
+                                item["scope_id"] != task.object_id
+                                or item["revision"] != target_rev
+                                or item["status"] not in {"pending_validation", "repair_needed"}
+                            ):
+                                raise ValueError("explicit_target_unavailable_or_changed")
+                            if item.get("requires_resolution"):
+                                raise ValueError("explicit_target_requires_resolution")
+                        else:
+                            raise ValueError("explicit_resolution_required")
+                    elif any(
+                        native_args.get(key) is not None
+                        for key in ("candidate_resolution", "target_draft_id", "target_expected_revision")
+                    ):
+                        raise ValueError("unexpected_resolution")
+                except (KeyError, ValueError) as exc:
+                    resolution_error = str(exc).strip("'") or "unknown_target"
+                    source = None
+                    item = attempt
+            elif requested_id is not None and requested_id != "" or requested_rev is not None:
+                resolution_error = "invalid_target"
+            elif any(
+                native_args.get(key) is not None
+                for key in ("candidate_resolution", "target_draft_id", "target_expected_revision")
+            ):
+                resolution_error = "unexpected_resolution"
+            errors = []
+            if resolution_error:
+                attempt["requires_resolution"] = True
+                attempt["target_resolution"] = "unknown"
+                errors.append({"field": "draft_id", "reason": resolution_error})
+            if "review_state" in native_args:
+                try:
+                    scope_row = db.execute(
+                        "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (task.object_id,)
+                    ).fetchone()
+                    scope = ReviewScope(**json.loads(scope_row[0]))
+                    state = native_args["review_state"]
+                    self._validate_refs(db, replace(scope, working_state=state))
+                    updates = [("question", text, []) for text in state["open_questions"]]
+                    for observation in state["observations"]:
+                        if not observation["evidence_refs"]:
+                            raise BindingError("review_state observation has no source")
+                        updates.append(("observation", observation["statement"], observation["evidence_refs"]))
+                    for kind, value, refs in updates:
+                        fingerprint = self._navigation_fingerprint(scope.id, kind, value, refs)
+                        entry = db.execute(
+                            "SELECT o.payload FROM navigation_aliases n JOIN objects o "
+                            "ON o.kind='NavigationItem' AND o.id=n.item_id WHERE n.scope_id=? AND n.fingerprint=?",
+                            (scope.id, fingerprint),
+                        ).fetchone()
+                        if entry is None:
+                            raise BindingError("review_state has not been merged")
+                        nav = NavigationItem(**json.loads(entry[0]))
+                        if self._navigation_fingerprint(scope.id, nav.kind, nav.text, nav.evidence_refs) != fingerprint:
+                            raise BindingError("review_state navigation was corrected")
+                except (BindingError, KeyError, TypeError, ValueError) as exc:
+                    errors.append({"field": "review_state", "reason": str(exc) or "invalid_review_state"})
+            allowed = {"trigger", "behavior", "impact", "evidence_refs", "case_id", "open_questions"}
+            if set(args) - allowed:
+                errors.append({"field": "arguments", "reason": "unknown_fields", "fields": sorted(set(args) - allowed)})
+            for field in ("trigger", "behavior", "impact"):
+                if not isinstance(args.get(field), str) or not args[field].strip():
+                    errors.append({"field": field, "reason": "nonempty_string_required"})
+            submitted_refs = args.get("evidence_refs")
+            if not isinstance(submitted_refs, list) or not submitted_refs:
+                errors.append({"field": "evidence_refs", "reason": "nonempty_list_required"})
+                submitted_refs = []
+            case_id = args.get("case_id", "")
+            if not isinstance(case_id, str):
+                errors.append({"field": "case_id", "reason": "invalid_case_id"})
+                case_id = ""
+            target = None
+            if force_new and case_id:
+                errors.append({"field": "case_id", "reason": "new_case_cannot_target_existing_case"})
+            if case_id and not resolution_error and not force_new:
+                case_row = db.execute("SELECT payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
+                if case_row is None:
+                    errors.append({"field": "case_id", "value": case_id, "reason": "unknown_case"})
+                else:
+                    target = Case(**json.loads(case_row[0]))
+                    if target.run_id != self.run.id or target.scope_id != task.object_id:
+                        errors.append({"field": "case_id", "value": case_id, "reason": "wrong_scope"})
+                        target = None
+            elif (
+                not force_new
+                and not resolution_error
+                and isinstance(args.get("trigger"), str)
+                and isinstance(args.get("behavior"), str)
+            ):
+                candidates = [
+                    Case(**json.loads(row[0])) for row in db.execute("SELECT payload FROM objects WHERE kind='Case'")
+                ]
+                candidates = [
+                    case
+                    for case in candidates
+                    if case.run_id == self.run.id
+                    and case.scope_id == task.object_id
+                    and case.trigger == args["trigger"].strip()
+                    and case.mechanism == args["behavior"].strip()
+                ]
+                if len(candidates) > 1:
+                    errors.append({"field": "case_id", "reason": "ambiguous_existing_case"})
+                elif candidates:
+                    target = candidates[0]
+            if target and isinstance(args.get("trigger"), str) and target.trigger != args["trigger"].strip():
+                errors.append({"field": "trigger", "reason": "existing_trigger_immutable"})
+            question_ids = args.get("open_questions", [])
+            if not isinstance(question_ids, list):
+                errors.append({"field": "open_questions", "reason": "list_required"})
+                question_ids = []
+            for qid in question_ids:
+                qrow = (
+                    db.execute("SELECT payload FROM objects WHERE kind='Question' AND id=?", (qid,)).fetchone()
+                    if isinstance(qid, str)
+                    else None
+                )
+                if qrow is None or Question(**json.loads(qrow[0])).scope_id != task.object_id:
+                    errors.append({"field": "open_questions", "value": qid, "reason": "unknown_or_wrong_scope"})
+            all_refs = list(submitted_refs)
+            if target:
+                all_refs.extend(target.evidence_refs + target.counter_evidence_refs)
+            seen = set()
+            frontier = self._task_frontier_refs(db, task_id)
+            for ref_id in all_refs:
+                if not isinstance(ref_id, str) or not ref_id:
+                    errors.append({"field": "evidence_refs", "ref": ref_id, "reason": "invalid_id"})
+                    continue
+                if ref_id in seen:
+                    continue
+                seen.add(ref_id)
+                if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone() is None:
+                    errors.append({"field": "evidence_refs", "ref": ref_id, "reason": "unknown_id"})
+                    continue
+                try:
+                    ref = self._unit_refs(db, [ref_id])[0]
+                    self._validate_question_original(ref)
+                    if ref_id not in frontier:
+                        raise BindingError("source was not read by this task")
+                    spans = self._require_delivered(db, task_id, token, turn_id, {ref_id})[ref_id]
+                    content = (self.blob_dir / ref.content_hash).read_bytes().decode("utf-8")
+                    first = ref.start_line or 1
+                    last = first + len(source_lines(self.run, content)) - 1
+                    next_line = first
+                    for start, end in sorted(spans):
+                        if start <= next_line <= end:
+                            next_line = end + 1
+                    if next_line <= last:
+                        raise BindingError("source was not fully delivered")
+                except (BindingError, KeyError, OSError, UnicodeError, ValueError) as exc:
+                    errors.append({"field": "evidence_refs", "ref": ref_id, "reason": str(exc) or "invalid_source"})
+            if errors:
+                item.update(current_args=args, errors=errors, status="repair_needed", revision=item["revision"] + 1)
+            else:
+                trigger, behavior, impact = (args[field].strip() for field in ("trigger", "behavior", "impact"))
+                claim_id = "claim_" + hashlib.sha256(_json([item["id"], behavior, impact]).encode()).hexdigest()
+                if target:
+                    claims = list(target.claims)
+                    if not any(
+                        claim.get("statement") == behavior and claim.get("impact") == impact for claim in claims
+                    ):
+                        claims.append({"id": claim_id, "statement": behavior, "impact": impact})
+                    refs = list(dict.fromkeys(target.evidence_refs + submitted_refs))
+                    questions = list(dict.fromkeys(target.question_ids + question_ids))
+                    if claims == target.claims and refs == target.evidence_refs and questions == target.question_ids:
+                        updated = target
+                    else:
+                        updated = self.update_unit_object(
+                            task_id,
+                            token,
+                            Case,
+                            target.id,
+                            target.revision,
+                            turn_id=turn_id,
+                            now=now,
+                            _db=db,
+                            claims=claims,
+                            evidence_refs=refs,
+                            question_ids=questions,
+                            status="candidate",
+                        )
+                else:
+                    ident = "case_" + hashlib.sha256(_json([self.run.id, item["id"]]).encode()).hexdigest()
+                    new_case = Case(
+                        ident,
+                        self.run.id,
+                        scope_id=task.object_id,
+                        trigger=trigger,
+                        mechanism=behavior,
+                        claims=[{"id": claim_id, "statement": behavior, "impact": impact}],
+                        evidence_refs=submitted_refs,
+                        question_ids=question_ids,
+                    )
+                    self.commit_unit_decision(
+                        task_id,
+                        token,
+                        task.input_revision,
+                        "decision_" + operation_id,
+                        checked_region_ids=[],
+                        observations=[],
+                        questions=[],
+                        cases=[new_case],
+                        unresolved=[],
+                        turn_id=turn_id,
+                        now=now,
+                        _db=db,
+                    )
+                    updated = new_case
+                item.update(
+                    current_args=args,
+                    errors=[],
+                    status="promoted",
+                    revision=item["revision"] + 1,
+                    case_id=updated.id,
+                    case_revision=updated.revision,
+                )
+            db.execute(
+                "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
+                (item["revision"], item["status"], _json(item), item["id"]),
+            )
+            if source is not None and source["id"] != item["id"]:
+                source.update(status="applied", revision=source["revision"] + 1, linked_draft_id=item["id"])
+                db.execute(
+                    "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
+                    (source["revision"], source["status"], _json(source), source["id"]),
+                )
+                self._event(db, "CandidateDraft", source["id"], "applied", {"target": item["id"], "result": source})
+            if attempt["id"] != item["id"]:
+                attempt.update(status="applied", revision=attempt["revision"] + 1, linked_draft_id=item["id"])
+                db.execute(
+                    "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
+                    (attempt["revision"], attempt["status"], _json(attempt), attempt["id"]),
+                )
+                self._event(db, "CandidateDraft", attempt["id"], "applied", {"target": item["id"], "result": attempt})
+            db.execute(
+                "INSERT INTO candidate_draft_operations VALUES (?,?,?)", (operation_id, _json(request), _json(item))
+            )
+            self._event(
+                db,
+                "CandidateDraft",
+                draft_id,
+                "submit",
+                {"task_id": task_id, "turn_id": turn_id, "call_id": call_id, "result": item},
+            )
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            db.commit()
+            return item
+
+    def retract_candidate_draft(
+        self,
+        task_id: str,
+        token: str,
+        draft_id: str,
+        expected_revision: int,
+        *,
+        turn_id: str,
+        call_id: str,
+        reason: str,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        if not self._candidate_draft_enabled():
+            raise BindingError("candidate drafts are not enabled")
+        if (
+            type(expected_revision) is not int
+            or expected_revision < 0
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise ValueError("candidate withdrawal requires revision and reason")
+        operation_id = hashlib.sha256(_json([self.run.id, task_id, turn_id, call_id]).encode()).hexdigest()
+        request = {"draft_id": draft_id, "expected_revision": expected_revision, "reason": reason}
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            calls, _ = self._candidate_turn_calls(db, task_id, token, turn_id)
+            matches = [
+                call for call in calls if call.get("id") == call_id and call.get("name") == "retract_candidate_draft"
+            ]
+            if (
+                len(matches) != 1
+                or not isinstance(matches[0].get("args"), dict)
+                or {key: value for key, value in matches[0]["args"].items() if key != "review_state"} != request
+            ):
+                raise BindingError("candidate withdrawal does not match its native call")
+            item = self.get_candidate_draft(draft_id, db=db)
+            if item["scope_id"] != task.object_id:
+                raise BindingError("candidate draft belongs to another scope")
+            previous = db.execute(
+                "SELECT request,result FROM candidate_draft_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            if previous:
+                if previous[0] != _json(request):
+                    raise RevisionConflict("candidate operation has different inputs")
+                return json.loads(previous[1])
+            if item["revision"] != expected_revision or item["status"] not in {"pending_validation", "repair_needed"}:
+                raise RevisionConflict("candidate draft revision or status changed")
+            item.update(status="retracted", reason=reason, revision=item["revision"] + 1)
+            db.execute(
+                "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
+                (item["revision"], item["status"], _json(item), draft_id),
+            )
+            db.execute(
+                "INSERT INTO candidate_draft_operations VALUES (?,?,?)", (operation_id, _json(request), _json(item))
+            )
+            self._event(
+                db,
+                "CandidateDraft",
+                draft_id,
+                "retract",
+                {"task_id": task_id, "turn_id": turn_id, "call_id": call_id, "reason": reason},
+            )
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            db.commit()
+            return item
 
     def _question_input_digest(self, db: sqlite3.Connection, question: Question) -> str:
         """Fingerprint substantive delegated inputs, excluding routine scope/lease updates."""

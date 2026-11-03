@@ -2,8 +2,9 @@
 
 ## 当前开发状态
 
+- 2026-11-03 14:46，中转的小型流式推理成功，实报 3193 tokens；随后启动 `6bc8eda` 的 Cal.com #14740 空状态实验评测，单主责、`shared-1` 和 `question-delivery-1` 均已实际绑定。15:24 +08:00 运行中快照：30 个完整响应、2519271 已知 tokens，3 次失败和 1 个在途请求用量未知，0/24 完成、0 Case；最大输入约 382924 字符，进程当时仍在运行。原账本位于 `.reviewforge/benchmarks/v42-calcom-question-20261103-033424/`，不得作为完整质量结果，也不要启动重复评测。细节见 [设计 19.19](docs/v4.2-architecture.md#1919-中转恢复后的运行中诊断)。
 - v4 在 `dev` 开发；`main` 保留现有生产版本与自动部署。未经验收不向 `main` 推送 v4。
-- v4.2 可选 `REVIEWFORGE_V42_UNIT_PLAN=single-owner-1` 与 `REVIEWFORGE_V42_SHARED_INVESTIGATION=shared-1` 分别启用单主责和运行绑定的共享调查；共享笔记仅供导航，跨单元反证使相关结论失效并重新独立核验。新运行绑定 Git LF 行语义，旧 checkpoint 不升级；未知写入中断保留 partial，生产挂载硬链接能力未验证。`a8ce20d` 同 PR 旧诊断人工停止，815881 已知 tokens、61 次失败用量未知、0/24 完成、0 Case；`d70bb49` 新诊断及同绑定续跑均 partial，累计 20 次失败用量未知、0 完整响应。2026-11-03 03:31 单次独立小型推理请求仍返回 HTTP 530、用量未知，等待中转恢复。新路径真实质量及成本未验收，详见 [设计 19.18](docs/v4.2-architecture.md#1918-明确问题的委派与交付)。
+- v4.2 可选 `REVIEWFORGE_V42_UNIT_PLAN=single-owner-1` 与 `REVIEWFORGE_V42_SHARED_INVESTIGATION=shared-1` 分别启用单主责和运行绑定的共享调查；共享笔记仅供导航，跨单元反证使相关结论失效并重新独立核验。新运行绑定 Git LF 行语义，旧 checkpoint 不升级；未知写入中断保留 partial，生产挂载硬链接能力未验证。`a8ce20d` 同 PR 旧诊断人工停止，815881 已知 tokens、61 次失败用量未知、0/24 完成、0 Case；`d70bb49` 新诊断及同绑定续跑均 partial，累计 20 次失败用量未知、0 完整响应。2026-11-03 03:31 单次独立小型推理请求返回 HTTP 530、用量未知，随后恢复情况见设计 19.19。新路径真实质量及成本未验收，详见 [设计 19.18](docs/v4.2-architecture.md#1918-明确问题的委派与交付)。
 - 独立 `review_v42` 新运行使用 `v42-units-6`：固定区域有唯一主责，共享原始来源和不可信导航，另有逐项跨单元整合与独立核验；正文送达审计不能证明模型理解或发现全部关联，真实 PR 与 holdout 未验收。实验性 `REVIEWFORGE_V42_QUESTION_ASSISTANT=question-delivery-1` 需同时启用 `shared-1`，允许主责委派具体问题，由独立租约和来源送达回执约束；回答仍是不可信导航。新运行绑定细粒度问题输入，旧 checkpoint 不升级；未知写入保持 partial，生产默认仍为 legacy。详见 [v4.2 设计](docs/v4.2-architecture.md#1918-明确问题的委派与交付)。
 - `5826b79` 同 PR 复测因 4 次候选提交使用模型自造 ID、接口按未知更新拒绝且反馈不清而停止；2149178 已知 tokens、5 失败及 1 中断请求未知、0 持久 Case/0 评论，未判分。新 ID 契约已修正，可选公平调度仍需真实验收。v4.2 开发诊断累计 14003411 已知 tokens、123 请求未知，不含历史协议，非供应商账单。[记录](docs/v4.2-architecture.md#1916-候选交付失败与可选公平调度)。
 - 用户已授权统一使用 `dev`，替代旧任务卡的 `hp/<卡号>` 分支约定。

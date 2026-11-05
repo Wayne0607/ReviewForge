@@ -2,6 +2,8 @@
 
 ## 当前开发状态
 
+- `982fc03` 首轮小范围真实对照未通过：同一缺陷样本基线 11 完整响应/186585 tokens，新循环 6 完整响应/61111 tokens，均 0 Case、0 区域完成，请求间隙人工停止，无新增未知或在途；本地分别只完成 10/5 批审计。新循环暴露 `find_references(query=...)` 缺 `symbol` 被误记工具不可用，现已补模型可见 JSON Schema 的嵌套参数校验并锁定依赖，需新绑定复测。**尚未运行完整 PR**。v4.2 合计 **35634741 已知 tokens、217 请求未知**，非账单；原诊断不改写，不计算节省比例。[记录](docs/v4.2-delivery-plan.md#131-首轮小范围真实诊断尚未通过)。
+
 - 2026-11-05 用户授权两名 GPT-6.1 Terra / xhigh 实现交付方案前两阶段。可选 `REVIEWFORGE_V42_DECISION_CYCLE=decision-cycle-1` 绑定单一 `review_step`、持久问题/判断/来源 outbox、当前问题原文投影、候选即时核验和完整配置依赖，保留现有责任分组。完整后端 **4165 passed、1 skipped**；随后仅补全模型可见的完成动作嵌套格式，相关专项 **42 passed**，lint/format/spec-check/严格裁判离线检查通过。真实小范围 A/B 尚待完成，**通过后才跑完整 PR**；旧运行、legacy 默认和 GitHub 零投递保持。跨租约且原 exchange 未完整落盘、来源 in-flight 未知仍 partial，整合非最终动作沿用逐项事务。[实施与门槛](docs/v4.2-delivery-plan.md#13-2026-11-05-首个实现与验收记录)。
 
 - `5527278` 同 PR 空状态诊断人工停止：**12612418 已知 tokens**、7 次失败用量未知、76 完整响应、0 Case/草稿、0/24 完成、3 未核实导航，裁判未运行；候选修复未实际触发。确认同请求固定源码重叠，后续可选 `REVIEWFORGE_V42_FRONTIER_PROJECTION=source-line-union-1` 的完整后端 **4124 passed、1 skipped**，质量与成本均未验收。[记录](docs/v4.2-architecture.md#1922-候选恢复策略真实诊断与中断记录)。v4.2 开发累计 **35387045 已知 tokens、217 请求未知**，非供应商账单。

@@ -15,6 +15,11 @@ from reviewforge.review_v42.tools import EvidenceGateway
 
 
 class PagedGateway(PinnedGateway):
+    def __init__(self):
+        super().__init__()
+        properties = self.tool_specs[0]["function"]["parameters"]["properties"]
+        properties.update(start_line={"type": "integer", "minimum": 1}, end_line={"type": "integer", "minimum": 1})
+
     async def __call__(self, name, args):
         self.calls.append((name, args.copy()))
         first, last = args.get("start_line", 1), args.get("end_line", 1)

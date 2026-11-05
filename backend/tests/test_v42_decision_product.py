@@ -112,7 +112,10 @@ async def test_single_option_binds_dependencies_and_preserves_old_identity(tmp_p
 
 
 @pytest.mark.parametrize("candidate", [False, True])
-async def test_real_product_checks_two_units_and_independent_integration(tmp_path, monkeypatch, candidate):
+@pytest.mark.parametrize("bad_source_args", [False, True])
+async def test_real_product_checks_two_units_and_independent_integration(
+    tmp_path, monkeypatch, candidate, bad_source_args
+):
     monkeypatch.setenv("REVIEWFORGE_V42_DECISION_CYCLE", "decision-cycle-1")
     phases, refs = defaultdict(int), {}
     visited = set()
@@ -125,14 +128,34 @@ async def test_real_product_checks_two_units_and_independent_integration(tmp_pat
         phases[key] += 1
         visited.add((key, role))
         item = board["decision_items"][-1] if board["decision_items"] else None
+        assert not any(q["owner"] == "tool_controller" for q in board["questions"])
         for message in messages:
             if message.type == "tool":
                 receipt = json.loads(message.content)
                 assert "error" not in receipt, receipt
                 for result in receipt.get("results", []):
                     value = result["result"]
+                    if "error" in value:
+                        assert bad_source_args and phase == 1, value
+                        assert "InvalidEvidenceRequestError" in value["error"]
+                        assert "question_id" not in value
                     if "evidence_ref" in value:
                         refs.setdefault(key, {})[value["path"]] = value["evidence_ref"]
+        if bad_source_args and phase == 0:
+            return tool(
+                "review_step",
+                step(
+                    "request_evidence",
+                    {
+                        "gap": "Caller references",
+                        "relevance": "Trace impact",
+                        "alternatives": "Used or unused",
+                        "operations": [{"name": "find_references", "args": {"query": "value"}}],
+                    },
+                ),
+            )
+        if bad_source_args:
+            phase -= 1
         if phase == 0:
             paths = ["a.py", "b.py"] if role == "integration" else [scope["regions"][0]["path"]]
             payload = {
@@ -141,7 +164,7 @@ async def test_real_product_checks_two_units_and_independent_integration(tmp_pat
                 "alternatives": "Confirm regression or refute premise",
                 "operations": [{"name": "read_source", "args": {"path": p}} for p in paths],
             }
-            return tool("review_step", step("request_evidence", payload))
+            return tool("review_step", step("request_evidence", payload, item))
         own_refs = list(refs[key].values())
         offer = candidate and role == "primary" and scope["regions"][0]["path"] == "a.py"
         if offer and phase == 1:

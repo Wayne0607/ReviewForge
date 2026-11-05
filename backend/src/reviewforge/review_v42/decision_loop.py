@@ -11,6 +11,8 @@ import json
 import uuid
 from typing import Any, Literal
 
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema.validators import validator_for
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -19,13 +21,13 @@ from langchain_core.messages import (
     messages_from_dict,
     messages_to_dict,
 )
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from reviewforge.engine.native_submission import inspect_tool_calls
 from reviewforge.engine.session_tools import result_tool
 from reviewforge.review_v42.context import ContextBuilder
 from reviewforge.review_v42.context_recovery import decode_session, is_context_length_exceeded
-from reviewforge.review_v42.contracts import Case, EvidenceRef, LeaseError, Question, ReviewScope, Task
+from reviewforge.review_v42.contracts import BindingError, Case, EvidenceRef, LeaseError, Question, ReviewScope, Task
 from reviewforge.review_v42.decision_state import DecisionState
 from reviewforge.review_v42.reviewer import Reviewer, _ambiguous_native_ids, _visible_message, reviewer_tools
 from reviewforge.review_v42.store import _json
@@ -226,8 +228,7 @@ class DecisionReviewer(Reviewer):
         }
         custom = getattr(self.gateway, "tool_specs", None)
         if custom is not None:
-            names = {s["function"]["name"] for s in custom}
-            definitions = {name: None for name in names}
+            definitions = {s["function"]["name"]: s["function"]["parameters"] for s in custom}
             definitions["read_evidence"] = next(t for t in reviewer_tools() if t.name == "read_evidence")
             definitions.update(
                 {
@@ -302,7 +303,7 @@ class DecisionReviewer(Reviewer):
             *[
                 {"name": name, "parameters": tool.args_schema.model_json_schema()}
                 for name, tool in self._operations().items()
-                if tool is not None
+                if hasattr(tool, "args_schema")
             ],
         ]
         context[0] = SystemMessage(content=DECISION_PROMPT.format(operations=", ".join(names)))
@@ -318,14 +319,33 @@ class DecisionReviewer(Reviewer):
         if name not in allowed:
             raise InvalidEvidenceRequestError("unknown or non-source operation")
         schema = allowed[name]
-        if schema is not None:
-            schema.args_schema.model_validate(args)
+        if isinstance(schema, dict):
+            try:
+                validator = validator_for(schema)
+                validator.check_schema(schema)
+                validator(schema).validate(args)
+            except JsonSchemaValidationError as exc:
+                raise InvalidEvidenceRequestError(f"invalid arguments for {name}: {exc.message}") from exc
+            except Exception as exc:
+                # A broken schema or unresolved schema reference is controller
+                # configuration, not a correctable model argument or outage.
+                raise BindingError(f"invalid source operation schema for {name}: {exc}") from exc
+        else:
+            try:
+                schema.args_schema.model_validate(args)
+            except ValidationError as exc:
+                raise InvalidEvidenceRequestError(f"invalid arguments for {name}: {exc}") from exc
         if name == "query_shared":
             return self.store.query_shared(**args)
         if name == "read_search_section":
-            return ContextBuilder(self.store).search_section(
-                args["ref"], args["section"], offset=args["offset"], limit=args["limit"]
-            )
+            try:
+                return ContextBuilder(self.store).search_section(
+                    args["ref"], args["section"], offset=args["offset"], limit=args["limit"]
+                )
+            except BindingError:
+                raise
+            except (KeyError, ValueError) as exc:
+                raise InvalidEvidenceRequestError(f"invalid search section request: {exc}") from exc
         result = await self.gateway.execute(name, args)
         if not isinstance(result, dict):
             raise ValueError("source operation did not return a native result")
@@ -377,7 +397,7 @@ class DecisionReviewer(Reviewer):
                 state.claim_operation(self.task_id, self.lease_token, step["id"], operation["id"])
                 try:
                     source = await self._read_operation(operation, allowed)
-                except (LeaseError, asyncio.CancelledError):
+                except (BindingError, LeaseError, asyncio.CancelledError):
                     raise
                 except Exception as exc:
                     source = {"error": f"{type(exc).__name__}: {exc}"}

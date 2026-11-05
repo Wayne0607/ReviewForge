@@ -3360,6 +3360,173 @@ class ReviewStore:
             db.commit()
             return result
 
+    def settle_candidate_preflight_failure(
+        self,
+        task_id: str,
+        token: str,
+        turn_id: str,
+        call_id: str,
+        *,
+        phase: str,
+        errors: list[dict[str, Any]],
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Record a known pre-execution rejection without inventing target relationships.
+
+        The controller calls this only for explicitly classified input errors, not
+        for ambiguous execution, source corruption, storage errors or lease loss.
+        """
+        if self.run.metadata.get("decision_cycle_policy") != "decision-cycle-1":
+            raise BindingError("candidate preflight settlement requires decision-cycle-1")
+        if phase not in {"schema_validation", "decision_validation"}:
+            raise ValueError("invalid candidate preflight phase")
+        if (
+            not isinstance(errors, list)
+            or not errors
+            or any(
+                not isinstance(error, dict) or not isinstance(error.get("reason"), str) or not error["reason"].strip()
+                for error in errors
+            )
+        ):
+            raise ValueError("candidate preflight requires structured errors")
+        request = {"phase": phase, "errors": errors}
+        encoded_request = _json(request)
+        operation_id = hashlib.sha256(_json([self.run.id, task_id, turn_id, call_id]).encode()).hexdigest()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = Task(**json.loads(row[0]))
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            calls, response_hash = self._candidate_turn_calls(db, task_id, token, turn_id)
+            matches = [call for call in calls if call.get("id") == call_id and call.get("name") == "submit_case"]
+            if len(matches) != 1 or not isinstance(matches[0].get("args"), dict):
+                raise BindingError("candidate preflight does not match a unique native call")
+            attempt_row = db.execute(
+                "SELECT payload FROM decision_attempts WHERE task_id=? AND turn_id=? AND call_id=?",
+                (task_id, turn_id, call_id),
+            ).fetchone()
+            if attempt_row is None:
+                raise BindingError("candidate preflight has no audited decision attempt")
+            decision_attempt = json.loads(attempt_row[0])
+            decision_args = decision_attempt.get("args")
+            response = json.loads((self.audit_dir / response_hash).read_bytes())
+            native_matches = [
+                call
+                for message in response
+                if isinstance(message, dict) and isinstance(message.get("data"), dict)
+                for call in message["data"].get("tool_calls", [])
+                if isinstance(call, dict) and call.get("id") == call_id and call.get("name") == "review_step"
+            ]
+            if (
+                len(native_matches) != 1
+                or native_matches[0].get("args") != decision_args
+                or decision_attempt.get("response_hash") != response_hash
+                or not isinstance(decision_args, dict)
+                or decision_args.get("action") != "offer_candidate"
+                or not isinstance(decision_args.get("payload"), dict)
+                or decision_args["payload"].get("candidate") != matches[0]["args"]
+            ):
+                raise BindingError("candidate preflight attempt differs from audited native call")
+            ident = (
+                "draft_"
+                + hashlib.sha256(_json([self.run.id, task.object_id, task_id, turn_id, call_id]).encode()).hexdigest()
+            )
+            item = self.get_candidate_draft(ident, db=db)
+            if (
+                item["scope_id"] != task.object_id
+                or item["origin_task_id"] != task_id
+                or item["origin_turn_id"] != turn_id
+                or item["origin_call_id"] != call_id
+                or item["response_hash"] != response_hash
+                or item["original_args"] != matches[0]["args"]
+            ):
+                raise BindingError("candidate preflight draft binding differs")
+            previous = db.execute(
+                "SELECT request,result FROM candidate_draft_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            if previous:
+                if previous[0] != encoded_request:
+                    raise RevisionConflict("candidate preflight identity already has different input")
+                return json.loads(previous[1])
+            if db.execute(
+                "SELECT 1 FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
+                (task_id, turn_id, call_id),
+            ).fetchone():
+                raise BindingError("candidate decision already staged; preflight settlement is not allowed")
+            if item["revision"] != 0 or item["status"] != "pending_validation":
+                raise RevisionConflict("candidate attempt revision or status changed")
+            target_keys = (
+                "draft_id",
+                "expected_revision",
+                "candidate_resolution",
+                "target_draft_id",
+                "target_expected_revision",
+            )
+            target_intent = any(
+                key in item["original_args"] and item["original_args"][key] not in (None, "") for key in target_keys
+            )
+            outer = decision_args["payload"]
+            outer_target = any(key in outer and outer[key] not in (None, "") for key in target_keys)
+            target_intent = target_intent or outer_target
+            target_hint: dict[str, Any] = {"status": "unknown"}
+            original = item["original_args"]
+            target_id, target_rev = original.get("draft_id"), original.get("expected_revision")
+            if (
+                isinstance(target_id, str)
+                and target_id
+                and type(target_rev) is int
+                and target_id != ident
+                and not outer_target
+                and all(original.get(key) in (None, "") for key in target_keys[2:])
+            ):
+                try:
+                    target = self.get_candidate_draft(target_id, db=db)
+                except KeyError:
+                    target = None
+                if (
+                    target is not None
+                    and target["scope_id"] == task.object_id
+                    and target["revision"] == target_rev
+                    and target["status"] in {"pending_validation", "repair_needed"}
+                    and not target["requires_resolution"]
+                ):
+                    target_hint = {"status": "known", "draft_id": target_id, "revision": target_rev}
+            item.update(
+                status="repair_needed",
+                revision=1,
+                errors=errors,
+                requires_resolution=target_intent,
+                target_resolution="unknown" if target_intent else "new",
+                preflight_phase=phase,
+                preflight_target=target_hint,
+                original_decision_args=decision_args,
+            )
+            db.execute(
+                "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
+                (item["revision"], item["status"], _json(item), ident),
+            )
+            db.execute(
+                "INSERT INTO candidate_draft_operations VALUES (?,?,?)", (operation_id, encoded_request, _json(item))
+            )
+            self._event(
+                db,
+                "CandidateDraft",
+                ident,
+                "preflight_rejected",
+                {
+                    "task_id": task_id,
+                    "turn_id": turn_id,
+                    "call_id": call_id,
+                    "phase": phase,
+                    "result": item,
+                },
+            )
+            self._guard_review_task(db, task_id, token, task.object_id, now)
+            db.commit()
+            return item
+
     def submit_candidate_draft(
         self,
         task_id: str,
@@ -3581,6 +3748,37 @@ class ReviewStore:
             all_refs = list(submitted_refs)
             if target:
                 all_refs.extend(target.evidence_refs + target.counter_evidence_refs)
+            decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+            verified_refs: dict[str, EvidenceRef] = {}
+            verified_content: dict[str, str] = {}
+            delivered_refs: dict[str, list[tuple[int, int]]] = {}
+            if decision_cycle:
+                # Validate every existing reference before reporting any model-input
+                # error; unknown IDs must not mask a corrupt or foreign sibling.
+                existing_ids = sorted(
+                    {
+                        ref_id
+                        for ref_id in all_refs
+                        if isinstance(ref_id, str)
+                        and ref_id
+                        and db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone()
+                        is not None
+                    }
+                )
+                for ref in self._unit_refs(db, existing_ids):
+                    identity = asdict(ref)
+                    ref_id = identity.pop("id")
+                    if ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
+                        raise BindingError("candidate evidence identity mismatch")
+                    verified_refs[ref_id] = ref
+                    verified_content[ref_id] = (self.blob_dir / ref.content_hash).read_bytes().decode("utf-8")
+                    if ref.kind in {"source", "documentation", "issue", "test"} and (
+                        ref.metadata.get("navigation_only") is not True
+                    ):
+                        self._validate_question_original(ref)
+                delivered_refs = self._require_delivered(
+                    db, task_id, token, turn_id, set(existing_ids), required_ref_ids=set()
+                )
             seen = set()
             frontier = self._task_frontier_refs(db, task_id)
             for ref_id in all_refs:
@@ -3592,6 +3790,43 @@ class ReviewStore:
                 seen.add(ref_id)
                 if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone() is None:
                     errors.append({"field": "evidence_refs", "ref": ref_id, "reason": "unknown_id"})
+                    continue
+                if decision_cycle:
+                    ref = verified_refs[ref_id]
+                    path = (
+                        f"payload.candidate.evidence_refs[{submitted_refs.index(ref_id)}]"
+                        if ref_id in submitted_refs
+                        else "existing_case_evidence"
+                    )
+                    reason = ""
+                    if ref.kind not in {"source", "documentation", "issue", "test"} or (
+                        ref.metadata.get("navigation_only") is True
+                    ):
+                        reason = "navigation_only"
+                    elif ref_id not in frontier:
+                        reason = "not_read_by_task"
+                    elif ref_id not in delivered_refs:
+                        reason = "not_delivered"
+                    else:
+                        content = verified_content[ref_id]
+                        first = ref.start_line or 1
+                        last = first + len(source_lines(self.run, content)) - 1
+                        next_line = first
+                        for start, end in sorted(delivered_refs[ref_id]):
+                            if start <= next_line <= end:
+                                next_line = end + 1
+                        if next_line <= last:
+                            reason = "not_fully_delivered"
+                    if reason:
+                        errors.append(
+                            {
+                                "field": "evidence_refs",
+                                "ref": ref_id,
+                                "reason": reason,
+                                "kind": ref.kind,
+                                "path": path,
+                            }
+                        )
                     continue
                 try:
                     ref = self._unit_refs(db, [ref_id])[0]

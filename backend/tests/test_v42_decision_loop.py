@@ -501,7 +501,8 @@ async def test_invalid_candidate_can_be_explicitly_retracted(tmp_path):
     def retract(messages):
         board = json.loads(messages[1].content)
         draft = board["candidate_drafts"][0]
-        item = board["decision_items"][0]
+        # A rejected first submission does not create a work item.
+        item = board["decision_items"][0] if board["decision_items"] else None
         payload = {
             "retract_draft": {"draft_id": draft["id"], "expected_revision": draft["revision"], "reason": "Wrong target"}
         }

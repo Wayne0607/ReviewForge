@@ -7,9 +7,12 @@ envelope.  The existing fixed-source gateway and coverage gates remain authorita
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 import uuid
-from typing import Any, Literal
+from dataclasses import asdict
+from typing import Annotated, Any, Literal
 
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema.validators import validator_for
@@ -28,7 +31,7 @@ from reviewforge.engine.session_tools import result_tool
 from reviewforge.review_v42.context import ContextBuilder
 from reviewforge.review_v42.context_recovery import decode_session, is_context_length_exceeded
 from reviewforge.review_v42.contracts import BindingError, Case, EvidenceRef, LeaseError, Question, ReviewScope, Task
-from reviewforge.review_v42.decision_state import DecisionState
+from reviewforge.review_v42.decision_state import CorrectableDecisionInputError, DecisionState
 from reviewforge.review_v42.reviewer import Reviewer, _ambiguous_native_ids, _visible_message, reviewer_tools
 from reviewforge.review_v42.store import _json
 from reviewforge.review_v42.tools import InvalidEvidenceRequestError
@@ -55,13 +58,47 @@ class Candidate(_Strict):
     behavior: str = Field(min_length=1)
     impact: str = Field(min_length=1)
     evidence_refs: list[str] = Field(min_length=1)
-    open_questions: list[str] = Field(default_factory=list)
-    case_id: str = ""
-    draft_id: str = ""
-    expected_revision: int | None = None
-    candidate_resolution: str = ""
-    target_draft_id: str = ""
-    target_expected_revision: int | None = None
+    open_questions: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list,
+        description="Existing same-scope Question IDs, not question text. "
+        "Create a work item for a real missing premise.",
+    )
+    case_id: Annotated[str, Field(min_length=1)] = Field(
+        default_factory=str, description="Omit for a new case; otherwise use an existing same-scope Case ID."
+    )
+    draft_id: Annotated[str, Field(min_length=1)] | None = Field(
+        default=None, description="Omit for a new candidate; use the exact draft ID for correction."
+    )
+    expected_revision: int | None = Field(
+        default=None, ge=0, description="Revision of draft_id, not work_item_revision."
+    )
+    candidate_resolution: Literal["new_case", "apply_to_draft"] | None = Field(
+        default=None, description="Omit for ordinary correction; use only for an attempt with unknown association."
+    )
+    target_draft_id: Annotated[str, Field(min_length=1)] | None = Field(
+        default=None, description="For apply_to_draft only: the distinct target draft ID selected by the reviewer."
+    )
+    target_expected_revision: int | None = Field(default=None, ge=0, description="Revision of target_draft_id.")
+
+    @model_validator(mode="after")
+    def target_fields_match(self) -> Candidate:
+        if (self.draft_id is None) != (self.expected_revision is None):
+            raise ValueError("draft_id and expected_revision must be supplied together")
+        if self.candidate_resolution is None:
+            if self.target_draft_id is not None or self.target_expected_revision is not None:
+                raise ValueError("target fields require apply_to_draft")
+        elif self.draft_id is None:
+            raise ValueError("resolution requires the source draft_id and expected_revision")
+        elif self.candidate_resolution == "new_case":
+            if self.target_draft_id is not None or self.target_expected_revision is not None or self.case_id:
+                raise ValueError("new_case cannot specify a target draft or case")
+        elif (
+            self.target_draft_id is None
+            or self.target_expected_revision is None
+            or self.target_draft_id == self.draft_id
+        ):
+            raise ValueError("apply_to_draft requires a distinct target draft ID and revision")
+        return self
 
 
 class CandidateRetraction(_Strict):
@@ -129,12 +166,16 @@ class Unresolved(_Strict):
     recovery_condition: str = Field(min_length=1)
 
 
-class InvalidCompletionReferencesError(ValueError):
-    """Specific, correctable reference errors in a completion payload."""
+class InvalidDecisionReferencesError(ValueError):
+    """Specific, correctable source-reference errors in a native decision."""
 
     def __init__(self, issues: list[dict[str, Any]]):
-        super().__init__("Completion contains invalid source references; see reference_errors.")
+        super().__init__("Decision contains invalid source references; see reference_errors.")
         self.issues = issues
+
+
+class InvalidCompletionReferencesError(InvalidDecisionReferencesError):
+    """Specific reference errors in a completion payload."""
 
 
 PAYLOADS = {
@@ -172,6 +213,12 @@ def review_step_tool():
         "offer_candidate {candidate:{trigger,behavior,impact,evidence_refs,open_questions?,case_id?,draft_id?,"
         "expected_revision?,candidate_resolution?,target_draft_id?,target_expected_revision?}} or "
         "{retract_draft:{draft_id,expected_revision,reason}}; "
+        "open_questions contains existing same-scope Question IDs, never question text. Omit case_id and draft "
+        "fields for a new candidate. For ordinary correction use the returned draft_id and draft_revision as "
+        "candidate.expected_revision and omit candidate_resolution and target fields. Only an attempt marked "
+        "requires_resolution needs candidate_resolution=new_case or apply_to_draft; apply_to_draft requires "
+        "a distinct target_draft_id and target_expected_revision. Optional IDs and resolution cannot be empty strings. "
+        "Each failed attempt remains separate until corrected or explicitly retracted. "
         "close_question {question_id,answer,evidence_refs,affected_regions?}; "
         "complete_review {checked_region_ids:[string],"
         "observations:[{statement:string,evidence_refs:[string],region_ids:[string]}],"
@@ -194,7 +241,7 @@ def review_step_tool():
                 Literal["request_evidence", "offer_candidate", "close_question", "complete_review", "unresolved"],
                 ...,
             ),
-            "payload": (dict[str, Any], ...),
+            "payload": (EvidenceRequest | CandidateOffer | QuestionClose | ReviewCompletion | Unresolved, ...),
         },
     )
 
@@ -221,8 +268,12 @@ DECISION_PROMPT = (
     "A source_union is a lossless display of original fixed source; mappings identify the exact "
     "ref_id and lines that may be cited. It is not itself a reference. Candidate drafts are unverified "
     "attempts: correct their references using original source and offer the candidate with its exact "
-    "draft_id and expected_revision. For an invalid target choose candidate_resolution=new_case or "
-    "apply_to_draft with target_draft_id and target_expected_revision. Explicitly retract an unneeded draft "
+    "draft_id and expected_revision; omit candidate_resolution and target fields in normal correction. "
+    "Only if the attempt says requires_resolution, choose candidate_resolution=new_case or apply_to_draft "
+    "with a different target_draft_id and target_expected_revision. Never invent question, case or draft IDs. "
+    "Candidate open_questions must reference existing Question IDs in this scope; create a work item first "
+    "for a genuine unresolved premise, and do not describe prose as an ID. "
+    "Explicitly retract an unneeded draft "
     "with offer_candidate and retract_draft, providing its exact ID, revision and reason. "
     "Each work item shows only its latest judgment; use read_decision_history via request_evidence "
     "to retrieve its earlier judgments. They are untrusted navigation, not evidence."
@@ -235,6 +286,27 @@ def _candidate_receipt(outcome: dict[str, Any]) -> dict[str, Any]:
         "draft_id" if key == "id" else "draft_revision" if key == "revision" else key: value
         for key, value in outcome.items()
     }
+
+
+def _failure_signature(issues: list[dict[str, Any]]) -> str:
+    """Ignore generated attempt IDs and text when comparing failed batches."""
+    return _json(sorted((str(issue.get("field", "")), str(issue.get("reason", ""))) for issue in issues))
+
+
+def _validation_issues(exc: ValidationError) -> list[dict[str, Any]]:
+    issues = []
+    for error in exc.errors(include_url=False, include_context=False, include_input=False):
+        path = list(error["loc"])
+        if path and path[0] in {"candidate", "retract_draft"}:
+            path.insert(0, "payload")
+        issues.append(
+            {
+                "field": ".".join(str(part) for part in path) or "review_step",
+                "reason": error["type"],
+                "message": error["msg"],
+            }
+        )
+    return issues
 
 
 def _decision_history_tool():
@@ -546,8 +618,36 @@ class DecisionReviewer(Reviewer):
         self.store.append_turn_audit(self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict(recent))
         return recent
 
-    def _validate_completion_refs(self, payload: ReviewCompletion) -> None:
-        """Identify obvious navigation/unknown IDs without replacing source gates."""
+    def _check_known_source_integrity(self, args: dict[str, Any]) -> None:
+        """Check every enumerable known source before any correctable rejection."""
+        collections = [args.get("evidence_refs")]
+        payload = args.get("payload")
+        if isinstance(payload, dict):
+            candidate = payload.get("candidate")
+            if isinstance(candidate, dict):
+                collections.append(candidate.get("evidence_refs"))
+            if args.get("action") == "close_question":
+                collections.append(payload.get("evidence_refs"))
+            if args.get("action") == "complete_review":
+                for name in ("observations", "relations", "integration_relations", "integration_receipts"):
+                    entries = payload.get(name)
+                    if isinstance(entries, list):
+                        collections.extend(row.get("evidence_refs") for row in entries if isinstance(row, dict))
+        refs = {
+            ref for values in collections if isinstance(values, list) for ref in values if isinstance(ref, str) and ref
+        }
+        with self.store._connect() as db:
+            for ref_id in sorted(refs):
+                if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone() is None:
+                    continue
+                ref = self.store._unit_refs(db, [ref_id])[0]
+                identity = asdict(ref)
+                identity.pop("id")
+                if ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
+                    raise BindingError("decision evidence identity mismatch")
+
+    def _reference_issues(self, fields: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
+        """Classify only known navigation or absent IDs; corrupt originals remain failures."""
         navigation_kinds = {
             "diff",
             "search",
@@ -560,10 +660,10 @@ class DecisionReviewer(Reviewer):
             "search_page",
         }
         issues = []
-        for field in ("observations", "relations", "integration_relations", "integration_receipts"):
-            for index, entry in enumerate(getattr(payload, field)):
-                for ref_index, ref_id in enumerate(entry.evidence_refs):
-                    location = f"payload.{field}[{index}].evidence_refs[{ref_index}]"
+        with self.store._connect() as db:
+            for field, refs in fields:
+                for ref_index, ref_id in enumerate(refs):
+                    location = f"{field}[{ref_index}]"
                     try:
                         ref = self.store.get(EvidenceRef, ref_id)
                     except KeyError:
@@ -577,9 +677,9 @@ class DecisionReviewer(Reviewer):
                             }
                         )
                         continue
-                    if ref.run_id != self.store.run.id or ref.repo != self.store.run.repo:
-                        # Leave source binding errors to the existing gate.
-                        continue
+                    # Verify source identity, frozen binding and stored bytes before
+                    # calling a reference an ordinary model-correctable error.
+                    self.store._unit_refs(db, [ref_id])
                     if (isinstance(ref.kind, str) and ref.kind.lower() in navigation_kinds) or (
                         isinstance(ref.metadata, dict) and ref.metadata.get("navigation_only") is True
                     ):
@@ -594,8 +694,111 @@ class DecisionReviewer(Reviewer):
                                 ),
                             }
                         )
+        return issues
+
+    def _validate_completion_refs(self, payload: ReviewCompletion) -> None:
+        """Identify obvious navigation/unknown IDs without replacing source gates."""
+        fields = [
+            (f"payload.{field}[{index}].evidence_refs", entry.evidence_refs)
+            for field in ("observations", "relations", "integration_relations", "integration_receipts")
+            for index, entry in enumerate(getattr(payload, field))
+        ]
+        issues = self._reference_issues(fields)
         if issues:
             raise InvalidCompletionReferencesError(issues)
+
+    def _validate_decision_refs(self, parsed: ReviewStep, *, turn_id: str | None = None) -> None:
+        fields = [("evidence_refs", parsed.evidence_refs)]
+        question_issues = []
+        if parsed.action == "offer_candidate" and isinstance(parsed.payload.get("candidate"), dict):
+            candidate = parsed.payload["candidate"]
+            fields.append(("payload.candidate.evidence_refs", candidate["evidence_refs"]))
+            scope_id = self.store.get(Task, self.task_id).object_id
+            for index, question_id in enumerate(candidate.get("open_questions", [])):
+                try:
+                    question = self.store.get(Question, question_id)
+                except KeyError:
+                    question = None
+                if question is not None and question.run_id != self.store.run.id:
+                    raise BindingError("question belongs to another run")
+                if question is None or question.scope_id != scope_id:
+                    question_issues.append(
+                        {
+                            "field": f"payload.candidate.open_questions[{index}]",
+                            "reason": "unknown_or_wrong_scope",
+                            "value": question_id,
+                            "message": "Use an existing Question ID in this scope, not question text.",
+                        }
+                    )
+        elif parsed.action == "close_question":
+            fields.append(("payload.evidence_refs", parsed.payload["evidence_refs"]))
+        elif parsed.action == "complete_review":
+            completion = ReviewCompletion.model_validate(parsed.payload)
+            fields.extend(
+                (f"payload.{field}[{index}].evidence_refs", entry.evidence_refs)
+                for field in ("observations", "relations", "integration_relations", "integration_receipts")
+                for index, entry in enumerate(getattr(completion, field))
+            )
+        issues = [*self._reference_issues(fields), *question_issues]
+        if turn_id:
+            bad_ids = {issue["evidence_ref"] for issue in issues if "evidence_ref" in issue}
+            source_ids = {ref for _, refs in fields for ref in refs if ref not in bad_ids}
+            if source_ids:
+                # The source and audit integrity checks inside this gate must
+                # propagate unchanged; only an actual missing delivery is input feedback.
+                with self.store._connect() as db:
+                    delivered = self.store._require_delivered(
+                        db, self.task_id, self.lease_token, turn_id, source_ids, required_ref_ids=set()
+                    )
+                for field, refs in fields:
+                    for index, ref_id in enumerate(refs):
+                        if ref_id in source_ids and ref_id not in delivered:
+                            ref = self.store.get(EvidenceRef, ref_id)
+                            issues.append(
+                                {
+                                    "field": f"{field}[{index}]",
+                                    "reason": "not_delivered",
+                                    "evidence_ref": ref_id,
+                                    "kind": ref.kind,
+                                    "message": "The original source was not delivered in this successful request.",
+                                }
+                            )
+        if issues:
+            error = (
+                InvalidCompletionReferencesError
+                if parsed.action == "complete_review"
+                else InvalidDecisionReferencesError
+            )
+            raise error(issues)
+
+    def _correctable_issues(self, exc: Exception, args: dict[str, Any]) -> list[dict[str, Any]]:
+        if isinstance(exc, ValidationError):
+            return _validation_issues(exc)
+        issues = exc.issues
+        expanded = []
+        for issue in issues:
+            ref_id = issue.get("evidence_ref")
+            if issue.get("field") == "evidence_refs" and isinstance(ref_id, str):
+                indexes = [index for index, value in enumerate(args.get("evidence_refs", [])) if value == ref_id]
+                try:
+                    kind = self.store.get(EvidenceRef, ref_id).kind
+                except KeyError:
+                    kind = None
+                for index in indexes:
+                    expanded.append(
+                        {
+                            **issue,
+                            "field": f"evidence_refs[{index}]",
+                            "kind": kind,
+                            "message": "The original source was not delivered in this successful request."
+                            if issue.get("reason") == "not_delivered"
+                            else "Unknown evidence ID.",
+                        }
+                    )
+                if indexes:
+                    continue
+            expanded.append(issue)
+        return expanded
 
     def _complete(
         self, scope_id: str, turn_id: str, call_id: str, payload: ReviewCompletion, obligation_snapshot: dict[str, Any]
@@ -754,9 +957,9 @@ class DecisionReviewer(Reviewer):
                         if call["name"] != "review_step":
                             raise ValueError("unknown native action; use review_step")
                         state.record_attempt(self.task_id, self.lease_token, turn_id, call_id, args)
+                        self._check_known_source_integrity(args)
                         parsed = ReviewStep.model_validate(args)
-                        if parsed.action == "complete_review":
-                            self._validate_completion_refs(ReviewCompletion.model_validate(parsed.payload))
+                        self._validate_decision_refs(parsed, turn_id=turn_id)
                         step = state.stage(self.task_id, self.lease_token, turn_id, call_id, args)
                         result = {
                             "step_id": step["id"],
@@ -836,11 +1039,53 @@ class DecisionReviewer(Reviewer):
                             # The state transaction has already closed the bound Question.
                             result["status"] = "answered"
                         if "error" in result:
-                            failures.append(result["error"])
+                            failures.append(
+                                _failure_signature(result["errors"])
+                                if isinstance(result.get("errors"), list) and result["errors"]
+                                else result["error"]
+                            )
                         elif parsed.action != "request_evidence":
                             batch_has_success = True
                     except (LeaseError, asyncio.CancelledError):
                         raise
+                    except (ValidationError, InvalidDecisionReferencesError, CorrectableDecisionInputError) as exc:
+                        issues = self._correctable_issues(exc, args)
+                        result = (
+                            {
+                                "step_id": step["id"],
+                                "work_item_id": step["work_item_id"],
+                                "work_item_revision": step["revision"],
+                            }
+                            if step is not None
+                            else {}
+                        )
+                        result["error"] = f"{type(exc).__name__}: {exc}"
+                        reference_issues = [issue for issue in issues if "evidence_ref" in issue]
+                        if reference_issues:
+                            result["reference_errors"] = reference_issues
+                        if step is None and call_id in staged_drafts:
+                            draft = self.store.settle_candidate_preflight_failure(
+                                self.task_id,
+                                self.lease_token,
+                                turn_id,
+                                call_id,
+                                phase="schema_validation"
+                                if isinstance(exc, ValidationError)
+                                else "decision_validation",
+                                errors=issues,
+                            )
+                            result.update(_candidate_receipt(draft))
+                            current = next(
+                                (
+                                    item
+                                    for item in state.list_items(self.task_id)
+                                    if item["id"] == args.get("work_item_id")
+                                ),
+                                None,
+                            )
+                            if current is not None:
+                                result.update(work_item_id=current["id"], work_item_revision=current["revision"])
+                        failures.append(_failure_signature(issues))
                     except Exception as exc:
                         result = (
                             {
@@ -852,22 +1097,10 @@ class DecisionReviewer(Reviewer):
                             else {}
                         )
                         result["error"] = f"{type(exc).__name__}: {exc}"
-                        if isinstance(exc, InvalidCompletionReferencesError):
-                            result["reference_errors"] = exc.issues
-                            # Fixing one reference changes the actual failed set;
-                            # reordering unchanged IDs is not a new failure state.
-                            failures.append(
-                                _json(
-                                    {
-                                        "error": result["error"],
-                                        "references": sorted(
-                                            (issue["evidence_ref"], issue["reason"]) for issue in exc.issues
-                                        ),
-                                    }
-                                )
-                            )
-                        else:
-                            failures.append(result["error"])
+                        failures.append(result["error"])
+                        if call_id in staged_drafts or isinstance(exc, (BindingError, OSError, sqlite3.DatabaseError)):
+                            self.error = "candidate_or_source_unavailable"
+                            finished = "partial"
                         if step is not None and any(
                             op["status"] == "in_flight"
                             for pending_step in state.pending(self.task_id)

@@ -50,6 +50,18 @@ async def test_copy_receipts_through_candidate_correction_and_completion(tmp_pat
         ],
     )
 
+    def reread(messages):
+        item = item_from_receipt(messages, store, task)
+        payload = {
+            "gap": "comparison",
+            "relevance": "behavior",
+            "alternatives": "confirm or refute",
+            "operations": [{"name": "read_source", "args": {"path": "a.py"}}],
+        }
+        return AIMessage(
+            content="", tool_calls=[call("review_step", step("request_evidence", payload, item), "reread")]
+        )
+
     def invalid_candidate(messages):
         item = item_from_receipt(messages, store, task)
         saved["ref"] = receipt(messages)["results"][0]["result"]["evidence_ref"]
@@ -112,7 +124,7 @@ async def test_copy_receipts_through_candidate_correction_and_completion(tmp_pat
 
     reviewer = DecisionReviewer(
         store,
-        Model([first, invalid_candidate, corrected_candidate, close, complete]),
+        Model([first, reread, invalid_candidate, corrected_candidate, close, complete]),
         EvidenceGateway(store, PinnedGateway()),
         on_case=accepted.append,
         task_id=task.id,
@@ -130,7 +142,17 @@ async def test_retraction_receipt_keeps_distinct_versions(tmp_path):
     candidate = {
         "candidate": {"trigger": "trigger", "behavior": "behavior", "impact": "impact", "evidence_refs": ["missing"]}
     }
-    first = AIMessage(content="", tool_calls=[call("review_step", step("offer_candidate", candidate), "bad")])
+    payload = {
+        "gap": "source",
+        "relevance": "behavior",
+        "alternatives": "confirm or refute",
+        "operations": [{"name": "read_source", "args": {"path": "a.py"}}],
+    }
+    first = AIMessage(content="", tool_calls=[call("review_step", step("request_evidence", payload), "read")])
+
+    def invalid_candidate(messages):
+        item = item_from_receipt(messages, store, task)
+        return AIMessage(content="", tool_calls=[call("review_step", step("offer_candidate", candidate, item), "bad")])
 
     def retract(messages):
         item, value = item_from_receipt(messages, store, task), receipt(messages)
@@ -153,7 +175,7 @@ async def test_retraction_receipt_keeps_distinct_versions(tmp_path):
 
     reviewer = DecisionReviewer(
         store,
-        Model([first, retract, stop]),
+        Model([first, invalid_candidate, retract, stop]),
         EvidenceGateway(store, PinnedGateway()),
         task_id=task.id,
         lease_token=task.lease_token,

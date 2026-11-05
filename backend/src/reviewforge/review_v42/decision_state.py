@@ -16,6 +16,16 @@ from .contracts import BindingError, Case, LeaseError, Question, RevisionConflic
 from .store import ReviewStore, _json
 
 
+class CorrectableDecisionInputError(ValueError):
+    """Known invalid model inputs, never an unavailable or corrupt source."""
+
+    def __init__(self, issues: list[dict[str, Any]]):
+        if not issues:
+            raise ValueError("correctable decision error requires specific issues")
+        self.issues = issues
+        super().__init__("Invalid decision input; see issues.")
+
+
 def _id(prefix: str, values: list[Any]) -> str:
     return prefix + hashlib.sha256(_json(values).encode()).hexdigest()
 
@@ -257,7 +267,30 @@ class DecisionState:
             refs = args["evidence_refs"]
             if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref for ref in refs):
                 raise ValueError("invalid decision evidence references")
-            self.store._require_delivered(db, task_id, token, turn_id, set(refs))
+            ref_ids = set(refs)
+            missing = [
+                ref
+                for ref in sorted(ref_ids)
+                if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref,)).fetchone() is None
+            ]
+            for ref in self.store._unit_refs(db, sorted(ref_ids - set(missing))):
+                identity = asdict(ref)
+                ref_id = identity.pop("id")
+                if ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
+                    raise BindingError("decision evidence identity mismatch")
+            if missing:
+                raise CorrectableDecisionInputError(
+                    [{"field": "evidence_refs", "reason": "unknown_id", "evidence_ref": ref} for ref in missing]
+                )
+            delivered = self.store._require_delivered(db, task_id, token, turn_id, ref_ids, required_ref_ids=set())
+            not_delivered = sorted(ref_ids - delivered.keys())
+            if not_delivered:
+                raise CorrectableDecisionInputError(
+                    [
+                        {"field": "evidence_refs", "reason": "not_delivered", "evidence_ref": ref}
+                        for ref in not_delivered
+                    ]
+                )
             if not isinstance(args["payload"], dict) or args["action"] not in {
                 "request_evidence",
                 "offer_candidate",
@@ -283,15 +316,23 @@ class DecisionState:
                     "SELECT scope_id,revision,payload FROM decision_items WHERE id=?", (item_id,)
                 ).fetchone()
                 if row is None or row[0] != task.object_id:
-                    raise BindingError("unknown or wrong-scope work item")
+                    raise CorrectableDecisionInputError(
+                        [{"field": "work_item_id", "reason": "unknown_or_wrong_scope", "value": item_id}]
+                    )
                 if row[1] != rev:
-                    raise RevisionConflict("work item revision changed")
+                    raise CorrectableDecisionInputError(
+                        [{"field": "expected_revision", "reason": "revision_changed", "current_revision": row[1]}]
+                    )
                 item = json.loads(row[2])
                 if item["question"] != args["question"].strip():
-                    raise BindingError("existing work item question cannot be replaced; create a new item")
+                    raise CorrectableDecisionInputError(
+                        [{"field": "question", "reason": "question_does_not_match_work_item"}]
+                    )
             else:
                 if rev != 0:
-                    raise RevisionConflict("new work item requires revision zero")
+                    raise CorrectableDecisionInputError(
+                        [{"field": "expected_revision", "reason": "new_item_requires_zero"}]
+                    )
                 item_id = _id("work_", [self.store.run.id, task.object_id, task_id, turn_id, call_id])
                 qid = _id("question_", [item_id])
                 question = Question(
@@ -316,7 +357,15 @@ class DecisionState:
                 payload = args["payload"]
                 answer, answer_refs = payload.get("answer"), payload.get("evidence_refs")
                 if payload.get("question_id") != item["question_id"]:
-                    raise BindingError("close must identify this work item's question")
+                    raise CorrectableDecisionInputError(
+                        [
+                            {
+                                "field": "payload.question_id",
+                                "reason": "unknown_or_wrong_work_item",
+                                "value": payload.get("question_id"),
+                            }
+                        ]
+                    )
                 if (
                     not isinstance(answer, str)
                     or not answer.strip()

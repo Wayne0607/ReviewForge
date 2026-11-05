@@ -525,6 +525,11 @@ class DecisionState:
                 "step_id": step_id,
                 "results": [{"operation_id": op["id"], "result": op["result"]} for op in ops],
             }
+            current = {
+                **expected,
+                "work_item_id": step["work_item_id"],
+                "work_item_revision": step["revision"],
+            }
             audit = db.execute(
                 "SELECT content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase='request'",
                 (task_id, turn_id),
@@ -538,7 +543,8 @@ class DecisionState:
                 if message.get("type") != "tool" or not isinstance(message.get("data"), dict):
                     return False
                 try:
-                    return json.loads(message["data"].get("content", "")) == expected
+                    receipt = json.loads(message["data"].get("content", ""))
+                    return receipt == expected or receipt == current
                 except (TypeError, ValueError):
                     return False
 

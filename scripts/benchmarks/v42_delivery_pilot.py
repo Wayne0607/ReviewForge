@@ -40,6 +40,44 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+class PilotStopRequested(asyncio.CancelledError):
+    """Operator interruption, never a quality result or a provider failure."""
+
+
+class RequestBoundary:
+    """Drain active physical calls before honoring an explicit operator stop."""
+
+    def __init__(self, stop_file):
+        self.stop_file = stop_file
+        self.active = 0
+        self.idle = asyncio.Event()
+        self.idle.set()
+
+    async def invoke(self, model, *args, **kwargs):
+        if self.stop_file.exists():
+            await self.idle.wait()
+            raise PilotStopRequested("operator requested stop at request boundary")
+        self.active += 1
+        self.idle.clear()
+        try:
+            return await model.ainvoke(*args, **kwargs)
+        finally:
+            self.active -= 1
+            if not self.active:
+                self.idle.set()
+
+
+class ControlledModel:
+    def __init__(self, model, boundary):
+        self.model, self.boundary = model, boundary
+
+    def bind_tools(self, *args, **kwargs):
+        return ControlledModel(self.model.bind_tools(*args, **kwargs), self.boundary)
+
+    async def ainvoke(self, *args, **kwargs):
+        return await self.boundary.invoke(self.model, *args, **kwargs)
+
+
 class FixtureArchives:
     """Use the normal tarball workspace path without external source access."""
 
@@ -166,6 +204,8 @@ async def episode(args):
         meter.requests()
         owner = SimpleNamespace(_pipeline_v4_config=policy, _db=None)
         reviewer, verifier_model = _models(owner, run, meter, raw)
+        boundary = RequestBoundary(args.output / "operator-stop.json")
+        reviewer, verifier_model = (ControlledModel(model, boundary) for model in (reviewer, verifier_model))
         gateway = PinnedToolGateway(head_workspace, state, base_workspace=base_workspace, run=run)
         verifier = Verifier(store, verifier_model, EvidenceGateway(store, gateway))
         error = None

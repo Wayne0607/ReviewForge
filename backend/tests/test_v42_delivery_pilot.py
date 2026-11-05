@@ -1,5 +1,6 @@
 """Pilot isolation: scorer answers never enter the fixed source workspace."""
 
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
@@ -56,3 +57,31 @@ async def test_pilot_uses_complete_fixed_tarballs_and_exact_base_head_bytes():
     finally:
         left.cleanup()
         right.cleanup()
+
+
+async def test_operator_stop_drains_active_request_without_starting_another(tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Model:
+        calls = 0
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            entered.set()
+            await release.wait()
+            return "recorded response"
+
+    model = Model()
+    stop = tmp_path / "operator-stop.json"
+    boundary = pilot.RequestBoundary(stop)
+    active = asyncio.create_task(boundary.invoke(model, []))
+    await entered.wait()
+    stop.write_text('{"reason":"confirmed contract defect"}')
+    blocked = asyncio.create_task(boundary.invoke(model, []))
+    await asyncio.sleep(0)
+    assert not blocked.done() and model.calls == 1
+    release.set()
+    assert await active == "recorded response"
+    with pytest.raises(pilot.PilotStopRequested):
+        await blocked
+    assert boundary.active == 0 and model.calls == 1

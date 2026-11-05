@@ -129,6 +129,14 @@ class Unresolved(_Strict):
     recovery_condition: str = Field(min_length=1)
 
 
+class InvalidCompletionReferencesError(ValueError):
+    """Specific, correctable reference errors in a completion payload."""
+
+    def __init__(self, issues: list[dict[str, Any]]):
+        super().__init__("Completion contains invalid source references; see reference_errors.")
+        self.issues = issues
+
+
 PAYLOADS = {
     "request_evidence": EvidenceRequest,
     "offer_candidate": CandidateOffer,
@@ -172,7 +180,9 @@ def review_step_tool():
         "integration_relations:[{unit_ids:[string],description:string,evidence_refs:[string]}],"
         "integration_receipts:[{obligation_id:string,disposition:checked|unresolved,evidence_refs:[string],reason:string}],"
         "finish:boolean}. Completion lists default to empty and finish defaults to true; these defaults do not "
-        "waive source-backed coverage or integration obligations. "
+        "waive source-backed coverage or integration obligations. A primary unit's relations target_scope_id "
+        "must be another member of primary_scope_ids, never its own ID or the integration scope. "
+        "Only the integration role submits integration_relations and integration_receipts. "
         "unresolved {missing_fact,attempted,recovery_condition}.",
         {
             "work_item_id": (str, ...),
@@ -202,7 +212,9 @@ DECISION_PROMPT = (
     "Read results are retained completely and must appear in a successful later request before being cited. "
     "Offer supported candidates promptly for independent verification. A candidate is not a finding. "
     "For a primary unit complete_review lists actually checked regions with source-backed observations; "
-    "identify cross-unit relations. For integration record each obligation with its sources and disposition; "
+    "identify cross-unit relations only to another primary_scope_ids member, never the integration scope. "
+    "Only the integration role submits integration_relations and integration_receipts; "
+    "for integration record each obligation with its sources and disposition; "
     "finish only after all obligations are resolved. An unanswered question or unavailable source is not clean. "
     "Use unresolved with the missing fact, attempted paths and recovery condition when unable to continue. "
     "A read, navigation, or question closure alone does not prove region coverage. "
@@ -534,6 +546,57 @@ class DecisionReviewer(Reviewer):
         self.store.append_turn_audit(self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict(recent))
         return recent
 
+    def _validate_completion_refs(self, payload: ReviewCompletion) -> None:
+        """Identify obvious navigation/unknown IDs without replacing source gates."""
+        navigation_kinds = {
+            "diff",
+            "search",
+            "query",
+            "search_code",
+            "find_references",
+            "search_knowledge",
+            "search_index",
+            "search_section",
+            "search_page",
+        }
+        issues = []
+        for field in ("observations", "relations", "integration_relations", "integration_receipts"):
+            for index, entry in enumerate(getattr(payload, field)):
+                for ref_index, ref_id in enumerate(entry.evidence_refs):
+                    location = f"payload.{field}[{index}].evidence_refs[{ref_index}]"
+                    try:
+                        ref = self.store.get(EvidenceRef, ref_id)
+                    except KeyError:
+                        issues.append(
+                            {
+                                "field": location,
+                                "evidence_ref": ref_id,
+                                "kind": None,
+                                "reason": "unknown_reference",
+                                "message": "Unknown evidence ID; use an existing source reference.",
+                            }
+                        )
+                        continue
+                    if ref.run_id != self.store.run.id or ref.repo != self.store.run.repo:
+                        # Leave source binding errors to the existing gate.
+                        continue
+                    if (isinstance(ref.kind, str) and ref.kind.lower() in navigation_kinds) or (
+                        isinstance(ref.metadata, dict) and ref.metadata.get("navigation_only") is True
+                    ):
+                        issues.append(
+                            {
+                                "field": location,
+                                "evidence_ref": ref_id,
+                                "kind": ref.kind,
+                                "reason": "navigation_only",
+                                "message": (
+                                    "Navigation cannot support this receipt; cite the original source actually read."
+                                ),
+                            }
+                        )
+        if issues:
+            raise InvalidCompletionReferencesError(issues)
+
     def _complete(
         self, scope_id: str, turn_id: str, call_id: str, payload: ReviewCompletion, obligation_snapshot: dict[str, Any]
     ) -> dict[str, Any]:
@@ -692,6 +755,8 @@ class DecisionReviewer(Reviewer):
                             raise ValueError("unknown native action; use review_step")
                         state.record_attempt(self.task_id, self.lease_token, turn_id, call_id, args)
                         parsed = ReviewStep.model_validate(args)
+                        if parsed.action == "complete_review":
+                            self._validate_completion_refs(ReviewCompletion.model_validate(parsed.payload))
                         step = state.stage(self.task_id, self.lease_token, turn_id, call_id, args)
                         result = {
                             "step_id": step["id"],
@@ -787,7 +852,22 @@ class DecisionReviewer(Reviewer):
                             else {}
                         )
                         result["error"] = f"{type(exc).__name__}: {exc}"
-                        failures.append(result["error"])
+                        if isinstance(exc, InvalidCompletionReferencesError):
+                            result["reference_errors"] = exc.issues
+                            # Fixing one reference changes the actual failed set;
+                            # reordering unchanged IDs is not a new failure state.
+                            failures.append(
+                                _json(
+                                    {
+                                        "error": result["error"],
+                                        "references": sorted(
+                                            (issue["evidence_ref"], issue["reason"]) for issue in exc.issues
+                                        ),
+                                    }
+                                )
+                            )
+                        else:
+                            failures.append(result["error"])
                         if step is not None and any(
                             op["status"] == "in_flight"
                             for pending_step in state.pending(self.task_id)

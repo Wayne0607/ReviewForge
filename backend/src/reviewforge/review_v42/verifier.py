@@ -699,6 +699,11 @@ class Verifier:
                 raise RevisionConflict(
                     "verification gathered new evidence or questions; schedule the new case revision"
                 )
+            if self.store.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+                # Navigation remains in this verifier's observed/allowed set and audit,
+                # but the store is authoritative about semantic Case evidence.
+                combined = sorted(revised.evidence_refs)
+                questions = revised.question_ids
         else:
             for question in pending_questions:
                 self.store.add(question)

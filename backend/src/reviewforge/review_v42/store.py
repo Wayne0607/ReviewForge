@@ -5738,6 +5738,18 @@ class ReviewStore:
             case = Case(**json.loads(row[0]))
             if case.revision != expected_revision:
                 raise RevisionConflict("verification input revision is stale")
+            decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+            if decision_cycle and (task.run_id != self.run.id or case.run_id != self.run.id):
+                raise BindingError("verification task or case belongs to another run")
+            def validate_decision_refs(ids: list[str]) -> list[EvidenceRef]:
+                refs = self._unit_refs(db, ids)
+                for ref in refs:
+                    identity = asdict(ref)
+                    ref_id = identity.pop("id")
+                    if ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
+                        raise BindingError("verification evidence identity mismatch")
+                return refs
+
             question_ids = list(case.question_ids)
             for question in questions:
                 if question.run_id != case.run_id or question.case_id != case.id or question.scope_id != case.scope_id:
@@ -5745,6 +5757,11 @@ class ReviewStore:
                 if question.revision != 0:
                     raise ValueError("new questions start at revision 0")
                 self._validate_refs(db, question)
+                if decision_cycle:
+                    question_refs = list(question.evidence_refs)
+                    for interpretation in question.interpretations:
+                        question_refs.extend(interpretation.get("evidence_refs", []))
+                    validate_decision_refs(question_refs)
                 payload = _json(asdict(question))
                 row = db.execute(
                     "SELECT payload FROM objects WHERE kind='Question' AND id=?", (question.id,)
@@ -5759,10 +5776,34 @@ class ReviewStore:
             if not set(case.evidence_refs) <= set(evidence_refs):
                 raise BindingError("verification cannot silently remove case evidence")
             if self.run.policy == "v42-units-6":
+                # Validate every incoming ref before treating any of it as navigation.
+                # Filtering first would silently hide missing, foreign or corrupt blobs.
+                incoming = (
+                    validate_decision_refs(evidence_refs)
+                    if decision_cycle
+                    else self._unit_refs(db, [r for r in evidence_refs if r not in case.evidence_refs])
+                )
+                if decision_cycle:
+                    navigation = [
+                        ref.id for ref in incoming
+                        if ref.id not in case.evidence_refs
+                        and (ref.kind.casefold() == "search" or (
+                            ref.kind.casefold() in {"diff", "query"}
+                            and ref.metadata.get("navigation_only") is True
+                        ))
+                    ]
+                    if navigation:
+                        self._event(db, "Case", case.id, "verification_navigation", {
+                            "task_id": task_id, "input_revision": expected_revision, "evidence_refs": navigation,
+                        })
+                    navigation_ids = set(navigation)
+                    incoming = [ref for ref in incoming if ref.id not in navigation_ids]
                 old_sources = self._unit_refs(db, case.evidence_refs)
                 identities = {_unit_source_identity(ref) for ref in old_sources}
                 genuinely_new = []
-                for ref in self._unit_refs(db, [r for r in evidence_refs if r not in case.evidence_refs]):
+                for ref in incoming:
+                    if ref.id in case.evidence_refs:
+                        continue
                     identity = _unit_source_identity(ref)
                     if identity not in identities:
                         genuinely_new.append(ref.id)
@@ -5771,6 +5812,8 @@ class ReviewStore:
             updated = replace(case, evidence_refs=list(evidence_refs), question_ids=question_ids)
             self._validate_refs(db, updated)
             if updated == case:
+                if decision_cycle:
+                    db.commit()
                 return case
             updated = replace(updated, revision=case.revision + 1)
             db.execute(

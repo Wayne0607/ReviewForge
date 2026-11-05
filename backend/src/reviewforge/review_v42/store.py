@@ -5741,6 +5741,7 @@ class ReviewStore:
             decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
             if decision_cycle and (task.run_id != self.run.id or case.run_id != self.run.id):
                 raise BindingError("verification task or case belongs to another run")
+
             def validate_decision_refs(ids: list[str]) -> list[EvidenceRef]:
                 refs = self._unit_refs(db, ids)
                 for ref in refs:
@@ -5785,17 +5786,28 @@ class ReviewStore:
                 )
                 if decision_cycle:
                     navigation = [
-                        ref.id for ref in incoming
+                        ref.id
+                        for ref in incoming
                         if ref.id not in case.evidence_refs
-                        and (ref.kind.casefold() == "search" or (
-                            ref.kind.casefold() in {"diff", "query"}
-                            and ref.metadata.get("navigation_only") is True
-                        ))
+                        and (
+                            ref.kind.casefold() == "search"
+                            or (
+                                ref.kind.casefold() in {"diff", "query"} and ref.metadata.get("navigation_only") is True
+                            )
+                        )
                     ]
                     if navigation:
-                        self._event(db, "Case", case.id, "verification_navigation", {
-                            "task_id": task_id, "input_revision": expected_revision, "evidence_refs": navigation,
-                        })
+                        self._event(
+                            db,
+                            "Case",
+                            case.id,
+                            "verification_navigation",
+                            {
+                                "task_id": task_id,
+                                "input_revision": expected_revision,
+                                "evidence_refs": navigation,
+                            },
+                        )
                     navigation_ids = set(navigation)
                     incoming = [ref for ref in incoming if ref.id not in navigation_ids]
                 old_sources = self._unit_refs(db, case.evidence_refs)

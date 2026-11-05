@@ -18,6 +18,12 @@ class ContextBuilder:
     def __init__(self, store: ReviewStore):
         self.store = store
 
+    def decision_items(self, task_id: str) -> list[dict]:
+        """Return durable question identities; these are navigation, never evidence."""
+        from .decision_state import DecisionState
+
+        return DecisionState(self.store).list_items(task_id)
+
     def reviewer(self, scope_id: str) -> dict:
         scope = self.store.get(ReviewScope, scope_id)
         questions = [q for q in self.store.list(Question) if q.scope_id == scope_id]

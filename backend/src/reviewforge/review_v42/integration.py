@@ -398,23 +398,37 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         raise ValueError("v4.2 requires fixed repo/base/head")
     if orchestrator._model_router is None:
         raise ValueError("v4.2 requires an explicit model router")
+    decision_cycle = os.environ.get("REVIEWFORGE_V42_DECISION_CYCLE", "").strip()
+    if decision_cycle and (decision_cycle != "decision-cycle-1" or EXECUTION_POLICY != "v42-units-6"):
+        raise ValueError("unsupported v4.2 decision cycle policy")
+
+    def option(name: str, decision_default: str = "") -> str:
+        value = os.environ.get(name, "").strip()
+        if decision_cycle and decision_default:
+            if value and value != decision_default:
+                raise ValueError(f"incompatible decision cycle option: {name}")
+            return decision_default
+        return value
+
     unit_scheduler = os.environ.get("REVIEWFORGE_V42_UNIT_SCHEDULER", "").strip()
     if unit_scheduler and (unit_scheduler != "cooperative-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 unit scheduler")
     unit_plan = os.environ.get("REVIEWFORGE_V42_UNIT_PLAN", "").strip()
     if unit_plan and (unit_plan != "single-owner-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 unit plan")
-    shared_investigation = os.environ.get("REVIEWFORGE_V42_SHARED_INVESTIGATION", "").strip()
+    shared_investigation = option("REVIEWFORGE_V42_SHARED_INVESTIGATION", "shared-1")
     if shared_investigation and (shared_investigation != "shared-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 shared investigation")
     question_assistant = os.environ.get("REVIEWFORGE_V42_QUESTION_ASSISTANT", "").strip()
+    if decision_cycle and question_assistant:
+        raise ValueError("decision-cycle-1 does not enable delegated question assistants")
     if question_assistant and (
         question_assistant != "question-delivery-1"
         or EXECUTION_POLICY != "v42-units-6"
         or shared_investigation != "shared-1"
     ):
         raise ValueError("unsupported v4.2 question assistant")
-    candidate_draft = os.environ.get("REVIEWFORGE_V42_CANDIDATE_DRAFT", "").strip()
+    candidate_draft = option("REVIEWFORGE_V42_CANDIDATE_DRAFT", "candidate-draft-1")
     if candidate_draft and (
         candidate_draft != "candidate-draft-1"
         or EXECUTION_POLICY != "v42-units-6"
@@ -422,7 +436,7 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
     ):
         raise ValueError("unsupported v4.2 candidate draft policy")
     line_policy = "git-lf-1"
-    frontier_projection = os.environ.get("REVIEWFORGE_V42_FRONTIER_PROJECTION", "").strip()
+    frontier_projection = option("REVIEWFORGE_V42_FRONTIER_PROJECTION", "source-line-union-1")
     if frontier_projection and (
         frontier_projection != "source-line-union-1"
         or EXECUTION_POLICY != "v42-units-6"
@@ -521,6 +535,8 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["candidate_draft_policy"] = candidate_draft
         if frontier_projection:
             metadata["frontier_projection_policy"] = frontier_projection
+        if decision_cycle:
+            metadata["decision_cycle_policy"] = decision_cycle
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

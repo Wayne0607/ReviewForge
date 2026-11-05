@@ -2,6 +2,8 @@
 
 ## 当前开发状态
 
+- 2026-11-05 用户授权两名 GPT-6.1 Terra / xhigh 实现交付方案前两阶段。可选 `REVIEWFORGE_V42_DECISION_CYCLE=decision-cycle-1` 绑定单一 `review_step`、持久问题/判断/来源 outbox、当前问题原文投影、候选即时核验和完整配置依赖，保留现有责任分组。完整后端 **4165 passed、1 skipped**；随后仅补全模型可见的完成动作嵌套格式，相关专项 **42 passed**，lint/format/spec-check/严格裁判离线检查通过。真实小范围 A/B 尚待完成，**通过后才跑完整 PR**；旧运行、legacy 默认和 GitHub 零投递保持。跨租约且原 exchange 未完整落盘、来源 in-flight 未知仍 partial，整合非最终动作沿用逐项事务。[实施与门槛](docs/v4.2-delivery-plan.md#13-2026-11-05-首个实现与验收记录)。
+
 - `5527278` 同 PR 空状态诊断人工停止：**12612418 已知 tokens**、7 次失败用量未知、76 完整响应、0 Case/草稿、0/24 完成、3 未核实导航，裁判未运行；候选修复未实际触发。确认同请求固定源码重叠，后续可选 `REVIEWFORGE_V42_FRONTIER_PROJECTION=source-line-union-1` 的完整后端 **4124 passed、1 skipped**，质量与成本均未验收。[记录](docs/v4.2-architecture.md#1922-候选恢复策略真实诊断与中断记录)。v4.2 开发累计 **35387045 已知 tokens、217 请求未知**，非供应商账单。
 
 - 可选 `REVIEWFORGE_V42_CANDIDATE_DRAFT=candidate-draft-1` 为每次可解析的候选提交保留独立纠错尝试；错误目标须显式处理，Case 晋升与草稿处置事务一致，未知关联保守阻断。需 `v42-units-6` 和 `shared-1`；旧 checkpoint、默认路径不变。完整后端 **4084 passed、1 skipped**；真实质量和成本未验收，同请求重叠源码仍未去重。详见 [设计 19.20](docs/v4.2-architecture.md#1920-可恢复的候选提交尝试)。

@@ -68,6 +68,16 @@ class _FairModel:
 class ReviewRuntime:
     def __init__(self, store: Any, llm: Any, gateway: Any, verifier: Any):
         metadata = store.run.metadata
+        if "decision_cycle_policy" in metadata and (
+            metadata["decision_cycle_policy"] != "decision-cycle-1"
+            or store.run.policy != "v42-units-6"
+            or metadata.get("shared_investigation") != "shared-1"
+            or metadata.get("candidate_draft_policy") != "candidate-draft-1"
+            or metadata.get("frontier_projection_policy") != "source-line-union-1"
+            or metadata.get("source_line_policy") != "git-lf-1"
+            or "question_assistant_policy" in metadata
+        ):
+            raise ValueError("unsupported v4.2 decision cycle policy")
         if "frontier_projection_policy" in metadata and (
             metadata["frontier_projection_policy"] != "source-line-union-1"
             or store.run.policy != "v42-units-6"
@@ -193,6 +203,27 @@ class ReviewRuntime:
             case = self.store.update(Case, case.id, case.revision, evidence_refs=sorted(set(case.evidence_refs) | refs))
         return case
 
+    def _ack_decision_verification(self, case: Case, task: Task) -> None:
+        if self.store.run.metadata.get("decision_cycle_policy") != "decision-cycle-1":
+            return
+        from reviewforge.review_v42.decision_state import DecisionState
+
+        decisions = DecisionState(self.store)
+        for item in decisions.pending_verifications():
+            if item["case_id"] == case.id:
+                try:
+                    decisions.ack_verification(case.id, item["case_revision"], task.id)
+                except (BindingError, RevisionConflict):
+                    # Another durable transition may supersede this snapshot.
+                    # Preserve readiness for the next scan, but do not hide a
+                    # binding error on the same current Case and Task.
+                    current_case = self.store.get(Case, case.id)
+                    current_task = self.store.get(Task, task.id)
+                    latest = decisions.pending_verifications()
+                    if current_case != case or current_task != task or item not in latest:
+                        return
+                    raise
+
     def _enqueue(self, case: Case) -> None:
         # A verdict is never re-sampled on unchanged claims and source evidence,
         # including when a question-only edit has advanced the case revision.
@@ -204,6 +235,7 @@ class ReviewRuntime:
                 and previous.input_revision != case.revision
                 and previous.result.get("case_input") == self._case_input(case)
             ):
+                self._ack_decision_verification(case, previous)
                 return
             detail = previous.result.get("detail", {}) if previous.status == "superseded" else previous.result
             if (
@@ -214,6 +246,15 @@ class ReviewRuntime:
                 and detail.get("claims") == case.claims
                 and detail.get("evidence_refs") == sorted(case.evidence_refs + case.counter_evidence_refs)
             ):
+                for verified in self.store.list(Task):
+                    if (
+                        verified.kind == "verify"
+                        and verified.object_id == case.id
+                        and verified.status == "completed"
+                        and verified.result.get("case_input") == self._case_input(case)
+                    ):
+                        self._ack_decision_verification(case, verified)
+                        break
                 return
         key = f"{case.id}:{case.revision}"
         task_id = "verify_" + hashlib.sha256(key.encode()).hexdigest()[:24]
@@ -228,6 +269,9 @@ class ReviewRuntime:
         if task.status != "completed" and task_id not in self._enqueued:
             self._enqueued.add(task_id)
             self._queue.put_nowait(task_id)
+        # The durable Task exists before consuming the transactional outbox.
+        # A crash before this point is recovered by the normal Case scan.
+        self._ack_decision_verification(case, task)
 
     def _enqueue_question(
         self, question: Question, reason: str, task_id: str, token: str, turn_id: str = "", call_id: str = ""
@@ -486,7 +530,12 @@ class ReviewRuntime:
             self._errors_real.append(f"review {scope_id}: lease unavailable")
             return "partial"
         heartbeat = asyncio.create_task(self._heartbeat(task, 120))
-        reviewer = Reviewer(
+        reviewer_class = Reviewer
+        if self.store.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+            from reviewforge.review_v42.decision_loop import DecisionReviewer
+
+            reviewer_class = DecisionReviewer
+        reviewer = reviewer_class(
             self.store,
             _FairModel(self.llm, self, task.id, task.lease_token) if self._fair_enabled() else self.llm,
             self.gateway,

@@ -98,6 +98,17 @@ class ReviewStore:
             or run.metadata.get("source_line_policy") != "git-lf-1"
         ):
             raise BindingError("unsupported frontier projection policy")
+        decision_policy = run.metadata.get("decision_cycle_policy")
+        if "decision_cycle_policy" in run.metadata and (
+            decision_policy != "decision-cycle-1"
+            or run.policy != "v42-units-6"
+            or run.metadata.get("shared_investigation") != "shared-1"
+            or run.metadata.get("source_line_policy") != "git-lf-1"
+            or projection != "source-line-union-1"
+            or candidate_policy != "candidate-draft-1"
+            or "question_assistant_policy" in run.metadata
+        ):
+            raise BindingError("unsupported decision cycle profile")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
@@ -147,6 +158,22 @@ class ReviewStore:
                     "CREATE TABLE IF NOT EXISTS frontier_generations ("
                     "task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL)"
                 )
+            if decision_policy == "decision-cycle-1":
+                db.executescript("""
+                    CREATE TABLE IF NOT EXISTS decision_attempts (
+                        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, turn_id TEXT NOT NULL, call_id TEXT NOT NULL,
+                        payload TEXT NOT NULL, UNIQUE(task_id,turn_id,call_id));
+                    CREATE TABLE IF NOT EXISTS decision_items (
+                        id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS decision_steps (
+                        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, turn_id TEXT NOT NULL, call_id TEXT NOT NULL,
+                        item_id TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(task_id,turn_id,call_id));
+                    CREATE TABLE IF NOT EXISTS decision_operations (
+                        id TEXT PRIMARY KEY, step_id TEXT NOT NULL, ordinal INTEGER NOT NULL, payload TEXT NOT NULL,
+                        UNIQUE(step_id,ordinal));
+                    CREATE TABLE IF NOT EXISTS decision_verification_queue (
+                        case_id TEXT PRIMARY KEY, step_id TEXT NOT NULL, case_revision INTEGER NOT NULL);
+                """)
             if run.policy == "v42-units-6":
                 db.executescript("""
                     CREATE TABLE IF NOT EXISTS unit_plan (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
@@ -522,7 +549,15 @@ class ReviewStore:
                         terminal = [
                             call
                             for call in calls
-                            if (scope_id == plan.integration_scope_id and call["name"] == "finish_integration")
+                            if (
+                                self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+                                and call["name"] == "review_step"
+                                and isinstance(call["args"], dict)
+                                and call["args"].get("action") == "complete_review"
+                                and isinstance(call["args"].get("payload"), dict)
+                                and call["args"]["payload"].get("finish") is True
+                            )
+                            or (scope_id == plan.integration_scope_id and call["name"] == "finish_integration")
                             or (
                                 scope_id != plan.integration_scope_id
                                 and call["name"] == "submit_unit_decision"
@@ -1236,7 +1271,56 @@ class ReviewStore:
                 continue
             if not isinstance(obj, dict):
                 continue
-            if message["type"] == "tool" and isinstance(obj.get("evidence_ref"), str):
+            if (
+                message["type"] == "tool"
+                and self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+                and isinstance(obj.get("step_id"), str)
+                and isinstance(obj.get("results"), list)
+            ):
+                step_row = db.execute(
+                    "SELECT task_id,turn_id,payload FROM decision_steps WHERE id=?", (obj["step_id"],)
+                ).fetchone()
+                if step_row is None or step_row[0] != task_id:
+                    continue
+                origin_owner = db.execute(
+                    "SELECT lease_hash FROM unit_turn_owners WHERE task_id=? AND turn_id=?",
+                    (task_id, step_row[1]),
+                ).fetchone()
+                if origin_owner is None or step_row[1] == turn_id:
+                    continue
+                seen_operations = set()
+                for wrapped in obj["results"]:
+                    if not isinstance(wrapped, dict) or set(wrapped) != {"operation_id", "result"}:
+                        continue
+                    operation_id = wrapped["operation_id"]
+                    if not isinstance(operation_id, str) or operation_id in seen_operations:
+                        continue
+                    seen_operations.add(operation_id)
+                    row = db.execute(
+                        "SELECT payload FROM decision_operations WHERE id=? AND step_id=?",
+                        (operation_id, obj["step_id"]),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    operation = json.loads(row[0])
+                    result = wrapped["result"]
+                    if operation.get("status") != "completed" or operation.get("result") != result:
+                        continue
+                    if not isinstance(result, dict) or not isinstance(result.get("evidence_ref"), str):
+                        continue
+                    ref_id = result["evidence_ref"]
+                    if ref_id not in ref_ids or not isinstance(result.get("content"), str):
+                        continue
+                    ref = self._unit_refs(db, [ref_id])[0]
+                    raw = (self.blob_dir / ref.content_hash).read_bytes()
+                    start, end = result.get("start_line"), result.get("end_line")
+                    try:
+                        actual = self._frontier_content(ref, raw, start, end, run=self.run).decode("utf-8")
+                    except (ValueError, UnicodeError):
+                        continue
+                    if result["content"] == actual:
+                        record(ref, actual.encode("utf-8"), start, end)
+            elif message["type"] == "tool" and isinstance(obj.get("evidence_ref"), str):
                 ref_id = obj["evidence_ref"]
                 if ref_id not in ref_ids or not isinstance(obj.get("content"), str):
                     continue
@@ -1535,6 +1619,36 @@ class ReviewStore:
                             "INSERT OR IGNORE INTO unit_pending_sources VALUES (?,?,?)", (sid, region["id"], ref_id)
                         )
 
+    def _settle_scope_decision(
+        self,
+        db: sqlite3.Connection,
+        task_id: str,
+        turn_id: str,
+        call_id: str,
+        *,
+        result_status: str,
+        expected: dict[str, Any] | None = None,
+    ) -> None:
+        row = db.execute(
+            "SELECT id,payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
+            (task_id, turn_id, call_id),
+        ).fetchone()
+        if row is None:
+            raise BindingError("completion decision has not been staged")
+        step = json.loads(row[1])
+        args = step.get("args", {})
+        payload = args.get("payload") if isinstance(args, dict) else None
+        if step.get("action") != "complete_review" or not isinstance(payload, dict):
+            raise BindingError("completion decision action mismatch")
+        if expected is not None:
+            for key, value in expected.items():
+                default = True if key == "finish" else []
+                if payload.get(key, default) != value:
+                    raise BindingError("completion decision differs from its native payload")
+        step.update(status="settled", disposition=result_status)
+        db.execute("UPDATE decision_steps SET payload=? WHERE id=?", (_json(step), row[0]))
+        self._event(db, "DecisionStep", row[0], "scope_disposition", step)
+
     def commit_unit_decision(
         self,
         task_id: str,
@@ -1551,6 +1665,7 @@ class ReviewStore:
         finish: bool = False,
         now: float | None = None,
         _db: sqlite3.Connection | None = None,
+        decision_call_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(decision_id, str) or not decision_id.strip() or type(finish) is not bool:
             raise ValueError("decision requires an ID and boolean finish")
@@ -1758,8 +1873,13 @@ class ReviewStore:
                     navigation and navigation.status == "open"
                 ):
                     current_unresolved.append(unresolved_id)
+            decision_items_open = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1" and any(
+                json.loads(row[0]).get("status") != "answered"
+                for row in db.execute("SELECT payload FROM decision_items WHERE scope_id=?", (scope.id,))
+            )
             blocked = (
-                current_unresolved
+                decision_items_open
+                or current_unresolved
                 or self._pending_shared_investigations(db, scope.id)
                 or self.pending_candidate_drafts(scope.id, db=db)
                 or any(
@@ -1823,6 +1943,22 @@ class ReviewStore:
                 "INSERT INTO unit_decisions VALUES (?,?,?,?)", (decision_id, scope.id, _json(request), _json(result))
             )
             self._event(db, "UnitDecision", decision_id, "commit", result)
+            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1" and decision_call_id:
+                self._settle_scope_decision(
+                    db,
+                    task_id,
+                    turn_id,
+                    decision_call_id,
+                    result_status=status,
+                    expected={
+                        "checked_region_ids": checked_region_ids,
+                        "observations": observations,
+                        "unresolved_refs": unresolved,
+                        "finish": finish,
+                    },
+                )
+            elif self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1" and finish:
+                raise BindingError("completion requires a staged native decision")
             if _db is None:
                 db.commit()
             result["scope"] = updated
@@ -2540,6 +2676,7 @@ class ReviewStore:
         now: float | None = None,
         *,
         turn_id: str | None = None,
+        decision_call_id: str | None = None,
     ) -> ReviewScope:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2564,7 +2701,14 @@ class ReviewStore:
             if not obligations or any(not o["valid"] for o in obligations):
                 raise BindingError("integration obligations are unresolved or stale")
             if (
-                scope.unresolved
+                (
+                    self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+                    and any(
+                        json.loads(row[0]).get("status") != "answered"
+                        for row in db.execute("SELECT payload FROM decision_items WHERE scope_id=?", (scope.id,))
+                    )
+                )
+                or scope.unresolved
                 or self._pending_shared_investigations(db, scope.id)
                 or self.pending_candidate_drafts(db=db)
                 or any(
@@ -2605,6 +2749,12 @@ class ReviewStore:
                 (task.revision, _json(asdict(task)), task.id),
             )
             self._event(db, "IntegrationReview", scope.id, "finish", {"task_id": task_id})
+            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+                if not decision_call_id or not turn_id:
+                    raise BindingError("integration completion requires a staged native decision")
+                self._settle_scope_decision(
+                    db, task_id, turn_id, decision_call_id, result_status="reviewed", expected={"finish": True}
+                )
             db.execute("DELETE FROM unit_pending_cases WHERE scope_id=?", (scope.id,))
             db.commit()
             return scope
@@ -3039,23 +3189,60 @@ class ReviewStore:
                 or len(native) != 1
                 or not isinstance(native[0], dict)
                 or not isinstance(native[0].get("invalid_tool_calls"), list)
-                or native[0]["invalid_tool_calls"]
-                or native[0].get("protocol_errors")
+                or (
+                    self.run.metadata.get("decision_cycle_policy") != "decision-cycle-1"
+                    and (native[0]["invalid_tool_calls"] or native[0].get("protocol_errors"))
+                )
             ):
                 raise BindingError("candidate native calls are invalid")
             raw_calls = native[0].get("raw_tool_calls")
-            if raw_calls is not None and (not isinstance(raw_calls, list) or len(raw_calls) != len(calls)):
+            if raw_calls is not None and (
+                not isinstance(raw_calls, list)
+                or (
+                    self.run.metadata.get("decision_cycle_policy") != "decision-cycle-1"
+                    and len(raw_calls) != len(calls)
+                )
+            ):
                 raise BindingError("candidate native call count differs")
         from reviewforge.engine.native_submission import strict_tool_call
 
+        valid_calls = []
         for call in calls:
-            raw_call = None
-            if raw_calls is not None:
-                matching = [item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]]
-                if len(matching) != 1:
-                    raise BindingError("candidate raw call identity is ambiguous")
-                raw_call = matching[0]
-            strict_tool_call(call, raw_call)
+            try:
+                raw_call = None
+                if raw_calls is not None:
+                    matching = [item for item in raw_calls if isinstance(item, dict) and item.get("id") == call["id"]]
+                    if len(matching) != 1:
+                        raise BindingError("candidate raw call identity is ambiguous")
+                    raw_call = matching[0]
+                strict_tool_call(call, raw_call)
+                valid_calls.append(call)
+            except (BindingError, ValueError, TypeError):
+                if self.run.metadata.get("decision_cycle_policy") != "decision-cycle-1":
+                    raise
+        calls = valid_calls
+        if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+            adapted = []
+            for call in calls:
+                args = call.get("args")
+                if (
+                    call.get("name") == "review_step"
+                    and isinstance(args, dict)
+                    and args.get("action") == "offer_candidate"
+                    and isinstance(args.get("payload"), dict)
+                    and isinstance(args["payload"].get("candidate"), dict)
+                ):
+                    call = {**call, "name": "submit_case", "args": args["payload"]["candidate"]}
+                elif (
+                    call.get("name") == "review_step"
+                    and isinstance(args, dict)
+                    and args.get("action") == "offer_candidate"
+                    and isinstance(args.get("payload"), dict)
+                    and isinstance(args["payload"].get("retract_draft"), dict)
+                ):
+                    call = {**call, "name": "retract_candidate_draft", "args": args["payload"]["retract_draft"]}
+                adapted.append(call)
+            calls = adapted
         return calls, phases["response"]
 
     def stage_candidate_batch(
@@ -3516,6 +3703,27 @@ class ReviewStore:
                 "submit",
                 {"task_id": task_id, "turn_id": turn_id, "call_id": call_id, "result": item},
             )
+            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+                decision_row = db.execute(
+                    "SELECT id,payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
+                    (task_id, turn_id, call_id),
+                ).fetchone()
+                if decision_row is None:
+                    raise BindingError("candidate decision must be staged before promotion")
+                step = json.loads(decision_row[1])
+                if step.get("action") != "offer_candidate":
+                    raise BindingError("candidate decision action mismatch")
+                step.update(status="settled", disposition=item["status"], candidate_draft_id=item["id"])
+                if item["status"] == "promoted":
+                    step["case_id"] = item["case_id"]
+                    db.execute(
+                        "INSERT INTO decision_verification_queue VALUES (?,?,?) "
+                        "ON CONFLICT(case_id) DO UPDATE SET step_id=excluded.step_id,"
+                        "case_revision=excluded.case_revision",
+                        (item["case_id"], decision_row[0], item["case_revision"]),
+                    )
+                db.execute("UPDATE decision_steps SET payload=? WHERE id=?", (_json(step), decision_row[0]))
+                self._event(db, "DecisionStep", decision_row[0], "candidate_disposition", step)
             self._guard_review_task(db, task_id, token, task.object_id, now)
             db.commit()
             return item
@@ -3587,6 +3795,19 @@ class ReviewStore:
                 "retract",
                 {"task_id": task_id, "turn_id": turn_id, "call_id": call_id, "reason": reason},
             )
+            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+                decision_row = db.execute(
+                    "SELECT id,payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
+                    (task_id, turn_id, call_id),
+                ).fetchone()
+                if decision_row is None:
+                    raise BindingError("candidate withdrawal decision must be staged")
+                step = json.loads(decision_row[1])
+                if step.get("action") != "offer_candidate":
+                    raise BindingError("candidate withdrawal action mismatch")
+                step.update(status="settled", disposition="retracted", candidate_draft_id=draft_id)
+                db.execute("UPDATE decision_steps SET payload=? WHERE id=?", (_json(step), decision_row[0]))
+                self._event(db, "DecisionStep", decision_row[0], "candidate_withdrawal", step)
             self._guard_review_task(db, task_id, token, task.object_id, now)
             db.commit()
             return item

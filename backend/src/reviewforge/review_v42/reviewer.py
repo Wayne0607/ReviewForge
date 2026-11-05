@@ -1083,7 +1083,9 @@ class Reviewer:
                 output.append(entry)
         return output
 
-    def _context(self, scope_id: str, *, recent: list[Any] | None = None) -> list[Any]:
+    def _context(
+        self, scope_id: str, *, recent: list[Any] | None = None, frontier_refs: set[str] | None = None
+    ) -> list[Any]:
         state = reviewer_context(self.store, scope_id)
         frontier = self.store.run.policy in {"v42-frontier-4", "v42-frontier-5", "v42-units-6"}
         unit_role = ""
@@ -1153,6 +1155,8 @@ class Reviewer:
             try:
                 entries = []
                 for item in self.store.list_frontier(self.task_id):
+                    if frontier_refs is not None and not frontier_refs.intersection(item.aliases):
+                        continue
                     raw = self.store.read_frontier_entry(self.task_id, item.id)
                     if item.id in latest_ids:
                         continue

@@ -2,6 +2,8 @@
 
 ## 当前开发状态
 
+- `2d8cfc2` 的 `claim-delivery-2` 独立提交每条结论的判决或具体补证缺口，补证后回到同一 Case 版本和 Claim ID。专项 **41 passed**，完整 Linux CI **4266 passed、3 skipped**。保存 Case 的隔离核验用 **2 响应、10629 已知 tokens、0 未知/在途** 落盘 `accept`。随后真实小样本再落盘一个 `accept`，但主审反复把工作项版本当作草稿版本，草稿与新开问题未关闭，最终 0/1 覆盖、0 评论、partial。小样本 **25 响应、447291 已知 tokens、3 次失败用量未知、0 在途**，完整 PR 未启动。v4.2 累计 **39552966 已知 tokens、227 次失败用量未知**，非账单。[记录](docs/v4.2-delivery-plan.md#1313-逐结论判决与补证)。
+
 - `b49569e` 的 `complete_scope` 将范围结算与工作项分离，专项 **41 passed**，完整 Linux CI **4264 passed、3 skipped**。同一保存 Case 的三项隔离诊断合计 **22 完整响应、217184 已知 tokens、4 次失败用量未知、0 在途、0 判决**。自动核验在合法搜索间反复返回未注册命令，定向探针返回无具体缺口的 `needs_evidence` 并被拒绝。真实门槛未过，新小测和完整 PR 均未启动。v4.2 累计 **39095046 已知 tokens、224 次失败用量未知**，非账单。[记录](docs/v4.2-delivery-plan.md#1312-审查范围结算与保存-case-的独立诊断)。
 
 - `7d05f0a` 完整 Linux CI **4261 passed、3 skipped**。真实复测仅晋升 1 Case，原工作项仍 `answered`。`complete_review` 空工作项 ID 误开第二个未答问题，主责 partial；核验已排空，**29 完整响应、389913 已知 tokens、1 未知请求、0 在途、0 判决/评论**。已加完成动作身份前置校验，拒绝空 ID 后可根据回执用原工作项完成，专项 **41 passed**。小测未过，完整 PR 未启动。v4.2 累计 **38877862 已知 tokens、220 未知**，非账单。[记录](docs/v4.2-delivery-plan.md#1311-收敛修复真实复测完成动作误开新工作项)。

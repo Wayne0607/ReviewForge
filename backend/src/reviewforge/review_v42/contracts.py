@@ -55,6 +55,15 @@ class Question:
     revision: int = 0
 
 
+def evidence_gap(value: Any) -> dict[str, str] | None:
+    fields = ("missing_fact", "attempted", "recovery_condition")
+    if not isinstance(value, dict) or any(
+        not isinstance(value.get(key), str) or not value[key].strip() for key in fields
+    ):
+        return None
+    return {key: value[key].strip() for key in fields}
+
+
 @dataclass
 class NavigationItem:
     """Untrusted investigation navigation; never evidence or a case verdict."""

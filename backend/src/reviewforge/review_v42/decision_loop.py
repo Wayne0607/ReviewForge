@@ -136,11 +136,18 @@ class CandidateOffer(_Strict):
         return self
 
 
+class Unresolved(_Strict):
+    missing_fact: str = Field(min_length=1)
+    attempted: str = Field(min_length=1)
+    recovery_condition: str = Field(min_length=1)
+
+
 class QuestionClose(_Strict):
     question_id: str = Field(min_length=1)
     answer: str = Field(min_length=1)
     evidence_refs: list[str] = Field(min_length=1)
     affected_regions: list[str] = Field(default_factory=list)
+    evidence_gap: Unresolved | None = None
 
 
 class UnitObservation(_Strict):
@@ -176,12 +183,6 @@ class ReviewCompletion(_Strict):
     integration_relations: list[IntegrationRelation] = Field(default_factory=list)
     integration_receipts: list[IntegrationReceipt] = Field(default_factory=list)
     finish: bool = True
-
-
-class Unresolved(_Strict):
-    missing_fact: str = Field(min_length=1)
-    attempted: str = Field(min_length=1)
-    recovery_condition: str = Field(min_length=1)
 
 
 class InvalidDecisionReferencesError(ValueError):
@@ -265,7 +266,9 @@ def review_step_tool():
         "apply_to_draft; apply_to_draft requires "
         "a distinct target_draft_id and target_expected_revision. Optional IDs and resolution cannot be empty strings. "
         "Each failed attempt remains separate until corrected or explicitly retracted. "
-        "close_question {question_id,answer,evidence_refs,affected_regions?}; "
+        "close_question {question_id,answer,evidence_refs,affected_regions?,evidence_gap?:"
+        "{missing_fact,attempted,recovery_condition}}; include evidence_gap when the answer still depends "
+        "on unavailable material; "
         "complete_review {checked_region_ids:[string],"
         "observations:[{statement:string,evidence_refs:[string],region_ids:[string]}],"
         "unresolved_refs:[string],"
@@ -317,7 +320,10 @@ DECISION_PROMPT = (
     "On missing_unit_source, add an eligible original ref to that receipt or read a listed path if needed. "
     "Submit only obligations still open; checked receipts are already saved. "
     "finish only after all obligations are resolved. An unanswered question or unavailable source is not clean. "
-    "Use unresolved with the missing fact, attempted paths and recovery condition when unable to continue. "
+    "If a requested determination depends on an unavailable policy, contract or environment, save the gap "
+    "as soon as it is established. Use review_step action unresolved with missing_fact, attempted and "
+    "recovery_condition, or include those fields in close_question.payload.evidence_gap when also reporting "
+    "a supported partial answer. State what authoritative material would let this question be resolved. "
     "A read, navigation, or question closure alone does not prove region coverage. "
     "A source_union is a lossless display of original fixed source; mappings identify the exact "
     "ref_id and lines that may be cited. It is not itself a reference. Candidate drafts are unverified "
@@ -1050,7 +1056,10 @@ class DecisionReviewer(Reviewer):
                     try:
                         name = call["name"]
                         if name not in {"review_step", "complete_scope"}:
-                            raise ValueError("unknown native action; use review_step or complete_scope")
+                            raise ValueError(
+                                "Unknown native action. Use review_step for source operations or to report "
+                                "an unresolved gap. Use complete_scope for supported completion."
+                            )
                         state.record_attempt(self.task_id, self.lease_token, turn_id, call_id, args, native_name=name)
                         scope_completion = name == "complete_scope"
                         self._check_known_source_integrity(
@@ -1137,7 +1146,9 @@ class DecisionReviewer(Reviewer):
                                 result.pop("scope_revision")
                             if result["status"] != "running":
                                 finished = result["status"]
-                        elif action == "unresolved":
+                        elif action == "unresolved" or (
+                            action == "close_question" and parsed.payload.get("evidence_gap") is not None
+                        ):
                             result["status"] = "partial"
                             finished = "partial"
                         else:

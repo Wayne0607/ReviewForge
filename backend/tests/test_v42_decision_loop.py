@@ -10,6 +10,7 @@ from test_v42_stateful_reviewer import call
 
 from reviewforge.review_v42.contracts import Case, Question, ReviewScope
 from reviewforge.review_v42.decision_loop import DecisionReviewer
+from reviewforge.review_v42.publication import local_report
 from reviewforge.review_v42.store import ReviewStore
 from reviewforge.review_v42.tools import EvidenceGateway
 
@@ -196,9 +197,15 @@ async def test_integration_uses_its_own_review_and_completion_gate(tmp_path):
     assert store.get(ReviewScope, "integration").status == "reviewed"
 
 
-async def test_candidate_is_enqueued_before_scope_finishes(tmp_path):
+@pytest.mark.parametrize("partial_answer", [False, True])
+async def test_candidate_is_enqueued_before_scope_finishes(tmp_path, partial_answer):
     store, task = decision_store(tmp_path)
     accepted = []
+    gap = {
+        "missing_fact": "Approved policy for the current deployment",
+        "attempted": "Checked fixed repository sources",
+        "recovery_condition": "Obtain the approved, versioned policy for this deployment",
+    }
 
     def read(_):
         payload = {
@@ -221,19 +228,21 @@ async def test_candidate_is_enqueued_before_scope_finishes(tmp_path):
     def unresolved(messages):
         assert len(accepted) == 1
         item = from_board(messages)
+        refs = item["judgments"][-1]["evidence_refs"]
+        action, payload = "unresolved", gap
+        if partial_answer:
+            action, payload = (
+                "close_question",
+                {
+                    "question_id": item["question_id"],
+                    "answer": "The repository establishes the implemented threshold",
+                    "evidence_refs": refs,
+                    "evidence_gap": gap,
+                },
+            )
         return AIMessage(
             content="",
-            tool_calls=[
-                call(
-                    "review_step",
-                    step(
-                        "unresolved",
-                        {"missing_fact": "contract", "attempted": "source", "recovery_condition": "contract available"},
-                        item,
-                    ),
-                    "u",
-                )
-            ],
+            tool_calls=[call("review_step", step(action, payload, item, refs), "u")],
         )
 
     reviewer = DecisionReviewer(
@@ -247,6 +256,19 @@ async def test_candidate_is_enqueued_before_scope_finishes(tmp_path):
     assert await reviewer.run("a") == "partial", reviewer.error
     assert len(store.list(Case)) == len(accepted) == 1
     assert store.get(ReviewScope, "a").status != "reviewed"
+    reopened = ReviewStore(store.path, store.run)
+    (question,) = reopened.list(Question)
+    assert question.status == "unresolved" and bool(question.answer) is partial_answer
+    report = local_report(reopened)
+    assert report["status"] == "partial"
+    assert report["open_questions"] == [question.id]
+    assert {
+        "kind": "evidence_gap",
+        "question_id": question.id,
+        "scope_id": "a",
+        "evidence_refs": accepted[0].evidence_refs,
+        **gap,
+    } in report["unresolved"]
 
 
 async def test_result_survives_interruption_before_exchange(tmp_path, monkeypatch):

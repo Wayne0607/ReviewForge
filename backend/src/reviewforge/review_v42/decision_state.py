@@ -12,7 +12,7 @@ import sqlite3
 from dataclasses import asdict
 from typing import Any
 
-from .contracts import BindingError, Case, LeaseError, Question, RevisionConflict, Task
+from .contracts import BindingError, Case, LeaseError, Question, RevisionConflict, Task, evidence_gap
 from .store import ReviewStore, _json
 
 
@@ -436,6 +436,9 @@ class DecisionState:
                     or not answer_refs
                 ):
                     raise ValueError("closing a question requires an answer and original references")
+                gap = evidence_gap(payload.get("evidence_gap"))
+                if gap is None and payload.get("evidence_gap") is not None:
+                    raise ValueError("evidence gap requires missing fact, attempted sources and recovery condition")
                 question = self.store.update_unit_object(
                     task_id,
                     token,
@@ -445,17 +448,15 @@ class DecisionState:
                     turn_id=turn_id,
                     now=now,
                     _db=db,
-                    status="answered",
+                    status="answered" if gap is None else "unresolved",
                     answer=answer.strip(),
                     answer_status="supported",
                     evidence_refs=answer_refs,
+                    **({"change_reason": _json(gap)} if gap else {}),
                 )
             elif args["action"] == "unresolved":
-                payload = args["payload"]
-                if any(
-                    not isinstance(payload.get(key), str) or not payload[key].strip()
-                    for key in ("missing_fact", "attempted", "recovery_condition")
-                ):
+                gap = evidence_gap(args["payload"])
+                if gap is None:
                     raise ValueError("unresolved requires missing fact, attempted paths and recovery condition")
                 question = self.store.update_unit_object(
                     task_id,
@@ -467,7 +468,8 @@ class DecisionState:
                     now=now,
                     _db=db,
                     status="unresolved",
-                    change_reason=_json(payload),
+                    change_reason=_json(gap),
+                    evidence_refs=refs or question.evidence_refs,
                 )
             if args["judgment"].strip():
                 item["judgments"].append(

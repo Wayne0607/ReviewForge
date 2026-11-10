@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from .contracts import Case, EvidenceRef, NavigationItem, Question, ReviewScope
+from .contracts import Case, EvidenceRef, NavigationItem, Question, ReviewScope, evidence_gap
 from .line_semantics import source_line_policy, source_lines, source_quote_lines, source_slice
 from .verifier import POLICY, _citation, validate_result
 
@@ -628,6 +628,24 @@ class Publication:
         workspace = self.store.run.policy in {"v42-workspace-3", "v42-frontier-4", "v42-frontier-5", "v42-units-6"}
         unreviewed = [s.id for s in active_scopes if s.status != "reviewed" or (workspace and bool(s.unresolved))]
         open_questions = [q.id for q in questions if q.status in {"open", "disputed", "unresolved"}]
+        if self.store.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+            for question in questions:
+                if question.status != "unresolved" or not question.change_reason:
+                    continue
+                try:
+                    gap = evidence_gap(json.loads(question.change_reason))
+                except (TypeError, ValueError):
+                    continue
+                if gap is not None:
+                    unresolved.append(
+                        {
+                            "kind": "evidence_gap",
+                            "question_id": question.id,
+                            "scope_id": question.scope_id,
+                            "evidence_refs": question.evidence_refs,
+                            **gap,
+                        }
+                    )
         open_navigation = []
         if workspace:
             active_scope_ids = {scope.id for scope in active_scopes}

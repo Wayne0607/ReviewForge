@@ -156,7 +156,11 @@ class Unresolved(_Strict):
 class QuestionClose(_Strict):
     question_id: str = Field(min_length=1)
     answer: str = Field(min_length=1)
-    evidence_refs: list[str] = Field(min_length=1)
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        min_length=1,
+        description="Separate answer citations for older callers. Omit when using the outer evidence_refs.",
+    )
     affected_regions: list[str] = Field(default_factory=list)
     evidence_gap: Unresolved | None = None
 
@@ -199,9 +203,10 @@ class ReviewCompletion(_Strict):
 class InvalidDecisionReferencesError(ValueError):
     """Specific, correctable source-reference errors in a native decision."""
 
-    def __init__(self, issues: list[dict[str, Any]]):
+    def __init__(self, issues: list[dict[str, Any]], *, usable_evidence_refs: list[str] | None = None):
         super().__init__("Decision contains invalid source references; see reference_errors.")
         self.issues = issues
+        self.usable_evidence_refs = usable_evidence_refs or []
 
 
 class InvalidCompletionReferencesError(InvalidDecisionReferencesError):
@@ -277,9 +282,9 @@ def review_step_tool():
         "apply_to_draft; apply_to_draft requires "
         "a distinct target_draft_id and target_expected_revision. Optional IDs and resolution cannot be empty strings. "
         "Each failed attempt remains separate until corrected or explicitly retracted. "
-        "close_question {question_id,answer,evidence_refs,affected_regions?,evidence_gap?:"
+        "close_question {question_id,answer,affected_regions?,evidence_gap?:"
         "{missing_fact,attempted,recovery_condition}}; include evidence_gap when the answer still depends "
-        "on unavailable material; "
+        "on unavailable material. Put original citations for the answer once in the outer evidence_refs. "
         "complete_review {checked_region_ids:[string],"
         "observations:[{statement:string,evidence_refs:[string],region_ids:[string]}],"
         "unresolved_refs:[string],"
@@ -322,6 +327,8 @@ DECISION_PROMPT = (
     "Read results are retained completely and must appear in a successful later request before being cited. "
     "Use request_evidence.payload.navigation_refs for search, diff and other locators. "
     "Use original-source IDs in evidence_refs when supporting a judgment or receipt. "
+    "For close_question, put the original IDs that support the answer in the outer evidence_refs. "
+    "The payload contains question_id and answer, plus an evidence_gap if needed. "
     "Offer supported candidates promptly for independent verification. A candidate is not a finding. "
     "If the same finding already has a Case, keep it and continue the review; paraphrasing it adds no finding. "
     "Use its case_id only to deliver a substantive addition to that Case. Use a separate work item for a "
@@ -817,7 +824,16 @@ class DecisionReviewer(Reviewer):
                         }
                     )
         elif action == "close_question":
-            fields.append(("payload.evidence_refs", parsed.payload["evidence_refs"]))
+            if "evidence_refs" in parsed.payload:
+                fields.append(("payload.evidence_refs", parsed.payload["evidence_refs"]))
+            elif not parsed.evidence_refs:
+                question_issues.append(
+                    {
+                        "field": "evidence_refs",
+                        "reason": "missing_answer_sources",
+                        "message": "Cite the originals supporting this answer in the outer evidence_refs.",
+                    }
+                )
         elif action == "complete_review":
             completion = parsed.payload if scope_completion else ReviewCompletion.model_validate(parsed.payload)
             fields.extend(
@@ -826,6 +842,7 @@ class DecisionReviewer(Reviewer):
                 for index, entry in enumerate(getattr(completion, field))
             )
         issues = [*self._reference_issues(fields), *question_issues]
+        delivered = {}
         if turn_id:
             bad_ids = {issue["evidence_ref"] for issue in issues if "evidence_ref" in issue}
             source_ids = {ref for _, refs in fields for ref in refs if ref not in bad_ids}
@@ -855,7 +872,12 @@ class DecisionReviewer(Reviewer):
             issues = [issue for issue in issues if issue["reason"] != "navigation_only"]
         if issues:
             error = InvalidCompletionReferencesError if action == "complete_review" else InvalidDecisionReferencesError
-            raise error(issues)
+            usable = (
+                [ref for ref in parsed.payload.get("evidence_refs", parsed.evidence_refs) if ref in delivered]
+                if action == "close_question"
+                else []
+            )
+            raise error(issues, usable_evidence_refs=usable)
 
     def _correctable_issues(self, exc: Exception, args: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(exc, ValidationError):
@@ -1015,6 +1037,9 @@ class DecisionReviewer(Reviewer):
                 self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
                 return "partial"
             previous_failure = None
+            previous_close_item = None
+            previous_close_feedback = {}
+            seen_locators: set[tuple[str, str]] = set()
             while True:
                 chat = self._decision_context(scope_id, recent, state)
                 board = json.loads(chat[1].content)
@@ -1084,6 +1109,8 @@ class DecisionReviewer(Reviewer):
                         self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
                         return "partial"
                     previous_failure = signature
+                    previous_close_item = None
+                    previous_close_feedback = {}
                     continue
                 staged_drafts = {
                     draft["origin_call_id"]: draft
@@ -1093,6 +1120,13 @@ class DecisionReviewer(Reviewer):
                 failures = []
                 batch_has_success = False
                 finished = None
+                only_args = calls[0]["args"] if len(calls) == 1 else {}
+                close_item = only_args.get("work_item_id") if only_args.get("action") == "close_question" else None
+                repeated_locators = (
+                    previous_close_item is not None
+                    and only_args.get("action") == "request_evidence"
+                    and only_args.get("work_item_id") == previous_close_item
+                )
                 ordered_calls = sorted(
                     calls,
                     key=lambda call: (
@@ -1138,6 +1172,16 @@ class DecisionReviewer(Reviewer):
                                     failures.append(entry["result"]["error"])
                                 else:
                                     batch_has_success = True
+                                    ref_id = entry["result"].get("evidence_ref")
+                                    if not isinstance(ref_id, str):
+                                        repeated_locators = False
+                                    else:
+                                        locator = (step["work_item_id"], ref_id)
+                                        if locator in seen_locators:
+                                            continue
+                                        repeated_locators = False
+                                        if is_navigation_reference(self.store.get(EvidenceRef, ref_id)):
+                                            seen_locators.add(locator)
                         elif action == "offer_candidate":
                             if parsed.payload.get("retract_draft") is not None:
                                 retract = CandidateRetraction.model_validate(parsed.payload["retract_draft"])
@@ -1251,6 +1295,8 @@ class DecisionReviewer(Reviewer):
                         reference_issues = [issue for issue in issues if "evidence_ref" in issue]
                         if reference_issues:
                             result["reference_errors"] = reference_issues
+                        if isinstance(exc, InvalidDecisionReferencesError) and exc.usable_evidence_refs:
+                            result["usable_evidence_refs"] = exc.usable_evidence_refs
                         if step is None and call_id in staged_drafts:
                             draft = self.store.settle_candidate_preflight_failure(
                                 self.task_id,
@@ -1295,20 +1341,36 @@ class DecisionReviewer(Reviewer):
                         self.task_id, self.lease_token, turn_id, f"tool:{index}:{call_id}", messages_to_dict([receipt])
                     )
                 recent = [visible, *receipts]
+                repeated_locators = repeated_locators and batch_has_success and not failures and not errors
+                if repeated_locators:
+                    recent.append(
+                        HumanMessage(
+                            content=_json(
+                                {
+                                    "message": "These locators were already returned for the current work item. "
+                                    "Correct its close_question with the original answer citations in outer "
+                                    "evidence_refs, or identify a specific missing original.",
+                                    "work_item_id": previous_close_item,
+                                    "work_item_revision": result["work_item_revision"],
+                                    **previous_close_feedback,
+                                }
+                            )
+                        )
+                    )
                 if errors:
                     recent.append(HumanMessage(content="Malformed sibling tool calls: " + ", ".join(errors)))
                 self.store.append_turn_audit(
                     self.task_id, self.lease_token, turn_id, "exchange", messages_to_dict(recent)
                 )
                 self._save_session(self._decision_context(scope_id, recent, state))
-                # Only an entirely failed batch can be a repeated protocol failure.
-                # A successful reread or decision must remain available to the next
-                # model request even when a sibling failed. It is not, by itself,
-                # evidence of semantic progress.
+                # Compare fully failed batches. A pure reread of identical locators
+                # for the failed closure's work item preserves that correction.
+                # Fresh evidence, a different item and mixed batches break the chain.
                 signature = (
                     _json(
                         {
                             "failures": failures,
+                            "close_item": close_item,
                             "sources": sorted(
                                 {
                                     (ref.repo, ref.revision, ref.side, ref.path, ref.kind)
@@ -1328,7 +1390,14 @@ class DecisionReviewer(Reviewer):
                     )
                     self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
                     return "partial"
-                previous_failure = signature
+                if not repeated_locators:
+                    previous_failure = signature
+                    previous_close_item = close_item if signature is not None else None
+                    previous_close_feedback = (
+                        {key: result[key] for key in ("errors", "usable_evidence_refs") if key in result}
+                        if previous_close_item
+                        else {}
+                    )
                 if finished is not None:
                     if finished == "partial":
                         self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")

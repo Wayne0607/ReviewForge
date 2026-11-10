@@ -5,6 +5,7 @@ import json
 import pytest
 from langchain_core.messages import AIMessage
 from test_v42_candidate_draft_reviewer import Model
+from test_v42_decision_completion_refs import NavigationGateway
 from test_v42_decision_loop import decision_store, from_board, last_ref, step
 from test_v42_fair_runtime import PinnedGateway
 from test_v42_stateful_reviewer import call
@@ -107,6 +108,59 @@ async def test_identical_entirely_failed_batches_still_stop(tmp_path):
     reviewer = make_reviewer(store, task, [response, response])
     assert await reviewer.run("a") == "partial"
     assert reviewer.error == "repeated_failed_batch"
+
+
+@pytest.mark.parametrize("repeat_locator", [True, False])
+async def test_only_duplicate_locators_preserve_closure_failure(tmp_path, repeat_locator):
+    store, task = decision_store(tmp_path)
+    gateway = NavigationGateway()
+
+    def locate(messages=None, *, path="a.py"):
+        item = from_board(messages) if messages else None
+        payload = {
+            "gap": "Locate the implementation",
+            "relevance": "Check the original behavior",
+            "alternatives": "Read the changed lines",
+            "operations": [{"name": "read_diff", "args": {"path": path}}],
+        }
+        return AIMessage(
+            content="", tool_calls=[call("review_step", step("request_evidence", payload, item), "locate")]
+        )
+
+    def close(messages):
+        item = from_board(messages)
+        payload = {"question_id": item["question_id"], "answer": "No change to the behavior"}
+        return AIMessage(content="", tool_calls=[call("review_step", step("close_question", payload, item), "close")])
+
+    def locate_again(messages):
+        receipt = json.loads(messages[-1].content)
+        assert [(e["field"], e["reason"]) for e in receipt["errors"]] == [("evidence_refs", "missing_answer_sources")]
+        return locate(messages, path="a.py" if repeat_locator else "b.py")
+
+    def second_close(messages):
+        assert ("These locators were already returned" in messages[-1].content) == repeat_locator
+        if repeat_locator:
+            correction = json.loads(messages[-1].content)
+            assert correction["work_item_revision"] == from_board(messages)["work_item_revision"]
+            assert correction["errors"][0]["reason"] == "missing_answer_sources"
+        return close(messages)
+
+    def report_gap(messages):
+        return AIMessage(content="", tool_calls=[unresolved(from_board(messages))])
+
+    replies = [locate(), close, locate_again, second_close]
+    if not repeat_locator:
+        replies.append(report_gap)
+    reviewer = make_reviewer(store, task, replies, gateway)
+    assert await reviewer.run("a") == "partial"
+    question = store.list(Question)[0]
+    assert [name for name, _ in gateway.calls] == ["read_diff", "read_diff"]
+    if repeat_locator:
+        assert reviewer.error == "repeated_failed_batch"
+        assert question.status == "open" and not question.evidence_refs
+    else:
+        assert reviewer.error is None
+        assert question.status == "unresolved"
 
 
 @pytest.mark.parametrize("action", ["close_question", "offer_candidate", "unresolved"])

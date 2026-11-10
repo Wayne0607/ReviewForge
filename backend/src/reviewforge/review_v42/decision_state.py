@@ -435,7 +435,7 @@ class DecisionState:
                 }
             if args["action"] == "close_question":
                 payload = args["payload"]
-                answer, answer_refs = payload.get("answer"), payload.get("evidence_refs")
+                answer, answer_refs = payload.get("answer"), payload.get("evidence_refs", refs)
                 if payload.get("question_id") != item["question_id"]:
                     raise CorrectableDecisionInputError(
                         [

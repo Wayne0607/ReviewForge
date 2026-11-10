@@ -37,6 +37,7 @@ from .line_semantics import source_lines, source_slice
 
 T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)
 _TYPES = {c.__name__: c for c in (ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)}
+_VERIFICATION_DELIVERY_POLICY = "claim-delivery-1"
 
 
 def _json(value: Any) -> str:
@@ -71,6 +72,29 @@ def _install_verified_blob(temp: Path, destination: Path, digest: str, *, label:
         return
     if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
         raise BindingError(f"{label} blob hash mismatch")
+
+
+class _VerificationSources:
+    """Expose only transaction-validated originals to the verifier's citation validator."""
+
+    def __init__(self, run: Run):
+        self.run = run
+        self.refs: dict[str, EvidenceRef] = {}
+        self.blobs: dict[str, bytes] = {}
+
+    def get(self, cls: type[EvidenceRef], ref_id: str) -> EvidenceRef:
+        if cls is not EvidenceRef or ref_id not in self.refs:
+            raise BindingError("citation does not bind an original source in this delivery")
+        return self.refs[ref_id]
+
+    def read_evidence(self, ref_id: str) -> bytes:
+        return self.blobs[ref_id]
+
+    def for_claim(self, observed: list[str]) -> _VerificationSources:
+        sources = _VerificationSources(self.run)
+        sources.refs = {ref_id: self.refs[ref_id] for ref_id in observed}
+        sources.blobs = {ref_id: self.blobs[ref_id] for ref_id in observed}
+        return sources
 
 
 class ReviewStore:
@@ -109,6 +133,12 @@ class ReviewStore:
             or "question_assistant_policy" in run.metadata
         ):
             raise BindingError("unsupported decision cycle profile")
+        if "verification_delivery_policy" in run.metadata and (
+            run.metadata["verification_delivery_policy"] != _VERIFICATION_DELIVERY_POLICY
+            or decision_policy != "decision-cycle-1"
+            or run.policy != "v42-units-6"
+        ):
+            raise BindingError("unsupported verification delivery profile")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
@@ -1032,7 +1062,9 @@ class ReviewStore:
             rows = db.execute("SELECT payload FROM integration_obligations ORDER BY id").fetchall()
             return [self._obligation_view(db, IntegrationObligation(**json.loads(row[0]))) for row in rows]
 
-    def _unit_refs(self, db: sqlite3.Connection, ids: list[str]) -> list[EvidenceRef]:
+    def _unit_refs(
+        self, db: sqlite3.Connection, ids: list[str], *, blobs: dict[str, bytes] | None = None
+    ) -> list[EvidenceRef]:
         if not isinstance(ids, list) or any(not isinstance(r, str) or not r for r in ids):
             raise ValueError("evidence references must be IDs")
         refs = []
@@ -1052,6 +1084,8 @@ class ReviewStore:
             raw = (self.blob_dir / ref.content_hash).read_bytes()
             if hashlib.sha256(raw).hexdigest() != ref.content_hash:
                 raise BindingError("evidence blob hash mismatch")
+            if blobs is not None:
+                blobs[ref_id] = raw
             refs.append(ref)
         return refs
 
@@ -4527,7 +4561,7 @@ class ReviewStore:
             db.commit()
             return task
 
-    def _validate_question_original(self, ref: EvidenceRef) -> None:
+    def _validate_question_original(self, ref: EvidenceRef, *, content: str | None = None) -> None:
         """Accept only provenance shapes emitted by the fixed-source gateway."""
         metadata = ref.metadata
         expected_tools = {
@@ -4603,7 +4637,7 @@ class ReviewStore:
             if ref.side != "head":
                 raise BindingError("test receipt must use the fixed head")
             try:
-                raw = json.loads((self.blob_dir / ref.content_hash).read_bytes())
+                raw = json.loads(content if content is not None else (self.blob_dir / ref.content_hash).read_bytes())
             except (OSError, ValueError, UnicodeError) as exc:
                 raise BindingError("test receipt is unavailable") from exc
             if (
@@ -5620,6 +5654,8 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Freeze one independently produced decision for one immutable claim input."""
+        if self.run.metadata.get("verification_delivery_policy") == _VERIFICATION_DELIVERY_POLICY:
+            raise BindingError("verification decisions require a claim delivery transaction")
         if not policy or verdict not in ("accept", "reject", "needs_evidence", "unresolved"):
             raise ValueError("invalid policy or verdict")
         with self._connect() as db:
@@ -5693,23 +5729,317 @@ class ReviewStore:
             db.commit()
         return decision
 
+    def _load_verification_sources(
+        self, db: sqlite3.Connection, sources: _VerificationSources, ids: list[str]
+    ) -> list[str]:
+        if not isinstance(ids, list) or any(not isinstance(ref_id, str) or not ref_id for ref_id in ids):
+            raise ValueError("verification evidence references must be IDs")
+        ordered = sorted(set(ids))
+        missing = [ref_id for ref_id in ordered if ref_id not in sources.refs]
+        for ref_id, ref in zip(missing, self._unit_refs(db, missing, blobs=sources.blobs)):
+            identity = asdict(ref)
+            identity.pop("id")
+            if ref.id != ref_id or ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
+                raise BindingError("verification evidence identity mismatch")
+            sources.refs[ref_id] = ref
+        return ordered
+
+    def is_verification_delivery_source(self, ref: EvidenceRef, content: str) -> bool:
+        """Recognize an original eligible for the claim delivery profile."""
+        from .verifier import is_verification_source
+
+        if not is_verification_source(self, ref, content):
+            return False
+        try:
+            self._validate_question_original(ref, content=content)
+        except BindingError:
+            return False
+        if ref.kind != "source":
+            return True
+        if "\x00" in content:
+            return False
+        if not content:
+            return ref.start_line is None and ref.end_line is None
+        return (
+            type(ref.start_line) is int
+            and type(ref.end_line) is int
+            and ref.start_line > 0
+            and ref.end_line - ref.start_line + 1 == len(source_lines(self.run, content))
+        )
+
+    def _eligible_verification_sources(self, sources: _VerificationSources, ids: list[str]) -> list[str]:
+        eligible = []
+        for ref_id in ids:
+            try:
+                content = sources.read_evidence(ref_id).decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if self.is_verification_delivery_source(sources.refs[ref_id], content):
+                eligible.append(ref_id)
+        return eligible
+
+    @staticmethod
+    def _verification_result(
+        db: sqlite3.Connection,
+        sources: _VerificationSources,
+        case: Case,
+        claim: dict[str, Any],
+        result: dict[str, Any],
+        observed: list[str],
+    ) -> dict[str, Any]:
+        from .verifier import validate_result, verification_gap_id
+
+        identity = {"case_trigger": case.trigger, "claim_id": claim["id"], "claim_statement": claim["statement"]}
+        if not isinstance(result, dict) or any(result.get(key) != value for key, value in identity.items()):
+            raise BindingError("original trigger or claim identity mismatch")
+        checked = {**validate_result(sources.for_claim(observed), result, set(observed)), **identity}
+        if set(result) - checked.keys() or result.get("cited_refs", checked["cited_refs"]) != checked["cited_refs"]:
+            raise BindingError("verdict citations or result fields do not match validated proof")
+        if checked["verdict"] in {"accept", "reject"} and set(case.counter_evidence_refs) - set(observed):
+            raise BindingError("known counter-evidence was not delivered to this verifier claim")
+        for gap in checked["gaps"]:
+            qid = verification_gap_id(case.id, claim["id"], gap)
+            row = db.execute("SELECT payload FROM objects WHERE kind='Question' AND id=?", (qid,)).fetchone()
+            if qid not in case.question_ids or row is None:
+                raise BindingError("uncertain verification requires a durable Case gap")
+            question = Question(**json.loads(row[0]))
+            if (
+                question.id,
+                question.run_id,
+                question.case_id,
+                question.scope_id,
+                question.statement,
+                question.owner,
+            ) != (
+                qid,
+                case.run_id,
+                case.id,
+                case.scope_id,
+                gap,
+                "verifier",
+            ) or question.status not in {"open", "unresolved"}:
+                raise BindingError("uncertain verification gap does not match its Case question")
+        return checked
+
+    def _verification_decision(
+        self,
+        case: Case,
+        claim_id: str,
+        policy: str,
+        result: dict[str, Any],
+        case_refs: list[str],
+        observed: list[str],
+        sources: _VerificationSources,
+    ) -> tuple[str, dict[str, Any]]:
+        evidence_refs = sorted(set(case_refs) | set(observed))
+        delivery = {
+            "policy": _VERIFICATION_DELIVERY_POLICY,
+            "case_digest": hashlib.sha256(_json(asdict(case)).encode()).hexdigest(),
+            "case_evidence_refs": case_refs,
+            "observed_evidence_refs": observed,
+        }
+        digest = hashlib.sha256(
+            _json([delivery, [asdict(sources.refs[ref_id]) for ref_id in evidence_refs]]).encode()
+        ).hexdigest()
+        key = hashlib.sha256(_json([case.id, claim_id, case.revision, digest, policy]).encode()).hexdigest()
+        return key, {
+            "run_id": self.run.id,
+            "repo": self.run.repo,
+            "base": self.run.base,
+            "head": self.run.head,
+            "case_id": case.id,
+            "claim_id": claim_id,
+            "case_revision": case.revision,
+            "source_digest": digest,
+            "evidence_refs": evidence_refs,
+            "delivery": delivery,
+            "policy": policy,
+            "verdict": result["verdict"],
+            "result": result,
+        }
+
+    def _read_verification_delivery(
+        self,
+        db: sqlite3.Connection,
+        sources: _VerificationSources,
+        case: Case,
+        claim: dict[str, Any],
+        policy: str,
+        case_refs: list[str],
+        row: tuple[str, str],
+    ) -> dict[str, Any]:
+        stored_key, payload = row
+        decision = json.loads(payload)
+        delivery = decision.get("delivery")
+        if not isinstance(delivery, dict) or delivery.get("policy") != _VERIFICATION_DELIVERY_POLICY:
+            raise BindingError("verdict does not bind a claim delivery")
+        observed = self._load_verification_sources(db, sources, delivery.get("observed_evidence_refs"))
+        if self._eligible_verification_sources(sources, observed) != observed:
+            raise BindingError("verdict observed evidence is no longer eligible")
+        result = self._verification_result(db, sources, case, claim, decision.get("result"), observed)
+        key, expected = self._verification_decision(case, claim["id"], policy, result, case_refs, observed, sources)
+        if stored_key != key or decision != expected:
+            raise BindingError("verdict source or Case binding no longer matches")
+        return decision
+
+    def save_verification_delivery(
+        self,
+        case_id: str,
+        expected_revision: int,
+        policy: str,
+        deliveries: list[dict[str, Any]],
+        *,
+        task_id: str,
+        lease_token: str,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Freeze each claim with its own observed proof, without changing the Case input."""
+        if self.run.metadata.get("verification_delivery_policy") != _VERIFICATION_DELIVERY_POLICY:
+            raise BindingError("claim delivery requires the verification delivery profile")
+        if not isinstance(policy, str) or not policy or not isinstance(deliveries, list):
+            raise ValueError("verification delivery requires a policy and a list of claims")
+        incoming = {}
+        for delivery in deliveries:
+            if (
+                not isinstance(delivery, dict)
+                or set(delivery) != {"claim_id", "result", "observed_refs"}
+                or not isinstance(delivery["claim_id"], str)
+                or not delivery["claim_id"]
+                or delivery["claim_id"] in incoming
+            ):
+                raise ValueError("each verification delivery requires a unique claim id, result and observed refs")
+            incoming[delivery["claim_id"]] = delivery
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = time.time() if now is None else now
+            if not math.isfinite(current):
+                raise ValueError("time must be finite")
+            row = db.execute("SELECT revision,payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
+            if row is None:
+                raise KeyError(case_id)
+            case = Case(**json.loads(row[1]))
+            if row[0] != expected_revision or case.revision != expected_revision:
+                raise RevisionConflict("case revision changed during verification")
+            if case.id != case_id or case.run_id != self.run.id:
+                raise BindingError("verification Case does not belong to this run")
+            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+            task = Task(**json.loads(row[0])) if row is not None else None
+            if (
+                task is None
+                or task.id != task_id
+                or task.run_id != self.run.id
+                or task.kind not in {"verify", "verification"}
+                or task.object_id != case_id
+                or task.input_revision != expected_revision
+                or task.status != "leased"
+                or not lease_token
+                or task.lease_token != lease_token
+                or not math.isfinite(task.lease_expires)
+                or task.lease_expires <= current
+            ):
+                raise LeaseError("a current verification lease for this case revision is required")
+            if (
+                not case.trigger.strip()
+                or not case.mechanism.strip()
+                or not case.claims
+                or any(
+                    not all(
+                        isinstance(claim.get(key), str) and claim[key].strip() for key in ("id", "statement", "impact")
+                    )
+                    for claim in case.claims
+                )
+            ):
+                raise ValueError("verification delivery must bind the Case's original trigger and concrete claims")
+            claims = {claim["id"]: claim for claim in case.claims}
+            if len(claims) != len(case.claims) or incoming.keys() - claims.keys():
+                raise ValueError("verification delivery must bind the Case's concrete claims")
+            sources = _VerificationSources(self.run)
+            case_refs = self._load_verification_sources(db, sources, case.evidence_refs + case.counter_evidence_refs)
+            decisions = []
+            for claim_id, claim in claims.items():
+                rows = db.execute(
+                    "SELECT id,payload FROM verdicts WHERE case_id=? AND claim_id=? AND revision=? AND policy=?",
+                    (case_id, claim_id, expected_revision, policy),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise BindingError("ambiguous verdicts for current input")
+                existing = (
+                    self._read_verification_delivery(db, sources, case, claim, policy, case_refs, rows[0])
+                    if rows
+                    else None
+                )
+                delivery = incoming.get(claim_id)
+                if delivery is None:
+                    if existing is None:
+                        raise BindingError("verification delivery does not include every claim")
+                    decisions.append(existing)
+                    continue
+                observed = self._load_verification_sources(db, sources, delivery["observed_refs"])
+                eligible = self._eligible_verification_sources(sources, observed)
+                result = self._verification_result(db, sources, case, claim, delivery["result"], eligible)
+                key, decision = self._verification_decision(
+                    case, claim_id, policy, result, case_refs, eligible, sources
+                )
+                if existing is not None:
+                    if existing != decision:
+                        raise RevisionConflict("a different verdict is already frozen for this input")
+                else:
+                    db.execute(
+                        "INSERT INTO verdicts VALUES (?,?,?,?,?,?)",
+                        (key, case_id, claim_id, expected_revision, policy, _json(decision)),
+                    )
+                    self._event(db, "Case", case_id, "verdict", decision)
+                    audit_refs = sorted(set(observed) - set(eligible))
+                    if audit_refs:
+                        self._event(
+                            db,
+                            "Case",
+                            case_id,
+                            "verification_navigation",
+                            {
+                                "task_id": task_id,
+                                "input_revision": expected_revision,
+                                "claim_id": claim_id,
+                                "evidence_refs": audit_refs,
+                            },
+                        )
+                decisions.append(decision)
+            if task.lease_expires <= (time.time() if now is None else now):
+                raise LeaseError("verification lease expired during delivery")
+            db.commit()
+        return decisions
+
     def get_verdict(self, case_id: str, claim_id: str, policy: str) -> dict[str, Any] | None:
         """Check case, decision and sources against a single database snapshot."""
         with self._connect() as db:
             db.execute("BEGIN")
-            row = db.execute("SELECT payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
+            row = db.execute("SELECT revision,payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
             if row is None:
                 raise KeyError(case_id)
-            case = Case(**json.loads(row[0]))
+            case = Case(**json.loads(row[1]))
+            claim_delivery = self.run.metadata.get("verification_delivery_policy") == _VERIFICATION_DELIVERY_POLICY
+            if claim_delivery and (case.id != case_id or case.run_id != self.run.id or row[0] != case.revision):
+                raise BindingError("verdict does not match current Case input")
             rows = db.execute(
-                "SELECT payload FROM verdicts WHERE case_id=? AND claim_id=? AND revision=? AND policy=?",
+                "SELECT id,payload FROM verdicts WHERE case_id=? AND claim_id=? AND revision=? AND policy=?",
                 (case_id, claim_id, case.revision, policy),
             ).fetchall()
             if not rows:
                 return None
             if len(rows) != 1:
                 raise BindingError("ambiguous verdicts for current input")
-            decision = json.loads(rows[0][0])
+            if claim_delivery:
+                claims = [claim for claim in case.claims if claim["id"] == claim_id]
+                if len(claims) != 1:
+                    raise BindingError("verdict does not match current Case input")
+                sources = _VerificationSources(self.run)
+                case_refs = self._load_verification_sources(
+                    db, sources, case.evidence_refs + case.counter_evidence_refs
+                )
+                return self._read_verification_delivery(db, sources, case, claims[0], policy, case_refs, rows[0])
+            decision = json.loads(rows[0][1])
+            if "delivery" in decision:
+                raise BindingError("claim delivery requires the verification delivery profile")
             sources = []
             for ref_id in decision["evidence_refs"]:
                 row = db.execute("SELECT payload FROM objects WHERE kind='EvidenceRef' AND id=?", (ref_id,)).fetchone()
@@ -5976,6 +6306,11 @@ class ReviewStore:
             decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
             if decision_cycle and (task.run_id != self.run.id or case.run_id != self.run.id):
                 raise BindingError("verification task or case belongs to another run")
+            if (
+                self.run.metadata.get("verification_delivery_policy") == _VERIFICATION_DELIVERY_POLICY
+                and evidence_refs != case.evidence_refs
+            ):
+                raise BindingError("verification observations cannot change Case evidence under claim delivery")
 
             def validate_decision_refs(ids: list[str]) -> list[EvidenceRef]:
                 refs = self._unit_refs(db, ids)

@@ -78,6 +78,11 @@ class ReviewRuntime:
             or "question_assistant_policy" in metadata
         ):
             raise ValueError("unsupported v4.2 decision cycle policy")
+        if "verification_delivery_policy" in metadata and (
+            metadata["verification_delivery_policy"] != "claim-delivery-1"
+            or metadata.get("decision_cycle_policy") != "decision-cycle-1"
+        ):
+            raise ValueError("unsupported v4.2 verification delivery policy")
         if "frontier_projection_policy" in metadata and (
             metadata["frontier_projection_policy"] != "source-line-union-1"
             or store.run.policy != "v42-units-6"
@@ -436,15 +441,22 @@ class ReviewRuntime:
                 except LeaseError:
                     # Another live worker owns this revision. It is still pending.
                     continue
+                except RevisionConflict:
+                    self._enqueue(self.store.get(Case, task.object_id))
+                    continue
                 heartbeat = asyncio.create_task(self._heartbeat(task, 120))
                 try:
                     result = await self.verifier.verify(case.id, task_id=task.id, lease_token=task.lease_token)
                     policy = getattr(self.verifier, "policy", "v42-independent-1")
+                    if self.store.get(Case, case.id).revision != task.input_revision:
+                        raise RevisionConflict("case changed before verification completion")
                     if not isinstance(result, list) or len(result) != len(case.claims):
                         raise ValueError("verifier did not deliver every claim")
                     for claim in case.claims:
                         persisted = self.store.get_verdict(case.id, claim["id"], policy)
                         if persisted is None or persisted not in result:
+                            if self.store.get(Case, case.id).revision != task.input_revision:
+                                raise RevisionConflict("case changed before verification completion")
                             raise ValueError("verdict is not frozen in the store")
                     self.store.complete_task(
                         task.id, task.lease_token, {"verdicts": result, "case_input": self._case_input(case)}

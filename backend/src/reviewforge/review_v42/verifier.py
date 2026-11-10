@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import asdict
 from typing import Any
 
@@ -14,7 +15,7 @@ from reviewforge.engine.session_tools import result_tool
 
 from .context import ContextBuilder
 from .context_recovery import is_context_length_exceeded
-from .contracts import Case, EvidenceRef, Question, RevisionConflict
+from .contracts import Case, EvidenceRef, LeaseError, Question, RevisionConflict, Task
 from .line_semantics import source_line_policy, source_slice
 from .reviewer import reviewer_tools
 
@@ -227,6 +228,37 @@ def _unit_workspace_matches(store: Any, ref: dict[str, Any]) -> bool:
     return bool(expected) and (ref.get("metadata") or {}).get("workspace_digest") == expected
 
 
+def _verification_source_error(store: Any, ref: EvidenceRef) -> str | None:
+    workspace = store.run.policy in _WORKSPACE_POLICIES
+    kind = _kind_key(ref.kind, workspace)
+    if (
+        kind in {"query", *_NON_EVIDENCE_KINDS}
+        or (workspace and kind in _NAVIGATION_KINDS)
+        or (store.run.policy in _FRONTIER_POLICIES and kind in _FRONTIER_KINDS)
+        or (store.run.policy in _SEARCH_POLICIES and _search_navigation(asdict(ref)))
+        or (store.run.policy == "v42-units-6" and _unit_navigation(asdict(ref)))
+        or ref.metadata.get("status", "success") not in {"success", "available", "ok", "executed"}
+        or ref.metadata.get("complete") is False
+        or ref.metadata.get("navigation_only") is True
+    ):
+        return "unavailable or navigation-only evidence"
+    if store.run.policy == "v42-units-6" and not _unit_workspace_matches(store, asdict(ref)):
+        return "citation workspace mismatch"
+    return None
+
+
+def is_verification_source(store: Any, ref: EvidenceRef, content: str) -> bool:
+    """Distinguish original proof material from navigation in a validated snapshot."""
+    return _verification_source_error(store, ref) is None and not (
+        store.run.policy in _SEARCH_POLICIES and _search_projection(content)
+    )
+
+
+def verification_gap_id(case_id: str, claim_id: str, gap: str) -> str:
+    key = json.dumps([case_id, claim_id, gap], ensure_ascii=False).encode()
+    return "vq_" + hashlib.sha256(key).hexdigest()
+
+
 def _citation(store: Any, cite: Any) -> str:
     line_policy = source_line_policy(store.run)
     if (
@@ -258,21 +290,9 @@ def _citation(store: Any, cite: Any) -> str:
         or ref.metadata.get("historical_head_time") is not False
     ):
         raise ValueError("issue snapshot is missing its external provenance or time boundary")
-    workspace = store.run.policy in _WORKSPACE_POLICIES
-    kind = _kind_key(ref.kind, workspace)
-    if (
-        kind in {"query", *_NON_EVIDENCE_KINDS}
-        or (workspace and kind in _NAVIGATION_KINDS)
-        or (store.run.policy in _FRONTIER_POLICIES and kind in _FRONTIER_KINDS)
-        or (store.run.policy in _SEARCH_POLICIES and _search_navigation(asdict(ref)))
-        or (store.run.policy == "v42-units-6" and _unit_navigation(asdict(ref)))
-        or ref.metadata.get("status", "success") not in {"success", "available", "ok", "executed"}
-        or ref.metadata.get("complete") is False
-        or ref.metadata.get("navigation_only") is True
-    ):
-        raise ValueError("unavailable or navigation-only evidence")
-    if store.run.policy == "v42-units-6" and not _unit_workspace_matches(store, asdict(ref)):
-        raise ValueError("citation workspace mismatch")
+    source_error = _verification_source_error(store, ref)
+    if source_error:
+        raise ValueError(source_error)
     content = store.read_evidence(ref_id).decode("utf-8")
     if store.run.policy in _SEARCH_POLICIES and _search_projection(content):
         raise ValueError("unavailable or navigation-only evidence")
@@ -380,6 +400,7 @@ class _ProviderFailureError(Exception):
 class Verifier:
     def __init__(self, store: Any, llm: Any, gateway: Any, *, policy: str = POLICY):
         self.store, self.llm, self.gateway, self.policy = store, llm, gateway, policy
+        self._claim_delivery = store.run.metadata.get("verification_delivery_policy") == "claim-delivery-1"
 
     async def _claim(self, context: dict[str, Any], claim: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
         source_line_policy(self.store.run)
@@ -407,14 +428,29 @@ class Verifier:
         language = self.store.run.metadata.get("output_language")
         if language in {"en", "zh-CN"}:
             packet["output_language"] = language
-        allowed = {item["ref"]["id"] for item in packet["evidence"] + packet["counter_evidence"]}
-        counter_refs = {item["ref"]["id"] for item in packet["counter_evidence"]}
+        initial_evidence = packet["evidence"] + packet["counter_evidence"]
+        allowed = {item["ref"]["id"] for item in initial_evidence}
+        # Keep full original receipts separately from proof eligibility. Navigation can be audited.
+        presented = {
+            item["ref"]["id"]: self.store.is_verification_delivery_source(EvidenceRef(**item["ref"]), item["content"])
+            for item in context["evidence"] + context["counter_evidence"]
+            if self._claim_delivery and item["ref"]["id"] in allowed and isinstance(item["content"], str)
+        }
+        counter_evidence = context["counter_evidence"] if self._claim_delivery else packet["counter_evidence"]
+        counter_refs = {item["ref"]["id"] for item in counter_evidence}
         prompt = PROMPT + (
             " Search and index results are navigation only, never evidence of absence; next_offset=null "
             "does not establish completeness when sources were skipped or complete=false."
             if frontier5
             else ""
         )
+        if self._claim_delivery:
+            prompt += (
+                " For every verdict fact, cite original fixed source, repository documentation, an external issue "
+                "snapshot, or a fixed-head executed test. Search and diff are navigation only. Cite the returned page "
+                "evidence_ref when reading a source page. For other evidence, read the complete original before "
+                "citing it. Read all known counter-evidence in full before deciding."
+            )
         chat = [SystemMessage(content=prompt), HumanMessage(content=json.dumps(packet, ensure_ascii=False))]
         bound = self.llm.bind_tools(verifier_tools(self.gateway), tool_choice="auto")
         seen_actions = set()
@@ -454,6 +490,7 @@ class Verifier:
                             raise ValueError("context capacity exceeded again for the same recovered input") from exc
                         recovered_states.add(signature)
                         recovered, visible, pages, page_bounds = True, {}, {}, {}
+                        presented.clear()
                         seen_actions.clear()
                         chat = [SystemMessage(content=prompt), HumanMessage(content=serialized)]
                         continue
@@ -478,8 +515,12 @@ class Verifier:
                             if errors:
                                 raise ValueError("malformed tool response")
                             submitted = {**args, "tool_failures": list(failures.values())}
-                            result = validate_result(self.store, submitted, allowed)
-                            if recovered and result["verdict"] in {"accept", "reject"}:
+                            proof = {ref for ref, original in presented.items() if original}
+                            result = validate_result(self.store, submitted, proof if self._claim_delivery else allowed)
+                            decisive = result["verdict"] in {"accept", "reject"}
+                            if self._claim_delivery and decisive and not counter_refs <= proof:
+                                raise ValueError("known counter-evidence must be fully read before a decision")
+                            if not self._claim_delivery and recovered and decisive:
                                 for fact in result["facts"].values():
                                     for cite in fact["citations"]:
                                         if not any(
@@ -501,7 +542,7 @@ class Verifier:
                                         cursor = max(cursor, last + 1)
                                     if cursor <= end:
                                         raise ValueError("known counter-evidence must be fully re-read")
-                            return result, allowed
+                            return result, set(presented) if self._claim_delivery else allowed
                         except (ValueError, KeyError, UnicodeError, OSError) as exc:
                             signature = (
                                 "invalid-verdict",
@@ -585,6 +626,14 @@ class Verifier:
                                 ref = result["evidence_ref"]
                                 allowed.add(ref)
                                 if isinstance(result.get("content"), str):
+                                    if self._claim_delivery:
+                                        original = self.store.get(EvidenceRef, ref)
+                                        content_hash = hashlib.sha256(result["content"].encode("utf-8")).hexdigest()
+                                        # A page receipt proves only its own fixed bytes, not the parent ref.
+                                        if content_hash == original.content_hash:
+                                            presented[ref] = self.store.is_verification_delivery_source(
+                                                original, result["content"]
+                                            )
                                     visible.setdefault(ref, []).append(result["content"])
                                     if result.get("complete") is True or result.get("start_line") is None:
                                         pages.setdefault(ref, []).append((None, None))
@@ -628,13 +677,28 @@ class Verifier:
                 "cited_refs": [],
                 "tool_failures": unresolved_failures,
                 "failure_explanation": "",
-            }, allowed
+            }, set(presented) if self._claim_delivery else allowed
 
     async def verify(
         self, case_id: str, *, task_id: str | None = None, lease_token: str | None = None
     ) -> list[dict[str, Any]]:
         source_line_policy(self.store.run)
         case = self.store.get(Case, case_id)
+        if self._claim_delivery:
+            if not task_id or not lease_token:
+                raise LeaseError("a current verification lease is required for claim delivery")
+            task = self.store.get(Task, task_id)
+            if (
+                task.kind != "verify"
+                or task.object_id != case_id
+                or task.run_id != case.run_id
+                or task.status != "leased"
+                or task.lease_token != lease_token
+                or task.lease_expires <= time.time()
+            ):
+                raise LeaseError("a current verification lease is required for claim delivery")
+            if task.input_revision != case.revision:
+                raise RevisionConflict("verification task input revision is stale")
         claims = case.claims
         if (
             not claims
@@ -648,10 +712,19 @@ class Verifier:
         if not case.trigger.strip() or not case.mechanism.strip():
             raise ValueError("case needs original trigger and mechanism")
         old = [self.store.get_verdict(case_id, c["id"], self.policy) for c in claims]
+        if self._claim_delivery and any(row and row["case_revision"] != case.revision for row in old):
+            raise RevisionConflict("case changed while loading frozen verdicts")
         if all(old):
+            if self._claim_delivery:
+                return self.store.save_verification_delivery(
+                    case_id, case.revision, self.policy, [], task_id=task_id, lease_token=lease_token
+                )
             return old
         context = ContextBuilder(self.store).verifier(case_id)
+        if self._claim_delivery and context["revision"] != case.revision:
+            raise RevisionConflict("case changed while building verification input")
         collected = []
+        deliveries = []
         new_refs = set(case.evidence_refs + case.counter_evidence_refs)
         for claim, existing in zip(claims, old):
             if existing:
@@ -661,7 +734,10 @@ class Verifier:
             outcome["case_trigger"] = case.trigger
             outcome["claim_id"] = claim["id"]
             outcome["claim_statement"] = claim["statement"]
-            new_refs.update(observed)
+            if self._claim_delivery:
+                deliveries.append({"claim_id": claim["id"], "result": outcome, "observed_refs": sorted(observed)})
+            else:
+                new_refs.update(observed)
             collected.append((claim, outcome, None))
         current = self.store.get(Case, case_id)
         if current.revision != case.revision:
@@ -671,12 +747,7 @@ class Verifier:
         for claim, outcome, _ in collected:
             if outcome["verdict"] in {"needs_evidence", "unresolved"}:
                 for gap in outcome["gaps"]:
-                    qid = (
-                        "vq_"
-                        + hashlib.sha256(
-                            json.dumps([case.id, claim["id"], gap], ensure_ascii=False).encode()
-                        ).hexdigest()
-                    )
+                    qid = verification_gap_id(case.id, claim["id"], gap)
                     if qid not in questions:
                         pending_questions.append(
                             Question(
@@ -690,6 +761,16 @@ class Verifier:
                             )
                         )
                         questions.append(qid)
+        if self._claim_delivery:
+            if pending_questions:
+                revised = self.store.record_verification_observations(
+                    task_id, lease_token, case.revision, pending_questions, case.evidence_refs
+                )
+                if revised.revision != case.revision:
+                    raise RevisionConflict("verification recorded new gaps; schedule the new case revision")
+            return self.store.save_verification_delivery(
+                case_id, case.revision, self.policy, deliveries, task_id=task_id, lease_token=lease_token
+            )
         combined = sorted(new_refs - set(case.counter_evidence_refs))
         if task_id is not None:
             revised = self.store.record_verification_observations(

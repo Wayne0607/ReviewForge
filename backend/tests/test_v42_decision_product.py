@@ -38,6 +38,7 @@ def test_native_tool_exposes_nested_completion_contract():
         ("REVIEWFORGE_V42_CANDIDATE_DRAFT", "wrong"),
         ("REVIEWFORGE_V42_FRONTIER_PROJECTION", "wrong"),
         ("REVIEWFORGE_V42_QUESTION_ASSISTANT", "question-delivery-1"),
+        ("REVIEWFORGE_V42_VERIFICATION_DELIVERY", "wrong"),
     ],
 )
 async def test_invalid_profile_fails_before_workspace_or_model(tmp_path, monkeypatch, variable, value):
@@ -90,6 +91,7 @@ async def test_single_option_binds_dependencies_and_preserves_old_identity(tmp_p
         "QUESTION_ASSISTANT",
         "UNIT_PLAN",
         "UNIT_SCHEDULER",
+        "VERIFICATION_DELIVERY",
     ):
         monkeypatch.delenv("REVIEWFORGE_V42_" + variable, raising=False)
     model = NativeModel(lambda *_: AIMessage(content="No decision yet"))
@@ -107,7 +109,15 @@ async def test_single_option_binds_dependencies_and_preserves_old_identity(tmp_p
     assert new["run_id"] != old["run_id"]
     assert "decision_cycle_policy" not in old["review_v42_report"]["run"]["metadata"]
     assert (await obj.run(two_file_state()))["run_id"] == new["run_id"]
+    monkeypatch.setenv("REVIEWFORGE_V42_VERIFICATION_DELIVERY", "claim-delivery-1")
+    delivery = await obj.run(two_file_state())
+    assert delivery["review_v42_report"]["run"]["metadata"]["verification_delivery_policy"] == "claim-delivery-1"
+    assert delivery["run_id"] not in {old["run_id"], new["run_id"]}
+    assert (await obj.run(two_file_state()))["run_id"] == delivery["run_id"]
     monkeypatch.delenv("REVIEWFORGE_V42_DECISION_CYCLE")
+    with pytest.raises(ValueError, match="verification delivery requires decision-cycle-1"):
+        await obj.run(two_file_state())
+    monkeypatch.delenv("REVIEWFORGE_V42_VERIFICATION_DELIVERY")
     assert (await obj.run(two_file_state()))["run_id"] == old["run_id"]
 
 

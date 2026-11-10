@@ -113,6 +113,8 @@ def input_material(path):
 
 
 async def episode(args):
+    if args.verification_delivery and args.arm != "decision":
+        raise ValueError("verification delivery requires the decision arm")
     record = input_material(args.input)
     settings = EncryptedLLMSettingsStore(args.settings).load()
     if settings is None:
@@ -182,6 +184,8 @@ async def episode(args):
         }
         if args.arm == "decision":
             metadata["decision_cycle_policy"] = "decision-cycle-1"
+        if args.verification_delivery:
+            metadata["verification_delivery_policy"] = args.verification_delivery
         identity = "pilot_" + digest([repo, base, head, metadata])[:24]
         run = Run(
             identity,
@@ -260,6 +264,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--arm", choices=["baseline", "decision"], required=True)
+    parser.add_argument("--verification-delivery", choices=["claim-delivery-1"])
     parser.add_argument("--replicate", type=int, choices=[1, 2, 3], required=True)
     asyncio.run(episode(parser.parse_args()))
 

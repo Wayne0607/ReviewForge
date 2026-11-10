@@ -401,6 +401,9 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
     decision_cycle = os.environ.get("REVIEWFORGE_V42_DECISION_CYCLE", "").strip()
     if decision_cycle and (decision_cycle != "decision-cycle-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 decision cycle policy")
+    verification_delivery = os.environ.get("REVIEWFORGE_V42_VERIFICATION_DELIVERY", "").strip()
+    if verification_delivery and (verification_delivery != "claim-delivery-1" or decision_cycle != "decision-cycle-1"):
+        raise ValueError("verification delivery requires decision-cycle-1 and claim-delivery-1")
 
     def option(name: str, decision_default: str = "") -> str:
         value = os.environ.get(name, "").strip()
@@ -537,6 +540,8 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["frontier_projection_policy"] = frontier_projection
         if decision_cycle:
             metadata["decision_cycle_policy"] = decision_cycle
+        if verification_delivery:
+            metadata["verification_delivery_policy"] = verification_delivery
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

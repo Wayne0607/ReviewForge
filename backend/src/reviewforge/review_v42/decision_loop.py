@@ -313,7 +313,9 @@ DECISION_PROMPT = (
     "For a primary unit complete_scope lists actually checked regions with source-backed observations; "
     "identify cross-unit relations only to another primary_scope_ids member, never the integration scope. "
     "Only the integration role submits integration_relations and integration_receipts; "
-    "for integration record each obligation with its sources and disposition; "
+    "for integration each obligation needs its own original source citations for every listed unit. "
+    "On missing_unit_source, add an eligible original ref to that receipt or read a listed path if needed. "
+    "Submit only obligations still open; checked receipts are already saved. "
     "finish only after all obligations are resolved. An unanswered question or unavailable source is not clean. "
     "Use unresolved with the missing fact, attempted paths and recovery condition when unable to continue. "
     "A read, navigation, or question closure alone does not prove region coverage. "
@@ -351,7 +353,8 @@ def _step_receipt(step: dict[str, Any] | None) -> dict[str, Any]:
 
 def _failure_signature(issues: list[dict[str, Any]]) -> str:
     """Ignore generated attempt IDs and text when comparing failed batches."""
-    return _json(sorted((str(issue.get("field", "")), str(issue.get("reason", ""))) for issue in issues))
+    keys = ("field", "reason", "obligation_id", "unit_id")
+    return _json(sorted(tuple(str(issue.get(key, "")) for key in keys) for issue in issues))
 
 
 def _validation_issues(exc: ValidationError) -> list[dict[str, Any]]:
@@ -883,21 +886,34 @@ class DecisionReviewer(Reviewer):
                     relation.evidence_refs,
                     turn_id=turn_id,
                 )
-            for receipt in payload.integration_receipts:
+            issues, settled = [], []
+            for index, receipt in enumerate(payload.integration_receipts):
                 row = obligation_snapshot.get(receipt.obligation_id)
                 if row is None:
                     raise ValueError("unknown integration obligation")
-                self.store.record_integration_receipt(
-                    self.task_id,
-                    self.lease_token,
-                    receipt.obligation_id,
-                    row["revision"],
-                    row["input_digest"],
-                    disposition=receipt.disposition,
-                    evidence_refs=receipt.evidence_refs,
-                    reason=receipt.reason,
-                    turn_id=turn_id,
-                )
+                try:
+                    saved = self.store.record_integration_receipt(
+                        self.task_id,
+                        self.lease_token,
+                        receipt.obligation_id,
+                        row["revision"],
+                        row["input_digest"],
+                        disposition=receipt.disposition,
+                        evidence_refs=receipt.evidence_refs,
+                        reason=receipt.reason,
+                        turn_id=turn_id,
+                        report_blockers=True,
+                    )
+                except CorrectableDecisionInputError as exc:
+                    issues.extend(
+                        {**issue, "field": f"payload.integration_receipts[{index}].{issue['field']}"}
+                        for issue in exc.issues
+                    )
+                else:
+                    if saved["valid"]:
+                        settled.append(receipt.obligation_id)
+            if issues:
+                raise CorrectableDecisionInputError([{**issue, "settled_obligation_ids": settled} for issue in issues])
             scope = self.store.get(ReviewScope, scope_id)
             if payload.finish:
                 scope = self.store.finish_integration(

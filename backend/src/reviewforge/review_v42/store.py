@@ -2698,6 +2698,7 @@ class ReviewStore:
         reason: str,
         turn_id: str,
         now: float | None = None,
+        report_blockers: bool = False,
     ) -> dict[str, Any]:
         if disposition not in {"checked", "unresolved"} or not isinstance(reason, str) or not reason.strip():
             raise ValueError("integration receipt requires a disposition and reason")
@@ -2717,22 +2718,50 @@ class ReviewStore:
             if disposition == "checked":
                 if not set(obligation.origin_evidence_refs) <= set(evidence_refs):
                     raise BindingError("checked relationship must include its original source references")
-                if not set(evidence_refs) <= self._task_frontier_refs(db, task_id):
+                frontier_refs = self._task_frontier_refs(db, task_id)
+                if not set(evidence_refs) <= frontier_refs:
                     raise BindingError("integration requires sources explicitly read by this task")
-                for sid in obligation.unit_ids:
-                    row = db.execute("SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (sid,)).fetchone()
-                    scope = ReviewScope(**json.loads(row[0]))
-                    paths = {region["path"] for region in scope.regions}
-                    if not any(
+
+                def is_unit_original(ref: EvidenceRef, paths: set[str]) -> bool:
+                    return (
                         ref.kind == "source"
                         and ref.path in paths
                         and ref.side in {"base", "head"}
                         and ref.metadata.get("navigation_only") is not True
                         and ref.metadata.get("complete", True) is not False
                         and ref.metadata.get("status", "available") in {"available", "success", "ok"}
-                        for ref in refs
-                    ):
+                    )
+
+                missing_units = {}
+                for sid in obligation.unit_ids:
+                    row = db.execute("SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (sid,)).fetchone()
+                    scope = ReviewScope(**json.loads(row[0]))
+                    paths = {region["path"] for region in scope.regions}
+                    if not any(is_unit_original(ref, paths) for ref in refs):
+                        missing_units[sid] = paths
+                if missing_units:
+                    if not report_blockers:
                         raise BindingError("checked integration needs original source for each unit")
+                    from .decision_state import CorrectableDecisionInputError
+
+                    delivered = self._require_delivered(
+                        db, task_id, token, turn_id, frontier_refs - set(evidence_refs), required_ref_ids=set()
+                    )
+                    originals = self._unit_refs(db, sorted(delivered))
+                    raise CorrectableDecisionInputError(
+                        [
+                            {
+                                "field": "evidence_refs",
+                                "reason": "missing_unit_source",
+                                "obligation_id": obligation_id,
+                                "unit_id": sid,
+                                "paths": sorted(paths),
+                                "eligible_refs": [ref.id for ref in originals if is_unit_original(ref, paths)],
+                                "message": "Cite original source for this unit in this obligation's receipt.",
+                            }
+                            for sid, paths in missing_units.items()
+                        ]
+                    )
             obligation.evidence_refs = list(evidence_refs)
             obligation.disposition = disposition
             obligation.reason = reason

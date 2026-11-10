@@ -135,8 +135,11 @@ async def test_real_product_checks_two_units_and_independent_integration(
     rejected_completion = set()
     premature_scopes = set()
     rejected_retraction = set()
+    integration_correction = None
+    settled_revisions = {}
 
     def review(messages, _turn):
+        nonlocal integration_correction
         board = json.loads(messages[1].content)
         scope, role = board["scope"], board["unit_role"]
         key = scope["id"]
@@ -173,6 +176,19 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     assert receipt["work_item_revision"] == item["work_item_revision"] != receipt["draft_revision"]
                     assert receipt["errors"][0]["field"] == "payload.retract_draft.draft_revision"
                     rejected_retraction.add(key)
+                elif (receipt.get("errors") or [{}])[0].get("reason") == "missing_unit_source":
+                    assert role == "integration" and integration_correction is None
+                    (issue,) = receipt["errors"]
+                    obligations = board["integration_obligations"]
+                    (pending,) = [obligation for obligation in obligations if not obligation["valid"]]
+                    assert pending["id"] == issue["obligation_id"]
+                    assert issue["field"] == f"payload.integration_receipts[{len(obligations) - 1}].evidence_refs"
+                    assert issue["unit_id"] in pending["unit_ids"]
+                    assert issue["paths"] == ["b.py"]
+                    assert issue["eligible_refs"] == [refs[key]["b.py"]]
+                    settled_revisions.update((o["id"], o["revision"]) for o in obligations if o["valid"])
+                    assert set(issue["settled_obligation_ids"]) == set(settled_revisions)
+                    integration_correction = issue
                 elif offer and phase == 5 + int(bad_source_args) and "error" in receipt:
                     assert receipt["status"] == "repair_needed"
                 else:
@@ -282,6 +298,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
         if role == "integration":
             obligations = board["integration_obligations"]
             assert obligations and any(len(o["unit_ids"]) == 2 for o in obligations)
+            obligations = sorted(obligations, key=lambda o: o["kind"] == "cross_unit")
             payload = {
                 "integration_receipts": [
                     {
@@ -294,6 +311,19 @@ async def test_real_product_checks_two_units_and_independent_integration(
                 ],
                 "finish": True,
             }
+            if not candidate and not bad_source_args and key in rejected_completion:
+                if integration_correction is None:
+                    assert obligations[-1]["kind"] == "cross_unit"
+                    payload["integration_receipts"][-1]["evidence_refs"] = [refs[key]["a.py"]]
+                else:
+                    payload["integration_receipts"] = [
+                        {
+                            "obligation_id": integration_correction["obligation_id"],
+                            "disposition": "checked",
+                            "evidence_refs": [refs[key]["a.py"], *integration_correction["eligible_refs"]],
+                            "reason": "Compared the definition with the consuming import",
+                        }
+                    ]
         else:
             ids = [r["id"] for r in scope["regions"]]
             payload = {
@@ -343,6 +373,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
     assert report["metrics"]["coverage"]["checked_regions"] == 2
     assert rejected_completion == {key for key, _role in visited}
     assert len(rejected_retraction) == int(candidate)
+    assert (integration_correction is not None) == (not candidate and not bad_source_args)
     assert result["comments_sent"] == 0 and result["local_only"]
     assert len(verifier._inputs) == int(candidate)
     if candidate:
@@ -350,13 +381,24 @@ async def test_real_product_checks_two_units_and_independent_integration(
     with sqlite3.connect(Path(result["report_path"]).parent / "board.sqlite") as db:
         assert db.execute("SELECT count(*) FROM decision_verification_queue").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM decision_items").fetchone()[0] == 3
+        if integration_correction is not None:
+            stored = {
+                row["id"]: row["revision"]
+                for (payload,) in db.execute("SELECT payload FROM integration_obligations")
+                if (row := json.loads(payload))["id"] in settled_revisions
+            }
+            assert stored == settled_revisions
         completions = [
             json.loads(payload) for (payload,) in db.execute("SELECT payload FROM decision_steps WHERE item_id=''")
         ]
         assert {
             step["scope_id"] for step in completions if step.get("disposition") == "reviewed"
         } == rejected_completion
-        assert {step["scope_id"] for step in completions if step["status"] == "pending"} == premature_scopes
+        pending_scopes = {step["scope_id"] for step in completions if step["status"] == "pending"}
+        expected_pending = premature_scopes | (
+            {key for key, role in visited if role == "integration"} if integration_correction is not None else set()
+        )
+        assert pending_scopes == expected_pending
     calls = len(reviewer._inputs), len(verifier._inputs)
     again = await obj.run(two_file_state())
     assert again["status"] == "completed" and again["run_id"] == result["run_id"]

@@ -56,7 +56,8 @@ def test_outer_schema_errors_keep_their_own_path():
     ]
 
 
-async def test_model_uses_nested_field_receipt_to_close_question(tmp_path):
+@pytest.mark.parametrize("missing_finish_item", [False, True])
+async def test_model_uses_nested_field_receipt_to_close_question(tmp_path, missing_finish_item):
     store, task = decision_store(tmp_path)
     first = AIMessage(content="", tool_calls=[call("review_step", read(1), "read")])
 
@@ -88,9 +89,24 @@ async def test_model_uses_nested_field_receipt_to_close_question(tmp_path):
             "observations": [{"statement": "Checked", "evidence_refs": question.evidence_refs, "region_ids": ["a"]}],
         }
         args = step("complete_review", payload, item, question.evidence_refs)
+        if missing_finish_item:
+            args.update(work_item_id="", expected_revision=0, question="A new phrasing of the answered question")
+            return AIMessage(content="", tool_calls=[call("review_step", args, "finish-bad")])
         return AIMessage(content="", tool_calls=[call("review_step", args, "finish")])
 
-    reviewer = make_reviewer(store, task, [first, missing_inner_refs, correct_from_receipt, finish])
+    def finish_existing(messages):
+        receipt = json.loads(messages[-1].content)
+        assert receipt["errors"][0]["field"] == "work_item_id"
+        assert receipt["errors"][0]["reason"] == "existing_work_item_required"
+        assert len(store.list(Question)) == 1
+        submitted = messages[-2].tool_calls[0]["args"]
+        corrected = step("complete_review", submitted["payload"], from_board(messages), submitted["evidence_refs"])
+        return AIMessage(content="", tool_calls=[call("review_step", corrected, "finish")])
+
+    responses = [first, missing_inner_refs, correct_from_receipt, finish]
+    if missing_finish_item:
+        responses.append(finish_existing)
+    reviewer = make_reviewer(store, task, responses)
     assert await reviewer.run("a") == "reviewed", reviewer.error
     assert store.get(ReviewScope, "a").status == "reviewed"
     attempts = {event["payload"]["call_id"]: event["payload"]["args"] for event in store.history("DecisionAttempt")}

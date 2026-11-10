@@ -338,6 +338,16 @@ class DecisionState:
                 raise ValueError("invalid evidence operations")
             if args["action"] == "request_evidence" and not operations:
                 raise ValueError("at least one source operation is required")
+            if args["action"] == "complete_review" and not item_id:
+                raise CorrectableDecisionInputError(
+                    [
+                        {
+                            "field": "work_item_id",
+                            "reason": "existing_work_item_required",
+                            "message": "Use an existing work item's ID, revision and question from decision_items.",
+                        }
+                    ]
+                )
             if args["action"] == "complete_review" and args["payload"].get("finish", True) is True:
                 for (payload,) in db.execute("SELECT payload FROM decision_steps WHERE task_id=?", (task_id,)):
                     prior = json.loads(payload)

@@ -8,6 +8,8 @@ from typing import Any
 from reviewforge.engine.native_submission import _invalid_constant, _unique_object, inspect_tool_calls
 
 INTEGRATION_DELIVERY_POLICY = "integration-delivery-1"
+INTEGRATION_JSON_CONSTRAINT = "openai-json-object-1"
+JSON_REQUEST_OPTIONS = {"tool_choice": "none", "response_format": {"type": "json_object"}}
 
 PROMPT = """
 You are the independent cross-unit integration reviewer. Return exactly one JSON object in the
@@ -31,18 +33,21 @@ The controller performs source operations from source_operation_schemas and retu
 Explain exactly what is missing. Review the returned sources and return to the same obligation.
 Navigation IDs may help locate originals. Cite only original evidence IDs in conclusions.
 Use the returned work_item_id and work_item_revision for a continuing question.
-With the same outer work-item fields you can use action "offer_candidate" or "close_question".
-After resolving a source question, close it with the board's question_id and cited original IDs,
-then submit the receipt for the current obligation. A checked receipt does not close a question.
+With the same outer work-item fields you can use action "offer_candidate".
+After resolving a source question, close it with this exact flat object:
+{"action":"close_question","work_item_id":"...","expected_revision":0,
+"answer":"...","evidence_refs":["..."]}.
+The controller finds the existing question from that work item. Then submit the receipt for the
+current obligation. A checked receipt does not close a question.
 If an authoritative rule or environment is absent, use action "unresolved" with payload
 {"missing_fact":"...","attempted":"...","recovery_condition":"..."}.
-If part of an answer is supported, use close_question with the same gap in payload.evidence_gap.
+If part of an answer is supported, use close_question with the same gap in top-level evidence_gap.
 Use the current obligation in the question and describe the specific fact that prevents settlement.
 Pending candidates and open questions must be handled before finish_integration.
 """
 
 
-def integration_action(response: Any, turn_id: str) -> dict[str, Any]:
+def integration_action(response: Any, turn_id: str, board: dict[str, Any] | None = None) -> dict[str, Any]:
     """Derive a controller action from the actual text, without constructing a model tool call."""
     calls, errors = inspect_tool_calls(response)
     metadata = getattr(response, "response_metadata", None) or {}
@@ -63,6 +68,34 @@ def integration_action(response: Any, turn_id: str) -> dict[str, Any]:
     if not isinstance(args, dict):
         raise ValueError("Return one JSON object.")
     action = args.get("action")
+    if action == "close_question":
+        required = {"action", "work_item_id", "expected_revision", "answer", "evidence_refs"}
+        if not required <= args.keys() <= required | {"evidence_gap"}:
+            raise ValueError(
+                "Use the flat close_question object with work_item_id, expected_revision, answer and evidence_refs."
+            )
+        work_item = next(
+            (item for item in (board or {}).get("decision_items", []) if item["id"] == args["work_item_id"]),
+            None,
+        )
+        if work_item is None:
+            raise ValueError("Use a work_item_id from the current board's decision_items.")
+        payload = {
+            "question_id": work_item["question_id"],
+            "answer": args["answer"],
+            "evidence_refs": args["evidence_refs"],
+        }
+        if "evidence_gap" in args:
+            payload["evidence_gap"] = args["evidence_gap"]
+        args = {
+            "action": action,
+            "work_item_id": args["work_item_id"],
+            "expected_revision": args["expected_revision"],
+            "question": work_item["question"],
+            "judgment": args["answer"],
+            "evidence_refs": args["evidence_refs"],
+            "payload": payload,
+        }
     if action in ("request_evidence", "offer_candidate", "close_question", "unresolved"):
         return {"id": f"json-{turn_id}", "name": "review_step", "args": args}
 

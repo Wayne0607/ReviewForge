@@ -545,7 +545,7 @@ class DecisionState:
         self, db: sqlite3.Connection, task_id: str, turn_id: str, call_id: str, response: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         if self.store._uses_integration_delivery(db, task_id):
-            action = self.store._text_decision_call(response, turn_id)
+            action = self.store._text_decision_call(db, task_id, response, turn_id)
             return [action] if action["id"] == call_id else []
         return [
             call

@@ -53,6 +53,8 @@ from reviewforge.review_v42.contracts import (
 from reviewforge.review_v42.decision_state import CorrectableDecisionInputError, DecisionState
 from reviewforge.review_v42.integration_delivery import (
     INTEGRATION_DELIVERY_POLICY,
+    INTEGRATION_JSON_CONSTRAINT,
+    JSON_REQUEST_OPTIONS,
     integration_action,
 )
 from reviewforge.review_v42.integration_delivery import (
@@ -519,7 +521,7 @@ class DecisionReviewer(Reviewer):
             )
             board["work_item_payload_schemas"] = {
                 action: PAYLOADS[action].model_json_schema()
-                for action in ("request_evidence", "offer_candidate", "close_question", "unresolved")
+                for action in ("request_evidence", "offer_candidate", "unresolved")
             }
         context[0] = SystemMessage(content=prompt)
         context[1] = HumanMessage(content=json.dumps(board, ensure_ascii=False, default=str))
@@ -995,6 +997,12 @@ class DecisionReviewer(Reviewer):
             if self._text_delivery
             else self.llm.bind_tools([review_step_tool(), complete_scope_tool()], tool_choice="auto")
         )
+        options = (
+            JSON_REQUEST_OPTIONS
+            if self._text_delivery
+            and self.store.run.metadata.get("integration_response_constraint") == INTEGRATION_JSON_CONSTRAINT
+            else {}
+        )
         saved, self.failed_contexts = decode_session(self.store.load_task_session(self.task_id))
         recent = self._last_exchange(messages_from_dict(saved)) if saved else []
         try:
@@ -1015,7 +1023,7 @@ class DecisionReviewer(Reviewer):
                 obligation_id = current_obligation["id"] if current_obligation else None
                 turn_id = uuid.uuid4().hex
                 self.store.append_turn_audit(self.task_id, self.lease_token, turn_id, "request", messages_to_dict(chat))
-                response = await bound.ainvoke(chat)
+                response = await bound.ainvoke(chat, **options)
                 calls, errors = inspect_tool_calls(response)
                 visible = _visible_message(response, calls, deep=True)
                 extra = getattr(response, "additional_kwargs", {}) or {}
@@ -1029,7 +1037,7 @@ class DecisionReviewer(Reviewer):
                         "integration_native_errors": bool(errors or ambiguous),
                     }
                     try:
-                        calls = [integration_action(response, turn_id)]
+                        calls = [integration_action(response, turn_id, board)]
                     except ValueError as exc:
                         text_error = str(exc)
                 if raw_calls is not None or invalid_calls or errors or ambiguous:

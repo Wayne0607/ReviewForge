@@ -27,7 +27,11 @@ from reviewforge.engine.request_budget import _actual_usage
 from reviewforge.review_v42.adapter import PinnedToolGateway, changed_regions
 from reviewforge.review_v42.contracts import VERIFICATION_DELIVERY_POLICIES, Run
 from reviewforge.review_v42.evaluation import summarize_run
-from reviewforge.review_v42.integration_delivery import INTEGRATION_DELIVERY_POLICY
+from reviewforge.review_v42.integration_delivery import (
+    INTEGRATION_DELIVERY_POLICY,
+    INTEGRATION_JSON_CONSTRAINT,
+    JSON_REQUEST_OPTIONS,
+)
 from reviewforge.review_v42.knowledge import SCHEMA as KNOWLEDGE_SCHEMA
 from reviewforge.review_v42.knowledge import capture_knowledge, validate_knowledge
 from reviewforge.review_v42.publication import PublicationOutbox
@@ -172,6 +176,11 @@ class MeteredModel(BaseChatModel):
                 "agent": self._agent,
                 "input_chars": len(json.dumps(messages_to_dict(messages), ensure_ascii=False)),
                 "tool_schema_chars": len(json.dumps(kwargs.get("tools", []), ensure_ascii=False)),
+                **(
+                    {"response_constraint": INTEGRATION_JSON_CONSTRAINT}
+                    if all(kwargs.get(key) == value for key, value in JSON_REQUEST_OPTIONS.items())
+                    else {}
+                ),
             }
         )
         result = await self._inner._agenerate(messages, stop, run_manager, **kwargs)
@@ -552,6 +561,8 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["verification_delivery_policy"] = verification_delivery
         if integration_delivery:
             metadata["integration_delivery_policy"] = integration_delivery
+            if getattr(raw_models["v42_reviewer"], "v42_stream_transport", False) is True:
+                metadata["integration_response_constraint"] = INTEGRATION_JSON_CONSTRAINT
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

@@ -12,13 +12,21 @@ from test_v42_stateful_reviewer import call
 
 from reviewforge.review_v42.contracts import Question, Task
 from reviewforge.review_v42.decision_loop import DecisionReviewer
-from reviewforge.review_v42.integration_delivery import INTEGRATION_DELIVERY_POLICY
+from reviewforge.review_v42.integration_delivery import (
+    INTEGRATION_DELIVERY_POLICY,
+    INTEGRATION_JSON_CONSTRAINT,
+    JSON_REQUEST_OPTIONS,
+)
 from reviewforge.review_v42.tools import EvidenceGateway
 
 
 class TextModel(Model):
     def bind_tools(self, *_args, **_kwargs):
         pytest.fail("integration delivery must use the ordinary message channel")
+
+    async def ainvoke(self, messages, **options):
+        assert options == JSON_REQUEST_OPTIONS
+        return await super().ainvoke(messages)
 
 
 def submission(action):
@@ -30,7 +38,11 @@ def shell():
 
 
 async def integration_store(tmp_path):
-    store, primary = decision_store(tmp_path, integration_delivery_policy=INTEGRATION_DELIVERY_POLICY)
+    store, primary = decision_store(
+        tmp_path,
+        integration_delivery_policy=INTEGRATION_DELIVERY_POLICY,
+        integration_response_constraint=INTEGRATION_JSON_CONSTRAINT,
+    )
     await finish_primary(store, primary)
     task = store.add(Task("integration-task", store.run.id, "review", "integration", 0))
     return store, store.acquire_task(task.id, "integrator", 120)
@@ -73,12 +85,15 @@ async def test_shell_rejection_source_delivery_and_receipt_resume(tmp_path):
     def close(messages):
         item = from_board(messages)
         received["ref"] = json.loads(messages[-1].content)["results"][0]["result"]["evidence_ref"]
-        payload = {
-            "question_id": item["question_id"],
-            "answer": "Checked fixed source",
-            "evidence_refs": [received["ref"]],
-        }
-        return submission(step("close_question", payload, item, [received["ref"]]))
+        return submission(
+            {
+                "action": "close_question",
+                "work_item_id": item["id"],
+                "expected_revision": item["work_item_revision"],
+                "answer": "Checked fixed source",
+                "evidence_refs": [received["ref"]],
+            }
+        )
 
     def receipt(messages):
         current = json.loads(messages[1].content)["current_integration_obligation"]

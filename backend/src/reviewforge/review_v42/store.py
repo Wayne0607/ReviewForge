@@ -36,7 +36,7 @@ from .contracts import (
     Task,
     UnitPlan,
 )
-from .integration_delivery import INTEGRATION_DELIVERY_POLICY, integration_action
+from .integration_delivery import INTEGRATION_DELIVERY_POLICY, INTEGRATION_JSON_CONSTRAINT, integration_action
 from .line_semantics import source_lines, source_slice
 
 T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)
@@ -147,6 +147,11 @@ class ReviewStore:
             or decision_policy != "decision-cycle-1"
         ):
             raise BindingError("unsupported integration delivery profile")
+        if "integration_response_constraint" in run.metadata and (
+            run.metadata["integration_response_constraint"] != INTEGRATION_JSON_CONSTRAINT
+            or run.metadata.get("integration_delivery_policy") != INTEGRATION_DELIVERY_POLICY
+        ):
+            raise BindingError("unsupported integration response constraint")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
@@ -495,7 +500,7 @@ class ReviewStore:
                             calls.append({"id": call.get("id"), "name": call.get("name"), "args": call.get("args")})
                     text_delivery = self._uses_integration_delivery(db, task.id)
                     if text_delivery:
-                        calls = [self._text_decision_call(response, turn_id)]
+                        calls = [self._text_decision_call(db, task.id, response, turn_id)]
                     from reviewforge.engine.native_submission import strict_tool_call
 
                     ids = [call["id"] for call in calls]
@@ -3326,14 +3331,28 @@ class ReviewStore:
         task = Task(**json.loads(row[0]))
         return task.kind == "review" and task.object_id == self._unit_plan_db(db).integration_scope_id
 
-    @staticmethod
-    def _text_decision_call(response: list[dict[str, Any]], turn_id: str) -> dict[str, Any]:
+    def _text_decision_call(
+        self, db: sqlite3.Connection, task_id: str, response: list[dict[str, Any]], turn_id: str
+    ) -> dict[str, Any]:
         from langchain_core.messages import AIMessage, messages_from_dict
 
         messages = messages_from_dict(response)
         if len(messages) != 1 or not isinstance(messages[0], AIMessage):
             raise BindingError("integration decision requires one audited assistant response")
-        return integration_action(messages[0], turn_id)
+        row = db.execute(
+            "SELECT content_hash FROM turn_audit WHERE task_id=? AND turn_id=? AND phase='request'",
+            (task_id, turn_id),
+        ).fetchone()
+        if row is None:
+            raise BindingError("integration decision requires the audited work board")
+        raw = (self.audit_dir / row[0]).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != row[0]:
+            raise BindingError("turn audit blob hash mismatch")
+        request = json.loads(raw)
+        if len(request) < 2 or request[1].get("type") != "human":
+            raise BindingError("integration decision requires the audited work board")
+        board = json.loads(request[1]["data"]["content"])
+        return integration_action(messages[0], turn_id, board)
 
     def _candidate_turn_calls(
         self, db: sqlite3.Connection, task_id: str, token: str, turn_id: str
@@ -3361,7 +3380,7 @@ class ReviewStore:
             raise BindingError("candidate turn response is invalid")
         text_delivery = self._uses_integration_delivery(db, task_id)
         calls = (
-            [self._text_decision_call(response, turn_id)]
+            [self._text_decision_call(db, task_id, response, turn_id)]
             if text_delivery
             else response[0]["data"].get("tool_calls", [])
         )
@@ -3602,7 +3621,7 @@ class ReviewStore:
             decision_args = decision_attempt.get("args")
             response = json.loads((self.audit_dir / response_hash).read_bytes())
             audited_calls = (
-                [self._text_decision_call(response, turn_id)]
+                [self._text_decision_call(db, task_id, response, turn_id)]
                 if self._uses_integration_delivery(db, task_id)
                 else [
                     call

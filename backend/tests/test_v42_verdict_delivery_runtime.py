@@ -1,5 +1,6 @@
 """Independent verification delivers fixed sources with the verdict they support."""
 
+import asyncio
 import json
 from collections import defaultdict
 
@@ -11,7 +12,17 @@ from test_v42_integration import NativeModel, tool
 from reviewforge.core.state import StateStore
 from reviewforge.review_v42.adapter import PinnedToolGateway
 from reviewforge.review_v42.context import ContextBuilder
-from reviewforge.review_v42.contracts import Case, EvidenceRef, Question, ReviewScope, RevisionConflict, Run, Task
+from reviewforge.review_v42.contracts import (
+    CLAIM_CYCLE_POLICY,
+    Case,
+    EvidenceRef,
+    Question,
+    ReviewScope,
+    RevisionConflict,
+    Run,
+    Task,
+    VerificationIncomplete,
+)
 from reviewforge.review_v42.publication import Publication, PublicationOutbox
 from reviewforge.review_v42.runtime import ReviewRuntime
 from reviewforge.review_v42.snapshot import snapshot_identity
@@ -44,7 +55,7 @@ class MemorySnapshot:
         return self.files[path].encode()
 
 
-async def make_board(tmp_path):
+async def make_board(tmp_path, delivery="claim-delivery-1"):
     state = StateStore(repo="example/repo", pr_number=1, base_sha="base", head_sha="head")
     head = MemorySnapshot(state.head_sha, HEAD_SOURCES)
     base = MemorySnapshot(state.base_sha, BASE_SOURCES)
@@ -63,7 +74,7 @@ async def make_board(tmp_path):
             "source_line_policy": "git-lf-1",
             "frontier_projection_policy": "source-line-union-1",
             "decision_cycle_policy": "decision-cycle-1",
-            "verification_delivery_policy": "claim-delivery-1",
+            "verification_delivery_policy": delivery,
         },
     )
     store = ReviewStore(tmp_path / "board.db", run)
@@ -200,6 +211,119 @@ def reject_verdict(ref, quote, statement):
         "facts": {"counterexample": fact(statement, ref, quote)},
         "gaps": [],
     }
+
+
+def claim_response(response):
+    return AIMessage(content=json.dumps(response))
+
+
+def claim_gap(path, *, side="base"):
+    return claim_response(
+        {
+            "action": "request_evidence",
+            "gap": {
+                "fact": "counterexample",
+                "question": "Does the original establish the claimed premise?",
+                "source": {"side": side, "path": path},
+            },
+        }
+    )
+
+
+def claim_rejection(original, quote):
+    decision = reject_verdict(original, quote, "The original disproves the premise")
+    decision.pop("gaps")
+    return claim_response({"action": "submit_verdict", **decision})
+
+
+@pytest.mark.asyncio
+async def test_claim_cycle_restarts_pending_source_and_preserves_prior_verdict(tmp_path, monkeypatch):
+    store, gateway = await make_board(tmp_path, CLAIM_CYCLE_POLICY)
+    head = await gateway.execute("read_source", {"path": "notify.py"})
+    head_ref = head["evidence_ref"]
+    case = store.add(
+        Case(
+            "case",
+            store.run.id,
+            trigger="Repeat a session",
+            mechanism="Notify participants",
+            claims=[
+                {"id": "first", "statement": "No recipients are passed", "impact": "Nobody receives a notice"},
+                {"id": "second", "statement": "The contract is silent", "impact": "Behavior is undefined"},
+            ],
+            evidence_refs=[head_ref],
+        )
+    )
+    task = store.add(Task("verify", store.run.id, "verify", case.id, case.revision))
+    lease = store.acquire_task(task.id, "before-restart", 120)
+    read = gateway.execute
+
+    async def interrupt(name, args):
+        assert (name, args) == ("read_source", {"side": "base", "path": "README.md"})
+        assert store.verification_gaps(case, "second")[0]["status"] == "pending"
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(gateway, "execute", interrupt)
+
+    def initial(messages, _turn):
+        packet = json.loads(messages[1].content)
+        assert packet["claim"]["id"] == ("first" if _turn == 1 else "second")
+        if _turn == 1:
+            return claim_rejection(head_ref, HEAD_SOURCES["notify.py"].strip())
+        assert store.get_verdict(case.id, "first", POLICY)["verdict"] == "reject"
+        return claim_gap("README.md")
+
+    with pytest.raises(asyncio.CancelledError):
+        await Verifier(store, NativeModel(initial), gateway).verify(
+            case.id, task_id=task.id, lease_token=lease.lease_token
+        )
+    first = store.get_verdict(case.id, "first", POLICY)
+    store.release_task(task.id, lease.lease_token)
+    monkeypatch.setattr(gateway, "execute", read)
+    lease = store.acquire_task(task.id, "after-restart", 120)
+
+    def resumed(messages, _turn):
+        packet = json.loads(messages[1].content)
+        assert packet["claim"]["id"] == "second" and packet["case_revision"] == case.revision
+        (gap,) = packet["answered_source_requests"]
+        assert gap["status"] == "supplied"
+        base = next(source for source in packet["originals"] if source["id"] == gap["receipt_ref"])
+        assert (base["side"], base["path"]) == ("base", "README.md")
+        return claim_rejection(base["id"], CONTEXT_SOURCES["README.md"].strip())
+
+    verifier = Verifier(store, NativeModel(resumed), gateway)
+    result = await verifier.verify(case.id, task_id=task.id, lease_token=lease.lease_token)
+    assert result[0] == first and result[1]["verdict"] == "reject"
+    assert result[0]["evidence_refs"] == [head_ref]
+    assert result[1]["result"]["cited_refs"] == [store.verification_gaps(case, "second")[0]["receipt_ref"]]
+    assert len(verifier.llm._inputs) == 1
+    assert store.get(Case, case.id) == case and not store.list(Question)
+
+
+@pytest.mark.asyncio
+async def test_claim_cycle_external_gap_survives_restart_without_a_verdict(tmp_path):
+    store, gateway = await make_board(tmp_path, CLAIM_CYCLE_POLICY)
+    case = store.add(
+        Case(
+            "case",
+            store.run.id,
+            trigger="Checkout",
+            mechanism="Compare a cutoff",
+            claims=[{"id": "policy", "statement": "The cutoff is wrong", "impact": "Eligible users are charged"}],
+        )
+    )
+    task = store.add(Task("verify", store.run.id, "verify", case.id, case.revision))
+    lease = store.acquire_task(task.id, "worker", 120)
+    model = NativeModel(lambda _messages, _turn: claim_gap("Approved deployment cutoff", side="external"))
+    verifier = Verifier(store, model, gateway)
+    for _ in range(2):
+        with pytest.raises(VerificationIncomplete, match="concrete source is unavailable"):
+            await verifier.verify(case.id, task_id=task.id, lease_token=lease.lease_token)
+        store.release_task(task.id, lease.lease_token)
+        lease = store.acquire_task(task.id, "worker", 120)
+    assert len(model._inputs) == 1 and store.get_verdict(case.id, "policy", POLICY) is None
+    (gap,) = store.verification_gaps(case, "policy")
+    assert gap["status"] == "unavailable" and gap["gap"]["source"]["path"] == "Approved deployment cutoff"
 
 
 @pytest.mark.asyncio

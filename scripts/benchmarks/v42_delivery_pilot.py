@@ -24,7 +24,7 @@ from reviewforge.core.llm_settings import EncryptedLLMSettingsStore, apply_overr
 from reviewforge.core.state import StateStore
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.review_v42.adapter import PinnedToolGateway
-from reviewforge.review_v42.contracts import Question, Run
+from reviewforge.review_v42.contracts import VERIFICATION_DELIVERY_POLICIES, Question, Run
 from reviewforge.review_v42.evaluation import summarize_run
 from reviewforge.review_v42.integration import PhysicalMeter, _model_signature, _models, _raw_models, _write_json
 from reviewforge.review_v42.publication import PublicationOutbox
@@ -264,7 +264,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--arm", choices=["baseline", "decision"], required=True)
-    parser.add_argument("--verification-delivery", choices=["claim-delivery-1"])
+    parser.add_argument("--verification-delivery", choices=sorted(VERIFICATION_DELIVERY_POLICIES))
     parser.add_argument("--replicate", type=int, choices=[1, 2, 3], required=True)
     asyncio.run(episode(parser.parse_args()))
 

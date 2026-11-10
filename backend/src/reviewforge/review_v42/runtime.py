@@ -9,6 +9,8 @@ import time
 from typing import Any
 
 from reviewforge.review_v42.contracts import (
+    CLAIM_CYCLE_POLICY,
+    VERIFICATION_DELIVERY_POLICIES,
     BindingError,
     Case,
     EvidenceRef,
@@ -17,6 +19,7 @@ from reviewforge.review_v42.contracts import (
     ReviewScope,
     RevisionConflict,
     Task,
+    VerificationIncomplete,
 )
 from reviewforge.review_v42.reviewer import QuestionAssistant, Reviewer, _status_code
 from reviewforge.review_v42.scope import compile_scopes
@@ -79,7 +82,7 @@ class ReviewRuntime:
         ):
             raise ValueError("unsupported v4.2 decision cycle policy")
         if "verification_delivery_policy" in metadata and (
-            metadata["verification_delivery_policy"] != "claim-delivery-1"
+            metadata["verification_delivery_policy"] not in VERIFICATION_DELIVERY_POLICIES
             or metadata.get("decision_cycle_policy") != "decision-cycle-1"
         ):
             raise ValueError("unsupported v4.2 verification delivery policy")
@@ -473,6 +476,12 @@ class ReviewRuntime:
                     except LeaseError:
                         pass
                     self._enqueue(self.store.get(Case, case.id))
+                except VerificationIncomplete as exc:
+                    self._errors_real.append(f"verification {case.id}: {exc}")
+                    try:
+                        self.store.release_task(task.id, task.lease_token)
+                    except LeaseError:
+                        pass
                 except Exception as exc:
                     if _status_code(exc) in {401, 402, 403}:
                         self._blocked = True
@@ -1043,6 +1052,14 @@ class ReviewRuntime:
                 if case.revision == task.input_revision:
                     verdicts.extend(task.result.get("verdicts", []))
         policy = getattr(self.verifier, "policy", "v42-independent-1")
+        claim_cycle = self.store.run.metadata.get("verification_delivery_policy") == CLAIM_CYCLE_POLICY
+        if claim_cycle:
+            verdicts = [
+                verdict
+                for case in cases
+                for claim in case.claims
+                if (verdict := self.store.get_verdict(case.id, claim["id"], policy)) is not None
+            ]
         unresolved = (
             any(v.get("verdict") in {"needs_evidence", "unresolved"} for v in verdicts)
             or any(q.status in {"open", "disputed", "unresolved"} for q in self.store.list(Question))
@@ -1097,4 +1114,8 @@ class ReviewRuntime:
         }
         if draft_policy is not None:
             result["pending_candidate_drafts"] = pending_drafts
+        if claim_cycle:
+            result["verification_gaps"] = [
+                gap for case in cases for gap in self.store.verification_gaps(case) if gap["status"] != "supplied"
+            ]
         return result

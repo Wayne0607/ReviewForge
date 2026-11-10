@@ -18,6 +18,8 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from .contracts import (
+    CLAIM_CYCLE_POLICY,
+    VERIFICATION_DELIVERY_POLICIES,
     BindingError,
     Case,
     EvidenceRef,
@@ -37,7 +39,6 @@ from .line_semantics import source_lines, source_slice
 
 T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)
 _TYPES = {c.__name__: c for c in (ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)}
-_VERIFICATION_DELIVERY_POLICY = "claim-delivery-1"
 
 
 def _json(value: Any) -> str:
@@ -134,7 +135,7 @@ class ReviewStore:
         ):
             raise BindingError("unsupported decision cycle profile")
         if "verification_delivery_policy" in run.metadata and (
-            run.metadata["verification_delivery_policy"] != _VERIFICATION_DELIVERY_POLICY
+            run.metadata["verification_delivery_policy"] not in VERIFICATION_DELIVERY_POLICIES
             or decision_policy != "decision-cycle-1"
             or run.policy != "v42-units-6"
         ):
@@ -204,6 +205,12 @@ class ReviewStore:
                     CREATE TABLE IF NOT EXISTS decision_verification_queue (
                         case_id TEXT PRIMARY KEY, step_id TEXT NOT NULL, case_revision INTEGER NOT NULL);
                 """)
+            if run.metadata.get("verification_delivery_policy") == CLAIM_CYCLE_POLICY:
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS verification_gaps (
+                        id TEXT PRIMARY KEY, case_id TEXT NOT NULL, case_revision INTEGER NOT NULL,
+                        claim_id TEXT NOT NULL, payload TEXT NOT NULL)
+                    """)
             if run.policy == "v42-units-6":
                 db.executescript("""
                     CREATE TABLE IF NOT EXISTS unit_plan (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
@@ -5781,7 +5788,7 @@ class ReviewStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Freeze one independently produced decision for one immutable claim input."""
-        if self.run.metadata.get("verification_delivery_policy") == _VERIFICATION_DELIVERY_POLICY:
+        if self.run.metadata.get("verification_delivery_policy") in VERIFICATION_DELIVERY_POLICIES:
             raise BindingError("verification decisions require a claim delivery transaction")
         if not policy or verdict not in ("accept", "reject", "needs_evidence", "unresolved"):
             raise ValueError("invalid policy or verdict")
@@ -5920,6 +5927,20 @@ class ReviewStore:
         if not isinstance(result, dict) or any(result.get(key) != value for key, value in identity.items()):
             raise BindingError("original trigger or claim identity mismatch")
         checked = {**validate_result(sources.for_claim(observed), result, set(observed)), **identity}
+        if sources.run.metadata.get("verification_delivery_policy") == CLAIM_CYCLE_POLICY:
+            if checked["gaps"]:
+                raise BindingError("claim cycle records gaps separately from verdicts")
+            supplied = set(case.evidence_refs + case.counter_evidence_refs)
+            for (payload,) in db.execute(
+                "SELECT payload FROM verification_gaps WHERE case_id=? AND case_revision=? AND claim_id=?",
+                (case.id, case.revision, claim["id"]),
+            ):
+                gap = json.loads(payload)
+                if gap["status"] != "supplied":
+                    raise BindingError("the claim still has an outstanding evidence gap")
+                supplied.add(gap["receipt_ref"])
+            if set(observed) - supplied:
+                raise BindingError("verdict cites proof outside this claim's source packet")
         if set(result) - checked.keys() or result.get("cited_refs", checked["cited_refs"]) != checked["cited_refs"]:
             raise BindingError("verdict citations or result fields do not match validated proof")
         if checked["verdict"] in {"accept", "reject"} and set(case.counter_evidence_refs) - set(observed):
@@ -5960,7 +5981,7 @@ class ReviewStore:
     ) -> tuple[str, dict[str, Any]]:
         evidence_refs = sorted(set(case_refs) | set(observed))
         delivery = {
-            "policy": _VERIFICATION_DELIVERY_POLICY,
+            "policy": self.run.metadata["verification_delivery_policy"],
             "case_digest": hashlib.sha256(_json(asdict(case)).encode()).hexdigest(),
             "case_evidence_refs": case_refs,
             "observed_evidence_refs": observed,
@@ -5998,7 +6019,10 @@ class ReviewStore:
         stored_key, payload = row
         decision = json.loads(payload)
         delivery = decision.get("delivery")
-        if not isinstance(delivery, dict) or delivery.get("policy") != _VERIFICATION_DELIVERY_POLICY:
+        if (
+            not isinstance(delivery, dict)
+            or delivery.get("policy") != self.run.metadata["verification_delivery_policy"]
+        ):
             raise BindingError("verdict does not bind a claim delivery")
         observed = self._load_verification_sources(db, sources, delivery.get("observed_evidence_refs"))
         if self._eligible_verification_sources(sources, observed) != observed:
@@ -6008,6 +6032,44 @@ class ReviewStore:
         if stored_key != key or decision != expected:
             raise BindingError("verdict source or Case binding no longer matches")
         return decision
+
+    def _guard_verification_delivery(
+        self,
+        db: sqlite3.Connection,
+        case_id: str,
+        expected_revision: int,
+        task_id: str,
+        lease_token: str,
+        now: float | None,
+    ) -> tuple[Case, Task]:
+        current = time.time() if now is None else now
+        if not math.isfinite(current):
+            raise ValueError("time must be finite")
+        row = db.execute("SELECT revision,payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
+        if row is None:
+            raise KeyError(case_id)
+        case = Case(**json.loads(row[1]))
+        if row[0] != expected_revision or case.revision != expected_revision:
+            raise RevisionConflict("case revision changed during verification")
+        if case.id != case_id or case.run_id != self.run.id:
+            raise BindingError("verification Case does not belong to this run")
+        row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+        task = Task(**json.loads(row[0])) if row is not None else None
+        if (
+            task is None
+            or task.id != task_id
+            or task.run_id != self.run.id
+            or task.kind not in {"verify", "verification"}
+            or task.object_id != case_id
+            or task.input_revision != expected_revision
+            or task.status != "leased"
+            or not lease_token
+            or task.lease_token != lease_token
+            or not math.isfinite(task.lease_expires)
+            or task.lease_expires <= current
+        ):
+            raise LeaseError("a current verification lease for this case revision is required")
+        return case, task
 
     def save_verification_delivery(
         self,
@@ -6021,7 +6083,8 @@ class ReviewStore:
         now: float | None = None,
     ) -> list[dict[str, Any]]:
         """Freeze each claim with its own observed proof, without changing the Case input."""
-        if self.run.metadata.get("verification_delivery_policy") != _VERIFICATION_DELIVERY_POLICY:
+        delivery_policy = self.run.metadata.get("verification_delivery_policy")
+        if delivery_policy not in VERIFICATION_DELIVERY_POLICIES:
             raise BindingError("claim delivery requires the verification delivery profile")
         if not isinstance(policy, str) or not policy or not isinstance(deliveries, list):
             raise ValueError("verification delivery requires a policy and a list of claims")
@@ -6038,33 +6101,7 @@ class ReviewStore:
             incoming[delivery["claim_id"]] = delivery
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            current = time.time() if now is None else now
-            if not math.isfinite(current):
-                raise ValueError("time must be finite")
-            row = db.execute("SELECT revision,payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
-            if row is None:
-                raise KeyError(case_id)
-            case = Case(**json.loads(row[1]))
-            if row[0] != expected_revision or case.revision != expected_revision:
-                raise RevisionConflict("case revision changed during verification")
-            if case.id != case_id or case.run_id != self.run.id:
-                raise BindingError("verification Case does not belong to this run")
-            row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
-            task = Task(**json.loads(row[0])) if row is not None else None
-            if (
-                task is None
-                or task.id != task_id
-                or task.run_id != self.run.id
-                or task.kind not in {"verify", "verification"}
-                or task.object_id != case_id
-                or task.input_revision != expected_revision
-                or task.status != "leased"
-                or not lease_token
-                or task.lease_token != lease_token
-                or not math.isfinite(task.lease_expires)
-                or task.lease_expires <= current
-            ):
-                raise LeaseError("a current verification lease for this case revision is required")
+            case, task = self._guard_verification_delivery(db, case_id, expected_revision, task_id, lease_token, now)
             if (
                 not case.trigger.strip()
                 or not case.mechanism.strip()
@@ -6098,6 +6135,8 @@ class ReviewStore:
                 delivery = incoming.get(claim_id)
                 if delivery is None:
                     if existing is None:
+                        if delivery_policy == CLAIM_CYCLE_POLICY and incoming:
+                            continue
                         raise BindingError("verification delivery does not include every claim")
                     decisions.append(existing)
                     continue
@@ -6136,6 +6175,99 @@ class ReviewStore:
             db.commit()
         return decisions
 
+    def verification_gaps(self, case: Case, claim_id: str | None = None) -> list[dict[str, Any]]:
+        if self.run.metadata.get("verification_delivery_policy") != CLAIM_CYCLE_POLICY:
+            return []
+        with self._connect() as db:
+            return [
+                json.loads(payload)
+                for (payload,) in db.execute(
+                    "SELECT payload FROM verification_gaps WHERE case_id=? AND case_revision=? "
+                    "AND (? IS NULL OR claim_id=?) ORDER BY rowid",
+                    (case.id, case.revision, claim_id, claim_id),
+                )
+            ]
+
+    def save_verification_gap(
+        self,
+        case: Case,
+        claim_id: str,
+        gap: dict[str, Any],
+        *,
+        task_id: str,
+        lease_token: str,
+        source_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a concrete request before reading, then bind its immutable receipt."""
+        from .claim_cycle import VerificationGap
+
+        if self.run.metadata.get("verification_delivery_policy") != CLAIM_CYCLE_POLICY:
+            raise BindingError("structured gaps require the claim cycle profile")
+        gap = VerificationGap.model_validate(gap).model_dump(exclude_none=True)
+        target = gap["source"]
+        key = "vg_" + hashlib.sha256(_json([case.id, case.revision, claim_id, target]).encode()).hexdigest()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current, task = self._guard_verification_delivery(db, case.id, case.revision, task_id, lease_token, None)
+            if current != case or sum(claim["id"] == claim_id for claim in case.claims) != 1:
+                raise BindingError("verification gap must bind the original Case and claim")
+            if db.execute(
+                "SELECT 1 FROM verdicts WHERE case_id=? AND revision=? AND claim_id=?",
+                (case.id, case.revision, claim_id),
+            ).fetchone():
+                raise BindingError("a decided claim cannot open another gap")
+            row = db.execute("SELECT payload FROM verification_gaps WHERE id=?", (key,)).fetchone()
+            if row:
+                saved = json.loads(row[0])
+            else:
+                if source_ref is not None:
+                    raise BindingError("source receipt requires an existing verification gap")
+                saved = {
+                    "id": key,
+                    "case_id": case.id,
+                    "case_revision": case.revision,
+                    "claim_id": claim_id,
+                    "gap": gap,
+                    "source_revision": getattr(self.run, target["side"]) if target["side"] != "external" else None,
+                    "status": "pending" if target["side"] != "external" else "unavailable",
+                }
+                db.execute(
+                    "INSERT INTO verification_gaps VALUES (?,?,?,?,?)",
+                    (key, case.id, case.revision, claim_id, _json(saved)),
+                )
+                self._event(db, "VerificationGap", key, "request", saved)
+            if source_ref is not None:
+                if saved["gap"] != gap or saved["status"] != "pending":
+                    if saved["gap"] == gap and saved.get("receipt_ref") == source_ref:
+                        return saved
+                    raise BindingError("source receipt does not match the pending verification gap")
+                sources = _VerificationSources(self.run)
+                self._load_verification_sources(db, sources, [source_ref])
+                ref = sources.refs[source_ref]
+                if (
+                    ref.side != target["side"]
+                    or ref.path != target["path"]
+                    or ref.metadata.get("tool_name") != "read_source"
+                    or ref.metadata.get("tool_args") != target
+                ):
+                    raise BindingError("verification gap receipt does not match its pinned source request")
+                if (
+                    ref.kind == "query"
+                    and ref.metadata.get("navigation_only") is True
+                    and ref.metadata.get("status") in {"not_found", "out_of_range"}
+                ):
+                    saved.update(status="unavailable", receipt_ref=source_ref, reason=ref.metadata["status"])
+                elif ref.kind == "source" and self._eligible_verification_sources(sources, [source_ref]):
+                    saved.update(status="supplied", receipt_ref=source_ref)
+                else:
+                    raise BindingError("verification gap requires an original source or a pinned absence receipt")
+                db.execute("UPDATE verification_gaps SET payload=? WHERE id=?", (_json(saved), key))
+                self._event(db, "VerificationGap", key, "receipt", saved)
+            if task.lease_expires <= time.time():
+                raise LeaseError("verification lease expired while saving a gap")
+            db.commit()
+        return saved
+
     def get_verdict(self, case_id: str, claim_id: str, policy: str) -> dict[str, Any] | None:
         """Check case, decision and sources against a single database snapshot."""
         with self._connect() as db:
@@ -6144,7 +6276,7 @@ class ReviewStore:
             if row is None:
                 raise KeyError(case_id)
             case = Case(**json.loads(row[1]))
-            claim_delivery = self.run.metadata.get("verification_delivery_policy") == _VERIFICATION_DELIVERY_POLICY
+            claim_delivery = self.run.metadata.get("verification_delivery_policy") in VERIFICATION_DELIVERY_POLICIES
             if claim_delivery and (case.id != case_id or case.run_id != self.run.id or row[0] != case.revision):
                 raise BindingError("verdict does not match current Case input")
             rows = db.execute(
@@ -6434,7 +6566,7 @@ class ReviewStore:
             if decision_cycle and (task.run_id != self.run.id or case.run_id != self.run.id):
                 raise BindingError("verification task or case belongs to another run")
             if (
-                self.run.metadata.get("verification_delivery_policy") == _VERIFICATION_DELIVERY_POLICY
+                self.run.metadata.get("verification_delivery_policy") in VERIFICATION_DELIVERY_POLICIES
                 and evidence_refs != case.evidence_refs
             ):
                 raise BindingError("verification observations cannot change Case evidence under claim delivery")

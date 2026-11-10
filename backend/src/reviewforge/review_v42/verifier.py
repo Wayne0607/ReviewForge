@@ -15,7 +15,16 @@ from reviewforge.engine.session_tools import result_tool
 
 from .context import ContextBuilder
 from .context_recovery import is_context_length_exceeded
-from .contracts import Case, EvidenceRef, LeaseError, Question, RevisionConflict, Task
+from .contracts import (
+    CLAIM_CYCLE_POLICY,
+    VERIFICATION_DELIVERY_POLICIES,
+    Case,
+    EvidenceRef,
+    LeaseError,
+    Question,
+    RevisionConflict,
+    Task,
+)
 from .line_semantics import source_line_policy, source_slice
 from .reviewer import reviewer_tools
 
@@ -400,7 +409,8 @@ class _ProviderFailureError(Exception):
 class Verifier:
     def __init__(self, store: Any, llm: Any, gateway: Any, *, policy: str = POLICY):
         self.store, self.llm, self.gateway, self.policy = store, llm, gateway, policy
-        self._claim_delivery = store.run.metadata.get("verification_delivery_policy") == "claim-delivery-1"
+        self._delivery_policy = store.run.metadata.get("verification_delivery_policy")
+        self._claim_delivery = self._delivery_policy in VERIFICATION_DELIVERY_POLICIES
 
     async def _claim(self, context: dict[str, Any], claim: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
         source_line_policy(self.store.run)
@@ -727,6 +737,11 @@ class Verifier:
             raise ValueError("case needs uniquely identified concrete claims")
         if not case.trigger.strip() or not case.mechanism.strip():
             raise ValueError("case needs original trigger and mechanism")
+        if self._delivery_policy == CLAIM_CYCLE_POLICY:
+            from .claim_cycle import ClaimCycle
+
+            assert task_id and lease_token  # Checked by the common delivery lease gate above.
+            return await ClaimCycle(self.store, self.llm, self.gateway, case, task_id, lease_token, self.policy).run()
         old = [self.store.get_verdict(case_id, c["id"], self.policy) for c in claims]
         if self._claim_delivery and any(row and row["case_revision"] != case.revision for row in old):
             raise RevisionConflict("case changed while loading frozen verdicts")

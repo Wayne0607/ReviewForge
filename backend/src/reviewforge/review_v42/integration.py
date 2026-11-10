@@ -25,7 +25,7 @@ from reviewforge.engine.model_router import ModelRouter, _is_minimax
 from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy, current_retry_attempt
 from reviewforge.engine.request_budget import _actual_usage
 from reviewforge.review_v42.adapter import PinnedToolGateway, changed_regions
-from reviewforge.review_v42.contracts import Run
+from reviewforge.review_v42.contracts import VERIFICATION_DELIVERY_POLICIES, Run
 from reviewforge.review_v42.evaluation import summarize_run
 from reviewforge.review_v42.knowledge import SCHEMA as KNOWLEDGE_SCHEMA
 from reviewforge.review_v42.knowledge import capture_knowledge, validate_knowledge
@@ -402,8 +402,10 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
     if decision_cycle and (decision_cycle != "decision-cycle-1" or EXECUTION_POLICY != "v42-units-6"):
         raise ValueError("unsupported v4.2 decision cycle policy")
     verification_delivery = os.environ.get("REVIEWFORGE_V42_VERIFICATION_DELIVERY", "").strip()
-    if verification_delivery and (verification_delivery != "claim-delivery-1" or decision_cycle != "decision-cycle-1"):
-        raise ValueError("verification delivery requires decision-cycle-1 and claim-delivery-1")
+    if verification_delivery and (
+        verification_delivery not in VERIFICATION_DELIVERY_POLICIES or decision_cycle != "decision-cycle-1"
+    ):
+        raise ValueError("verification delivery requires decision-cycle-1 and a supported claim delivery policy")
 
     def option(name: str, decision_default: str = "") -> str:
         value = os.environ.get(name, "").strip()

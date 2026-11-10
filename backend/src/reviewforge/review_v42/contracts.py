@@ -181,6 +181,14 @@ class Task:
     revision: int = 0
 
 
+CLAIM_CYCLE_POLICY = "claim-delivery-2"
+VERIFICATION_DELIVERY_POLICIES = frozenset({"claim-delivery-1", CLAIM_CYCLE_POLICY})
+
+
+class VerificationIncomplete(Exception):  # noqa: N818
+    """Some claims have no validated verdict. Their gaps remain on the board."""
+
+
 class RevisionConflict(ValueError):  # noqa: N818
     """An expected revision no longer matches current state."""
 

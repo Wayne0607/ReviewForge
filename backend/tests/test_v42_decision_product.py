@@ -138,11 +138,15 @@ async def test_real_product_checks_two_units_and_independent_integration(
         phases[key] += 1
         visited.add((key, role))
         item = board["decision_items"][-1] if board["decision_items"] else None
+        offer = candidate and role == "primary" and scope["regions"][0]["path"] == "a.py"
         assert not any(q["owner"] == "tool_controller" for q in board["questions"])
         for message in messages:
             if message.type == "tool":
                 receipt = json.loads(message.content)
-                assert "error" not in receipt, receipt
+                if offer and phase == 5 + int(bad_source_args) and "error" in receipt:
+                    assert receipt["status"] == "repair_needed"
+                else:
+                    assert "error" not in receipt, receipt
                 for result in receipt.get("results", []):
                     value = result["result"]
                     if "error" in value:
@@ -176,8 +180,14 @@ async def test_real_product_checks_two_units_and_independent_integration(
             }
             return tool("review_step", step("request_evidence", payload, item))
         own_refs = list(refs[key].values())
-        offer = candidate and role == "primary" and scope["regions"][0]["path"] == "a.py"
-        if offer and phase == 1:
+        if offer and phase in {2, 3, 4}:
+            assert item["status"] == "answered"
+            if phase == 3:
+                receipt = json.loads(messages[-1].content)
+                assert receipt["case_changed"] is True
+                assert item["case_ids"] == [receipt["case_id"]]
+            if phase == 4:
+                assert json.loads(messages[-1].content)["case_changed"] is False
             return tool(
                 "review_step",
                 step(
@@ -185,7 +195,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     {
                         "candidate": {
                             "trigger": "Import the value",
-                            "behavior": "The imported value is absent",
+                            "behavior": "The imported value is absent" if phase < 4 else "The value is missing",
                             "impact": "Consumers cannot import it",
                             "evidence_refs": own_refs,
                         }
@@ -194,7 +204,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     own_refs,
                 ),
             )
-        if phase == (2 if offer else 1):
+        if phase == 1:
             return tool(
                 "review_step",
                 step(
@@ -208,6 +218,28 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     own_refs,
                 ),
             )
+        if offer and phase == 5:
+            receipt = json.loads(messages[-1].content)
+            assert receipt["requires_resolution"]
+            assert receipt["errors"][0]["case_ids"] == item["case_ids"]
+            return tool(
+                "review_step",
+                step(
+                    "offer_candidate",
+                    {
+                        "retract_draft": {
+                            "draft_id": receipt["draft_id"],
+                            "expected_revision": receipt["draft_revision"],
+                            "reason": "This is the same finding with different wording",
+                        }
+                    },
+                    item,
+                    own_refs,
+                ),
+            )
+        if offer:
+            assert item["status"] == "answered"
+            assert json.loads(messages[-1].content)["status"] == "retracted"
         if role == "integration":
             obligations = board["integration_obligations"]
             assert obligations and any(len(o["unit_ids"]) == 2 for o in obligations)

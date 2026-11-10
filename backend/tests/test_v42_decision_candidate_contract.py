@@ -34,7 +34,8 @@ def test_native_schema_exposes_optional_candidate_fields_and_resolution_enum():
     assert fields["case_id"]["minLength"] == 1
     assert fields["candidate_resolution"]["anyOf"][0]["enum"] == ["new_case", "apply_to_draft"]
     assert "For ordinary correction" in schema["description"]
-    assert "Only an attempt marked requires_resolution" in schema["description"]
+    assert "select a listed case_id for an update" in schema["description"]
+    assert "Other attempts marked requires_resolution" in schema["description"]
 
 
 async def test_nested_candidate_schema_survives_native_stream_transport():

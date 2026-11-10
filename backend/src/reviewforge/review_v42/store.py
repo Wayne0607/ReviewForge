@@ -3186,6 +3186,34 @@ class ReviewStore:
                 return item
         raise KeyError(draft_id)
 
+    def _work_item_case_ids(self, db: sqlite3.Connection, item_id: str) -> list[str]:
+        """Read Cases already delivered by settled offers for this work item."""
+        item_row = db.execute("SELECT scope_id FROM decision_items WHERE id=?", (item_id,)).fetchone()
+        if item_row is None:
+            raise BindingError("candidate work item is missing")
+        case_ids = set()
+        for (payload,) in db.execute("SELECT payload FROM decision_steps WHERE item_id=?", (item_id,)):
+            step = json.loads(payload)
+            if (
+                step.get("action") != "offer_candidate"
+                or step.get("status") != "settled"
+                or step.get("disposition") != "promoted"
+            ):
+                continue
+            case_id = step.get("case_id")
+            if step.get("work_item_id") != item_id or not isinstance(case_id, str) or not case_id:
+                raise BindingError("promoted Case does not bind this work item")
+            if case_id in case_ids:
+                continue
+            case_row = db.execute("SELECT payload FROM objects WHERE kind='Case' AND id=?", (case_id,)).fetchone()
+            if case_row is None:
+                raise BindingError("promoted Case for this work item is missing")
+            case = Case(**json.loads(case_row[0]))
+            if (case.id, case.run_id, case.scope_id) != (case_id, self.run.id, item_row[0]):
+                raise BindingError("promoted Case belongs to another work item scope or run")
+            case_ids.add(case_id)
+        return sorted(case_ids)
+
     def _candidate_turn_calls(
         self, db: sqlite3.Connection, task_id: str, token: str, turn_id: str
     ) -> tuple[list[dict[str, Any]], str]:
@@ -3623,6 +3651,22 @@ class ReviewStore:
                 return json.loads(previous[1])
             if attempt["revision"] != expected_revision or attempt["status"] != "pending_validation":
                 raise RevisionConflict("candidate attempt revision or status changed")
+            decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+            if decision_cycle:
+                decision_row = db.execute(
+                    "SELECT id,item_id,payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
+                    (task_id, turn_id, call_id),
+                ).fetchone()
+                if decision_row is None:
+                    raise BindingError("candidate decision must be staged before promotion")
+                step_id, work_item_id, step_payload = decision_row
+                step = json.loads(step_payload)
+                if (
+                    step.get("action") != "offer_candidate"
+                    or step.get("work_item_id") != work_item_id
+                    or step.get("status") != "pending"
+                ):
+                    raise BindingError("candidate decision action, work item or status mismatch")
             item = attempt
             source = None
             resolution_error = None
@@ -3669,6 +3713,21 @@ class ReviewStore:
                                 raise ValueError("explicit_target_unavailable_or_changed")
                             if item.get("requires_resolution"):
                                 raise ValueError("explicit_target_requires_resolution")
+                        elif (
+                            decision_cycle
+                            and resolution is None
+                            and isinstance(args.get("case_id"), str)
+                            and args["case_id"]
+                            and native_args.get("target_draft_id") is None
+                            and native_args.get("target_expected_revision") is None
+                        ):
+                            guarded_cases = source.get("existing_case_ids")
+                            if not isinstance(guarded_cases, list) or not guarded_cases:
+                                raise ValueError("explicit_resolution_required")
+                            if args["case_id"] not in guarded_cases or args["case_id"] not in self._work_item_case_ids(
+                                db, work_item_id
+                            ):
+                                raise ValueError("case_not_listed_for_work_item")
                         else:
                             raise ValueError("explicit_resolution_required")
                     elif any(
@@ -3766,6 +3825,24 @@ class ReviewStore:
                     errors.append({"field": "case_id", "reason": "ambiguous_existing_case"})
                 elif candidates:
                     target = candidates[0]
+                if decision_cycle and target is None:
+                    case_ids = self._work_item_case_ids(db, work_item_id)
+                    if case_ids:
+                        # This offer has no established target. Preserve any separate draft it attempted to repair.
+                        item, source = attempt, None
+                        attempt.update(
+                            requires_resolution=True, target_resolution="unknown", existing_case_ids=case_ids
+                        )
+                        errors.append(
+                            {
+                                "field": "case_id",
+                                "reason": "work_item_already_promoted_case",
+                                "case_ids": case_ids,
+                                "message": "Retract this draft if redundant, or explicitly use new_case for an "
+                                "independent defect. To update a listed Case, submit this draft's ID and revision "
+                                "with that case_id and its original trigger.",
+                            }
+                        )
             if target and isinstance(args.get("trigger"), str) and target.trigger != args["trigger"].strip():
                 errors.append({"field": "trigger", "reason": "existing_trigger_immutable"})
             question_ids = args.get("open_questions", [])
@@ -3783,7 +3860,6 @@ class ReviewStore:
             all_refs = list(submitted_refs)
             if target:
                 all_refs.extend(target.evidence_refs + target.counter_evidence_refs)
-            decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
             verified_refs: dict[str, EvidenceRef] = {}
             verified_content: dict[str, str] = {}
             delivered_refs: dict[str, list[tuple[int, int]]] = {}
@@ -3945,6 +4021,8 @@ class ReviewStore:
                     case_id=updated.id,
                     case_revision=updated.revision,
                 )
+                if decision_cycle:
+                    item["case_changed"] = target is None or updated.revision != target.revision
             db.execute(
                 "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
                 (item["revision"], item["status"], _json(item), item["id"]),
@@ -3973,27 +4051,19 @@ class ReviewStore:
                 "submit",
                 {"task_id": task_id, "turn_id": turn_id, "call_id": call_id, "result": item},
             )
-            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
-                decision_row = db.execute(
-                    "SELECT id,payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
-                    (task_id, turn_id, call_id),
-                ).fetchone()
-                if decision_row is None:
-                    raise BindingError("candidate decision must be staged before promotion")
-                step = json.loads(decision_row[1])
-                if step.get("action") != "offer_candidate":
-                    raise BindingError("candidate decision action mismatch")
+            if decision_cycle:
                 step.update(status="settled", disposition=item["status"], candidate_draft_id=item["id"])
                 if item["status"] == "promoted":
-                    step["case_id"] = item["case_id"]
-                    db.execute(
-                        "INSERT INTO decision_verification_queue VALUES (?,?,?) "
-                        "ON CONFLICT(case_id) DO UPDATE SET step_id=excluded.step_id,"
-                        "case_revision=excluded.case_revision",
-                        (item["case_id"], decision_row[0], item["case_revision"]),
-                    )
-                db.execute("UPDATE decision_steps SET payload=? WHERE id=?", (_json(step), decision_row[0]))
-                self._event(db, "DecisionStep", decision_row[0], "candidate_disposition", step)
+                    step.update(case_id=item["case_id"], case_changed=item["case_changed"])
+                    if item["case_changed"]:
+                        db.execute(
+                            "INSERT INTO decision_verification_queue VALUES (?,?,?) "
+                            "ON CONFLICT(case_id) DO UPDATE SET step_id=excluded.step_id,"
+                            "case_revision=excluded.case_revision",
+                            (item["case_id"], step_id, item["case_revision"]),
+                        )
+                db.execute("UPDATE decision_steps SET payload=? WHERE id=?", (_json(step), step_id))
+                self._event(db, "DecisionStep", step_id, "candidate_disposition", step)
             self._guard_review_task(db, task_id, token, task.object_id, now)
             db.commit()
             return item

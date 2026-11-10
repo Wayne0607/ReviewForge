@@ -221,9 +221,12 @@ def review_step_tool():
         "expected_revision?,candidate_resolution?,target_draft_id?,target_expected_revision?}} or "
         "{retract_draft:{draft_id,expected_revision,reason}}; "
         "open_questions contains existing same-scope Question IDs, never question text. Omit case_id and draft "
-        "fields for a new candidate. For ordinary correction use the returned draft_id and draft_revision as "
-        "candidate.expected_revision and omit candidate_resolution and target fields. Only an attempt marked "
-        "requires_resolution needs candidate_resolution=new_case or apply_to_draft; apply_to_draft requires "
+        "fields for the first finding on a work item. Keep its returned Case ID for the same finding. "
+        "For ordinary correction use the returned draft_id and draft_revision as "
+        "candidate.expected_revision and omit candidate_resolution and target fields. If a work item already has "
+        "a Case, retract a redundant draft, select a listed case_id for an update, or explicitly resolve "
+        "as new_case for a distinct defect. Other attempts marked requires_resolution use new_case or "
+        "apply_to_draft; apply_to_draft requires "
         "a distinct target_draft_id and target_expected_revision. Optional IDs and resolution cannot be empty strings. "
         "Each failed attempt remains separate until corrected or explicitly retracted. "
         "close_question {question_id,answer,evidence_refs,affected_regions?}; "
@@ -265,6 +268,9 @@ DECISION_PROMPT = (
     "its relevance and how different results affect the judgment. Operations available: {operations}. "
     "Read results are retained completely and must appear in a successful later request before being cited. "
     "Offer supported candidates promptly for independent verification. A candidate is not a finding. "
+    "If the same finding already has a Case, keep it and continue the review; paraphrasing it adds no finding. "
+    "Use its case_id only to deliver a substantive addition to that Case. Use a separate work item for a "
+    "distinct defect or explicitly resolve a draft as new_case when it is a separate finding. "
     "For a primary unit complete_review lists actually checked regions with source-backed observations; "
     "identify cross-unit relations only to another primary_scope_ids member, never the integration scope. "
     "Only the integration role submits integration_relations and integration_receipts; "
@@ -276,8 +282,9 @@ DECISION_PROMPT = (
     "ref_id and lines that may be cited. It is not itself a reference. Candidate drafts are unverified "
     "attempts: correct their references using original source and offer the candidate with its exact "
     "draft_id and expected_revision; omit candidate_resolution and target fields in normal correction. "
-    "Only if the attempt says requires_resolution, choose candidate_resolution=new_case or apply_to_draft "
-    "with a different target_draft_id and target_expected_revision. Never invent question, case or draft IDs. "
+    "A requires_resolution receipt that lists existing Case IDs also accepts an exact case_id with the draft ID "
+    "and revision for a substantive update. For other unknown targets, choose candidate_resolution=new_case or "
+    "apply_to_draft with a different target_draft_id and target_expected_revision. Never invent IDs. "
     "Candidate open_questions must reference existing Question IDs in this scope; create a work item first "
     "for a genuine unresolved premise, and do not describe prose as an ID. "
     "Explicitly retract an unneeded draft "
@@ -1019,7 +1026,8 @@ class DecisionReviewer(Reviewer):
                                 )
                                 result.update(_candidate_receipt(outcome))
                                 if outcome.get("status") == "promoted":
-                                    self.on_case(self.store.get(Case, outcome["case_id"]))
+                                    if outcome.get("case_changed", True):
+                                        self.on_case(self.store.get(Case, outcome["case_id"]))
                                 else:
                                     result["error"] = "Candidate draft requires correction; see errors."
                         elif parsed.action == "complete_review":

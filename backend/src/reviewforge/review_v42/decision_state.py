@@ -104,12 +104,39 @@ class DecisionState:
     def list_items(self, task_id: str) -> list[dict[str, Any]]:
         task = self.store.get(Task, task_id)
         with self.store._connect() as db:
-            return [
-                json.loads(row[0])
-                for row in db.execute(
-                    "SELECT payload FROM decision_items WHERE scope_id=? ORDER BY rowid", (task.object_id,)
-                )
-            ]
+            db.execute("BEGIN")
+            items = []
+            for (payload,) in db.execute(
+                "SELECT payload FROM decision_items WHERE scope_id=? ORDER BY rowid", (task.object_id,)
+            ):
+                item = json.loads(payload)
+                item["status"] = self._item_status(self._item_question(db, item), item["status"])
+                item["case_ids"] = self.store._work_item_case_ids(db, item["id"])
+                items.append(item)
+            return items
+
+    def _item_question(self, db: sqlite3.Connection, item: dict[str, Any]) -> Question:
+        row = db.execute(
+            "SELECT payload FROM objects WHERE kind='Question' AND id=?", (item["question_id"],)
+        ).fetchone()
+        if row is None:
+            raise BindingError("decision work item has no bound question")
+        question = Question(**json.loads(row[0]))
+        if (question.id, question.run_id, question.scope_id) != (
+            item["question_id"],
+            self.store.run.id,
+            item["scope_id"],
+        ):
+            raise BindingError("decision work item question belongs to another binding")
+        return question
+
+    @staticmethod
+    def _item_status(question: Question, operation_status: str) -> str:
+        if question.status == "answered" and question.answer_status == "supported":
+            return "answered" if question.answer.strip() and question.evidence_refs else "unresolved"
+        if question.status != "open" or question.answer_status == "retracted":
+            return "unresolved"
+        return "waiting_evidence" if operation_status == "waiting_evidence" else "judging"
 
     def current(self, task_id: str) -> dict[str, Any] | None:
         task = self.store.get(Task, task_id)
@@ -311,6 +338,19 @@ class DecisionState:
                 raise ValueError("invalid evidence operations")
             if args["action"] == "request_evidence" and not operations:
                 raise ValueError("at least one source operation is required")
+            if args["action"] == "complete_review" and args["payload"].get("finish", True) is True:
+                for (payload,) in db.execute("SELECT payload FROM decision_steps WHERE task_id=?", (task_id,)):
+                    prior = json.loads(payload)
+                    if prior["action"] == "request_evidence" and not prior["consumed"]:
+                        raise CorrectableDecisionInputError(
+                            [
+                                {
+                                    "field": "payload.finish",
+                                    "reason": "unconsumed_source_operations",
+                                    "message": "Review the complete source receipt in a later request first.",
+                                }
+                            ]
+                        )
             if item_id:
                 row = db.execute(
                     "SELECT scope_id,revision,payload FROM decision_items WHERE id=?", (item_id,)
@@ -328,6 +368,7 @@ class DecisionState:
                     raise CorrectableDecisionInputError(
                         [{"field": "question", "reason": "question_does_not_match_work_item"}]
                     )
+                question = self._item_question(db, item)
             else:
                 if rev != 0:
                     raise CorrectableDecisionInputError(
@@ -373,11 +414,7 @@ class DecisionState:
                     or not answer_refs
                 ):
                     raise ValueError("closing a question requires an answer and original references")
-                qrow = db.execute(
-                    "SELECT payload FROM objects WHERE kind='Question' AND id=?", (item["question_id"],)
-                ).fetchone()
-                question = Question(**json.loads(qrow[0]))
-                self.store.update_unit_object(
+                question = self.store.update_unit_object(
                     task_id,
                     token,
                     Question,
@@ -388,6 +425,7 @@ class DecisionState:
                     _db=db,
                     status="answered",
                     answer=answer.strip(),
+                    answer_status="supported",
                     evidence_refs=answer_refs,
                 )
             elif args["action"] == "unresolved":
@@ -397,11 +435,7 @@ class DecisionState:
                     for key in ("missing_fact", "attempted", "recovery_condition")
                 ):
                     raise ValueError("unresolved requires missing fact, attempted paths and recovery condition")
-                qrow = db.execute(
-                    "SELECT payload FROM objects WHERE kind='Question' AND id=?", (item["question_id"],)
-                ).fetchone()
-                question = Question(**json.loads(qrow[0]))
-                self.store.update_unit_object(
+                question = self.store.update_unit_object(
                     task_id,
                     token,
                     Question,
@@ -423,17 +457,14 @@ class DecisionState:
                     }
                 )
             item["revision"] += 1
-            item["status"] = (
+            operation_status = (
                 "waiting_evidence"
                 if operations
-                else "answered"
-                if args["action"] == "close_question"
-                else "unresolved"
-                if args["action"] == "unresolved"
                 else item["status"]
                 if args["action"] == "complete_review"
                 else "judging"
             )
+            item["status"] = self._item_status(question, operation_status)
             db.execute(
                 "INSERT INTO decision_items VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "revision=excluded.revision,payload=excluded.payload",

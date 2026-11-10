@@ -182,13 +182,7 @@ class DecisionState:
             if hashlib.sha256(raw).hexdigest() != digest:
                 raise BindingError("turn audit blob hash mismatch")
             response = json.loads(raw)
-            calls = [
-                c
-                for m in response
-                if isinstance(m, dict) and isinstance(m.get("data"), dict)
-                for c in m["data"].get("tool_calls", [])
-                if isinstance(c, dict) and c.get("id") == call_id
-            ]
+            calls = self._matching_calls(db, task_id, turn_id, call_id, response)
             if len(calls) != 1 or calls[0].get("name") != native_name or calls[0].get("args") != args:
                 raise BindingError("decision does not match a unique native call")
             step_id = _id("step_", [self.store.run.id, task_id, turn_id, call_id])
@@ -238,13 +232,7 @@ class DecisionState:
             if hashlib.sha256(raw).hexdigest() != digest:
                 raise BindingError("turn audit blob hash mismatch")
             response = json.loads(raw)
-            calls = [
-                c
-                for m in response
-                if isinstance(m, dict) and isinstance(m.get("data"), dict)
-                for c in m["data"].get("tool_calls", [])
-                if isinstance(c, dict) and c.get("id") == call_id
-            ]
+            calls = self._matching_calls(db, task_id, turn_id, call_id, response)
             if len(calls) != 1 or calls[0].get("name") != native_name or calls[0].get("args") != args:
                 raise BindingError("decision does not match a unique native call")
             step_id = _id("step_", [self.store.run.id, task_id, turn_id, call_id])
@@ -275,7 +263,7 @@ class DecisionState:
                 (task_id, turn_id),
             ).fetchone()
             native_call = None
-            if native_row is not None:
+            if native_row is not None and not self.store._uses_integration_delivery(db, task_id):
                 native_raw = (self.store.audit_dir / native_row[0]).read_bytes()
                 if hashlib.sha256(native_raw).hexdigest() != native_row[0]:
                     raise BindingError("native audit blob hash mismatch")
@@ -553,6 +541,20 @@ class DecisionState:
             db.commit()
             return result
 
+    def _matching_calls(
+        self, db: sqlite3.Connection, task_id: str, turn_id: str, call_id: str, response: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if self.store._uses_integration_delivery(db, task_id):
+            action = self.store._text_decision_call(response, turn_id)
+            return [action] if action["id"] == call_id else []
+        return [
+            call
+            for message in response
+            if isinstance(message, dict) and isinstance(message.get("data"), dict)
+            for call in message["data"].get("tool_calls", [])
+            if isinstance(call, dict) and call.get("id") == call_id
+        ]
+
     @staticmethod
     def _require_consumed_sources(db: sqlite3.Connection, task_id: str) -> None:
         pending = [
@@ -749,8 +751,10 @@ class DecisionState:
                 raise BindingError("turn audit blob hash mismatch")
             messages = json.loads(raw)
 
+            receipt_type = "human" if self.store._uses_integration_delivery(db, task_id) else "tool"
+
             def matches(message: dict[str, Any]) -> bool:
-                if message.get("type") != "tool" or not isinstance(message.get("data"), dict):
+                if message.get("type") != receipt_type or not isinstance(message.get("data"), dict):
                     return False
                 try:
                     receipt = json.loads(message["data"].get("content", ""))

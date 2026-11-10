@@ -21,6 +21,7 @@ from reviewforge.review_v42.contracts import (
     Task,
     VerificationIncomplete,
 )
+from reviewforge.review_v42.integration_delivery import INTEGRATION_DELIVERY_POLICY
 from reviewforge.review_v42.reviewer import QuestionAssistant, Reviewer, _status_code
 from reviewforge.review_v42.scope import compile_scopes
 from reviewforge.review_v42.store import _unit_source_identity
@@ -67,6 +68,11 @@ class _FairModel:
     def bind_tools(self, *args: Any, **kwargs: Any) -> _FairBoundModel:
         return _FairBoundModel(self.model.bind_tools(*args, **kwargs), self.runtime, self.task_id, self.lease_token)
 
+    async def ainvoke(self, messages: Any, *args: Any, **kwargs: Any) -> Any:
+        return await _FairBoundModel(self.model, self.runtime, self.task_id, self.lease_token).ainvoke(
+            messages, *args, **kwargs
+        )
+
 
 class ReviewRuntime:
     def __init__(self, store: Any, llm: Any, gateway: Any, verifier: Any):
@@ -86,6 +92,11 @@ class ReviewRuntime:
             or metadata.get("decision_cycle_policy") != "decision-cycle-1"
         ):
             raise ValueError("unsupported v4.2 verification delivery policy")
+        if "integration_delivery_policy" in metadata and (
+            metadata["integration_delivery_policy"] != INTEGRATION_DELIVERY_POLICY
+            or metadata.get("decision_cycle_policy") != "decision-cycle-1"
+        ):
+            raise ValueError("unsupported v4.2 integration delivery policy")
         if "frontier_projection_policy" in metadata and (
             metadata["frontier_projection_policy"] != "source-line-union-1"
             or store.run.policy != "v42-units-6"

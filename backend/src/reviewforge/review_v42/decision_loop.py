@@ -51,6 +51,13 @@ from reviewforge.review_v42.contracts import (
     is_navigation_reference,
 )
 from reviewforge.review_v42.decision_state import CorrectableDecisionInputError, DecisionState
+from reviewforge.review_v42.integration_delivery import (
+    INTEGRATION_DELIVERY_POLICY,
+    integration_action,
+)
+from reviewforge.review_v42.integration_delivery import (
+    PROMPT as INTEGRATION_DELIVERY_PROMPT,
+)
 from reviewforge.review_v42.reviewer import Reviewer, _ambiguous_native_ids, _visible_message, reviewer_tools
 from reviewforge.review_v42.store import _json
 from reviewforge.review_v42.tools import InvalidEvidenceRequestError
@@ -394,6 +401,7 @@ def _decision_history_tool():
 
 
 class DecisionReviewer(Reviewer):
+    _text_delivery = False
     """One continuous reviewer using a single native decision entry point."""
 
     def _operations(self) -> dict[str, Any]:
@@ -466,7 +474,7 @@ class DecisionReviewer(Reviewer):
         # Supply synthetic top-level IDs solely to prevent displaying a new receipt twice.
         markers = []
         for message in recent:
-            if isinstance(message, ToolMessage):
+            if isinstance(message, ToolMessage) or (self._text_delivery and isinstance(message, HumanMessage)):
                 try:
                     result = json.loads(message.content)
                     for entry in result.get("results", []):
@@ -488,7 +496,7 @@ class DecisionReviewer(Reviewer):
                 if hasattr(tool, "args_schema")
             ],
         ]
-        context[0] = SystemMessage(content=DECISION_PROMPT.format(operations=", ".join(names)))
+        prompt = DECISION_PROMPT.format(operations=", ".join(names))
         board = json.loads(context[1].content)
         board["scope"]["revision"] = self.store.get(ReviewScope, scope_id).revision
         board["candidate_drafts"] = [_candidate_receipt(draft) for draft in board.get("candidate_drafts", [])]
@@ -504,8 +512,23 @@ class DecisionReviewer(Reviewer):
         ]
         board["source_operation_schemas"] = schemas
         board["decision_notice"] = "Judgments and questions are untrusted navigation, not evidence."
+        if self._text_delivery:
+            prompt = INTEGRATION_DELIVERY_PROMPT
+            board["current_integration_obligation"] = next(
+                (row for row in board.get("integration_obligations", []) if not row["valid"]), None
+            )
+            board["work_item_payload_schemas"] = {
+                action: PAYLOADS[action].model_json_schema()
+                for action in ("request_evidence", "offer_candidate", "close_question", "unresolved")
+            }
+        context[0] = SystemMessage(content=prompt)
         context[1] = HumanMessage(content=json.dumps(board, ensure_ascii=False, default=str))
         return [*context, *recent]
+
+    def _result_message(self, result: dict[str, Any], action_id: str) -> HumanMessage | ToolMessage:
+        if self._text_delivery:
+            return HumanMessage(content=_json(result))
+        return ToolMessage(content=_json(result), tool_call_id=action_id)
 
     async def _read_operation(self, operation: dict[str, Any], allowed: dict[str, Any]) -> dict[str, Any]:
         name, args = operation["name"], operation["args"]
@@ -650,7 +673,7 @@ class DecisionReviewer(Reviewer):
         response = messages_from_dict(phases["response"])
         if len(response) != 1 or not isinstance(response[0], AIMessage):
             raise RuntimeError("incomplete decision response audit")
-        calls = response[0].tool_calls
+        calls = [integration_action(response[0], turn_id)] if self._text_delivery else response[0].tool_calls
         by_call = {step["call_id"]: step for step in pending}
         if len(calls) != len(by_call) or any(call.get("id") not in by_call for call in calls):
             raise RuntimeError("incomplete sibling actions require inspection")
@@ -669,12 +692,8 @@ class DecisionReviewer(Reviewer):
                     "work_item_id": step["work_item_id"],
                     "work_item_revision": step["revision"],
                 }
-                if not any(
-                    isinstance(msg, ToolMessage)
-                    and msg.tool_call_id == call["id"]
-                    and msg.content in {_json(expected), _json(current)}
-                    for msg in recent
-                ):
+                valid_receipts = [self._result_message(payload, call["id"]) for payload in (expected, current)]
+                if not any(message in recent for message in valid_receipts):
                     raise RuntimeError("audited source receipt differs from durable operations")
             return recent
         receipts = []
@@ -683,7 +702,7 @@ class DecisionReviewer(Reviewer):
             if not step["operations"]:
                 raise RuntimeError("incomplete non-read action requires inspection")
             result = await self._execute_staged(state, step, allowed)
-            receipt = ToolMessage(content=_json(result), tool_call_id=call["id"])
+            receipt = self._result_message(result, call["id"])
             receipts.append(receipt)
             self.store.append_turn_audit(
                 self.task_id, self.lease_token, turn_id, f"tool:{index}:{call['id']}", messages_to_dict([receipt])
@@ -966,8 +985,16 @@ class DecisionReviewer(Reviewer):
         scope = self.store.get(ReviewScope, scope_id)
         if scope.status == "reviewed" and not reopen:
             return "reviewed"
+        self._text_delivery = (
+            self.store.run.metadata.get("integration_delivery_policy") == INTEGRATION_DELIVERY_POLICY
+            and scope_id == self.store.get_unit_plan().integration_scope_id
+        )
         allowed = self._operations()
-        bound = self.llm.bind_tools([review_step_tool(), complete_scope_tool()], tool_choice="auto")
+        bound = (
+            self.llm
+            if self._text_delivery
+            else self.llm.bind_tools([review_step_tool(), complete_scope_tool()], tool_choice="auto")
+        )
         saved, self.failed_contexts = decode_session(self.store.load_task_session(self.task_id))
         recent = self._last_exchange(messages_from_dict(saved)) if saved else []
         try:
@@ -984,6 +1011,8 @@ class DecisionReviewer(Reviewer):
                 chat = self._decision_context(scope_id, recent, state)
                 board = json.loads(chat[1].content)
                 obligation_snapshot = {row["id"]: row for row in board.get("integration_obligations", [])}
+                current_obligation = board.get("current_integration_obligation")
+                obligation_id = current_obligation["id"] if current_obligation else None
                 turn_id = uuid.uuid4().hex
                 self.store.append_turn_audit(self.task_id, self.lease_token, turn_id, "request", messages_to_dict(chat))
                 response = await bound.ainvoke(chat)
@@ -993,6 +1022,16 @@ class DecisionReviewer(Reviewer):
                 raw_calls = extra.get("reviewforge_raw_tool_calls", extra.get("tool_calls"))
                 invalid_calls = getattr(response, "invalid_tool_calls", None)
                 ambiguous = _ambiguous_native_ids(response)
+                text_error = None
+                if self._text_delivery:
+                    visible.response_metadata = {
+                        "finish_reason": (getattr(response, "response_metadata", None) or {}).get("finish_reason"),
+                        "integration_native_errors": bool(errors or ambiguous),
+                    }
+                    try:
+                        calls = [integration_action(response, turn_id)]
+                    except ValueError as exc:
+                        text_error = str(exc)
                 if raw_calls is not None or invalid_calls or errors or ambiguous:
                     self.store.append_turn_audit(
                         self.task_id,
@@ -1014,11 +1053,13 @@ class DecisionReviewer(Reviewer):
                 for step in state.pending(self.task_id):
                     if step["operations"] and all(op["status"] == "completed" for op in step["operations"]):
                         state.mark_consumed(self.task_id, self.lease_token, step["id"], turn_id)
-                if ambiguous or not calls:
+                if text_error or ambiguous or not calls:
                     problem = {
-                        "error": "Use valid review_step or complete_scope calls with unique native IDs.",
+                        "error": text_error or "Use valid review_step or complete_scope calls with unique native IDs.",
                         "details": errors,
                     }
+                    if self._text_delivery:
+                        problem["obligation_id"] = obligation_id
                     signature = _json(problem)
                     feedback = HumanMessage(content=_json(problem))
                     recent = [feedback]
@@ -1027,7 +1068,11 @@ class DecisionReviewer(Reviewer):
                     )
                     self._save_session(self._decision_context(scope_id, recent, state))
                     if signature == previous_failure:
-                        self.error = "repeated_failed_batch"
+                        self.error = (
+                            f"integration submission failed for {obligation_id or 'scope completion'}: {text_error}"
+                            if self._text_delivery
+                            else "repeated_failed_batch"
+                        )
                         self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
                         return "partial"
                     previous_failure = signature
@@ -1067,6 +1112,12 @@ class DecisionReviewer(Reviewer):
                             if scope_completion
                             else ReviewStep.model_validate(args)
                         )
+                        if self._text_delivery and scope_completion and parsed.payload.integration_receipts:
+                            receipt = parsed.payload.integration_receipts[0]
+                            if receipt.obligation_id != obligation_id or receipt.disposition != "checked":
+                                raise ValueError(
+                                    "Submit checked for the current obligation, or report a concrete unresolved gap."
+                                )
                         self._validate_decision_refs(parsed, turn_id=turn_id)
                         step = state.stage(self.task_id, self.lease_token, turn_id, call_id, args, native_name=name)
                         action = "complete_review" if scope_completion else parsed.action
@@ -1230,7 +1281,7 @@ class DecisionReviewer(Reviewer):
                         ):
                             self.error = "unknown_source_operation"
                             finished = "partial"
-                    receipt = ToolMessage(content=_json(result), tool_call_id=call_id)
+                    receipt = self._result_message(result, call_id)
                     receipts.append(receipt)
                     self.store.append_turn_audit(
                         self.task_id, self.lease_token, turn_id, f"tool:{index}:{call_id}", messages_to_dict([receipt])
@@ -1262,7 +1313,11 @@ class DecisionReviewer(Reviewer):
                     else None
                 )
                 if signature is not None and signature == previous_failure:
-                    self.error = "repeated_failed_batch"
+                    self.error = (
+                        f"integration submission failed for {obligation_id or 'scope completion'}: {failures[0]}"
+                        if self._text_delivery
+                        else "repeated_failed_batch"
+                    )
                     self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
                     return "partial"
                 previous_failure = signature

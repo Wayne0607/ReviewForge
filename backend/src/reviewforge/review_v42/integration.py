@@ -27,6 +27,7 @@ from reviewforge.engine.request_budget import _actual_usage
 from reviewforge.review_v42.adapter import PinnedToolGateway, changed_regions
 from reviewforge.review_v42.contracts import VERIFICATION_DELIVERY_POLICIES, Run
 from reviewforge.review_v42.evaluation import summarize_run
+from reviewforge.review_v42.integration_delivery import INTEGRATION_DELIVERY_POLICY
 from reviewforge.review_v42.knowledge import SCHEMA as KNOWLEDGE_SCHEMA
 from reviewforge.review_v42.knowledge import capture_knowledge, validate_knowledge
 from reviewforge.review_v42.publication import PublicationOutbox
@@ -406,6 +407,11 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         verification_delivery not in VERIFICATION_DELIVERY_POLICIES or decision_cycle != "decision-cycle-1"
     ):
         raise ValueError("verification delivery requires decision-cycle-1 and a supported claim delivery policy")
+    integration_delivery = os.environ.get("REVIEWFORGE_V42_INTEGRATION_DELIVERY", "").strip()
+    if integration_delivery and (
+        integration_delivery != INTEGRATION_DELIVERY_POLICY or decision_cycle != "decision-cycle-1"
+    ):
+        raise ValueError("integration delivery requires decision-cycle-1 and a supported integration delivery policy")
 
     def option(name: str, decision_default: str = "") -> str:
         value = os.environ.get(name, "").strip()
@@ -544,6 +550,8 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["decision_cycle_policy"] = decision_cycle
         if verification_delivery:
             metadata["verification_delivery_policy"] = verification_delivery
+        if integration_delivery:
+            metadata["integration_delivery_policy"] = integration_delivery
         identity = hashlib.sha256(
             json.dumps(
                 [state.repo, state.pr_number, state.base_sha, state.head_sha, metadata],

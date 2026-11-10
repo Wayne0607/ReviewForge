@@ -24,9 +24,20 @@ from reviewforge.core.llm_settings import EncryptedLLMSettingsStore, apply_overr
 from reviewforge.core.state import StateStore
 from reviewforge.engine.model_router import ModelRouter
 from reviewforge.review_v42.adapter import PinnedToolGateway
-from reviewforge.review_v42.contracts import VERIFICATION_DELIVERY_POLICIES, Question, Run
+from reviewforge.review_v42.contracts import (
+    VERIFICATION_DELIVERY_POLICIES,
+    Question,
+    Run,
+)
 from reviewforge.review_v42.evaluation import summarize_run
-from reviewforge.review_v42.integration import PhysicalMeter, _model_signature, _models, _raw_models, _write_json
+from reviewforge.review_v42.integration import (
+    PhysicalMeter,
+    _model_signature,
+    _models,
+    _raw_models,
+    _write_json,
+)
+from reviewforge.review_v42.integration_delivery import INTEGRATION_DELIVERY_POLICY
 from reviewforge.review_v42.publication import PublicationOutbox
 from reviewforge.review_v42.runtime import ReviewRuntime
 from reviewforge.review_v42.snapshot_diff import pinned_regions
@@ -37,7 +48,9 @@ from reviewforge.tools.workspace import PRHeadWorkspace
 
 
 def digest(value):
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
 
 
 class PilotStopRequested(asyncio.CancelledError):
@@ -99,20 +112,33 @@ class FixtureArchives:
 def input_material(path):
     record = json.loads(path.read_text(encoding="utf-8"))
     allowed = {"id", "title", "description", "base_files", "head_files"}
-    if set(record) != allowed or any(not isinstance(record[k], str) for k in ("id", "title", "description")):
-        raise ValueError("pilot input must contain only the declared task and source fields")
+    if set(record) != allowed or any(
+        not isinstance(record[k], str) for k in ("id", "title", "description")
+    ):
+        raise ValueError(
+            "pilot input must contain only the declared task and source fields"
+        )
     for key in ("base_files", "head_files"):
         if not isinstance(record[key], dict) or not record[key]:
             raise ValueError("complete source snapshots required")
         for name, content in record[key].items():
             if not isinstance(name, str) or not isinstance(content, str):
                 raise ValueError("source paths and UTF-8 text required")
-            if name.startswith("/") or "\\" in name or any(part in {"", ".", ".."} for part in name.split("/")):
+            if (
+                name.startswith("/")
+                or "\\" in name
+                or any(part in {"", ".", ".."} for part in name.split("/"))
+            ):
                 raise ValueError("invalid source path")
     return record
 
 
 async def episode(args):
+    integration_delivery = getattr(args, "integration_delivery", None)
+    if integration_delivery and (
+        integration_delivery != INTEGRATION_DELIVERY_POLICY or args.arm != "decision"
+    ):
+        raise ValueError("integration delivery requires the decision arm")
     if args.verification_delivery and args.arm != "decision":
         raise ValueError("verification delivery requires the decision arm")
     record = input_material(args.input)
@@ -123,7 +149,9 @@ async def episode(args):
     router = ModelRouter(apply_override(config.llm, settings), max_retries=0)
     policy = PipelineV4Config(mode="review_v42", output_language="en")
     raw = _raw_models(router, request_timeout=policy.v42_request_timeout_seconds)
-    model_binding = digest({name: _model_signature(model) for name, model in raw.items()})
+    model_binding = digest(
+        {name: _model_signature(model) for name, model in raw.items()}
+    )
     base, head = digest(record["base_files"]), digest(record["head_files"])
     repo = "delivery-pilot/" + record["id"]
     archives = FixtureArchives({base: record["base_files"], head: record["head_files"]})
@@ -145,15 +173,20 @@ async def episode(args):
         "issues": [],
     }
     head_workspace = await PRHeadWorkspace.build(state, archives)
-    base_workspace = await PRHeadWorkspace.build(StateStore(repo=repo, head_repo=repo, head_sha=base), archives)
+    base_workspace = await PRHeadWorkspace.build(
+        StateStore(repo=repo, head_repo=repo, head_sha=base), archives
+    )
     try:
         fixed = await pinned_regions(
-            base_workspace, head_workspace, run=SimpleNamespace(metadata={"source_line_policy": "git-lf-1"})
+            base_workspace,
+            head_workspace,
+            run=SimpleNamespace(metadata={"source_line_policy": "git-lf-1"}),
         )
         regions = fixed["regions"]
         state.files_changed = list(dict.fromkeys(region["path"] for region in regions))
         state.file_diffs = {
-            path: "\n".join(r["patch"] for r in regions if r["path"] == path) for path in state.files_changed
+            path: "\n".join(r["patch"] for r in regions if r["path"] == path)
+            for path in state.files_changed
         }
         metadata = {
             "title": record["title"],
@@ -171,7 +204,8 @@ async def episode(args):
             "kernel_revision": args.revision,
             "kernel_digest": hashlib.sha256(
                 b"".join(
-                    p.name.encode() + p.read_bytes() for p in sorted(Path(store_module.__file__).parent.glob("*.py"))
+                    p.name.encode() + p.read_bytes()
+                    for p in sorted(Path(store_module.__file__).parent.glob("*.py"))
                 )
             ).hexdigest(),
             "pilot_input_hash": digest(record),
@@ -186,6 +220,8 @@ async def episode(args):
             metadata["decision_cycle_policy"] = "decision-cycle-1"
         if args.verification_delivery:
             metadata["verification_delivery_policy"] = args.verification_delivery
+        if integration_delivery:
+            metadata["integration_delivery_policy"] = integration_delivery
         identity = "pilot_" + digest([repo, base, head, metadata])[:24]
         run = Run(
             identity,
@@ -200,17 +236,26 @@ async def episode(args):
         args.output.mkdir(parents=True, exist_ok=True)
         binding = asdict(run)
         binding_path = args.output / "binding.json"
-        if binding_path.exists() and json.loads(binding_path.read_text(encoding="utf-8")) != binding:
+        if (
+            binding_path.exists()
+            and json.loads(binding_path.read_text(encoding="utf-8")) != binding
+        ):
             raise ValueError("existing episode binding differs; use a new directory")
         _write_json(binding_path, binding)
         store = ReviewStore(args.output / "board.sqlite", run)
-        meter = PhysicalMeter(args.output / "requests.jsonl", {"run": identity, "input": digest(record)})
+        meter = PhysicalMeter(
+            args.output / "requests.jsonl", {"run": identity, "input": digest(record)}
+        )
         meter.requests()
         owner = SimpleNamespace(_pipeline_v4_config=policy, _db=None)
         reviewer, verifier_model = _models(owner, run, meter, raw)
         boundary = RequestBoundary(args.output / "operator-stop.json")
-        reviewer, verifier_model = (ControlledModel(model, boundary) for model in (reviewer, verifier_model))
-        gateway = PinnedToolGateway(head_workspace, state, base_workspace=base_workspace, run=run)
+        reviewer, verifier_model = (
+            ControlledModel(model, boundary) for model in (reviewer, verifier_model)
+        )
+        gateway = PinnedToolGateway(
+            head_workspace, state, base_workspace=base_workspace, run=run
+        )
         verifier = Verifier(store, verifier_model, EvidenceGateway(store, gateway))
         error = None
         runtime = None
@@ -227,7 +272,9 @@ async def episode(args):
             flush=True,
         )
         try:
-            runtime = await ReviewRuntime(store, reviewer, gateway, verifier).run(regions)
+            runtime = await ReviewRuntime(store, reviewer, gateway, verifier).run(
+                regions
+            )
         except BaseException as exc:
             error = type(exc).__name__
             raise
@@ -264,7 +311,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--arm", choices=["baseline", "decision"], required=True)
-    parser.add_argument("--verification-delivery", choices=sorted(VERIFICATION_DELIVERY_POLICIES))
+    parser.add_argument(
+        "--verification-delivery", choices=sorted(VERIFICATION_DELIVERY_POLICIES)
+    )
+    parser.add_argument("--integration-delivery", choices=[INTEGRATION_DELIVERY_POLICY])
     parser.add_argument("--replicate", type=int, choices=[1, 2, 3], required=True)
     asyncio.run(episode(parser.parse_args()))
 

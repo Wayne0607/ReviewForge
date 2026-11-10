@@ -27,7 +27,7 @@ def step(action, payload, item=None, refs=None):
     }
 
 
-def decision_store(tmp_path):
+def decision_store(tmp_path, **metadata):
     original, task = board(tmp_path)
     run = original.run
     # Use a fresh database because run identity is immutable.
@@ -35,6 +35,7 @@ def decision_store(tmp_path):
         decision_cycle_policy="decision-cycle-1",
         frontier_projection_policy="source-line-union-1",
         source_line_policy="git-lf-1",
+        **metadata,
     )
     store = ReviewStore(tmp_path / "decision.sqlite", run)
     original_plan = original.get_unit_plan()

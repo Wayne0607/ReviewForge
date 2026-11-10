@@ -36,6 +36,7 @@ from .contracts import (
     Task,
     UnitPlan,
 )
+from .integration_delivery import INTEGRATION_DELIVERY_POLICY, integration_action
 from .line_semantics import source_lines, source_slice
 
 T = TypeVar("T", ReviewScope, Question, Case, Task, EvidenceRef, NavigationItem)
@@ -141,6 +142,11 @@ class ReviewStore:
             or run.policy != "v42-units-6"
         ):
             raise BindingError("unsupported verification delivery profile")
+        if "integration_delivery_policy" in run.metadata and (
+            run.metadata["integration_delivery_policy"] != INTEGRATION_DELIVERY_POLICY
+            or decision_policy != "decision-cycle-1"
+        ):
+            raise BindingError("unsupported integration delivery profile")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"
@@ -487,6 +493,9 @@ class ReviewStore:
                             if not isinstance(call, dict):
                                 raise BindingError("invalid visible tool call")
                             calls.append({"id": call.get("id"), "name": call.get("name"), "args": call.get("args")})
+                    text_delivery = self._uses_integration_delivery(db, task.id)
+                    if text_delivery:
+                        calls = [self._text_decision_call(response, turn_id)]
                     from reviewforge.engine.native_submission import strict_tool_call
 
                     ids = [call["id"] for call in calls]
@@ -495,7 +504,7 @@ class ReviewStore:
                     ):
                         raise BindingError("ambiguous native tool identities")
                     raw_calls = None
-                    if "native" in phases:
+                    if "native" in phases and not text_delivery:
                         native = audit(phases["native"])
                         if (
                             len(native) != 1
@@ -1306,6 +1315,7 @@ class ReviewStore:
             last = end if end is not None else first + len(source_lines(self.run, content.decode("utf-8"))) - 1
             delivered.setdefault(ref.id, []).append((first, last))
 
+        text_delivery = self._uses_integration_delivery(db, task_id)
         for message in payloads["request"]:
             if not isinstance(message, dict) or message.get("type") not in {"human", "tool"}:
                 continue
@@ -1320,7 +1330,7 @@ class ReviewStore:
             if not isinstance(obj, dict):
                 continue
             if (
-                message["type"] == "tool"
+                (message["type"] == "tool" or (text_delivery and message["type"] == "human"))
                 and self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
                 and isinstance(obj.get("step_id"), str)
                 and isinstance(obj.get("results"), list)
@@ -3307,6 +3317,24 @@ class ReviewStore:
             case_ids.add(case_id)
         return sorted(case_ids)
 
+    def _uses_integration_delivery(self, db: sqlite3.Connection, task_id: str) -> bool:
+        if self.run.metadata.get("integration_delivery_policy") != INTEGRATION_DELIVERY_POLICY:
+            return False
+        row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        task = Task(**json.loads(row[0]))
+        return task.kind == "review" and task.object_id == self._unit_plan_db(db).integration_scope_id
+
+    @staticmethod
+    def _text_decision_call(response: list[dict[str, Any]], turn_id: str) -> dict[str, Any]:
+        from langchain_core.messages import AIMessage, messages_from_dict
+
+        messages = messages_from_dict(response)
+        if len(messages) != 1 or not isinstance(messages[0], AIMessage):
+            raise BindingError("integration decision requires one audited assistant response")
+        return integration_action(messages[0], turn_id)
+
     def _candidate_turn_calls(
         self, db: sqlite3.Connection, task_id: str, token: str, turn_id: str
     ) -> tuple[list[dict[str, Any]], str]:
@@ -3331,14 +3359,19 @@ class ReviewStore:
             or not isinstance(response[0].get("data"), dict)
         ):
             raise BindingError("candidate turn response is invalid")
-        calls = response[0]["data"].get("tool_calls", [])
+        text_delivery = self._uses_integration_delivery(db, task_id)
+        calls = (
+            [self._text_decision_call(response, turn_id)]
+            if text_delivery
+            else response[0]["data"].get("tool_calls", [])
+        )
         if not isinstance(calls, list) or any(not isinstance(call, dict) for call in calls):
             raise BindingError("candidate native calls are invalid")
         ids = [call.get("id") for call in calls]
         if any(not isinstance(ident, str) or not ident.strip() for ident in ids) or len(ids) != len(set(ids)):
             raise BindingError("candidate native call IDs are ambiguous")
         raw_calls = None
-        if "native" in phases:
+        if "native" in phases and not text_delivery:
             native = audit("native")
             if (
                 not isinstance(native, list)
@@ -3568,12 +3601,19 @@ class ReviewStore:
             decision_attempt = json.loads(attempt_row[0])
             decision_args = decision_attempt.get("args")
             response = json.loads((self.audit_dir / response_hash).read_bytes())
+            audited_calls = (
+                [self._text_decision_call(response, turn_id)]
+                if self._uses_integration_delivery(db, task_id)
+                else [
+                    call
+                    for message in response
+                    if isinstance(message, dict) and isinstance(message.get("data"), dict)
+                    for call in message["data"].get("tool_calls", [])
+                    if isinstance(call, dict)
+                ]
+            )
             native_matches = [
-                call
-                for message in response
-                if isinstance(message, dict) and isinstance(message.get("data"), dict)
-                for call in message["data"].get("tool_calls", [])
-                if isinstance(call, dict) and call.get("id") == call_id and call.get("name") == "review_step"
+                call for call in audited_calls if call.get("id") == call_id and call.get("name") == "review_step"
             ]
             if (
                 len(native_matches) != 1

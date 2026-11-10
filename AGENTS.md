@@ -2,6 +2,8 @@
 
 ## 当前开发状态
 
+- C 阶段后续 `4ffc1cd` 完整 Linux CI **4252 passed、3 skipped**。真实复测成功关题并触发核验，同一缺陷重复晋升为 2 Case。关题后提交候选使工作项转回 `judging`，Question 仍 `answered`，完成回执因此 partial。已在调用边界排空：**67 完整响应、764313 已知 tokens、1 请求用量未知、0 在途；0 持久判决/评论，1/1 区域检查回执、0/1 主责完成**。小测门槛未过，完整 PR 尚未启动。下一项先修正工作项状态与候选身份的收敛问题。11 月 10 日两轮合计 **908981 已知 tokens、2 未知**；v4.2 累计 **38487949 已知 tokens、219 未知**，非账单。[记录](docs/v4.2-delivery-plan.md#139-回执修复后的小测已关闭问题与工作项状态分离)。
+
 - C 阶段实现 `4fa7d81` 完整 Linux CI **4244 passed、3 skipped**。首轮真实小测 `partial/repeated_failed_batch`，10 完整响应、144668 已知 tokens、1 次网络失败用量未知、0 在途，0 Case/判决、0/1 覆盖。两次关题提交都有顶层引用但缺内层 `payload.evidence_refs`，回执丢失嵌套路径。已修正逐项字段回执并对齐完成动作默认值，合并专项 **198 passed**。C 尚待真实路径验收，完整 PR 未启动。v4.2 累计 **37723636 已知 tokens、218 请求未知**，非账单。[记录](docs/v4.2-delivery-plan.md#138-c-阶段首轮真实小测主审关闭动作缺少嵌套引用)。
 
 - C 阶段可选 `REVIEWFORGE_V42_VERIFICATION_DELIVERY=claim-delivery-1`，需 `decision-cycle-1`。在同一事务冻结每条结论独立收到的原文与判决，补读不改变 Case 或覆盖状态。新增缺口和显式反证仍使受影响输入失效。旧版隔离回归复现三份 base 补读导致 Case 升版、主责重开，新版通过该回归及重启、分页、隔离和租约检查。合并专项 **360 passed**，真实小测待验收。[实现与验证](docs/v4.2-delivery-plan.md#137-c-阶段实现逐结论提交核验来源与判决)。

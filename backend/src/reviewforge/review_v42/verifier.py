@@ -112,17 +112,17 @@ PROMPT = (
 )
 
 
+def _tool_name(spec: Any) -> str:
+    if isinstance(spec, dict):
+        return spec.get("function", {}).get("name", spec.get("name", ""))
+    return getattr(spec, "name", "")
+
+
 def verifier_tools(gateway: Any = None) -> list[Any]:
     adapter = getattr(gateway, "gateway", gateway)
     specs = getattr(adapter, "tool_specs", None)
     if specs:
-
-        def name(spec: Any) -> str:
-            if isinstance(spec, dict):
-                return spec.get("function", {}).get("name", spec.get("name", ""))
-            return getattr(spec, "name", "")
-
-        reads = [spec for spec in specs if name(spec) in READ_TOOLS and name(spec) != "read_evidence"]
+        reads = [spec for spec in specs if _tool_name(spec) in READ_TOOLS and _tool_name(spec) != "read_evidence"]
         reads.append(
             result_tool(
                 "read_evidence",
@@ -444,16 +444,20 @@ class Verifier:
             if frontier5
             else ""
         )
+        tools = verifier_tools(self.gateway)
+        tool_names = sorted({_tool_name(spec) for spec in tools})
         if self._claim_delivery:
             prompt += (
                 " For every verdict fact, cite original fixed source, repository documentation, an external issue "
                 "snapshot, or a fixed-head executed test. Search and diff are navigation only. Cite the returned page "
                 "evidence_ref when reading a source page. For other evidence, read the complete original before "
                 "citing it. Read all known counter-evidence in full before deciding."
+                " Use only the registered tools: " + ", ".join(tool_names) + "."
             )
         chat = [SystemMessage(content=prompt), HumanMessage(content=json.dumps(packet, ensure_ascii=False))]
-        bound = self.llm.bind_tools(verifier_tools(self.gateway), tool_choice="auto")
+        bound = self.llm.bind_tools(tools, tool_choice="auto")
         seen_actions = set()
+        previous_unbound = False
         failures = {}
         recovered_states = set()
         recovered = False
@@ -500,6 +504,7 @@ class Verifier:
                 if any(call.get("name") == "submit_verdict" for call in calls) and len(calls) != 1:
                     raise ValueError("mixed verdict and tool calls are not a valid submission")
                 if not calls:
+                    previous_unbound = False
                     signature = ("empty", tuple(errors), tuple(sorted(allowed)))
                     if signature in seen_actions:
                         raise ValueError("no progress: no verdict or tool call")
@@ -508,6 +513,11 @@ class Verifier:
                         HumanMessage(content="Use a read tool or submit_verdict; output alone is not a verdict.")
                     )
                     continue
+                if self._claim_delivery:
+                    unbound = all(call["name"] not in tool_names for call in calls)
+                    if unbound and previous_unbound:
+                        raise ValueError("no progress: consecutive batches used only unregistered verifier tools")
+                    previous_unbound = unbound
                 for call in calls:
                     name, args, call_id = call["name"], call["args"], call.get("id") or ""
                     if name == "submit_verdict":
@@ -554,7 +564,7 @@ class Verifier:
                                 raise ValueError("no progress: repeated invalid verdict")
                             seen_actions.add(signature)
                             result = {"error": str(exc)}
-                    elif name in READ_TOOLS:
+                    elif name in READ_TOOLS and (not self._claim_delivery or name in tool_names):
                         key = (name, json.dumps(args, sort_keys=True))
                         try:
                             if stateful and name == "read_evidence":
@@ -644,6 +654,12 @@ class Verifier:
                                             and type(result.get("last_line")) is int
                                         ):
                                             page_bounds[ref] = (result["first_line"], result["last_line"])
+                    elif self._claim_delivery:
+                        result = {
+                            "error": "unregistered verifier tool",
+                            "available_tools": tool_names,
+                            "instruction": "Use a registered tool or submit_verdict with the available proof.",
+                        }
                     else:
                         result = {"error": "unknown or unauthorized tool"}
                         failures[(name, json.dumps(args, sort_keys=True))] = {

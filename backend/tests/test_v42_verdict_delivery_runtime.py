@@ -10,6 +10,7 @@ from test_v42_integration import NativeModel, tool
 
 from reviewforge.core.state import StateStore
 from reviewforge.review_v42.adapter import PinnedToolGateway
+from reviewforge.review_v42.context import ContextBuilder
 from reviewforge.review_v42.contracts import Case, EvidenceRef, Question, ReviewScope, RevisionConflict, Run, Task
 from reviewforge.review_v42.publication import Publication, PublicationOutbox
 from reviewforge.review_v42.runtime import ReviewRuntime
@@ -199,6 +200,48 @@ def reject_verdict(ref, quote, statement):
         "facts": {"counterexample": fact(statement, ref, quote)},
         "gaps": [],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [True, False])
+async def test_unregistered_verifier_tools_allow_correction_but_cannot_sustain_a_loop(tmp_path, recover):
+    store, gateway = await make_board(tmp_path)
+    head = await gateway.execute("read_source", {"path": "notify.py"})
+    ref = head["evidence_ref"]
+    claim = {"id": "claim", "statement": "No recipients are passed", "impact": "Nobody receives a notice"}
+    case = store.add(
+        Case(
+            "case",
+            store.run.id,
+            trigger="Repeat a session",
+            mechanism="Notify recipients",
+            claims=[claim],
+            evidence_refs=[ref],
+        )
+    )
+
+    def respond(messages, turn):
+        assert "Use only the registered tools:" in messages[0].content
+        if turn == 1:
+            return tool("glob", {"path": "/unregistered", "pattern": "**/*"})
+        receipt = json.loads(messages[-1].content)
+        assert receipt["error"] == "unregistered verifier tool"
+        assert "glob" not in receipt["available_tools"]
+        assert "submit_verdict" in receipt["available_tools"]
+        if recover:
+            return tool(
+                "submit_verdict", reject_verdict(ref, HEAD_SOURCES["notify.py"].strip(), "Recipients are passed")
+            )
+        assert turn == 2
+        return tool("shell", {"command": "pwd"})
+
+    model = NativeModel(respond)
+    outcome, _observed = await Verifier(store, model, gateway)._claim(ContextBuilder(store).verifier(case.id), claim)
+    assert len(model._inputs) == 2
+    assert outcome["verdict"] == ("reject" if recover else "unresolved")
+    assert outcome["tool_failures"] == []
+    if not recover:
+        assert "consecutive batches used only unregistered verifier tools" in outcome["gaps"][0]
 
 
 @pytest.mark.asyncio

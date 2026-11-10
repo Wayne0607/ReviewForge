@@ -581,9 +581,14 @@ class ReviewStore:
                             for call in calls
                             if (
                                 self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
-                                and call["name"] == "review_step"
                                 and isinstance(call["args"], dict)
-                                and call["args"].get("action") == "complete_review"
+                                and (
+                                    call["name"] == "complete_scope"
+                                    or (
+                                        call["name"] == "review_step"
+                                        and call["args"].get("action") == "complete_review"
+                                    )
+                                )
                                 and isinstance(call["args"].get("payload"), dict)
                                 # Match ReviewCompletion's declared default when auditing raw calls.
                                 and call["args"]["payload"].get("finish", True) is True
@@ -1661,6 +1666,8 @@ class ReviewStore:
         turn_id: str,
         call_id: str,
         *,
+        scope_id: str,
+        scope_revision: int,
         result_status: str,
         expected: dict[str, Any] | None = None,
     ) -> None:
@@ -1675,6 +1682,8 @@ class ReviewStore:
         payload = args.get("payload") if isinstance(args, dict) else None
         if step.get("action") != "complete_review" or not isinstance(payload, dict):
             raise BindingError("completion decision action mismatch")
+        if "scope_revision" in step and (step["scope_id"], step["scope_revision"]) != (scope_id, scope_revision):
+            raise RevisionConflict("staged completion belongs to a different scope revision")
         if expected is not None:
             for key, value in expected.items():
                 default = True if key == "finish" else []
@@ -1683,6 +1692,16 @@ class ReviewStore:
         step.update(status="settled", disposition=result_status)
         db.execute("UPDATE decision_steps SET payload=? WHERE id=?", (_json(step), row[0]))
         self._event(db, "DecisionStep", row[0], "scope_disposition", step)
+
+    @staticmethod
+    def _report_scope_blockers(blockers: dict[str, list[str]]) -> None:
+        from .decision_state import CorrectableDecisionInputError
+
+        issues = [
+            {"field": "payload.finish", "reason": reason, "ids": sorted(ids)} for reason, ids in blockers.items() if ids
+        ]
+        if issues:
+            raise CorrectableDecisionInputError(issues)
 
     def commit_unit_decision(
         self,
@@ -1701,6 +1720,7 @@ class ReviewStore:
         now: float | None = None,
         _db: sqlite3.Connection | None = None,
         decision_call_id: str | None = None,
+        report_blockers: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(decision_id, str) or not decision_id.strip() or type(finish) is not bool:
             raise ValueError("decision requires an ID and boolean finish")
@@ -1908,20 +1928,34 @@ class ReviewStore:
                     navigation and navigation.status == "open"
                 ):
                     current_unresolved.append(unresolved_id)
-            decision_items_open = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1" and any(
-                json.loads(row[0]).get("status") != "answered"
-                for row in db.execute("SELECT payload FROM decision_items WHERE scope_id=?", (scope.id,))
-            )
-            blocked = (
-                decision_items_open
-                or current_unresolved
-                or self._pending_shared_investigations(db, scope.id)
-                or self.pending_candidate_drafts(scope.id, db=db)
-                or any(
-                    q.scope_id == scope.id and q.status in {"open", "disputed", "unresolved"} for q in open_questions
-                )
-                or any(n.scope_id == scope.id and n.kind == "question" and n.status == "open" for n in open_navigation)
-            )
+            open_items = []
+            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+                open_items = [
+                    ident
+                    for ident, payload in db.execute(
+                        "SELECT id,payload FROM decision_items WHERE scope_id=?", (scope.id,)
+                    )
+                    if json.loads(payload).get("status") != "answered"
+                ]
+            blockers = {
+                "open_work_items": open_items,
+                "unresolved_refs": current_unresolved,
+                "pending_shared_investigations": self._pending_shared_investigations(db, scope.id),
+                "pending_candidate_drafts": [draft["id"] for draft in self.pending_candidate_drafts(scope.id, db=db)],
+                "open_questions": [
+                    q.id
+                    for q in open_questions
+                    if q.scope_id == scope.id and q.status in {"open", "disputed", "unresolved"}
+                ],
+                "open_navigation": [
+                    n.id
+                    for n in open_navigation
+                    if n.scope_id == scope.id and n.kind == "question" and n.status == "open"
+                ],
+            }
+            if finish and report_blockers:
+                self._report_scope_blockers({**blockers, "unchecked_regions": list(set(by_id) - checked)})
+            blocked = any(blockers.values())
             status = (
                 "reviewed"
                 if finish and checked == set(by_id) and not blocked
@@ -1984,6 +2018,8 @@ class ReviewStore:
                     task_id,
                     turn_id,
                     decision_call_id,
+                    scope_id=scope.id,
+                    scope_revision=scope.revision,
                     result_status=status,
                     expected={
                         "checked_region_ids": checked_region_ids,
@@ -2712,6 +2748,7 @@ class ReviewStore:
         *,
         turn_id: str | None = None,
         decision_call_id: str | None = None,
+        report_blockers: bool = False,
     ) -> ReviewScope:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2719,9 +2756,10 @@ class ReviewStore:
             self._guard_review_task(db, task_id, token, plan.integration_scope_id, now)
             if self.run.metadata.get("shared_investigation") == "shared-1":
                 self._require_delivered(db, task_id, token, turn_id, set())
-                if self.pending_shared_batches(
+                pending_batches = self.pending_shared_batches(
                     plan.integration_scope_id, db=db, exclude_task_id=task_id, exclude_turn_id=turn_id
-                ):
+                )
+                if pending_batches:
                     raise BindingError("integration has an unfinished native tool batch")
             row = db.execute(
                 "SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (plan.integration_scope_id,)
@@ -2733,44 +2771,55 @@ class ReviewStore:
                 self._obligation_view(db, IntegrationObligation(**json.loads(r[0])))
                 for r in db.execute("SELECT payload FROM integration_obligations")
             ]
-            if not obligations or any(not o["valid"] for o in obligations):
-                raise BindingError("integration obligations are unresolved or stale")
-            if (
-                (
-                    self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
-                    and any(
-                        json.loads(row[0]).get("status") != "answered"
-                        for row in db.execute("SELECT payload FROM decision_items WHERE scope_id=?", (scope.id,))
+            unresolved_obligations = [o["id"] for o in obligations if not o["valid"]]
+            questions = [
+                Question(**json.loads(p)) for (p,) in db.execute("SELECT payload FROM objects WHERE kind='Question'")
+            ]
+            navigation = [
+                NavigationItem(**json.loads(p))
+                for (p,) in db.execute("SELECT payload FROM objects WHERE kind='NavigationItem'")
+            ]
+            scopes = {scope.id, *plan.primary_scope_ids}
+            blockers = {
+                "open_work_items": [
+                    ident
+                    for ident, payload in db.execute(
+                        "SELECT id,payload FROM decision_items WHERE scope_id=?", (scope.id,)
                     )
-                )
-                or scope.unresolved
-                or self._pending_shared_investigations(db, scope.id)
-                or self.pending_candidate_drafts(db=db)
-                or any(
-                    Question(**json.loads(row[0])).scope_id == scope.id
-                    and Question(**json.loads(row[0])).status in {"open", "disputed", "unresolved"}
-                    for row in db.execute("SELECT payload FROM objects WHERE kind='Question'")
-                )
-                or any(
-                    NavigationItem(**json.loads(row[0])).scope_id == scope.id
-                    and NavigationItem(**json.loads(row[0])).kind == "question"
-                    and NavigationItem(**json.loads(row[0])).status == "open"
-                    for row in db.execute("SELECT payload FROM objects WHERE kind='NavigationItem'")
-                )
-            ):
-                raise BindingError("integration has unresolved questions")
+                    if json.loads(payload).get("status") != "answered"
+                ]
+                if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+                else [],
+                "unresolved_refs": scope.unresolved,
+                "pending_shared_investigations": self._pending_shared_investigations(db, scope.id),
+                "pending_candidate_drafts": [draft["id"] for draft in self.pending_candidate_drafts(db=db)],
+                "open_questions": [
+                    q.id for q in questions if q.scope_id in scopes and q.status in {"open", "disputed", "unresolved"}
+                ],
+                "open_navigation": [
+                    n.id for n in navigation if n.scope_id in scopes and n.kind == "question" and n.status == "open"
+                ],
+            }
+            unreviewed_scopes = []
             for sid in plan.primary_scope_ids:
                 row = db.execute("SELECT payload FROM objects WHERE kind='ReviewScope' AND id=?", (sid,)).fetchone()
                 if row is None or ReviewScope(**json.loads(row[0])).status != "reviewed":
-                    raise BindingError("primary unit is not reviewed")
-                for (payload,) in db.execute("SELECT payload FROM objects WHERE kind='Question'"):
-                    question = Question(**json.loads(payload))
-                    if question.scope_id == sid and question.status in {"open", "disputed", "unresolved"}:
-                        raise BindingError("primary unit has unresolved questions")
-                for (payload,) in db.execute("SELECT payload FROM objects WHERE kind='NavigationItem'"):
-                    item = NavigationItem(**json.loads(payload))
-                    if item.scope_id == sid and item.kind == "question" and item.status == "open":
-                        raise BindingError("primary unit has unresolved navigation")
+                    unreviewed_scopes.append(sid)
+            if report_blockers:
+                self._report_scope_blockers(
+                    {
+                        **blockers,
+                        "missing_integration_obligations": [] if obligations else [scope.id],
+                        "unresolved_integration_obligations": unresolved_obligations,
+                        "unreviewed_primary_scopes": unreviewed_scopes,
+                    }
+                )
+            if not obligations or unresolved_obligations:
+                raise BindingError("integration obligations are unresolved or stale")
+            if unreviewed_scopes:
+                raise BindingError("primary unit is not reviewed")
+            if any(blockers.values()):
+                raise BindingError("integration has unresolved questions")
             scope = replace(scope, status="reviewed", revision=scope.revision + 1)
             db.execute(
                 "UPDATE objects SET revision=?,payload=? WHERE kind='ReviewScope' AND id=?",
@@ -2788,7 +2837,14 @@ class ReviewStore:
                 if not decision_call_id or not turn_id:
                     raise BindingError("integration completion requires a staged native decision")
                 self._settle_scope_decision(
-                    db, task_id, turn_id, decision_call_id, result_status="reviewed", expected={"finish": True}
+                    db,
+                    task_id,
+                    turn_id,
+                    decision_call_id,
+                    scope_id=scope.id,
+                    scope_revision=expected_scope_revision,
+                    result_status="reviewed",
+                    expected={"finish": True},
                 )
             db.execute("DELETE FROM unit_pending_cases WHERE scope_id=?", (scope.id,))
             db.commit()

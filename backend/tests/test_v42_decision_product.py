@@ -13,7 +13,7 @@ from test_v42_integration import NativeModel, product, tool
 from test_v42_units_product import FixedBaseGitHub, TwoFileWorkspace, two_file_state
 
 from reviewforge.review_v42.contracts import Run
-from reviewforge.review_v42.decision_loop import review_step_tool
+from reviewforge.review_v42.decision_loop import complete_scope_tool, review_step_tool
 from reviewforge.review_v42.runtime import ReviewRuntime
 
 
@@ -28,6 +28,9 @@ def test_native_tool_exposes_nested_completion_contract():
         "integration_receipts:[{obligation_id:string,disposition:checked|unresolved,evidence_refs:[string],reason:string}]",
     ):
         assert fields in sent["description"]
+    scope = convert_to_openai_tool(complete_scope_tool())["function"]["parameters"]
+    assert set(scope["required"]) == {"scope_id", "expected_scope_revision", "payload"}
+    assert "observations" in scope["properties"]["payload"]["properties"]
 
 
 @pytest.mark.parametrize(
@@ -129,6 +132,8 @@ async def test_real_product_checks_two_units_and_independent_integration(
     monkeypatch.setenv("REVIEWFORGE_V42_DECISION_CYCLE", "decision-cycle-1")
     phases, refs = defaultdict(int), {}
     visited = set()
+    rejected_completion = set()
+    premature_scopes = set()
 
     def review(messages, _turn):
         board = json.loads(messages[1].content)
@@ -143,7 +148,23 @@ async def test_real_product_checks_two_units_and_independent_integration(
         for message in messages:
             if message.type == "tool":
                 receipt = json.loads(message.content)
-                if offer and phase == 5 + int(bad_source_args) and "error" in receipt:
+                if (receipt.get("errors") or [{}])[0].get("reason") == "revision_changed":
+                    assert key not in rejected_completion
+                    assert receipt["errors"][0]["current_revision"] == scope["revision"]
+                    assert "work_item_id" not in receipt
+                    assert len(board["decision_items"]) == 1
+                    rejected_completion.add(key)
+                elif (receipt.get("errors") or [{}])[0].get("reason") == "open_work_items":
+                    blockers = {entry["reason"]: entry["ids"] for entry in receipt["errors"]}
+                    assert blockers == {
+                        "open_work_items": [item["id"]],
+                        "open_questions": [item["question_id"]],
+                        "unchecked_regions": [region["id"] for region in scope["regions"]],
+                    }
+                    assert len(board["decision_items"]) == 1
+                    assert receipt["scope_revision"] == scope["revision"]
+                    premature_scopes.add(key)
+                elif offer and phase == 5 + int(bad_source_args) and "error" in receipt:
                     assert receipt["status"] == "repair_needed"
                 else:
                     assert "error" not in receipt, receipt
@@ -170,6 +191,12 @@ async def test_real_product_checks_two_units_and_independent_integration(
             )
         if bad_source_args:
             phase -= 1
+        if key in premature_scopes:
+            phase -= 1
+        if not candidate and not bad_source_args and role == "primary" and phase == 1 and key not in premature_scopes:
+            return tool(
+                "complete_scope", {"scope_id": key, "expected_scope_revision": scope["revision"], "payload": {}}
+            )
         if phase == 0:
             paths = ["a.py", "b.py"] if role == "integration" else [scope["regions"][0]["path"]]
             payload = {
@@ -237,7 +264,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     own_refs,
                 ),
             )
-        if offer:
+        if offer and phase == 5:
             assert item["status"] == "answered"
             assert json.loads(messages[-1].content)["status"] == "retracted"
         if role == "integration":
@@ -265,7 +292,14 @@ async def test_real_product_checks_two_units_and_independent_integration(
                 "unresolved_refs": [],
                 "finish": True,
             }
-        return tool("review_step", step("complete_review", payload, item, own_refs))
+        return tool(
+            "complete_scope",
+            {
+                "scope_id": key,
+                "expected_scope_revision": scope["revision"] + int(key not in rejected_completion),
+                "payload": payload,
+            },
+        )
 
     def verify(messages, _turn):
         packet = json.loads(next(m.content for m in messages if m.type == "human"))
@@ -295,12 +329,21 @@ async def test_real_product_checks_two_units_and_independent_integration(
     assert len([v for v in visited if v[1] == "primary"]) == 2
     assert len([v for v in visited if v[1] == "integration"]) == 1
     assert report["metrics"]["coverage"]["checked_regions"] == 2
+    assert rejected_completion == {key for key, _role in visited}
     assert result["comments_sent"] == 0 and result["local_only"]
     assert len(verifier._inputs) == int(candidate)
     if candidate:
         assert report["verified"][0]["verdict"] == "reject"
     with sqlite3.connect(Path(result["report_path"]).parent / "board.sqlite") as db:
         assert db.execute("SELECT count(*) FROM decision_verification_queue").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM decision_items").fetchone()[0] == 3
+        completions = [
+            json.loads(payload) for (payload,) in db.execute("SELECT payload FROM decision_steps WHERE item_id=''")
+        ]
+        assert {
+            step["scope_id"] for step in completions if step.get("disposition") == "reviewed"
+        } == rejected_completion
+        assert {step["scope_id"] for step in completions if step["status"] == "pending"} == premature_scopes
     calls = len(reviewer._inputs), len(verifier._inputs)
     again = await obj.run(two_file_state())
     assert again["status"] == "completed" and again["run_id"] == result["run_id"]

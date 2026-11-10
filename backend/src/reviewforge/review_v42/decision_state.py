@@ -149,7 +149,15 @@ class DecisionState:
             return json.loads(row[0]) if row else None
 
     def record_attempt(
-        self, task_id: str, token: str, turn_id: str, call_id: str, args: dict[str, Any], *, now: float | None = None
+        self,
+        task_id: str,
+        token: str,
+        turn_id: str,
+        call_id: str,
+        args: dict[str, Any],
+        *,
+        now: float | None = None,
+        native_name: str = "review_step",
     ) -> dict[str, Any]:
         """Save an individually identifiable native call before schema validation."""
         with self.store._connect() as db:
@@ -172,7 +180,7 @@ class DecisionState:
                 for c in m["data"].get("tool_calls", [])
                 if isinstance(c, dict) and c.get("id") == call_id
             ]
-            if len(calls) != 1 or calls[0].get("name") != "review_step" or calls[0].get("args") != args:
+            if len(calls) != 1 or calls[0].get("name") != native_name or calls[0].get("args") != args:
                 raise BindingError("decision does not match a unique native call")
             step_id = _id("step_", [self.store.run.id, task_id, turn_id, call_id])
             attempt = {
@@ -196,7 +204,15 @@ class DecisionState:
             return attempt
 
     def stage(
-        self, task_id: str, token: str, turn_id: str, call_id: str, args: dict[str, Any], *, now: float | None = None
+        self,
+        task_id: str,
+        token: str,
+        turn_id: str,
+        call_id: str,
+        args: dict[str, Any],
+        *,
+        now: float | None = None,
+        native_name: str = "review_step",
     ) -> dict[str, Any]:
         if not isinstance(args, dict):
             raise ValueError("review_step arguments must be an object")
@@ -220,7 +236,7 @@ class DecisionState:
                 for c in m["data"].get("tool_calls", [])
                 if isinstance(c, dict) and c.get("id") == call_id
             ]
-            if len(calls) != 1 or calls[0].get("name") != "review_step" or calls[0].get("args") != args:
+            if len(calls) != 1 or calls[0].get("name") != native_name or calls[0].get("args") != args:
                 raise BindingError("decision does not match a unique native call")
             step_id = _id("step_", [self.store.run.id, task_id, turn_id, call_id])
             attempt = {
@@ -272,6 +288,13 @@ class DecisionState:
                 if step["args"] != args or step["response_hash"] != digest:
                     raise RevisionConflict("native decision identity has different input")
                 return self._with_operations(db, step)
+            if native_name == "complete_scope":
+                step = self._stage_scope_completion(db, task, step_id, turn_id, call_id, args, digest)
+                self._task(db, task_id, token, now)
+                db.commit()
+                return step
+            if native_name != "review_step":
+                raise ValueError("unknown native decision")
             if set(args) != {
                 "work_item_id",
                 "expected_revision",
@@ -349,18 +372,7 @@ class DecisionState:
                     ]
                 )
             if args["action"] == "complete_review" and args["payload"].get("finish", True) is True:
-                for (payload,) in db.execute("SELECT payload FROM decision_steps WHERE task_id=?", (task_id,)):
-                    prior = json.loads(payload)
-                    if prior["action"] == "request_evidence" and not prior["consumed"]:
-                        raise CorrectableDecisionInputError(
-                            [
-                                {
-                                    "field": "payload.finish",
-                                    "reason": "unconsumed_source_operations",
-                                    "message": "Review the complete source receipt in a later request first.",
-                                }
-                            ]
-                        )
+                self._require_consumed_sources(db, task_id)
             if item_id:
                 row = db.execute(
                     "SELECT scope_id,revision,payload FROM decision_items WHERE id=?", (item_id,)
@@ -508,6 +520,82 @@ class DecisionState:
             result = self._with_operations(db, step)
             db.commit()
             return result
+
+    @staticmethod
+    def _require_consumed_sources(db: sqlite3.Connection, task_id: str) -> None:
+        pending = [
+            step_id
+            for (step_id,) in db.execute(
+                "SELECT id FROM decision_steps WHERE task_id=? AND json_extract(payload,'$.action')='request_evidence' "
+                "AND json_extract(payload,'$.consumed')=0 ORDER BY rowid",
+                (task_id,),
+            )
+        ]
+        if pending:
+            raise CorrectableDecisionInputError(
+                [
+                    {
+                        "field": "payload.finish",
+                        "reason": "unconsumed_source_operations",
+                        "step_ids": pending,
+                        "message": "Review the complete source receipt in a later request first.",
+                    }
+                ]
+            )
+
+    def _stage_scope_completion(
+        self,
+        db: sqlite3.Connection,
+        task: Task,
+        step_id: str,
+        turn_id: str,
+        call_id: str,
+        args: dict[str, Any],
+        digest: str,
+    ) -> dict[str, Any]:
+        if (
+            set(args) != {"scope_id", "expected_scope_revision", "payload"}
+            or not isinstance(args["scope_id"], str)
+            or type(args["expected_scope_revision"]) is not int
+            or not isinstance(args["payload"], dict)
+        ):
+            raise ValueError("invalid scope completion fields")
+        if args["scope_id"] != task.object_id:
+            raise CorrectableDecisionInputError(
+                [{"field": "scope_id", "reason": "wrong_scope", "current_scope_id": task.object_id}]
+            )
+        if args["expected_scope_revision"] != task.input_revision:
+            raise CorrectableDecisionInputError(
+                [
+                    {
+                        "field": "expected_scope_revision",
+                        "reason": "revision_changed",
+                        "current_revision": task.input_revision,
+                    }
+                ]
+            )
+        if args["payload"].get("finish", True) is True:
+            self._require_consumed_sources(db, task.id)
+        step = {
+            "id": step_id,
+            "task_id": task.id,
+            "turn_id": turn_id,
+            "call_id": call_id,
+            "work_item_id": "",
+            "revision": task.input_revision,
+            "scope_id": task.object_id,
+            "scope_revision": task.input_revision,
+            "action": "complete_review",
+            "args": args,
+            "response_hash": digest,
+            "status": "pending",
+            "consumed": True,
+        }
+        db.execute(
+            "INSERT INTO decision_steps VALUES (?,?,?,?,?,?)", (step_id, task.id, turn_id, call_id, "", _json(step))
+        )
+        self.store._event(db, "DecisionStep", step_id, "stage", step)
+        return {**step, "operations": []}
 
     @staticmethod
     def _with_operations(db: sqlite3.Connection, step: dict[str, Any]) -> dict[str, Any]:

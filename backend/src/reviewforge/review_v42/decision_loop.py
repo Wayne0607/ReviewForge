@@ -24,7 +24,7 @@ from langchain_core.messages import (
     messages_from_dict,
     messages_to_dict,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from reviewforge.engine.native_submission import inspect_tool_calls
 from reviewforge.engine.session_tools import result_tool
@@ -196,9 +196,16 @@ class ReviewStep(_Strict):
     action: Literal["request_evidence", "offer_candidate", "close_question", "complete_review", "unresolved"]
     payload: dict[str, Any]
 
+    @field_validator("payload")
+    @classmethod
+    def validate_payload(cls, payload: dict[str, Any], info: ValidationInfo) -> dict[str, Any]:
+        # action precedes payload, so the field validator can keep the native path of child errors.
+        if action := info.data.get("action"):
+            PAYLOADS[action].model_validate(payload)
+        return payload
+
     @model_validator(mode="after")
-    def valid_payload(self) -> ReviewStep:
-        PAYLOADS[self.action].model_validate(self.payload)
+    def validate_initial_revision(self) -> ReviewStep:
         if not self.work_item_id and self.expected_revision != 0:
             raise ValueError("new work items start at revision 0")
         return self
@@ -296,12 +303,9 @@ def _failure_signature(issues: list[dict[str, Any]]) -> str:
 def _validation_issues(exc: ValidationError) -> list[dict[str, Any]]:
     issues = []
     for error in exc.errors(include_url=False, include_context=False, include_input=False):
-        path = list(error["loc"])
-        if path and path[0] in {"candidate", "retract_draft"}:
-            path.insert(0, "payload")
         issues.append(
             {
-                "field": ".".join(str(part) for part in path) or "review_step",
+                "field": ".".join(str(part) for part in error["loc"]) or "review_step",
                 "reason": error["type"],
                 "message": error["msg"],
             }
@@ -1060,6 +1064,7 @@ class DecisionReviewer(Reviewer):
                             else {}
                         )
                         result["error"] = f"{type(exc).__name__}: {exc}"
+                        result["errors"] = issues
                         reference_issues = [issue for issue in issues if "evidence_ref" in issue]
                         if reference_issues:
                             result["reference_errors"] = reference_issues

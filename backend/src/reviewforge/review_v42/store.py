@@ -585,7 +585,8 @@ class ReviewStore:
                                 and isinstance(call["args"], dict)
                                 and call["args"].get("action") == "complete_review"
                                 and isinstance(call["args"].get("payload"), dict)
-                                and call["args"]["payload"].get("finish") is True
+                                # Match ReviewCompletion's declared default when auditing raw calls.
+                                and call["args"]["payload"].get("finish", True) is True
                             )
                             or (scope_id == plan.integration_scope_id and call["name"] == "finish_integration")
                             or (

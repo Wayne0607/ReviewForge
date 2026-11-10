@@ -2,6 +2,8 @@
 
 ## 当前开发状态
 
+- C 阶段实现 `4fa7d81` 完整 Linux CI **4244 passed、3 skipped**。首轮真实小测 `partial/repeated_failed_batch`，10 完整响应、144668 已知 tokens、1 次网络失败用量未知、0 在途，0 Case/判决、0/1 覆盖。两次关题提交都有顶层引用但缺内层 `payload.evidence_refs`，回执丢失嵌套路径。已修正逐项字段回执并对齐完成动作默认值，合并专项 **198 passed**。C 尚待真实路径验收，完整 PR 未启动。v4.2 累计 **37723636 已知 tokens、218 请求未知**，非账单。[记录](docs/v4.2-delivery-plan.md#138-c-阶段首轮真实小测主审关闭动作缺少嵌套引用)。
+
 - C 阶段可选 `REVIEWFORGE_V42_VERIFICATION_DELIVERY=claim-delivery-1`，需 `decision-cycle-1`。在同一事务冻结每条结论独立收到的原文与判决，补读不改变 Case 或覆盖状态。新增缺口和显式反证仍使受影响输入失效。旧版隔离回归复现三份 base 补读导致 Case 升版、主责重开，新版通过该回归及重启、分页、隔离和租约检查。合并专项 **360 passed**，真实小测待验收。[实现与验证](docs/v4.2-delivery-plan.md#137-c-阶段实现逐结论提交核验来源与判决)。
 
 - 前两阶段实现已推 `dev` 的 `3d242d6`：联合专项 **329 passed**，完整 Linux CI **4224 passed、3 skipped**。最终小测主审成功纠正候选、关闭问题并达到 reviewed；随后核验新增三个 base 原文，使 Case 0→1，临时结果未落盘、主责重开。已请求边界停止并排空：**55 完整响应、760066 已知 tokens、0 未知/在途，1 Case、0 verdict/评论、最终 0/1 覆盖**。小测门槛未过，**没有运行完整 PR**。A+B 已实现但端到端效果未验收；下一阶段须处理核验来源/判决原子交付，不合并 base/head、不降低门禁。本任务小测累计 **2191923 已知 tokens、0 未知**；v4.2 累计 **37578968 已知 tokens、217 请求未知**，非账单。[最终记录与后续边界](docs/v4.2-delivery-plan.md#135-前两阶段最终小测主审完成后被核验来源回写重新打开)。

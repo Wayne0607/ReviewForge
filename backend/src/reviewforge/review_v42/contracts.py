@@ -174,6 +174,20 @@ class EvidenceRef:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def is_navigation_reference(ref: EvidenceRef) -> bool:
+    return ref.metadata.get("navigation_only") is True or ref.kind.casefold() in {
+        "diff",
+        "search",
+        "query",
+        "search_code",
+        "find_references",
+        "search_knowledge",
+        "search_index",
+        "search_section",
+        "search_page",
+    }
+
+
 @dataclass
 class Task:
     id: str

@@ -12,7 +12,16 @@ import sqlite3
 from dataclasses import asdict
 from typing import Any
 
-from .contracts import BindingError, Case, LeaseError, Question, RevisionConflict, Task, evidence_gap
+from .contracts import (
+    BindingError,
+    Case,
+    LeaseError,
+    Question,
+    RevisionConflict,
+    Task,
+    evidence_gap,
+    is_navigation_reference,
+)
 from .store import ReviewStore, _json
 
 
@@ -314,33 +323,6 @@ class DecisionState:
                 or not isinstance(args["judgment"], str)
             ):
                 raise ValueError("question and judgment must be text")
-            refs = args["evidence_refs"]
-            if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref for ref in refs):
-                raise ValueError("invalid decision evidence references")
-            ref_ids = set(refs)
-            missing = [
-                ref
-                for ref in sorted(ref_ids)
-                if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref,)).fetchone() is None
-            ]
-            for ref in self.store._unit_refs(db, sorted(ref_ids - set(missing))):
-                identity = asdict(ref)
-                ref_id = identity.pop("id")
-                if ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
-                    raise BindingError("decision evidence identity mismatch")
-            if missing:
-                raise CorrectableDecisionInputError(
-                    [{"field": "evidence_refs", "reason": "unknown_id", "evidence_ref": ref} for ref in missing]
-                )
-            delivered = self.store._require_delivered(db, task_id, token, turn_id, ref_ids, required_ref_ids=set())
-            not_delivered = sorted(ref_ids - delivered.keys())
-            if not_delivered:
-                raise CorrectableDecisionInputError(
-                    [
-                        {"field": "evidence_refs", "reason": "not_delivered", "evidence_ref": ref}
-                        for ref in not_delivered
-                    ]
-                )
             if not isinstance(args["payload"], dict) or args["action"] not in {
                 "request_evidence",
                 "offer_candidate",
@@ -350,7 +332,54 @@ class DecisionState:
                 "delegate",
             }:
                 raise ValueError("invalid decision action or payload")
-            operations = args["payload"].get("operations", []) if args["action"] == "request_evidence" else []
+            reading = args["action"] == "request_evidence"
+            refs = args["evidence_refs"]
+            if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref for ref in refs):
+                raise ValueError("invalid decision evidence references")
+            hints = args["payload"].get("navigation_refs", []) if reading else []
+            if not isinstance(hints, list) or any(not isinstance(ref, str) for ref in hints):
+                raise ValueError("invalid navigation references")
+            all_ids = set(refs) | set(hints)
+            missing = {
+                ref
+                for ref in all_ids
+                if db.execute("SELECT 1 FROM objects WHERE kind='EvidenceRef' AND id=?", (ref,)).fetchone() is None
+            }
+            navigation_ids = set()
+            for ref in self.store._unit_refs(db, sorted(all_ids - missing)):
+                identity = asdict(ref)
+                ref_id = identity.pop("id")
+                if ref_id != "ev_" + hashlib.sha256(_json(identity).encode()).hexdigest():
+                    raise BindingError("decision evidence identity mismatch")
+                if is_navigation_reference(ref):
+                    navigation_ids.add(ref_id)
+            missing_evidence = sorted(set(refs) & missing)
+            if missing_evidence:
+                raise CorrectableDecisionInputError(
+                    [
+                        {"field": "evidence_refs", "reason": "unknown_id", "evidence_ref": ref}
+                        for ref in missing_evidence
+                    ]
+                )
+            misfiled = [ref for ref in refs if ref in navigation_ids]
+            if misfiled and not reading:
+                raise CorrectableDecisionInputError(
+                    [{"field": "evidence_refs", "reason": "navigation_only", "evidence_ref": ref} for ref in misfiled]
+                )
+            # A hint only names a locator. It never enters the original delivery gate.
+            navigation_refs = list(dict.fromkeys([*misfiled, *(ref for ref in hints if ref not in missing)]))
+            refs = [ref for ref in refs if ref not in navigation_ids]
+            ref_ids = set(refs)
+            delivered = self.store._require_delivered(db, task_id, token, turn_id, ref_ids, required_ref_ids=set())
+            not_delivered = sorted(ref_ids - delivered.keys())
+            if not_delivered:
+                raise CorrectableDecisionInputError(
+                    [
+                        {"field": "evidence_refs", "reason": "not_delivered", "evidence_ref": ref}
+                        for ref in not_delivered
+                    ]
+                )
+            operations = args["payload"].get("operations", []) if reading else []
             if not isinstance(operations, list) or any(
                 not isinstance(op, dict)
                 or set(op) != {"name", "args"}
@@ -477,6 +506,7 @@ class DecisionState:
                         "id": _id("judgment_", [step_id]),
                         "text": args["judgment"].strip(),
                         "evidence_refs": refs,
+                        **({"navigation_refs": navigation_refs} if navigation_refs else {}),
                         "turn_id": turn_id,
                     }
                 )

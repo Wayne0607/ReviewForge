@@ -5,11 +5,11 @@ import json
 import pytest
 from langchain_core.messages import AIMessage
 from test_v42_candidate_draft_reviewer import Model
-from test_v42_decision_loop import decision_store, from_board, step
+from test_v42_decision_loop import decision_store, finish_primary, from_board, step
 from test_v42_fair_runtime import PinnedGateway
 from test_v42_stateful_reviewer import call
 
-from reviewforge.review_v42.contracts import EvidenceRef, ReviewScope
+from reviewforge.review_v42.contracts import EvidenceRef, ReviewScope, Task
 from reviewforge.review_v42.decision_loop import (
     DECISION_PROMPT,
     DecisionReviewer,
@@ -197,6 +197,97 @@ async def test_model_corrects_mixed_navigation_and_completes(tmp_path):
     )
     assert await reviewer.run("a") == "reviewed", reviewer.error
     assert store.get(ReviewScope, "a").status == "reviewed"
+
+
+async def test_integration_can_locate_originals_without_using_navigation_as_proof(tmp_path):
+    store, task = decision_store(tmp_path)
+    await finish_primary(store, task)
+    integration = store.add(Task("integration-task", store.run.id, "review", "integration", 0))
+    integration = store.acquire_task(integration.id, "integrator", 120)
+    refs = {}
+    gap = {"gap": "integration behavior", "relevance": "changed unit", "alternatives": "inspect original"}
+
+    def locate(_messages):
+        payload = {
+            **gap,
+            "operations": [
+                {"name": "read_diff", "args": {"path": "a.py"}},
+                {"name": "search_code", "args": {"query": "value"}},
+            ],
+        }
+        return AIMessage(content="", tool_calls=[call("review_step", step("request_evidence", payload), "locate")])
+
+    def read_original(messages):
+        results = json.loads(messages[-1].content)["results"]
+        refs["diff"], refs["search"] = [entry["result"]["evidence_ref"] for entry in results]
+        payload = {
+            **gap,
+            "navigation_refs": [refs["search"], "stale-navigation-hint"],
+            "operations": [{"name": "read_source", "args": {"path": "a.py"}}],
+        }
+        return AIMessage(
+            content="",
+            tool_calls=[
+                call("review_step", step("request_evidence", payload, from_board(messages), [refs["diff"]]), "read")
+            ],
+        )
+
+    def close(messages, *, include_navigation):
+        item = from_board(messages)
+        if include_navigation:
+            assert item["judgments"][-1]["navigation_refs"] == [refs["diff"], refs["search"]]
+            assert item["judgments"][-1]["evidence_refs"] == []
+            results = json.loads(messages[-1].content)["results"]
+            refs["original"] = results[0]["result"]["evidence_ref"]
+        else:
+            feedback = json.loads(messages[-1].content)
+            assert feedback["reference_errors"][0]["reason"] == "navigation_only"
+        evidence = [refs["original"], refs["diff"]] if include_navigation else [refs["original"]]
+        payload = {"question_id": item["question_id"], "answer": "Checked the original", "evidence_refs": evidence}
+        return AIMessage(
+            content="", tool_calls=[call("review_step", step("close_question", payload, item, evidence), "close")]
+        )
+
+    def finish(messages):
+        board = json.loads(messages[1].content)
+        receipts = [
+            {
+                "obligation_id": o["id"],
+                "disposition": "checked",
+                "evidence_refs": [refs["original"]],
+                "reason": "Checked original",
+            }
+            for o in board["integration_obligations"]
+        ]
+        args = {
+            "scope_id": "integration",
+            "expected_scope_revision": board["scope"]["revision"],
+            "payload": {"integration_receipts": receipts, "finish": True},
+        }
+        return AIMessage(content="", tool_calls=[call("complete_scope", args, "finish")])
+
+    gateway = NavigationGateway()
+    reviewer = DecisionReviewer(
+        store,
+        Model(
+            [
+                locate,
+                read_original,
+                lambda m: close(m, include_navigation=True),
+                lambda m: close(m, include_navigation=False),
+                finish,
+            ]
+        ),
+        EvidenceGateway(store, gateway),
+        task_id=integration.id,
+        lease_token=integration.lease_token,
+    )
+    assert await reviewer.run("integration") == "reviewed", reviewer.error
+    assert gateway.calls == [
+        ("read_diff", {"path": "a.py"}),
+        ("search_code", {"query": "value"}),
+        ("read_source", {"path": "a.py"}),
+    ]
 
 
 async def test_damaged_source_still_fails_original_gate(tmp_path):

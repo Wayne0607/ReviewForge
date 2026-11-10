@@ -48,6 +48,7 @@ from reviewforge.review_v42.contracts import (
     Question,
     ReviewScope,
     Task,
+    is_navigation_reference,
 )
 from reviewforge.review_v42.decision_state import CorrectableDecisionInputError, DecisionState
 from reviewforge.review_v42.reviewer import Reviewer, _ambiguous_native_ids, _visible_message, reviewer_tools
@@ -69,6 +70,7 @@ class EvidenceRequest(_Strict):
     relevance: str = Field(min_length=1)
     alternatives: str = Field(min_length=1)
     operations: list[EvidenceOperation] = Field(min_length=1)
+    navigation_refs: list[str] = Field(default_factory=list)
 
 
 class Candidate(_Strict):
@@ -252,7 +254,7 @@ def review_step_tool():
     return result_tool(
         "review_step",
         "Update the current question and select exactly one next action. The payload depends on action: "
-        "request_evidence {gap,relevance,alternatives,operations:[{name,args}]}; "
+        "request_evidence {gap,relevance,alternatives,operations:[{name,args}],navigation_refs?}; "
         "offer_candidate {candidate:{trigger,behavior,impact,evidence_refs,open_questions?,case_id?,draft_id?,"
         "expected_revision?,candidate_resolution?,target_draft_id?,target_expected_revision?}} or "
         "{retract_draft:{draft_id,draft_revision,reason}}. Use candidate_drafts[].draft_revision for retraction "
@@ -309,6 +311,8 @@ DECISION_PROMPT = (
     "Request every necessary fixed-source operation in one request_evidence batch; explain the missing fact, "
     "its relevance and how different results affect the judgment. Operations available: {operations}. "
     "Read results are retained completely and must appear in a successful later request before being cited. "
+    "Use request_evidence.payload.navigation_refs for search, diff and other locators. "
+    "Use original-source IDs in evidence_refs when supporting a judgment or receipt. "
     "Offer supported candidates promptly for independent verification. A candidate is not a finding. "
     "If the same finding already has a Case, keep it and continue the review; paraphrasing it adds no finding. "
     "Use its case_id only to deliver a substantive addition to that Case. Use a separate work item for a "
@@ -693,6 +697,8 @@ class DecisionReviewer(Reviewer):
         collections = [args.get("evidence_refs")]
         payload = args.get("payload")
         if isinstance(payload, dict):
+            if args.get("action") == "request_evidence":
+                collections.append(payload.get("navigation_refs"))
             candidate = payload.get("candidate")
             if isinstance(candidate, dict):
                 collections.append(candidate.get("evidence_refs"))
@@ -718,17 +724,6 @@ class DecisionReviewer(Reviewer):
 
     def _reference_issues(self, fields: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
         """Classify only known navigation or absent IDs; corrupt originals remain failures."""
-        navigation_kinds = {
-            "diff",
-            "search",
-            "query",
-            "search_code",
-            "find_references",
-            "search_knowledge",
-            "search_index",
-            "search_section",
-            "search_page",
-        }
         issues = []
         with self.store._connect() as db:
             for field, refs in fields:
@@ -750,9 +745,7 @@ class DecisionReviewer(Reviewer):
                     # Verify source identity, frozen binding and stored bytes before
                     # calling a reference an ordinary model-correctable error.
                     self.store._unit_refs(db, [ref_id])
-                    if (isinstance(ref.kind, str) and ref.kind.lower() in navigation_kinds) or (
-                        isinstance(ref.metadata, dict) and ref.metadata.get("navigation_only") is True
-                    ):
+                    if is_navigation_reference(ref):
                         issues.append(
                             {
                                 "field": location,
@@ -835,6 +828,10 @@ class DecisionReviewer(Reviewer):
                                     "message": "The original source was not delivered in this successful request.",
                                 }
                             )
+        if action == "request_evidence":
+            # Verified locators in the old field stay in the native audit. The journal
+            # projects them separately from the judgment's proof references.
+            issues = [issue for issue in issues if issue["reason"] != "navigation_only"]
         if issues:
             error = InvalidCompletionReferencesError if action == "complete_review" else InvalidDecisionReferencesError
             raise error(issues)

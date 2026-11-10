@@ -134,6 +134,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
     visited = set()
     rejected_completion = set()
     premature_scopes = set()
+    rejected_retraction = set()
 
     def review(messages, _turn):
         board = json.loads(messages[1].content)
@@ -164,6 +165,14 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     assert len(board["decision_items"]) == 1
                     assert receipt["scope_revision"] == scope["revision"]
                     premature_scopes.add(key)
+                elif (receipt.get("errors") or [{}])[0].get("reason") == "draft_revision_changed":
+                    (draft,) = board["candidate_drafts"]
+                    assert receipt["draft_id"] == draft["draft_id"]
+                    assert receipt["draft_revision"] == draft["draft_revision"]
+                    assert receipt["draft_status"] == draft["status"] == "repair_needed"
+                    assert receipt["work_item_revision"] == item["work_item_revision"] != receipt["draft_revision"]
+                    assert receipt["errors"][0]["field"] == "payload.retract_draft.draft_revision"
+                    rejected_retraction.add(key)
                 elif offer and phase == 5 + int(bad_source_args) and "error" in receipt:
                     assert receipt["status"] == "repair_needed"
                 else:
@@ -245,10 +254,13 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     own_refs,
                 ),
             )
-        if offer and phase == 5:
+        if offer and phase in {5, 6}:
             receipt = json.loads(messages[-1].content)
-            assert receipt["requires_resolution"]
-            assert receipt["errors"][0]["case_ids"] == item["case_ids"]
+            if phase == 5:
+                assert receipt["requires_resolution"]
+                assert receipt["errors"][0]["case_ids"] == item["case_ids"]
+            else:
+                assert key in rejected_retraction
             return tool(
                 "review_step",
                 step(
@@ -256,7 +268,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     {
                         "retract_draft": {
                             "draft_id": receipt["draft_id"],
-                            "expected_revision": receipt["draft_revision"],
+                            "draft_revision": item["work_item_revision"] if phase == 5 else receipt["draft_revision"],
                             "reason": "This is the same finding with different wording",
                         }
                     },
@@ -264,7 +276,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
                     own_refs,
                 ),
             )
-        if offer and phase == 5:
+        if offer and phase == 7:
             assert item["status"] == "answered"
             assert json.loads(messages[-1].content)["status"] == "retracted"
         if role == "integration":
@@ -330,6 +342,7 @@ async def test_real_product_checks_two_units_and_independent_integration(
     assert len([v for v in visited if v[1] == "integration"]) == 1
     assert report["metrics"]["coverage"]["checked_regions"] == 2
     assert rejected_completion == {key for key, _role in visited}
+    assert len(rejected_retraction) == int(candidate)
     assert result["comments_sent"] == 0 and result["local_only"]
     assert len(verifier._inputs) == int(candidate)
     if candidate:

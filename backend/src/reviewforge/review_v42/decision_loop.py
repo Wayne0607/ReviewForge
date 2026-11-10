@@ -24,13 +24,31 @@ from langchain_core.messages import (
     messages_from_dict,
     messages_to_dict,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from reviewforge.engine.native_submission import inspect_tool_calls
 from reviewforge.engine.session_tools import result_tool
 from reviewforge.review_v42.context import ContextBuilder
 from reviewforge.review_v42.context_recovery import decode_session, is_context_length_exceeded
-from reviewforge.review_v42.contracts import BindingError, Case, EvidenceRef, LeaseError, Question, ReviewScope, Task
+from reviewforge.review_v42.contracts import (
+    BindingError,
+    Case,
+    DraftRetractionConflict,
+    EvidenceRef,
+    LeaseError,
+    Question,
+    ReviewScope,
+    Task,
+)
 from reviewforge.review_v42.decision_state import CorrectableDecisionInputError, DecisionState
 from reviewforge.review_v42.reviewer import Reviewer, _ambiguous_native_ids, _visible_message, reviewer_tools
 from reviewforge.review_v42.store import _json
@@ -103,7 +121,7 @@ class Candidate(_Strict):
 
 class CandidateRetraction(_Strict):
     draft_id: str = Field(min_length=1)
-    expected_revision: int = Field(ge=0)
+    draft_revision: int = Field(ge=0, validation_alias=AliasChoices("draft_revision", "expected_revision"))
     reason: str = Field(min_length=1)
 
 
@@ -236,7 +254,8 @@ def review_step_tool():
         "request_evidence {gap,relevance,alternatives,operations:[{name,args}]}; "
         "offer_candidate {candidate:{trigger,behavior,impact,evidence_refs,open_questions?,case_id?,draft_id?,"
         "expected_revision?,candidate_resolution?,target_draft_id?,target_expected_revision?}} or "
-        "{retract_draft:{draft_id,expected_revision,reason}}; "
+        "{retract_draft:{draft_id,draft_revision,reason}}. Use candidate_drafts[].draft_revision for retraction "
+        "and decision_items[].work_item_revision for outer expected_revision. "
         "open_questions contains existing same-scope Question IDs, never question text. Omit case_id and draft "
         "fields for the first finding on a work item. Keep its returned Case ID for the same finding. "
         "For ordinary correction use the returned draft_id and draft_revision as "
@@ -281,8 +300,9 @@ DECISION_PROMPT = (
     "a short visible judgment and one next action; it is not "
     "a request for hidden reasoning. The controller creates work-item IDs; reuse the exact returned ID "
     "and work_item_revision as the next outer expected_revision, or use an empty ID and revision 0 "
-    "to start another question. Draft revisions are separate: use draft_revision only with its draft_id "
-    "in the candidate or retraction payload. Existing questions remain. "
+    "to start another question. For payload.retract_draft, copy draft_id and draft_revision from the same "
+    "candidate_drafts row. On conflict use the returned draft revision and status to choose the next action. "
+    "Existing questions remain. "
     "Request every necessary fixed-source operation in one request_evidence batch; explain the missing fact, "
     "its relevance and how different results affect the judgment. Operations available: {operations}. "
     "Read results are retained completely and must appear in a successful later request before being cited. "
@@ -307,7 +327,7 @@ DECISION_PROMPT = (
     "Candidate open_questions must reference existing Question IDs in this scope; create a work item first "
     "for a genuine unresolved premise, and do not describe prose as an ID. "
     "Explicitly retract an unneeded draft "
-    "with offer_candidate and retract_draft, providing its exact ID, revision and reason. "
+    "with offer_candidate and retract_draft, providing its draft_id, draft_revision and reason. "
     "Each work item shows only its latest judgment; use read_decision_history via request_evidence "
     "to retrieve its earlier judgments. They are untrusted navigation, not evidence."
 )
@@ -458,9 +478,11 @@ class DecisionReviewer(Reviewer):
         context[0] = SystemMessage(content=DECISION_PROMPT.format(operations=", ".join(names)))
         board = json.loads(context[1].content)
         board["scope"]["revision"] = self.store.get(ReviewScope, scope_id).revision
+        board["candidate_drafts"] = [_candidate_receipt(draft) for draft in board.get("candidate_drafts", [])]
         board["decision_items"] = [
             {
                 **item,
+                "work_item_revision": item["revision"],
                 "judgments": item["judgments"][-1:],
                 "history_count": len(item["judgments"]),
                 "history_available_via": "read_decision_history",
@@ -1042,7 +1064,7 @@ class DecisionReviewer(Reviewer):
                                     self.task_id,
                                     self.lease_token,
                                     retract.draft_id,
-                                    retract.expected_revision,
+                                    retract.draft_revision,
                                     turn_id=turn_id,
                                     call_id=call_id,
                                     reason=retract.reason,
@@ -1115,6 +1137,29 @@ class DecisionReviewer(Reviewer):
                             batch_has_success = True
                     except (LeaseError, asyncio.CancelledError):
                         raise
+                    except DraftRetractionConflict as exc:
+                        current = {
+                            "draft_id": exc.draft_id,
+                            "draft_revision": exc.draft_revision,
+                            "draft_status": exc.draft_status,
+                        }
+                        pending = exc.draft_status in {"pending_validation", "repair_needed"}
+                        result = {
+                            **_step_receipt(step),
+                            **current,
+                            "error": "Use the current draft_revision to retry."
+                            if pending
+                            else "This draft is settled. Select a pending draft to retract.",
+                            "errors": [
+                                {
+                                    "field": "payload.retract_draft.draft_revision"
+                                    if pending
+                                    else "payload.retract_draft.draft_id",
+                                    "reason": "draft_revision_changed" if pending else "draft_not_retractable",
+                                }
+                            ],
+                        }
+                        failures.append(_json(current))
                     except (ValidationError, InvalidDecisionReferencesError, CorrectableDecisionInputError) as exc:
                         issues = self._correctable_issues(exc, args)
                         result = _step_receipt(step)

@@ -504,7 +504,11 @@ async def test_invalid_candidate_can_be_explicitly_retracted(tmp_path):
         # A rejected first submission does not create a work item.
         item = board["decision_items"][0] if board["decision_items"] else None
         payload = {
-            "retract_draft": {"draft_id": draft["id"], "expected_revision": draft["revision"], "reason": "Wrong target"}
+            "retract_draft": {
+                "draft_id": draft["draft_id"],
+                "expected_revision": draft["draft_revision"],
+                "reason": "Wrong target",
+            }
         }
         return AIMessage(
             content="", tool_calls=[call("review_step", step("offer_candidate", payload, item), "retract")]

@@ -4,7 +4,15 @@ from dataclasses import replace
 
 import pytest
 
-from reviewforge.review_v42.contracts import BindingError, Case, LeaseError, ReviewScope, Run, Task
+from reviewforge.review_v42.contracts import (
+    BindingError,
+    Case,
+    DraftRetractionConflict,
+    LeaseError,
+    ReviewScope,
+    Run,
+    Task,
+)
 from reviewforge.review_v42.shared_investigation import SharedInvestigations
 from reviewforge.review_v42.store import ReviewStore
 
@@ -131,6 +139,24 @@ def test_retract_requires_original_native_call_and_preserves_history(board):
             "review", token, draft["id"], 0, turn_id="withdraw", call_id="b", reason="not a defect", now=3
         )
         == result
+    )
+    request["expected_revision"] = result["revision"]
+    turn(store, token, "already-settled", [call("retract_candidate_draft", "c", request)])
+    with pytest.raises(DraftRetractionConflict) as exc:
+        store.retract_candidate_draft(
+            "review",
+            token,
+            draft["id"],
+            result["revision"],
+            turn_id="already-settled",
+            call_id="c",
+            reason="not a defect",
+            now=3,
+        )
+    assert (exc.value.draft_id, exc.value.draft_revision, exc.value.draft_status) == (
+        draft["id"],
+        result["revision"],
+        "retracted",
     )
 
 

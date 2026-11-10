@@ -193,6 +193,16 @@ class RevisionConflict(ValueError):  # noqa: N818
     """An expected revision no longer matches current state."""
 
 
+class DraftRetractionConflict(RevisionConflict):  # noqa: N818
+    """Current draft state from the transaction that refused the withdrawal."""
+
+    def __init__(self, draft_id: str, draft_revision: int, draft_status: str):
+        super().__init__("candidate draft revision or status changed")
+        self.draft_id = draft_id
+        self.draft_revision = draft_revision
+        self.draft_status = draft_status
+
+
 class BindingError(ValueError):
     """A run, snapshot, or evidence binding is invalid."""
 

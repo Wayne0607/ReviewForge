@@ -22,6 +22,7 @@ from .contracts import (
     VERIFICATION_DELIVERY_POLICIES,
     BindingError,
     Case,
+    DraftRetractionConflict,
     EvidenceRef,
     FrontierEntry,
     IntegrationObligation,
@@ -4154,6 +4155,10 @@ class ReviewStore:
             raise ValueError("candidate withdrawal requires revision and reason")
         operation_id = hashlib.sha256(_json([self.run.id, task_id, turn_id, call_id]).encode()).hexdigest()
         request = {"draft_id": draft_id, "expected_revision": expected_revision, "reason": reason}
+        decision_cycle = self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1"
+        audited_requests = [request]
+        if decision_cycle:
+            audited_requests.append({"draft_id": draft_id, "draft_revision": expected_revision, "reason": reason})
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT payload FROM objects WHERE kind='Task' AND id=?", (task_id,)).fetchone()
@@ -4168,7 +4173,8 @@ class ReviewStore:
             if (
                 len(matches) != 1
                 or not isinstance(matches[0].get("args"), dict)
-                or {key: value for key, value in matches[0]["args"].items() if key != "review_state"} != request
+                or {key: value for key, value in matches[0]["args"].items() if key != "review_state"}
+                not in audited_requests
             ):
                 raise BindingError("candidate withdrawal does not match its native call")
             item = self.get_candidate_draft(draft_id, db=db)
@@ -4182,7 +4188,7 @@ class ReviewStore:
                     raise RevisionConflict("candidate operation has different inputs")
                 return json.loads(previous[1])
             if item["revision"] != expected_revision or item["status"] not in {"pending_validation", "repair_needed"}:
-                raise RevisionConflict("candidate draft revision or status changed")
+                raise DraftRetractionConflict(draft_id, item["revision"], item["status"])
             item.update(status="retracted", reason=reason, revision=item["revision"] + 1)
             db.execute(
                 "UPDATE candidate_drafts SET revision=?,status=?,payload=? WHERE id=?",
@@ -4198,7 +4204,7 @@ class ReviewStore:
                 "retract",
                 {"task_id": task_id, "turn_id": turn_id, "call_id": call_id, "reason": reason},
             )
-            if self.run.metadata.get("decision_cycle_policy") == "decision-cycle-1":
+            if decision_cycle:
                 decision_row = db.execute(
                     "SELECT id,payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
                     (task_id, turn_id, call_id),

@@ -389,6 +389,56 @@ async def test_read_only_wrapper_preserves_head_tarball_transport(runner):
 
 
 @pytest.mark.asyncio
+async def test_v42_bootstrap_preserves_json_capability_and_actual_request_options(runner, monkeypatch, tmp_path):
+    from langchain_core.messages import HumanMessage
+    from test_v42_stream_transport import ByteStream, client_with, final_usage, frame
+
+    from reviewforge.engine import model_router
+    from reviewforge.review_v42.integration import _raw_models
+    from reviewforge.review_v42.response_protocol import JSON_CONSTRAINT, JSON_REQUEST_OPTIONS, response_options
+
+    requests = []
+    streams = [
+        ByteStream(
+            [frame(delta={"role": "assistant", "content": "{}"}, finish="stop"), final_usage(), b"data: [DONE]\n\n"]
+        )
+        for _ in range(2)
+    ]
+    client = client_with(streams, requests)
+    original = model_router.V42StreamingChatOpenAI
+
+    def streaming_model(**options):
+        options["http_async_client"] = client
+        return original(**options)
+
+    monkeypatch.setattr(model_router, "V42StreamingChatOpenAI", streaming_model)
+    monkeypatch.setenv("GITHUB_TOKEN", "test-placeholder")
+    monkeypatch.setenv("LLM_API_KEY", "test-placeholder")
+    monkeypatch.setenv("REVIEWFORGE_SETTINGS_DIR", str(tmp_path))
+    orchestrator, db, raw = await runner._build_runtime(
+        tmp_path, "test-model", pipeline="review_v42", llm_min_interval=0, llm_max_attempts=10
+    )
+    try:
+        models = _raw_models(orchestrator._model_router, request_timeout=900)
+        for agent, role in (("v42_reviewer", "integration"), ("v42_verifier", "verification")):
+            traced = models[agent]
+            assert isinstance(traced, runner.BenchmarkLLM)
+            # This is the same capability predicate used when binding the product run.
+            assert traced.v42_stream_transport is True
+            metadata = {f"{role}_response_constraint": JSON_CONSTRAINT}
+            await traced.ainvoke([HumanMessage(content="Return JSON")], **response_options(metadata, role))
+        assert len(requests) == 2
+        assert all(all(request[key] == value for key, value in JSON_REQUEST_OPTIONS.items()) for request in requests)
+        traces = [json.loads(path.read_text()) for path in (tmp_path / "llm-traces").glob("*-input.json")]
+        assert len(traces) == 2
+        assert all(trace["request_options"] == JSON_REQUEST_OPTIONS for trace in traces)
+    finally:
+        await db.close()
+        await raw.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_provider_trace_survives_token_wrapper_private_call(runner, tmp_path):
     from langchain_core.messages import HumanMessage
 
@@ -396,6 +446,7 @@ async def test_provider_trace_survives_token_wrapper_private_call(runner, tmp_pa
     from reviewforge.engine.token_tracker import RunContext, TrackedChatLLM
 
     traced = runner.BenchmarkLLM(MockChatLLM(), tmp_path, "test", interval=0)
+    assert traced.v42_stream_transport is False
     llm = TrackedChatLLM(traced, RunContext(), "test")
     await llm.ainvoke([HumanMessage(content="review this code")])
     inputs = list(tmp_path.glob("*-input.json"))

@@ -93,6 +93,11 @@ class BenchmarkLLM(BaseChatModel):
         )
         root.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def v42_stream_transport(self) -> bool:
+        """Tracing preserves the inner transport's explicit request capabilities."""
+        return getattr(self._inner, "v42_stream_transport", False) is True
+
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         await wait_for_request_slot_async(_LLM_RATE_FILE, self._interval)
         request_id = uuid.uuid4().hex

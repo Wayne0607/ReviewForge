@@ -69,8 +69,8 @@ def observe(rid, refs):
     return {"statement": "Checked the fixed implementation", "region_ids": [rid], "evidence_refs": refs}
 
 
-@pytest.mark.parametrize("restart", [False, True])
-async def test_good_region_survives_missing_reference_and_missing_lines(tmp_path, restart):
+@pytest.mark.parametrize("restart", [False, True, "before_receipt"])
+async def test_good_region_survives_missing_reference_and_missing_lines(tmp_path, restart, monkeypatch):
     store, task = board(tmp_path)
     gateway = EvidenceGateway(store, PagedGateway())
     refs = {}
@@ -142,6 +142,8 @@ async def test_good_region_survives_missing_reference_and_missing_lines(tmp_path
 
     def missing_source(messages):
         assert json.loads(messages[1].content)["current_region_receipt"]["region_id"] == "b"
+        if restart == "before_receipt":
+            assert json.loads(messages[-1].content)["kind"] == "recovered_region_receipts"
         return native(
             step(
                 "request_evidence",
@@ -166,10 +168,21 @@ async def test_good_region_survives_missing_reference_and_missing_lines(tmp_path
         return completion(messages, [], [])
 
     model = Model([read, close, mixed_receipt, inspect_receipt, repair, finish])
+    append_audit = store.append_turn_audit
+    if restart == "before_receipt":
+
+        def interrupt_receipt(*args, **kwargs):
+            if args[3].startswith("tool:") and store.history("RegionSubmission"):
+                raise asyncio.CancelledError()
+            return append_audit(*args, **kwargs)
+
+        monkeypatch.setattr(store, "append_turn_audit", interrupt_receipt)
     reviewer = DecisionReviewer(store, model, gateway, task_id=task.id, lease_token=task.lease_token)
     if restart:
         with pytest.raises(asyncio.CancelledError):
             await reviewer.run("primary")
+        monkeypatch.setattr(store, "append_turn_audit", append_audit)
+        assert [r["id"] for r in store.get(ReviewScope, "primary").checked_regions] == ["a"]
         store.release_task(task.id, task.lease_token)
         task = store.acquire_task(task.id, "resumed", 120)
         reviewer = DecisionReviewer(

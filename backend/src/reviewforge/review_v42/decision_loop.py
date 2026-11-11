@@ -1055,6 +1055,11 @@ class DecisionReviewer(Reviewer):
                 self.error = "incomplete_native_batches"
                 self._update_scope(self.store.get(ReviewScope, scope_id), status="partial")
                 return "partial"
+            if self._region_delivery:
+                recent.extend(
+                    HumanMessage(content=_json(receipt))
+                    for receipt in CoverageDelivery(self.store).recovery_receipts(self.task_id)
+                )
             previous_failure = None
             previous_close_item = None
             previous_close_feedback = {}

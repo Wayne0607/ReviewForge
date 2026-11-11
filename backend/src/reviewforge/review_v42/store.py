@@ -542,6 +542,18 @@ class ReviewStore:
                                 raise BindingError("ambiguous native tool identities")
                             raw = matches[0]
                         strict_tool_call(call, raw)
+                    if (
+                        self.run.metadata.get("coverage_delivery_policy") == COVERAGE_DELIVERY_POLICY
+                        and task.kind == "review"
+                        and len(calls) == 1
+                    ):
+                        from .coverage_delivery import CoverageDelivery
+
+                        if (
+                            CoverageDelivery.committed_result(db, task.id, turn_id, calls[0], phases["response"])
+                            is not None
+                        ):
+                            continue
                     receipts = set()
                     receipt_messages = {}
                     failed_receipts = set()

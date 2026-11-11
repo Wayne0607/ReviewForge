@@ -45,6 +45,42 @@ class CoverageDelivery:
     def __init__(self, store: ReviewStore):
         self.store = store
 
+    @staticmethod
+    def committed_result(db, task_id, turn_id, call, response_hash):
+        row = db.execute(
+            "SELECT payload FROM decision_steps WHERE task_id=? AND turn_id=? AND call_id=?",
+            (task_id, turn_id, call["id"]),
+        ).fetchone()
+        if row is None:
+            return None
+        step = json.loads(row[0])
+        if "coverage_result" not in step:
+            return None
+        if (
+            call["name"] != "complete_scope"
+            or step["args"] != call["args"]
+            or step["response_hash"] != response_hash
+            or step["status"] != "settled"
+            or step.get("disposition") != "coverage_recorded"
+        ):
+            raise BindingError("saved region receipt differs from the audited submission")
+        return step["coverage_result"]
+
+    def recovery_receipts(self, task_id: str) -> list[dict[str, Any]]:
+        with self.store._connect() as db:
+            rows = db.execute(
+                "SELECT payload FROM decision_steps s WHERE task_id=? "
+                "AND json_type(payload,'$.coverage_result')='object' "
+                "AND NOT EXISTS (SELECT 1 FROM turn_audit a WHERE a.task_id=s.task_id "
+                "AND a.turn_id=s.turn_id AND a.phase='exchange') ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+        return [
+            {"kind": "recovered_region_receipts", "original_turn_id": step["turn_id"], **step["coverage_result"]}
+            for (payload,) in rows
+            for step in [json.loads(payload)]
+        ]
+
     def _issues(self, db, region, observations, refs, delivered):
         requirement = region_requirement(region)
         eligible = [

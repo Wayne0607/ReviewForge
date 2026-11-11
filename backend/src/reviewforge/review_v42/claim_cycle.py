@@ -13,6 +13,7 @@ from reviewforge.tools.workspace import _normalise_repo_path
 
 from .context import ContextBuilder
 from .contracts import BindingError, Case, EvidenceRef, RevisionConflict, VerificationIncomplete
+from .response_protocol import response_options
 from .verifier import validate_result
 
 if TYPE_CHECKING:
@@ -206,7 +207,8 @@ class ClaimCycle:
             if feedback:
                 packet["correction"] = feedback
             response = await self.llm.ainvoke(
-                [SystemMessage(content=PROMPT), HumanMessage(content=json.dumps(packet, ensure_ascii=False))]
+                [SystemMessage(content=PROMPT), HumanMessage(content=json.dumps(packet, ensure_ascii=False))],
+                **response_options(self.store.run.metadata, "verification"),
             )
             try:
                 submission = _submission(response)

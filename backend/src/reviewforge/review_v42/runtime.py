@@ -21,7 +21,9 @@ from reviewforge.review_v42.contracts import (
     Task,
     VerificationIncomplete,
 )
+from reviewforge.review_v42.coverage_delivery import COVERAGE_DELIVERY_POLICY
 from reviewforge.review_v42.integration_delivery import INTEGRATION_DELIVERY_POLICY
+from reviewforge.review_v42.response_protocol import JSON_CONSTRAINT
 from reviewforge.review_v42.reviewer import QuestionAssistant, Reviewer, _status_code
 from reviewforge.review_v42.scope import compile_scopes
 from reviewforge.review_v42.store import _unit_source_identity
@@ -97,6 +99,16 @@ class ReviewRuntime:
             or metadata.get("decision_cycle_policy") != "decision-cycle-1"
         ):
             raise ValueError("unsupported v4.2 integration delivery policy")
+        if "coverage_delivery_policy" in metadata and (
+            metadata["coverage_delivery_policy"] != COVERAGE_DELIVERY_POLICY
+            or metadata.get("decision_cycle_policy") != "decision-cycle-1"
+        ):
+            raise ValueError("unsupported v4.2 coverage delivery policy")
+        if "verification_response_constraint" in metadata and (
+            metadata["verification_response_constraint"] != JSON_CONSTRAINT
+            or metadata.get("verification_delivery_policy") != CLAIM_CYCLE_POLICY
+        ):
+            raise ValueError("unsupported v4.2 verification response constraint")
         if "frontier_projection_policy" in metadata and (
             metadata["frontier_projection_policy"] != "source-line-union-1"
             or store.run.policy != "v42-units-6"

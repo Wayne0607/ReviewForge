@@ -7,9 +7,11 @@ from typing import Any
 
 from reviewforge.engine.native_submission import _invalid_constant, _unique_object, inspect_tool_calls
 
+from .response_protocol import JSON_CONSTRAINT
+from .response_protocol import JSON_REQUEST_OPTIONS as JSON_REQUEST_OPTIONS
+
 INTEGRATION_DELIVERY_POLICY = "integration-delivery-1"
-INTEGRATION_JSON_CONSTRAINT = "openai-json-object-1"
-JSON_REQUEST_OPTIONS = {"tool_choice": "none", "response_format": {"type": "json_object"}}
+INTEGRATION_JSON_CONSTRAINT = JSON_CONSTRAINT
 
 PROMPT = """
 You are the independent cross-unit integration reviewer. Return exactly one JSON object in the

@@ -43,6 +43,7 @@ def test_native_tool_exposes_nested_completion_contract():
         ("REVIEWFORGE_V42_QUESTION_ASSISTANT", "question-delivery-1"),
         ("REVIEWFORGE_V42_VERIFICATION_DELIVERY", "wrong"),
         ("REVIEWFORGE_V42_INTEGRATION_DELIVERY", "wrong"),
+        ("REVIEWFORGE_V42_COVERAGE_DELIVERY", "wrong"),
     ],
 )
 async def test_invalid_profile_fails_before_workspace_or_model(tmp_path, monkeypatch, variable, value):

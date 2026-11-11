@@ -36,6 +36,7 @@ from .contracts import (
     Task,
     UnitPlan,
 )
+from .coverage_delivery import COVERAGE_DELIVERY_POLICY
 from .integration_delivery import INTEGRATION_DELIVERY_POLICY, INTEGRATION_JSON_CONSTRAINT, integration_action
 from .line_semantics import source_lines, source_slice
 
@@ -152,6 +153,16 @@ class ReviewStore:
             or run.metadata.get("integration_delivery_policy") != INTEGRATION_DELIVERY_POLICY
         ):
             raise BindingError("unsupported integration response constraint")
+        if "verification_response_constraint" in run.metadata and (
+            run.metadata["verification_response_constraint"] != INTEGRATION_JSON_CONSTRAINT
+            or run.metadata.get("verification_delivery_policy") != CLAIM_CYCLE_POLICY
+        ):
+            raise BindingError("unsupported verification response constraint")
+        if "coverage_delivery_policy" in run.metadata and (
+            run.metadata["coverage_delivery_policy"] != COVERAGE_DELIVERY_POLICY
+            or decision_policy != "decision-cycle-1"
+        ):
+            raise BindingError("unsupported coverage delivery profile")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.blob_dir = self.path.parent / ".review-v42-blobs"

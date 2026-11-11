@@ -26,6 +26,7 @@ from reviewforge.engine.provider_retry import RetryChatLLM, RetryPolicy, current
 from reviewforge.engine.request_budget import _actual_usage
 from reviewforge.review_v42.adapter import PinnedToolGateway, changed_regions
 from reviewforge.review_v42.contracts import VERIFICATION_DELIVERY_POLICIES, Run
+from reviewforge.review_v42.coverage_delivery import COVERAGE_DELIVERY_POLICY
 from reviewforge.review_v42.evaluation import summarize_run
 from reviewforge.review_v42.integration_delivery import (
     INTEGRATION_DELIVERY_POLICY,
@@ -421,6 +422,9 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
         integration_delivery != INTEGRATION_DELIVERY_POLICY or decision_cycle != "decision-cycle-1"
     ):
         raise ValueError("integration delivery requires decision-cycle-1 and a supported integration delivery policy")
+    coverage_delivery = os.environ.get("REVIEWFORGE_V42_COVERAGE_DELIVERY", "").strip()
+    if coverage_delivery and (coverage_delivery != COVERAGE_DELIVERY_POLICY or decision_cycle != "decision-cycle-1"):
+        raise ValueError("coverage delivery requires decision-cycle-1 and a supported region delivery policy")
 
     def option(name: str, decision_default: str = "") -> str:
         value = os.environ.get(name, "").strip()
@@ -559,6 +563,13 @@ async def _run_review_v42(orchestrator, state) -> dict[str, Any]:
             metadata["decision_cycle_policy"] = decision_cycle
         if verification_delivery:
             metadata["verification_delivery_policy"] = verification_delivery
+            if (
+                verification_delivery == "claim-delivery-2"
+                and getattr(raw_models["v42_verifier"], "v42_stream_transport", False) is True
+            ):
+                metadata["verification_response_constraint"] = INTEGRATION_JSON_CONSTRAINT
+        if coverage_delivery:
+            metadata["coverage_delivery_policy"] = coverage_delivery
         if integration_delivery:
             metadata["integration_delivery_policy"] = integration_delivery
             if getattr(raw_models["v42_reviewer"], "v42_stream_transport", False) is True:

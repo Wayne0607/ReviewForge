@@ -55,7 +55,7 @@ class MemorySnapshot:
         return self.files[path].encode()
 
 
-async def make_board(tmp_path, delivery="claim-delivery-1"):
+async def make_board(tmp_path, delivery="claim-delivery-1", **metadata):
     state = StateStore(repo="example/repo", pr_number=1, base_sha="base", head_sha="head")
     head = MemorySnapshot(state.head_sha, HEAD_SOURCES)
     base = MemorySnapshot(state.base_sha, BASE_SOURCES)
@@ -75,6 +75,7 @@ async def make_board(tmp_path, delivery="claim-delivery-1"):
             "frontier_projection_policy": "source-line-union-1",
             "decision_cycle_policy": "decision-cycle-1",
             "verification_delivery_policy": delivery,
+            **metadata,
         },
     )
     store = ReviewStore(tmp_path / "board.db", run)
@@ -234,6 +235,46 @@ def claim_rejection(original, quote):
     decision = reject_verdict(original, quote, "The original disproves the premise")
     decision.pop("gaps")
     return claim_response({"action": "submit_verdict", **decision})
+
+
+@pytest.mark.asyncio
+async def test_claim_cycle_uses_the_shared_json_constraints_and_rejects_native_calls(tmp_path):
+    from reviewforge.review_v42.response_protocol import JSON_CONSTRAINT, JSON_REQUEST_OPTIONS
+
+    store, gateway = await make_board(tmp_path, CLAIM_CYCLE_POLICY, verification_response_constraint=JSON_CONSTRAINT)
+    original = await gateway.execute("read_source", {"path": "notify.py"})
+    case = store.add(
+        Case(
+            "case",
+            store.run.id,
+            "Notifications are sent",
+            "New participant",
+            "Recipients are passed",
+            claims=[{"id": "claim", "statement": "Recipients are missing", "impact": "Nobody receives notice"}],
+            evidence_refs=[original["evidence_ref"]],
+        )
+    )
+    task = store.add(Task("verify", store.run.id, "verify", case.id, case.revision))
+    lease = store.acquire_task(task.id, "verifier", 120)
+
+    class ConstrainedModel(NativeModel):
+        def bind_tools(self, *_args, **_kwargs):
+            pytest.fail("claim delivery must use the message channel")
+
+        async def ainvoke(self, messages, **options):
+            assert options == JSON_REQUEST_OPTIONS
+            return await super().ainvoke(messages)
+
+    def decide(messages, turn):
+        if turn == 1:
+            return tool("shell", {"command": "unused"})
+        assert json.loads(messages[1].content)["correction"] == "Return a JSON message, without tool calls."
+        return claim_rejection(original["evidence_ref"], HEAD_SOURCES["notify.py"].strip())
+
+    verifier = Verifier(store, ConstrainedModel(decide), gateway)
+    result = await verifier.verify(case.id, task_id=task.id, lease_token=lease.lease_token)
+    assert result[0]["verdict"] == "reject"
+    assert store.get(Case, case.id).revision == case.revision
 
 
 @pytest.mark.asyncio

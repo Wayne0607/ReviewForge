@@ -29,6 +29,7 @@ from reviewforge.review_v42.contracts import (
     Question,
     Run,
 )
+from reviewforge.review_v42.coverage_delivery import COVERAGE_DELIVERY_POLICY
 from reviewforge.review_v42.evaluation import summarize_run
 from reviewforge.review_v42.integration import (
     PhysicalMeter,
@@ -124,6 +125,9 @@ def input_material(path):
 
 
 async def episode(args):
+    coverage_delivery = getattr(args, "coverage_delivery", None)
+    if coverage_delivery and (coverage_delivery != COVERAGE_DELIVERY_POLICY or args.arm != "decision"):
+        raise ValueError("coverage delivery requires the decision arm")
     integration_delivery = getattr(args, "integration_delivery", None)
     if integration_delivery and (integration_delivery != INTEGRATION_DELIVERY_POLICY or args.arm != "decision"):
         raise ValueError("integration delivery requires the decision arm")
@@ -202,6 +206,13 @@ async def episode(args):
             metadata["decision_cycle_policy"] = "decision-cycle-1"
         if args.verification_delivery:
             metadata["verification_delivery_policy"] = args.verification_delivery
+            if (
+                args.verification_delivery == "claim-delivery-2"
+                and getattr(raw["v42_verifier"], "v42_stream_transport", False) is True
+            ):
+                metadata["verification_response_constraint"] = INTEGRATION_JSON_CONSTRAINT
+        if coverage_delivery:
+            metadata["coverage_delivery_policy"] = coverage_delivery
         if integration_delivery:
             metadata["integration_delivery_policy"] = integration_delivery
             if getattr(raw["v42_reviewer"], "v42_stream_transport", False) is True:
@@ -286,6 +297,7 @@ def main():
     parser.add_argument("--arm", choices=["baseline", "decision"], required=True)
     parser.add_argument("--verification-delivery", choices=sorted(VERIFICATION_DELIVERY_POLICIES))
     parser.add_argument("--integration-delivery", choices=[INTEGRATION_DELIVERY_POLICY])
+    parser.add_argument("--coverage-delivery", choices=[COVERAGE_DELIVERY_POLICY])
     parser.add_argument("--replicate", type=int, choices=[1, 2, 3], required=True)
     asyncio.run(episode(parser.parse_args()))
 

@@ -50,16 +50,16 @@ from reviewforge.review_v42.contracts import (
     Task,
     is_navigation_reference,
 )
+from reviewforge.review_v42.coverage_delivery import COVERAGE_DELIVERY_POLICY, CoverageDelivery, region_requirement
 from reviewforge.review_v42.decision_state import CorrectableDecisionInputError, DecisionState
 from reviewforge.review_v42.integration_delivery import (
     INTEGRATION_DELIVERY_POLICY,
-    INTEGRATION_JSON_CONSTRAINT,
-    JSON_REQUEST_OPTIONS,
     integration_action,
 )
 from reviewforge.review_v42.integration_delivery import (
     PROMPT as INTEGRATION_DELIVERY_PROMPT,
 )
+from reviewforge.review_v42.response_protocol import response_options
 from reviewforge.review_v42.reviewer import Reviewer, _ambiguous_native_ids, _visible_message, reviewer_tools
 from reviewforge.review_v42.store import _json
 from reviewforge.review_v42.tools import InvalidEvidenceRequestError
@@ -411,6 +411,7 @@ def _decision_history_tool():
 
 class DecisionReviewer(Reviewer):
     _text_delivery = False
+    _region_delivery = False
     """One continuous reviewer using a single native decision entry point."""
 
     def _operations(self) -> dict[str, Any]:
@@ -521,6 +522,20 @@ class DecisionReviewer(Reviewer):
         ]
         board["source_operation_schemas"] = schemas
         board["decision_notice"] = "Judgments and questions are untrusted navigation, not evidence."
+        if self._region_delivery:
+            checked = {region["id"] for region in self.store.get(ReviewScope, scope_id).checked_regions}
+            board["pending_region_receipts"] = [
+                region_requirement(region) for region in board["scope"]["regions"] if region["id"] not in checked
+            ]
+            board["current_region_receipt"] = next(iter(board["pending_region_receipts"]), None)
+            prompt += (
+                " Record a source-backed judgment for the current_region_receipt with complete_scope, "
+                "checked_region_ids and observations. Region receipts are saved independently. "
+                "Correct only the remaining_region_ids and errors in the receipt. Available source IDs are "
+                "locators for resubmission, not automatic proof of a judgment. Once all regions are recorded, "
+                "call complete_scope with empty checked_region_ids and observations and finish true. "
+                "This final call checks the remaining work and source blockers."
+            )
         if self._text_delivery:
             prompt = INTEGRATION_DELIVERY_PROMPT
             board["current_integration_obligation"] = next(
@@ -530,6 +545,8 @@ class DecisionReviewer(Reviewer):
                 action: PAYLOADS[action].model_json_schema()
                 for action in ("request_evidence", "offer_candidate", "unresolved")
             }
+        if self.focus:
+            prompt += " Focus: " + self.focus
         context[0] = SystemMessage(content=prompt)
         context[1] = HumanMessage(content=json.dumps(board, ensure_ascii=False, default=str))
         return [*context, *recent]
@@ -840,6 +857,7 @@ class DecisionReviewer(Reviewer):
                 (f"payload.{field}[{index}].evidence_refs", entry.evidence_refs)
                 for field in ("observations", "relations", "integration_relations", "integration_receipts")
                 for index, entry in enumerate(getattr(completion, field))
+                if not (self._region_delivery and scope_completion and field == "observations")
             )
         issues = [*self._reference_issues(fields), *question_issues]
         delivered = {}
@@ -982,6 +1000,8 @@ class DecisionReviewer(Reviewer):
                 relation.evidence_refs,
                 turn_id=turn_id,
             )
+        if self._region_delivery and expected_scope_revision is not None and payload.checked_region_ids:
+            return CoverageDelivery(self.store).record(self.task_id, self.lease_token, turn_id, call_id)
         scope = self.store.get(ReviewScope, scope_id)
         self._turn_id, self._call_id = turn_id, call_id
         decision = self.store.commit_unit_decision(
@@ -1013,18 +1033,17 @@ class DecisionReviewer(Reviewer):
             self.store.run.metadata.get("integration_delivery_policy") == INTEGRATION_DELIVERY_POLICY
             and scope_id == self.store.get_unit_plan().integration_scope_id
         )
+        self._region_delivery = (
+            self.store.run.metadata.get("coverage_delivery_policy") == COVERAGE_DELIVERY_POLICY
+            and scope_id in self.store.get_unit_plan().primary_scope_ids
+        )
         allowed = self._operations()
         bound = (
             self.llm
             if self._text_delivery
             else self.llm.bind_tools([review_step_tool(), complete_scope_tool()], tool_choice="auto")
         )
-        options = (
-            JSON_REQUEST_OPTIONS
-            if self._text_delivery
-            and self.store.run.metadata.get("integration_response_constraint") == INTEGRATION_JSON_CONSTRAINT
-            else {}
-        )
+        options = response_options(self.store.run.metadata, "integration") if self._text_delivery else {}
         saved, self.failed_contexts = decode_session(self.store.load_task_session(self.task_id))
         recent = self._last_exchange(messages_from_dict(saved)) if saved else []
         try:
@@ -1154,6 +1173,17 @@ class DecisionReviewer(Reviewer):
                             if scope_completion
                             else ReviewStep.model_validate(args)
                         )
+                        if self._region_delivery and not scope_completion and parsed.action == "complete_review":
+                            raise CorrectableDecisionInputError(
+                                [
+                                    {
+                                        "field": "action",
+                                        "reason": "scope_receipt_required",
+                                        "message": "Use complete_scope to record region receipts "
+                                        "and to finish the scope.",
+                                    }
+                                ]
+                            )
                         if self._text_delivery and scope_completion and parsed.payload.integration_receipts:
                             receipt = parsed.payload.integration_receipts[0]
                             if receipt.obligation_id != obligation_id or receipt.disposition != "checked":
@@ -1242,6 +1272,8 @@ class DecisionReviewer(Reviewer):
                                     expected_scope_revision=step["scope_revision"] if scope_completion else None,
                                 )
                             )
+                            if result.get("settled_region_ids"):
+                                batch_has_success = True
                             if not scope_completion:
                                 result.pop("scope_revision")
                             if result["status"] != "running":

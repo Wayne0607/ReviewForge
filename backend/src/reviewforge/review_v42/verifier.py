@@ -25,7 +25,7 @@ from .contracts import (
     RevisionConflict,
     Task,
 )
-from .line_semantics import source_line_policy, source_slice
+from .line_semantics import source_line_policy, source_quote_lines, source_slice
 from .reviewer import reviewer_tools
 
 POLICY = "v42-independent-1"
@@ -328,7 +328,32 @@ def _citation(store: Any, cite: Any) -> str:
     return ref_id
 
 
-def validate_result(store: Any, result: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+class CitationCorrectionError(ValueError):
+    """All repairable citation errors, without changing or accepting the submitted proof."""
+
+    def __init__(self, issues: list[dict[str, Any]]):
+        self.issues = issues
+        super().__init__("Invalid citations. Correct each listed citation and resubmit the verdict.")
+
+
+def _citation_correction(store: Any, fact: str, index: int, cite: dict[str, Any], reason: str) -> dict[str, Any]:
+    ref = store.get(EvidenceRef, cite["ref"])
+    content = store.read_evidence(ref.id).decode("utf-8")
+    return {
+        "field": f"facts.{fact}.citations.{index}",
+        "ref": ref.id,
+        "side": ref.side,
+        "path": ref.path,
+        "reason": reason,
+        "submitted_range": [cite.get("start_line"), cite.get("end_line")],
+        "quote_hash": hashlib.sha256(cite["quote"].encode("utf-8")).hexdigest(),
+        "exact_quote_ranges": source_quote_lines(store.run, content, cite["quote"], first_line=ref.start_line or 1),
+    }
+
+
+def validate_result(
+    store: Any, result: dict[str, Any], allowed: set[str], *, citation_feedback: bool = False
+) -> dict[str, Any]:
     source_line_policy(store.run)
     verdict = result.get("verdict")
     reason, facts, gaps = result.get("reason"), result.get("facts"), result.get("gaps")
@@ -351,7 +376,8 @@ def validate_result(store: Any, result: dict[str, Any], allowed: set[str]) -> di
     if verdict in {"needs_evidence", "unresolved"} and (not gaps or facts):
         raise ValueError("uncertain verdict requires specific gaps only")
     used = set()
-    for fact in facts.values():
+    issues = []
+    for key, fact in facts.items():
         if (
             not isinstance(fact, dict)
             or set(fact) != {"statement", "citations"}
@@ -361,11 +387,27 @@ def validate_result(store: Any, result: dict[str, Any], allowed: set[str]) -> di
             or not fact["citations"]
         ):
             raise ValueError("invalid fact")
-        for cite in fact["citations"]:
-            ref = _citation(store, cite)
+        for index, cite in enumerate(fact["citations"]):
+            try:
+                ref = _citation(store, cite)
+            except ValueError as exc:
+                # Only position/text errors in an otherwise authenticated original are repairable here.
+                # Binding, provenance and source failures still follow the strict existing path.
+                if not citation_feedback or str(exc) not in {
+                    "citation requires an exact range within the evidence",
+                    "quote absent from cited lines",
+                    "quote absent from original evidence",
+                }:
+                    raise
+                if cite["ref"] not in allowed:
+                    raise ValueError("citation was not presented to this verifier") from exc
+                issues.append(_citation_correction(store, key, index, cite, str(exc)))
+                continue
             if ref not in allowed:
                 raise ValueError("citation was not presented to this verifier")
             used.add(ref)
+    if issues:
+        raise CitationCorrectionError(issues)
     if verdict == "accept":
         for key in ("trigger", "actual", "change"):
             if any(store.get(EvidenceRef, cite["ref"]).side == "external" for cite in facts[key]["citations"]):

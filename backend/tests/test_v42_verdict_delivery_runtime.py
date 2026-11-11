@@ -278,6 +278,90 @@ async def test_claim_cycle_uses_the_shared_json_constraints_and_rejects_native_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [True, False])
+async def test_claim_citation_feedback_collects_errors_and_distinguishes_repairs(tmp_path, monkeypatch, recover):
+    monkeypatch.setitem(HEAD_SOURCES, "notify.py", "one()\ntwo()\nthree()\n")
+    store, gateway = await make_board(tmp_path, CLAIM_CYCLE_POLICY)
+    original = await gateway.execute("read_source", {"path": "notify.py"})
+    ref = original["evidence_ref"]
+    case = store.add(
+        Case(
+            "case",
+            store.run.id,
+            trigger="Call notifications",
+            mechanism="Pass recipients",
+            claims=[{"id": "claim", "statement": "No recipients are passed", "impact": "No notice"}],
+            evidence_refs=[ref],
+        )
+    )
+    task = store.add(Task("verify", store.run.id, "verify", case.id, case.revision))
+    lease = store.acquire_task(task.id, "verifier", 120)
+
+    def decide(messages, turn):
+        assert store.get_verdict(case.id, "claim", POLICY) is None
+        if turn > 1:
+            errors = json.loads(messages[1].content)["correction"]["citation_errors"]
+            assert all(error["ref"] == ref and error["path"] == "notify.py" for error in errors)
+            if turn == 2:
+                assert [error["field"] for error in errors] == [
+                    "facts.counterexample.citations.0",
+                    "facts.counterexample.citations.1",
+                ]
+                assert [error["exact_quote_ranges"] for error in errors] == [[[2, 2]], [[3, 3]]]
+            else:
+                assert turn == 3
+                assert [error["field"] for error in errors] == ["facts.counterexample.citations.1"]
+                assert errors[0]["exact_quote_ranges"] == [[1, 1]]
+        decision = reject_verdict(ref, "two()", "The original contradicts the premise")
+        decision.pop("gaps")
+        first = decision["facts"]["counterexample"]["citations"][0]
+        first.update(start_line=1 if turn == 1 else 2, end_line=1 if turn == 1 else 2)
+        decision["facts"]["counterexample"]["citations"].append(
+            {
+                "ref": ref,
+                "quote": "three()" if turn == 1 else "one()",
+                "start_line": 2 if turn == 1 else (1 if recover and turn == 3 else 3),
+                "end_line": 2 if turn == 1 else (1 if recover and turn == 3 else 3),
+            }
+        )
+        return claim_response({"action": "submit_verdict", **decision})
+
+    model = NativeModel(decide)
+    verifier = Verifier(store, model, gateway)
+    if recover:
+        result = await verifier.verify(case.id, task_id=task.id, lease_token=lease.lease_token)
+        assert result[0]["verdict"] == "reject"
+        assert store.get_verdict(case.id, "claim", POLICY) == result[0]
+    else:
+        with pytest.raises(VerificationIncomplete, match="Invalid citations"):
+            await verifier.verify(case.id, task_id=task.id, lease_token=lease.lease_token)
+        assert store.get_verdict(case.id, "claim", POLICY) is None
+    assert len(model._inputs) == 3
+    assert store.get(Case, case.id) == case
+
+
+@pytest.mark.asyncio
+async def test_claim_citation_corrections_do_not_normalize_quotes_or_mask_integrity_failures(tmp_path):
+    from reviewforge.review_v42.contracts import BindingError
+    from reviewforge.review_v42.verifier import CitationCorrectionError, validate_result
+
+    store, gateway = await make_board(tmp_path, CLAIM_CYCLE_POLICY)
+    original = await gateway.execute("read_source", {"path": "notify.py"})
+    ref = original["evidence_ref"]
+    decision = reject_verdict(ref, "notify( original_emails )", "An unsupported quote")
+    with pytest.raises(CitationCorrectionError) as failure:
+        validate_result(store, decision, {ref}, citation_feedback=True)
+    assert failure.value.issues[0]["exact_quote_ranges"] == []
+    # Existing callers retain the original strict validation and error contract.
+    with pytest.raises(ValueError, match="quote absent from cited lines"):
+        validate_result(store, decision, {ref})
+    evidence = store.get(EvidenceRef, ref)
+    (store.blob_dir / evidence.content_hash).write_bytes(b"corrupt")
+    with pytest.raises(BindingError, match="evidence blob hash mismatch"):
+        validate_result(store, decision, {ref}, citation_feedback=True)
+
+
+@pytest.mark.asyncio
 async def test_claim_cycle_restarts_pending_source_and_preserves_prior_verdict(tmp_path, monkeypatch):
     store, gateway = await make_board(tmp_path, CLAIM_CYCLE_POLICY)
     head = await gateway.execute("read_source", {"path": "notify.py"})

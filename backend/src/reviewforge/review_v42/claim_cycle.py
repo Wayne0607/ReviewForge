@@ -14,7 +14,7 @@ from reviewforge.tools.workspace import _normalise_repo_path
 from .context import ContextBuilder
 from .contracts import BindingError, Case, EvidenceRef, RevisionConflict, VerificationIncomplete
 from .response_protocol import response_options
-from .verifier import validate_result
+from .verifier import CitationCorrectionError, validate_result
 
 if TYPE_CHECKING:
     from .store import ReviewStore
@@ -86,6 +86,8 @@ Each fact is {"statement":"...","citations":[{"ref":"exact ID from the packet","
 head source. Use the fixed base or other originals to establish the change and an independent basis for expected
 behavior. Do not infer a business rule from the base alone or treat missing evidence as a refutation. Tests are
 optional when original source already establishes the fact. Submit the verdict as soon as those facts are supported.
+If correction.citation_errors is present, repair every listed field. exact_quote_ranges locates the submitted
+text in that same original; it does not validate the fact. An empty list means copy exact text from the original.
 
 If a fact still needs evidence, return {"action":"request_evidence","gap":{"fact":"expected",
 "question":"Name the specific missing fact and what the source would establish",
@@ -227,11 +229,16 @@ class ClaimCycle:
                         raise ValueError("Every citation ID must appear in this claim's original packet.")
                     if set(self.case.counter_evidence_refs) - originals.keys():
                         raise ValueError("Known counter-evidence must be available before a decision.")
-                    outcome = validate_result(self.store, {**result, "gaps": []}, set(originals))
+                    outcome = validate_result(
+                        self.store, {**result, "gaps": []}, set(originals), citation_feedback=True
+                    )
             except BindingError:
                 raise
             except ValueError as exc:
-                if isinstance(exc, ValidationError):
+                if isinstance(exc, CitationCorrectionError):
+                    feedback = {"message": str(exc), "citation_errors": exc.issues}
+                    signature = tuple(sorted(json.dumps(issue, sort_keys=True) for issue in exc.issues))
+                elif isinstance(exc, ValidationError):
                     feedback = "Invalid submission. " + "; ".join(
                         f"{'.'.join(map(str, issue['loc']))}: {issue['msg']}"
                         for issue in exc.errors(include_url=False, include_input=False, include_context=False)

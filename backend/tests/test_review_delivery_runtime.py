@@ -258,18 +258,38 @@ async def test_notes_are_marked_read_only_through_successful_snapshot(tmp_path):
         task = store.list_research()[0]["id"]
         assert "first observation" in str(messages[-1].content)
         store.add_note(task, lead_id, "later observation")
-        return call("finish_review", {"summary": "done", "gaps": []}, 3)
+        return call("list_sources", {}, 3)
+
+    def notice_changed_notes(messages):
+        working = next(m.content for m in messages if str(m.content).startswith("Current session working set"))
+        payload = json.loads(working.split(": ", 1)[1])
+        assert payload["changed_notes"] == [store.list_research()[0]["id"]]
+        assert "later observation" not in working
+        return call("finish_review", {"summary": "done", "gaps": []}, 4)
 
     lead = Script(
         [
             call("delegate_research", {"question": "Check callers"}, 1),
             call("read_notes", {}, 2),
             concurrent_note,
+            notice_changed_notes,
         ]
     )
-    await DeliveryRuntime(store, Gateway(), lead, Script([]), research_model=helper).run("Review")
+    runtime = DeliveryRuntime(store, Gateway(), lead, Script([]), research_model=helper)
+    await runtime.run("Review")
     lead_id = next(s["id"] for s in store.list_sessions() if s["role"] == "lead")
     assert store.changed_note_tasks(lead_id) == [store.list_research()[0]["id"]]
+
+    def unseen_session(messages):
+        working = next(m.content for m in messages if str(m.content).startswith("Current session working set"))
+        assert json.loads(working.split(": ", 1)[1])["changed_notes"] == []
+        assert "later observation" not in working
+        return call("finish_research", {"answer": "done", "source_ids": [], "gaps": []}, 1)
+
+    new_session = store.create_session("research")
+    new_task = store.create_research("unrelated question", new_session["id"])
+    runtime.models["research"] = Script([unseen_session])
+    await runtime._research(new_task)
 
 
 async def test_new_counterevidence_reopens_only_its_finding(tmp_path):

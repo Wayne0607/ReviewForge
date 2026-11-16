@@ -16,7 +16,7 @@ import yaml
 _VALID_EVIDENCE_MODES = frozenset({"off", "shadow", "enforce"})
 _VALID_PUBLICATION_POLICY_MODES = _VALID_EVIDENCE_MODES
 _VALID_OUTPUT_LANGUAGES = frozenset({"auto", "en", "zh-CN"})
-_VALID_PIPELINE_MODES = frozenset({"legacy", "shadow", "hypothesis", "review_v42"})
+_VALID_PIPELINE_MODES = frozenset({"legacy", "shadow", "hypothesis", "review_v42", "review_delivery"})
 
 
 def _normalize_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -320,6 +320,9 @@ class ServerConfig:
 class GitHubConfig:
     token: str = ""
     webhook_secret: str = ""
+    # Optional trusted actor identity for installations whose token cannot use
+    # GET /user. Ordinary personal-access tokens resolve this automatically.
+    bot_user_id: int = 0
 
 
 def _v3_from_dict(data: dict[str, Any]) -> V3Config:
@@ -627,6 +630,8 @@ class ReviewForgeConfig:
         """Environment variables override config file."""
         self.github.token = os.environ.get("GITHUB_TOKEN", self.github.token)
         self.github.webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET", self.github.webhook_secret)
+        actor_id = os.environ.get("GITHUB_BOT_USER_ID", self.github.bot_user_id)
+        self.github.bot_user_id = 0 if isinstance(actor_id, bool) else _normalize_int(actor_id, 0, 0)
         self.llm.base_url = os.environ.get("LLM_BASE_URL", self.llm.base_url)
         self.llm.api_key = os.environ.get("LLM_API_KEY", self.llm.api_key)
         self.llm.model = os.environ.get("REVIEWFORGE_MODEL", self.llm.model)

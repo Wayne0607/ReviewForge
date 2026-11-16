@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import time
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -34,12 +36,14 @@ class GitHubAPIError(RuntimeError):
         kind: str = "http",
         retryable: bool = False,
         response_body: str = "",
+        retry_not_before: float | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.kind = kind
         self.retryable = retryable
         self.response_body = response_body
+        self.retry_not_before = retry_not_before
 
 
 def _encode_path(file_path: str) -> str:
@@ -52,8 +56,11 @@ class GitHubClient:
 
     BASE_URL = "https://api.github.com"
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, *, bot_user_id: int = 0) -> None:
+        if type(bot_user_id) is not int or bot_user_id < 0:
+            raise ValueError("invalid configured GitHub actor ID")
         self._token = token
+        self._bot_user_id = bot_user_id
         self._client = httpx.AsyncClient(
             base_url=self.BASE_URL,
             headers={
@@ -303,6 +310,83 @@ class GitHubClient:
         resp = await self._client.get(f"/repos/{repo}/pulls/{int(pr_number)}")
         resp.raise_for_status()
         return resp.json()
+
+    async def get_authenticated_user_id(self) -> int:
+        """Resolve the immutable authenticated account identity for receipts."""
+        if self._bot_user_id:
+            return self._bot_user_id
+        response = await self._client.get("/user")
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or type(data.get("id")) is not int or data["id"] <= 0:
+            raise GitHubAPIError("Invalid authenticated user identity", kind="delivery_uncertain")
+        return data["id"]
+
+    async def list_delivery_issue_comments(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """Read every issue-comment page for finding delivery reconciliation."""
+        if not valid_repo(repo) or type(pr_number) is not int or pr_number <= 0:
+            raise ValueError("invalid issue comment binding")
+        comments: list[dict[str, Any]] = []
+        page, seen = 1, set()
+        while True:
+            response = await self._client.get(
+                f"/repos/{repo}/issues/{pr_number}/comments", params={"per_page": 100, "page": page}
+            )
+            response.raise_for_status()
+            batch = response.json()
+            if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                raise GitHubAPIError("Invalid issue comment listing", kind="delivery_uncertain")
+            digest = hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
+            if batch and digest in seen:
+                raise GitHubAPIError("Repeated issue comment page", kind="delivery_uncertain")
+            seen.add(digest)
+            comments.extend(batch)
+            if len(batch) < 100:
+                return comments
+            page += 1
+
+    async def write_delivery_issue_comment(
+        self, repo: str, pr_number: int, body: str, *, remote_id: int | None = None
+    ) -> dict[str, Any]:
+        """One POST/PATCH attempt. A lost response is never retried here."""
+        if (
+            not valid_repo(repo)
+            or type(pr_number) is not int
+            or pr_number <= 0
+            or not isinstance(body, str)
+            or not body
+            or (remote_id is not None and (type(remote_id) is not int or remote_id <= 0))
+        ):
+            raise ValueError("invalid issue comment write")
+        try:
+            if remote_id is None:
+                response = await self._client.post(
+                    f"/repos/{repo}/issues/{pr_number}/comments", json={"body": body}, follow_redirects=False
+                )
+            else:
+                response = await self._client.patch(
+                    f"/repos/{repo}/issues/comments/{remote_id}", json={"body": body}, follow_redirects=False
+                )
+        except httpx.TransportError as exc:
+            raise GitHubAPIError("Issue comment response lost", kind="delivery_uncertain") from exc
+        if not response.is_success:
+            error = _classify_write_error("write issue comment", response)
+            # GitHub may include validation errors even in a spam/abuse response.
+            if response.status_code == 422 and any(
+                word in response.text.lower() for word in ("spam", "abuse", "secondary rate limit")
+            ):
+                error.kind = "spam"
+                error.retryable = True
+            if error.kind in {"rate_limit", "spam"} or response.headers.get("Retry-After"):
+                error.retry_not_before = _issue_comment_retry_not_before(response)
+            raise error
+        try:
+            receipt = response.json()
+        except ValueError as exc:
+            raise GitHubAPIError("Invalid issue comment receipt", kind="delivery_uncertain") from exc
+        if not isinstance(receipt, dict) or type(receipt.get("id")) is not int or receipt["id"] <= 0:
+            raise GitHubAPIError("Missing issue comment receipt", kind="delivery_uncertain")
+        return receipt
 
     async def get_pr_issue_context(self, repo: str, pr_number: int, head_sha: str) -> dict[str, Any]:
         """Snapshot same-repository incoming issue references using GET only.
@@ -632,3 +716,31 @@ def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
             except ValueError:
                 pass
     return min(_REVIEW_MAX_RETRY_DELAY, float(2**attempt))
+
+
+def _issue_comment_retry_not_before(response: httpx.Response) -> float:
+    """Preserve server cooldown for the durable issue-comment delivery path."""
+    now = time.time()
+    deadlines = [now + 60.0]
+    value = response.headers.get("Retry-After")
+    if value:
+        try:
+            delay = float(value)
+            if math.isfinite(delay) and delay >= 0:
+                deadlines.append(now + delay)
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value)
+                if parsed.tzinfo is not None:
+                    deadlines.append(parsed.timestamp())
+            except (ValueError, TypeError, OverflowError):
+                pass
+    value = response.headers.get("X-RateLimit-Reset")
+    if value:
+        try:
+            reset = float(value)
+            if math.isfinite(reset):
+                deadlines.append(reset)
+        except ValueError:
+            pass
+    return max(deadlines)

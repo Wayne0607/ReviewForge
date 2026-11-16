@@ -795,6 +795,10 @@ class Orchestrator:
             from reviewforge.review_v42.integration import run_review_v42
 
             return await run_review_v42(self, state)
+        if mode == "review_delivery":
+            from reviewforge.review_delivery.integration import run_review_delivery
+
+            return await run_review_delivery(self, state)
         if mode != "shadow":
             raise ValueError(f"unsupported pipeline mode: {mode!r}")
 

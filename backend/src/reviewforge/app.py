@@ -69,7 +69,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
             github = MockGitHubClient()
             logger.info("Mock mode: using MockGitHubClient")
         else:
-            github = GitHubClient(token=cfg.github.token)
+            github = GitHubClient(
+                token=cfg.github.token,
+                **({"bot_user_id": cfg.github.bot_user_id} if cfg.github.bot_user_id else {}),
+            )
 
         # Database
         db = Database(runtime_dir / "reviewforge.db")

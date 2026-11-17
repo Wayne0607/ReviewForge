@@ -83,7 +83,8 @@ release removes the source from future working sets; all originals remain
 available for authenticated rereading.
 
 Successful read batches are compared within an unchanged material basis: source
-availability, this session's read identities, investigation focus, findings,
+availability, this session's read identities, investigation focus, distinct visible
+model observations, findings,
 verdicts, research and distinct shared notes. A repeated batch first adds a
 visible correction naming the resident originals and inviting comparison, a new
 investigation, or the model's own conclusion/concrete gap. Repetition after that

@@ -217,3 +217,20 @@ async def test_diagnostic_execution_is_not_mistaken_for_cached_source_rereading(
     lead = Script([*(call("run_check", {}) for _ in range(8)), finish()])
     assert (await DeliveryRuntime(store, Checks(), lead, Script([])).run("Verify"))["status"] == "complete"
     assert lead.warnings == 0
+
+
+async def test_visible_new_observations_allow_rereading_without_requiring_set_progress(tmp_path):
+    store = store_at(tmp_path)
+    steps = []
+    for observation in [
+        "Check time units",
+        "Check caller conversion",
+        "Check default duration",
+        "Check comparison boundary",
+    ]:
+        message = call("read_source", {"path": "base.py"})
+        message.content = observation
+        steps.append(message)
+    lead = Script([*steps, finish()])
+    assert (await DeliveryRuntime(store, Gateway(), lead, Script([])).run("Compare"))["status"] == "complete"
+    assert lead.warnings == 0

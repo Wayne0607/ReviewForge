@@ -159,6 +159,17 @@ class DeliveryRuntime:
             "available_sources": [s["id"] for s in self.store.list_sources()],
             "session_reads": sorted({sid for e in events if e.get("ok") for sid in e.get("source_ids", [])}),
             "progress": progress,
+            # Ordinary visible observations also count as investigation progress;
+            # explicit set_progress is optional, and provider reasoning is excluded.
+            "visible_observations": sorted(
+                {
+                    " ".join(m["data"]["content"].split())
+                    for e in events
+                    if e.get("type") == "response"
+                    for m in e.get("message", [])
+                    if isinstance(m.get("data", {}).get("content"), str) and m["data"]["content"].strip()
+                }
+            ),
             "findings": self.store.list_findings(),
             "verdicts": self.store.list_verdicts(),
             "research": self.store.list_research(),

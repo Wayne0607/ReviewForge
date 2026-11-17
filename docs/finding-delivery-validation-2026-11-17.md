@@ -97,3 +97,38 @@ Local receipts are under
 transport usage receipts, original turn ledger, result and provenance audit.
 These private runtime artifacts are ignored by Git. No credentials are included
 in this document.
+
+## First repaired-kernel retest (`95230e3`)
+
+Automatic original residency and same-request body deduplication were effective:
+the verifier's current input preserved both sides without any model-authored
+retention/progress calls. The eight context regressions and complete Linux CI
+passed (4,359 passed, 3 skipped). This did not establish judgment delivery.
+
+The same saved case naturally ended as a reading-cycle partial with **70 complete
+responses, 395,568 known tokens, one failed request with unknown usage, no
+in-flight request, no verdict and no comment**. The transient failure was a
+`RemoteProtocolError`; its retry and unknown usage were retained. Successful
+responses reported USD 0 balance charge and USD 0.02434747 Go allowance usage;
+this excludes the failed request's unknown usage.
+
+The controller did eventually detect a cycle. Its granularity was too coarse:
+it compared complete batches, while the model recombined already completed
+diff/search/reference reads into new batches. A stable material basis persisted
+across many such combinations. The current context also lacked a compact index
+of completed queries, even though their durable receipts were stored. Those are
+remaining memory/loop-contract defects, not evidence that a stored verdict failed
+to publish. An operator-stop file was written after natural completion and was
+not consumed; this run is not labelled operator-terminated.
+
+The follow-up compares individual read actions and projects a deduplicated
+session-local navigation index of prior queries, source handles and completeness.
+The index is not evidence. Offline replay of the observed actions and recorded
+material-basis digests reaches a corrected cycle halt at response 19 instead of
+70; this is a deterministic mechanism replay, not a new model/quality result and
+not evidence of a 51-response saving in a live run. Original-source and
+independent-judgment requirements remain unchanged.
+
+Retest receipts are in
+`.reviewforge/benchmarks/finding-delivery-resident-20261117-112631/`. No small
+sample or full PR has started. The saved-case acceptance gate remains closed.

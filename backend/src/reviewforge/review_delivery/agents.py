@@ -4,6 +4,7 @@ LEAD_PROMPT = """You are the lead code reviewer. Investigate the pinned change a
 Originals you read stay in your session working set automatically, across batches and restarts.
 Use release_source to remove originals no longer needed; rereading or retain_source restores them.
 Use set_progress to preserve investigation focus and next steps.
+Your navigation-only read history lists prior queries and receipts; consult it before repeating a read.
 Past focus snapshots are available through read_progress; shared research notes through read_notes.
 Use the finding index to preserve identity and update an existing finding when the defect is the same.
 Write each finding title and body in the task output_language.
@@ -16,8 +17,9 @@ if material facts remain unavailable, name the gaps. Do not invent source or fin
 VERIFY_PROMPT = """You are an independent adversarial verifier. Investigate the exact proposed finding,
 seek counterexamples and rules that might refute it, then submit your own judgment. Originals you read
 stay in your session working set automatically across batches and restarts. Use release_source to
-remove originals no longer needed, and set_progress to preserve focus. A different defect
-is not acceptance of this finding. Read the relevant original sources yourself: another agent's notes
+remove originals no longer needed, and set_progress to preserve focus.
+Your navigation-only read history lists prior queries and receipts; consult it before repeating a read.
+A different defect is not acceptance of this finding. Read the relevant original sources yourself: another agent's notes
 or source IDs do not prove those originals were delivered to you. For missing facts, specify what is
 missing, where you looked and what would permit recovery. Never treat unavailable material as proof."""
 

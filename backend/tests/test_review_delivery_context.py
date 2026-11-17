@@ -126,6 +126,10 @@ async def test_navigation_is_not_automatically_resident_or_promoted_to_evidence(
     def check(messages):
         assert workspace(messages)["retained_sources"] == []
         assert "UNTRUSTED NAVIGATION" not in "\n".join(str(m.content) for m in messages)
+        history = workspace(messages)["read_history_navigation_only"]
+        assert history[0]["tool"] == "read_source" and history[0]["args"] == {"path": "query"}
+        assert history[0]["sources"][0]["kind"] == "navigation"
+        assert history[0]["ok"] is True
         return finish()
 
     lead = Script([call("read_source", {"path": "query"}), call("list_sources", {}), check])
@@ -234,3 +238,30 @@ async def test_visible_new_observations_allow_rereading_without_requiring_set_pr
     lead = Script([*steps, finish()])
     assert (await DeliveryRuntime(store, Gateway(), lead, Script([])).run("Compare"))["status"] == "complete"
     assert lead.warnings == 0
+
+
+async def test_recombining_old_reads_cannot_evade_cycle_detection(tmp_path):
+    store = store_at(tmp_path)
+
+    def batch(paths):
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": "read_source", "args": {"path": p}, "id": str(n)} for n, p in enumerate(paths)],
+        )
+
+    lead = Script(
+        [
+            batch(["base.py"]),
+            batch(["head.py"]),
+            batch(["base.py", "head.py"]),
+            batch(["base.py"]),
+            batch(["head.py", "base.py", "base.py"]),
+        ]
+    )
+    result = await DeliveryRuntime(store, Gateway(), lead, Script([])).run("Compare")
+    assert result["status"] == "partial" and "after correction" in result["reason"]
+    assert lead.warnings == 1
+    session = store.list_sessions()[0]["id"]
+    history = DeliveryRuntime(store, Gateway(), lead, Script([]))._working_set(session, "lead")[0]
+    assert len(history["read_history_navigation_only"]) == 2
+    assert len(history["retained_sources"]) == 2

@@ -22,7 +22,7 @@ from langchain_core.messages import (
 )
 
 from .agents import LEAD_PROMPT, RESEARCH_PROMPT, VERIFY_PROMPT
-from .context import READ_TOOLS, projected_receipt, reading_cycle, resident_sources
+from .context import READ_TOOLS, projected_receipt, read_history, reading_cycle, resident_sources
 from .tools import COMMON, LEAD, RESEARCH, VERIFY
 
 
@@ -124,6 +124,7 @@ class DeliveryRuntime:
         projected = {
             "progress": progress,
             "retained_sources": sources,
+            "read_history_navigation_only": read_history(events, self.store.get_source),
             "changed_notes": self.store.changed_note_tasks(session),
         }
         basis = self._context_basis(session)
@@ -133,7 +134,7 @@ class DeliveryRuntime:
         )
         if warning and warning["status"] == "warning":
             projected["repeated_reading"] = {
-                "reason": "The same read batch repeated without new material or investigation progress.",
+                "reason": "Previously completed reads repeated without new material or investigation progress.",
                 "resident_source_ids": retained,
                 "next_action": (
                     "Compare the resident originals, investigate a new fact, or submit your conclusion or concrete gap."
@@ -182,10 +183,8 @@ class DeliveryRuntime:
     def _read_cycle(self, session, calls, outcomes):
         if not calls or not all(e["ok"] for e in outcomes) or any(c["name"] not in READ_TOOLS for c in calls):
             return None
-        batch = sorted(_json({"name": c["name"], "args": c.get("args")}) for c in calls)
-        return reading_cycle(
-            self._events(session), self._context_basis(session), hashlib.sha256(_json(batch).encode()).hexdigest()
-        )
+        actions = sorted({_json({"name": c["name"], "args": c.get("args")}) for c in calls})
+        return reading_cycle(self._events(session), self._context_basis(session), actions)
 
     @staticmethod
     def _cycle_result(session):

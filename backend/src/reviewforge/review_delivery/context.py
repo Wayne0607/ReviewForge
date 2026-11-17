@@ -58,8 +58,52 @@ def projected_receipt(event, resident):
     return message
 
 
-def reading_cycle(events, basis, batch):
-    """Warn on a repeated read state; stop only if it repeats after correction.
+def read_history(events, get_source):
+    """A compact navigation index of this session's completed read operations.
+
+    Preserve query identity, source handles and completeness, not repeated raw
+    bodies or another session's history. These receipts are navigation, not proof.
+    """
+    calls = {}
+    index = {}
+    for event in events:
+        if event.get("type") == "response":
+            calls[event["request_id"]] = [
+                call for message in event["message"] for call in message["data"].get("tool_calls", [])
+            ]
+        elif event.get("type") == "receipt":
+            batch = calls.get(event["request_id"], [])
+            position = event["index"]
+            if position >= len(batch) or batch[position]["name"] not in READ_TOOLS:
+                continue
+            call = batch[position]
+            operation = {"tool": call["name"], "args": call.get("args", {})}
+            sources = []
+            for identity in event.get("source_ids", []):
+                source = get_source(identity)
+                metadata = source["metadata"].get("metadata", {})
+                sources.append(
+                    {
+                        "id": identity,
+                        "kind": source["kind"],
+                        **{k: metadata[k] for k in ("status", "complete") if k in metadata},
+                    }
+                )
+            index[json.dumps(operation, sort_keys=True)] = {
+                **operation,
+                "ok": event["ok"],
+                "sources": sources,
+                **(
+                    {"error": event["result"]["error"]}
+                    if isinstance(event.get("result"), dict) and event["result"].get("error")
+                    else {}
+                ),
+            }
+    return list(index.values())
+
+
+def reading_cycle(events, basis, actions):
+    """Warn on repeated read actions, including differently composed batches.
 
     A new material basis or an intervening non-reading exchange starts a fresh
     investigation sequence. There is no limit on distinct reads or requests.
@@ -72,10 +116,11 @@ def reading_cycle(events, basis, batch):
         if not cycle or cycle["basis"] != basis:
             break
         prior.append(cycle)
-    repeated = any(item["batch"] == batch for item in prior)
+    seen = {action for item in prior for action in item["actions"]}
+    repeated = set(actions).issubset(seen)
     warned = any(item["status"] == "warning" for item in prior)
     return {
         "basis": basis,
-        "batch": batch,
+        "actions": sorted(set(actions)),
         "status": "halt" if repeated and warned else "warning" if repeated else "reading",
     }

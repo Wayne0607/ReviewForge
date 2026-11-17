@@ -82,14 +82,22 @@ full unmodified tool receipt remains in the durable session history. Explicit
 release removes the source from future working sets; all originals remain
 available for authenticated rereading.
 
-Successful read batches are compared within an unchanged material basis: source
+Each session also sees a deduplicated navigation index of its prior read/query
+operations, source handles and completeness/error receipts, without repeated raw
+bodies. Query results remain navigation; this index never grants citation rights.
+This keeps agents aware of completed investigation steps without requiring a
+separate model-authored memory update.
+
+Individual successful read actions are compared within an unchanged material basis: source
 availability, this session's read identities, investigation focus, distinct visible
 model observations, findings,
-verdicts, research and distinct shared notes. A repeated batch first adds a
+verdicts, research and distinct shared notes. A batch containing only previously
+completed actions first adds a
 visible correction naming the resident originals and inviting comparison, a new
 investigation, or the model's own conclusion/concrete gap. Repetition after that
 correction returns an explicit partial result without inventing a semantic
-verdict. Distinct reads are unlimited; this is not a token, request, or evidence
+verdict. Recombining previously completed actions does not constitute progress.
+Distinct reads are unlimited; this is not a token, request, or evidence
 quota. An intervening non-reading exchange or a changed material basis starts a
 fresh sequence. Test execution is not classified as a plain source-reading loop.
 

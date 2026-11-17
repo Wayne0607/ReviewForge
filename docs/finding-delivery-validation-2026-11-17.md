@@ -132,3 +132,42 @@ independent-judgment requirements remain unchanged.
 Retest receipts are in
 `.reviewforge/benchmarks/finding-delivery-resident-20261117-112631/`. No small
 sample or full PR has started. The saved-case acceptance gate remains closed.
+
+## Action-level retest and isolated native protocol diagnostic (`c46eb5c`)
+
+The action-level/query-memory implementation passed full Linux CI (4,360 passed,
+3 skipped), but the same saved case still ended naturally as a cycle partial:
+**29 complete responses, 170,364 known tokens, no unknown/in-flight requests,
+no verdict and no comment**. Its known Go allowance receipt sums to USD
+0.01508673 and its reported balance charge to USD 0. This gate did not pass;
+small samples and the full PR were not started.
+
+The provider's documented native thinking/tool-call protocol requires carrying
+forward its own `reasoning_content` with the conversation. The reused v4.2 SSE
+adapter drops that field, and the workspace-only projection does not preserve
+the complete native exchanges. Go did not reject these incomplete continuations
+with HTTP 400; HTTP success alone therefore did not validate the conversation
+contract.
+
+A separately labelled diagnostic kept the same model, case text, originals,
+semantic prompts, tools and publication checks, but used the existing native
+non-streaming compatibility adapter and complete per-session protocol history.
+Provider state was returned only to its originating conversation, never used
+as evidence or shared with another role. It produced **one independent accept
+and one local comment in 7 complete responses**, with **47,513 known tokens**
+and **one additional failed physical attempt with unknown usage** (8 physical
+attempts total). Independent original-byte/side/revision/delivery auditing passed.
+Known responses report USD 0 balance charge and USD 0.00707154 Go allowance use;
+the failed attempt's usage remains unknown.
+
+This is a viable protocol/session-continuation combination, not a single-variable
+causal experiment, a holdout score, or product acceptance. The diagnostic changes
+both history projection and transport, as well as preserving the native field;
+it does not isolate which change caused the behavioral difference. Its files
+live separately under `native-protocol-diagnostic/` within the `c46eb5c` cohort.
+
+The new kernel now selects and freezes its own provider conversation policy,
+with native-state isolation, exact pending-request recovery, stable Go headers,
+original-body deduplication and explicit release. Nine native-protocol offline
+tests supplement the nine workspace/cycle regressions. The saved-case gate must
+be re-run using this actual product implementation before small samples.

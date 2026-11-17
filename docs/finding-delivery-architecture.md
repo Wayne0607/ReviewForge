@@ -107,3 +107,37 @@ investigation focus can reopen it. Existing accepted findings, independent
 verdicts and their outbox work survive a reading-cycle halt. Product kernel
 digests fence changed implementations from old frozen runs; no historical
 checkpoint or interrupted provider attempt is upgraded in place.
+
+## Provider-native conversation continuity (2026-11-17)
+
+Conversation protocol is a per-role, frozen part of the new kernel's model
+binding. Generic providers retain the existing visible workspace projection.
+OpenCode Go DeepSeek uses the existing OpenAI-compatible non-streaming adapter
+that preserves the provider-returned `reasoning_content` field. The provider's
+[thinking tool-call contract](https://api-docs.deepseek.com/guides/thinking_mode/)
+requires that field to accompany prior assistant/tool exchanges. The historical
+v4.2 SSE adapter intentionally strips it; that adapter and historical policies
+are unchanged.
+
+For these native sessions, actual model requests persist the ordered assistant
+and tool exchanges from that session, including its own returned continuation
+state. No other agent's native state is imported. This state is opaque protocol
+data: it is not a shared note, original source, semantic verdict or published
+comment. Only the independently delivered pinned originals can support citations.
+Go requests use a truthful ReviewForge User-Agent and a stable provider session
+derived from run plus persistent conversation identity. Other models/hosts do
+not inherit DeepSeek's native-state policy.
+
+Resident originals still appear once, referenced from their native tool receipts.
+Explicitly released historical source bodies can become source handles only
+after successful delivery. Newly requested results remain available in full even
+when released in the same batch. Navigation remains navigation and its native
+tool results remain in the conversation unless explicitly released; a compact
+query index does not replace newly delivered results. Previously persisted
+pending requests, including native continuation fields, are replayed unchanged.
+
+Native continuation does not change model, temperature, thinking effort, output
+capacity, source gates, semantic tools, retry accounting or publication rules.
+It does not enable a provider's thinking mode or fabricate missing provider
+state. A protocol change requires a new bound run, not an upgrade of an old
+checkpoint. Default legacy mode and production settings remain unchanged.

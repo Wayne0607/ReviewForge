@@ -23,13 +23,14 @@ from reviewforge.review_v42.integration import (
     _model_signature,
     _models,
     _process_lock,
-    _raw_models,
     _write_json,
 )
 from reviewforge.review_v42.snapshot_diff import pinned_regions
 from reviewforge.tools.workspace import PRHeadWorkspace
 
 from .contracts import Binding
+from .providers import conversation_protocols
+from .providers import raw_models as _raw_models
 from .publication import FindingPublisher
 from .runtime import DeliveryRuntime
 from .store import DeliveryStore
@@ -208,6 +209,7 @@ async def _run(orchestrator: Any, state: StateStore, directory: Path, run_id: st
         gateway = PinnedToolGateway(workspace, state, github, base_workspace=base_workspace, run=source_run)
         config = orchestrator._pipeline_v4_config
         raw_models = _raw_models(orchestrator._model_router, request_timeout=config.v42_request_timeout_seconds)
+        protocols = conversation_protocols(orchestrator._model_router)
         retry = {
             key: getattr(config, key)
             for key in (
@@ -234,6 +236,7 @@ async def _run(orchestrator: Any, state: StateStore, directory: Path, run_id: st
             },
             model_config={
                 "models": {key: _model_signature(value) for key, value in raw_models.items()},
+                "conversation_protocols": protocols,
                 "retry": retry,
                 "output_language": config.output_language,
                 "publication_actor": actor_id,
@@ -282,7 +285,12 @@ async def _run(orchestrator: Any, state: StateStore, directory: Path, run_id: st
         )
         try:
             runtime = await DeliveryRuntime(
-                store, gateway, lead, verifier, publisher=publisher.drain if publisher else None
+                store,
+                gateway,
+                lead,
+                verifier,
+                publisher=publisher.drain if publisher else None,
+                conversation_protocols=protocols,
             ).run(task)
         except Exception as exc:
             # Sessions and requests are already durable. Preserve accepted

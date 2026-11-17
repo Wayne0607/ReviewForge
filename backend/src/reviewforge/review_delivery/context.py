@@ -43,19 +43,51 @@ def resident_sources(events, get_source):
     return list(active)
 
 
-def projected_receipt(event, resident):
+def projected_receipt(event, resident, released=()):
     """Keep native tool receipts, with original bytes present once in the request."""
     message = deepcopy(event["message"])
     result = event.get("result")
     if not isinstance(result, dict) or "content" not in result:
         return message
     identity = result.get("source_id", result.get("id"))
-    if identity not in resident:
+    if identity in resident:
+        pointer = "content_in_working_set"
+    elif identity in released:
+        pointer = "source_content_released"
+    else:
         return message
     projected = {key: value for key, value in result.items() if key != "content"}
-    projected["content_in_working_set"] = identity
+    projected[pointer] = identity
     message["data"]["content"] = json.dumps(projected, ensure_ascii=False, sort_keys=True, default=str)
     return message
+
+
+def native_history(events, resident, delivered):
+    """Replay this session's provider state and tool exchanges, never another's.
+
+    Preserve provider-returned assistant fields. Already delivered historical
+    bodies can be represented by durable handles. The latest newly requested
+    result remains available even if it is navigation or explicitly released.
+    """
+    released = set()
+    for event in events:
+        if event.get("type") == "release":
+            released.add(event["source_id"])
+        elif event.get("type") == "retain":
+            released.discard(event["source_id"])
+        elif event.get("type") == "receipt" and event.get("ok"):
+            released.difference_update(event.get("source_ids", []))
+    responses = [e for e in events if e.get("type") == "response"]
+    messages = []
+    for event in responses:
+        messages.extend(event.get("raw_message", event["message"]))
+        receipts = sorted(
+            [e for e in events if e.get("type") == "receipt" and e["request_id"] == event["request_id"]],
+            key=lambda e: e["index"],
+        )
+        prunable = released.intersection(delivered) if event is not responses[-1] else ()
+        messages.extend(projected_receipt(e, resident, prunable) for e in receipts)
+    return messages
 
 
 def read_history(events, get_source):

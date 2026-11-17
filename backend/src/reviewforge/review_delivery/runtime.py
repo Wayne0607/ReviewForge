@@ -22,7 +22,7 @@ from langchain_core.messages import (
 )
 
 from .agents import LEAD_PROMPT, RESEARCH_PROMPT, VERIFY_PROMPT
-from .context import READ_TOOLS, projected_receipt, read_history, reading_cycle, resident_sources
+from .context import READ_TOOLS, native_history, projected_receipt, read_history, reading_cycle, resident_sources
 from .tools import COMMON, LEAD, RESEARCH, VERIFY
 
 
@@ -43,10 +43,21 @@ def _visible(response: AIMessage) -> AIMessage:
 
 
 class DeliveryRuntime:
-    def __init__(self, store, gateway, reviewer_model, verifier_model, publisher=None, research_model=None):
+    def __init__(
+        self,
+        store,
+        gateway,
+        reviewer_model,
+        verifier_model,
+        publisher=None,
+        research_model=None,
+        *,
+        conversation_protocols=None,
+    ):
         self.store, self.gateway = store, gateway
         self.models = {"lead": reviewer_model, "verifier": verifier_model, "research": research_model or reviewer_model}
         self.publisher = publisher
+        self.conversation_protocols = conversation_protocols or {}
 
     def _events(self, session):
         return [row["payload"] for row in self.store.list_turns(session)]
@@ -217,6 +228,7 @@ class DeliveryRuntime:
         return await self._session(item["session_id"], "verifier", context, item["id"])
 
     async def _session(self, session, role, task, task_id=None):
+        protocol = self.conversation_protocols.get(role, {})
         prompts = {"lead": LEAD_PROMPT, "verifier": VERIFY_PROMPT, "research": RESEARCH_PROMPT}
         schemas = [
             *self.gateway.tool_specs,
@@ -265,6 +277,8 @@ class DeliveryRuntime:
                     HumanMessage(content=task),
                     HumanMessage(content="Current session working set (notes are navigation): " + _json(working_set)),
                 ]
+                if protocol.get("native_history"):
+                    previous = native_history(events, retained, self.store.delivered_sources(session))
                 chat += messages_from_dict(previous)
                 request_id = uuid.uuid4().hex
                 last = {
@@ -278,7 +292,14 @@ class DeliveryRuntime:
                 response_event = None
             request_id = last["id"]
             if response_event is None:
-                raw_response = await model.ainvoke(messages_from_dict(last["messages"]))
+                options = {}
+                if protocol.get("provider") == "opencode-go":
+                    identity = hashlib.sha256(f"{self.store.binding.run_id}:{session}".encode()).hexdigest()
+                    options["extra_headers"] = {
+                        "User-Agent": "ReviewForge/0.2.0",
+                        "x-opencode-session": "reviewforge-" + identity,
+                    }
+                raw_response = await model.ainvoke(messages_from_dict(last["messages"]), **options)
                 response = _visible(raw_response)
                 response_event = {
                     "type": "response",

@@ -22,6 +22,7 @@ from langchain_core.messages import (
 )
 
 from .agents import LEAD_PROMPT, RESEARCH_PROMPT, VERIFY_PROMPT
+from .context import READ_TOOLS, projected_receipt, reading_cycle, resident_sources
 from .tools import COMMON, LEAD, RESEARCH, VERIFY
 
 
@@ -111,14 +112,11 @@ class DeliveryRuntime:
 
     def _working_set(self, session, role):
         progress = {}
-        retained = []
-        for event in self._events(session):
+        events = self._events(session)
+        retained = resident_sources(events, self.store.get_source)
+        for event in events:
             if event.get("type") == "progress":
                 progress = event["value"]
-            elif event.get("type") == "retain" and event["source_id"] not in retained:
-                retained.append(event["source_id"])
-            elif event.get("type") == "release" and event["source_id"] in retained:
-                retained.remove(event["source_id"])
         sources = []
         for source_id in retained:
             item = self.store.get_source(source_id)
@@ -128,6 +126,19 @@ class DeliveryRuntime:
             "retained_sources": sources,
             "changed_notes": self.store.changed_note_tasks(session),
         }
+        basis = self._context_basis(session)
+        warning = next(
+            (e["reading_cycle"] for e in reversed(events) if e.get("reading_cycle", {}).get("basis") == basis),
+            None,
+        )
+        if warning and warning["status"] == "warning":
+            projected["repeated_reading"] = {
+                "reason": "The same read batch repeated without new material or investigation progress.",
+                "resident_source_ids": retained,
+                "next_action": (
+                    "Compare the resident originals, investigate a new fact, or submit your conclusion or concrete gap."
+                ),
+            }
         if role == "lead":
             selected = set(progress.get("finding_ids", []))
             findings = self.store.list_findings()
@@ -138,6 +149,44 @@ class DeliveryRuntime:
                 {k: f[k] for k in ("id", "revision", "state", "claim")} for f in findings if f["id"] in selected
             ]
         return projected, retained
+
+    def _context_basis(self, session):
+        events = self._events(session)
+        progress = next((e["value"] for e in reversed(events) if e.get("type") == "progress"), {})
+        # Source availability and actual session reads are distinct. Neither
+        # a shared catalog entry nor this digest grants citation permission.
+        basis = {
+            "available_sources": [s["id"] for s in self.store.list_sources()],
+            "session_reads": sorted({sid for e in events if e.get("ok") for sid in e.get("source_ids", [])}),
+            "progress": progress,
+            "findings": self.store.list_findings(),
+            "verdicts": self.store.list_verdicts(),
+            "research": self.store.list_research(),
+            "notes": sorted(
+                {_json({k: n[k] for k in ("task_id", "text", "source_ids")}) for n in self.store.list_notes()}
+            ),
+        }
+        return hashlib.sha256(_json(basis).encode()).hexdigest()
+
+    def _read_cycle(self, session, calls, outcomes):
+        if not calls or not all(e["ok"] for e in outcomes) or any(c["name"] not in READ_TOOLS for c in calls):
+            return None
+        batch = sorted(_json({"name": c["name"], "args": c.get("args")}) for c in calls)
+        return reading_cycle(
+            self._events(session), self._context_basis(session), hashlib.sha256(_json(batch).encode()).hexdigest()
+        )
+
+    @staticmethod
+    def _cycle_result(session):
+        return {
+            "status": "partial",
+            "reason": "repeated reading without new evidence or investigation progress after correction",
+            "session_id": session,
+            "recovery": (
+                "Provide a new source or investigation focus; originals and prior results remain saved. "
+                "No semantic verdict was inferred."
+            ),
+        }
 
     async def _research(self, item):
         return await self._session(item["session_id"], "research", item["question"], item["id"])
@@ -172,6 +221,12 @@ class DeliveryRuntime:
             completed = next((e for e in reversed(events) if e.get("type") == "complete"), None)
             if completed:
                 return completed["result"]
+            halted = next(
+                (e["reading_cycle"] for e in reversed(events) if e.get("reading_cycle", {}).get("status") == "halt"),
+                None,
+            )
+            if halted and halted["basis"] == self._context_basis(session):
+                return self._cycle_result(session)
             # An exchange is either fully persisted or resumed from the persisted response.
             requests = [e for e in events if e.get("type") == "request"]
             last = requests[-1] if requests else None
@@ -187,12 +242,13 @@ class DeliveryRuntime:
                     previous = response_event["message"][:]
                     receipts = [e for e in events if e.get("type") == "receipt" and e["request_id"] == last["id"]]
                     receipts.sort(key=lambda x: x["index"])
-                    previous += [e["message"] for e in receipts]
                     delivered = [sid for e in receipts for sid in e.get("source_ids", [])]
                     for receipt in receipts:
                         for key, seq in receipt.get("note_watermarks", {}).items():
                             note_watermarks[key] = max(note_watermarks.get(key, 0), seq)
                 working_set, retained = self._working_set(session, role)
+                if last and response_event:
+                    previous += [projected_receipt(e, retained) for e in receipts]
                 delivered = list(dict.fromkeys([*delivered, *retained]))
                 chat = [
                     SystemMessage(content=prompts[role]),
@@ -288,7 +344,14 @@ class DeliveryRuntime:
                         return result
                 all_failed = all(not e["ok"] for e in outcomes)
                 calls_signature = _json([{"name": c["name"], "args": c.get("args")} for c in calls])
-            self._append(session, {"type": "exchange_done", "request_id": request_id}, "done:" + request_id)
+            cycle = self._read_cycle(session, calls, outcomes) if calls else None
+            self._append(
+                session,
+                {"type": "exchange_done", "request_id": request_id, **({"reading_cycle": cycle} if cycle else {})},
+                "done:" + request_id,
+            )
+            if cycle and cycle["status"] == "halt":
+                return self._cycle_result(session)
             if all_failed:
                 failures = failures + 1 if failed == calls_signature else 1
                 failed = calls_signature

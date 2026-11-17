@@ -58,3 +58,43 @@ Completed original-source responses become available to an agent for citation af
 Startup failures write a current partial report. A normal retry preserves accepted verdicts and recovers existing outbox work. Existing reject/needs-evidence corrections for the known frozen run can be recovered before the open/current-head gate for new investigation. Two controllers cannot run the same frozen review concurrently.
 
 HTTP response loss, 408, 5xx and corrupt receipts remain uncertain and reconcile-only. Explicit rejected writes return to intended state; rate-limit and Retry-After delays survive restarts and finding revisions. This deliberately does not promise exactly-once effects across an unknowable remote write: unknown outcomes remain visible until reconciled.
+
+## Session source residency and reading cycles (2026-11-17)
+
+The [Go saved-case diagnostic](finding-delivery-validation-2026-11-17.md) disproved
+the assumption that every agent reliably calls `retain_source` and `set_progress`
+before an earlier native exchange is omitted. Memory maintenance is therefore a
+controller responsibility rather than a prerequisite for investigation.
+
+An original read by a session is automatically resident in that session until
+`release_source`; a subsequent read restores it. Residency reconstructs from
+durable tool receipts and explicit release/retain events, including after process
+restart. It does not import another session's reads or automatically retain
+navigation/notes. Preparing resident originals for a request does not prove the
+model received them: citation eligibility still requires the successful model
+response and its persisted source-delivery receipt. Finding revisions do not
+change. Previously persisted pending request messages are replayed unchanged.
+
+Each resident source's full bytes appear once in a projected request. A native
+tool receipt whose original is already present keeps its source identity and
+provenance and points to the working set instead of duplicating those bytes. The
+full unmodified tool receipt remains in the durable session history. Explicit
+release removes the source from future working sets; all originals remain
+available for authenticated rereading.
+
+Successful read batches are compared within an unchanged material basis: source
+availability, this session's read identities, investigation focus, findings,
+verdicts, research and distinct shared notes. A repeated batch first adds a
+visible correction naming the resident originals and inviting comparison, a new
+investigation, or the model's own conclusion/concrete gap. Repetition after that
+correction returns an explicit partial result without inventing a semantic
+verdict. Distinct reads are unlimited; this is not a token, request, or evidence
+quota. An intervening non-reading exchange or a changed material basis starts a
+fresh sequence. Test execution is not classified as a plain source-reading loop.
+
+The warning/halt is persisted with its exchange. Restarting an unchanged halted
+session does not silently resume spending. New available material or an updated
+investigation focus can reopen it. Existing accepted findings, independent
+verdicts and their outbox work survive a reading-cycle halt. Product kernel
+digests fence changed implementations from old frozen runs; no historical
+checkpoint or interrupted provider attempt is upgraded in place.

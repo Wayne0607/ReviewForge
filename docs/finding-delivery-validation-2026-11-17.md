@@ -171,3 +171,35 @@ with native-state isolation, exact pending-request recovery, stable Go headers,
 original-body deduplication and explicit release. Nine native-protocol offline
 tests supplement the nine workspace/cycle regressions. The saved-case gate must
 be re-run using this actual product implementation before small samples.
+
+## Product native-session retest (`89af63e`)
+
+Full Linux CI passed with **4,369 passed, 3 skipped**. The actual product path's
+saved-case gate persisted one independent accept and one local comment in **9
+responses, 102,788 known tokens**, with zero failed/unknown/in-flight requests.
+Pinned original provenance and independent delivery passed; restart made zero
+new model requests and preserved the finding, verdict and comment identities.
+
+Fresh small episodes A1, B1 and C1 satisfied their frozen finding/source gates:
+A1 delivered one accepted defect and one comment (updated under the same finding
+identity after a wording correction), B1 correctly closed an equivalent change
+with zero findings, and C1 identified the absent authoritative policy with zero
+unsupported comments. Their response/token counts were respectively **23/229,451**,
+**10/99,014** and **7/42,280**. The fixtures contain no runnable tests; the reports
+retain that execution limitation and `partial` status separately from persisted
+lead completion and finding delivery. C1's policy gap is itself expected partial.
+
+**A2 failed the original-base evidence gate**: its defect and single comment were
+correct, but neither lead nor independent verifier read the original base
+`deadlines.py`; the comparison came only from diff navigation. It used **18
+responses, 171,722 known tokens**. No unknown/in-flight requests occurred in these
+episodes. This cohort totals **67 responses and 645,255 known tokens** including
+the saved case. Nine-sample acceptance was not achieved, and no full PR started.
+
+The follow-up repair supplies separately identified pinned original excerpts
+alongside requested diff navigation, without promoting navigation to evidence.
+It requires a new source binding and a fresh saved-case/nine-sample evaluation;
+earlier successful samples will not be combined with the new kernel's results.
+All comment transports in these runs are local simulations, with zero real
+GitHub writes. These fixture results do not establish holdout quality or a cost
+improvement over v3.

@@ -23,6 +23,7 @@ from langchain_core.messages import (
 
 from .agents import LEAD_PROMPT, RESEARCH_PROMPT, VERIFY_PROMPT
 from .context import READ_TOOLS, native_history, projected_receipt, read_history, reading_cycle, resident_sources
+from .excerpts import original_ranges
 from .tools import COMMON, LEAD, RESEARCH, VERIFY
 
 
@@ -53,11 +54,29 @@ class DeliveryRuntime:
         research_model=None,
         *,
         conversation_protocols=None,
+        changed_regions=None,
     ):
         self.store, self.gateway = store, gateway
         self.models = {"lead": reviewer_model, "verifier": verifier_model, "research": research_model or reviewer_model}
         self.publisher = publisher
         self.conversation_protocols = conversation_protocols or {}
+        self.changed_regions = changed_regions
+
+    def _gateway_specs(self):
+        return [
+            {
+                **item,
+                "function": {
+                    **item["function"],
+                    "description": item["function"]["description"]
+                    + " Also returns separate pinned base/head original excerpts for textual changed ranges. "
+                    "Only original source IDs are evidence; the diff remains navigation.",
+                },
+            }
+            if item["function"]["name"] == "read_diff" and self.changed_regions is not None
+            else item
+            for item in self.gateway.tool_specs
+        ]
 
     def _events(self, session):
         return [row["payload"] for row in self.store.list_turns(session)]
@@ -231,7 +250,7 @@ class DeliveryRuntime:
         protocol = self.conversation_protocols.get(role, {})
         prompts = {"lead": LEAD_PROMPT, "verifier": VERIFY_PROMPT, "research": RESEARCH_PROMPT}
         schemas = [
-            *self.gateway.tool_specs,
+            *self._gateway_specs(),
             *COMMON,
             *(LEAD if role == "lead" else VERIFY if role == "verifier" else RESEARCH),
         ]
@@ -395,9 +414,75 @@ class DeliveryRuntime:
             else:
                 failures, failed = 0, None
 
+    def _capture_source(self, raw):
+        metadata = {k: v for k, v in raw.items() if k not in {"content", "kind", "side"}}
+        side = raw["side"]
+        if side in {"head", "base"} and raw.get("revision") != getattr(self.store.binding, side + "_sha"):
+            raise ValueError("source revision does not match pinned binding")
+        original = (
+            raw["kind"] in {"source", "documentation", "issue", "test"}
+            and not raw.get("metadata", {}).get("navigation_only")
+            and raw.get("metadata", {}).get("status") == "available"
+        )
+        provenance = {"kind": raw["kind"], **metadata}
+        if side == "external" and original:
+            external = self.store.binding.source_environment.get("external", {})
+            if raw.get("path") not in external:
+                raise ValueError("external original is not in frozen binding")
+            provenance["provenance"] = external[raw["path"]]
+        source = self.store.put_source(
+            "original" if original else "navigation", side, raw["content"].encode("utf-8"), provenance
+        )
+        result = {"source_id": source["id"], **raw}
+        if raw.get("metadata", {}).get("status") == "unavailable":
+            result["error"] = raw.get("metadata", {}).get("reason", "source unavailable")
+        return result, source
+
+    async def _diff_originals(self, session, path):
+        ranges, gaps = original_ranges(self.changed_regions, path)
+        resident = [
+            self.store.get_source(sid) for sid in resident_sources(self._events(session), self.store.get_source)
+        ]
+        originals, identities = [], []
+        for request in ranges:
+            covered = next(
+                (
+                    source
+                    for source in resident
+                    if source["kind"] == "original"
+                    and source["snapshot_side"] == request["side"]
+                    and source["metadata"].get("path") == path
+                    and (source["metadata"].get("start_line") or 0) <= request["start_line"]
+                    and (source["metadata"].get("end_line") or 0) >= request["end_line"]
+                ),
+                None,
+            )
+            try:
+                if covered:
+                    result = {
+                        **covered["metadata"],
+                        "side": covered["snapshot_side"],
+                        "content": covered["content"].decode("utf-8"),
+                        "source_id": covered["id"],
+                    }
+                    source = covered
+                else:
+                    result, source = self._capture_source(await self.gateway("read_source", request))
+                identities.append(source["id"])
+                if source["kind"] != "original":
+                    gaps.append(
+                        {**request, "reason": result.get("error", "requested original unavailable"), "receipt": result}
+                    )
+                elif source["id"] not in {item["source_id"] for item in originals}:
+                    originals.append(result)
+            except Exception as exc:
+                # Failure to obtain a companion cannot hide the requested diff.
+                gaps.append({**request, "reason": str(exc), "error_type": type(exc).__name__})
+        return originals, list(dict.fromkeys(identities)), gaps
+
     async def _tool(self, role, session, task_id, name, args, invocation):
         permitted = [
-            *self.gateway.tool_specs,
+            *self._gateway_specs(),
             *COMMON,
             *(LEAD if role == "lead" else VERIFY if role == "verifier" else RESEARCH),
         ]
@@ -409,28 +494,13 @@ class DeliveryRuntime:
             raise ValueError("invalid tool arguments: " + errors[0].message)
         if name in {x["function"]["name"] for x in self.gateway.tool_specs}:
             raw = await self.gateway(name, args)
-            metadata = {k: v for k, v in raw.items() if k not in {"content", "kind", "side"}}
-            side = raw["side"]
-            if side in {"head", "base"} and raw.get("revision") != getattr(self.store.binding, side + "_sha"):
-                raise ValueError("source revision does not match pinned binding")
-            original = (
-                raw["kind"] in {"source", "documentation", "issue", "test"}
-                and not raw.get("metadata", {}).get("navigation_only")
-                and raw.get("metadata", {}).get("status") == "available"
-            )
-            provenance = {"kind": raw["kind"], **metadata}
-            if side == "external" and original:
-                external = self.store.binding.source_environment.get("external", {})
-                if raw.get("path") not in external:
-                    raise ValueError("external original is not in frozen binding")
-                provenance["provenance"] = external[raw["path"]]
-            source = self.store.put_source(
-                "original" if original else "navigation", side, raw["content"].encode("utf-8"), provenance
-            )
-            result = {"source_id": source["id"], **raw}
-            if raw.get("metadata", {}).get("status") == "unavailable":
-                result["error"] = raw.get("metadata", {}).get("reason", "source unavailable")
-            return result, [source["id"]], False
+            result, source = self._capture_source(raw)
+            identities = [source["id"]]
+            if name == "read_diff" and self.changed_regions is not None:
+                originals, companions, gaps = await self._diff_originals(session, args["path"])
+                result.update(originals=originals, evidence_gaps=gaps)
+                identities.extend(companions)
+            return result, list(dict.fromkeys(identities)), False
         if name == "set_progress":
             self._append(session, {"type": "progress", "value": args}, "work:" + invocation)
             return {"status": "saved"}, [], False

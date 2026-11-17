@@ -291,6 +291,7 @@ async def _run(orchestrator: Any, state: StateStore, directory: Path, run_id: st
                 verifier,
                 publisher=publisher.drain if publisher else None,
                 conversation_protocols=protocols,
+                changed_regions=regions,
             ).run(task)
         except Exception as exc:
             # Sessions and requests are already durable. Preserve accepted

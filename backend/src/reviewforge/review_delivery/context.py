@@ -46,19 +46,21 @@ def resident_sources(events, get_source):
 def projected_receipt(event, resident, released=()):
     """Keep native tool receipts, with original bytes present once in the request."""
     message = deepcopy(event["message"])
-    result = event.get("result")
-    if not isinstance(result, dict) or "content" not in result:
-        return message
-    identity = result.get("source_id", result.get("id"))
-    if identity in resident:
-        pointer = "content_in_working_set"
-    elif identity in released:
-        pointer = "source_content_released"
-    else:
-        return message
-    projected = {key: value for key, value in result.items() if key != "content"}
-    projected[pointer] = identity
-    message["data"]["content"] = json.dumps(projected, ensure_ascii=False, sort_keys=True, default=str)
+
+    def project(value):
+        if isinstance(value, list):
+            return [project(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        identity = value.get("source_id", value.get("id"))
+        pointer = "content_in_working_set" if identity in resident else "source_content_released"
+        if "content" in value and (identity in resident or identity in released):
+            value = {**{key: item for key, item in value.items() if key != "content"}, pointer: identity}
+        return {key: project(item) for key, item in value.items()}
+
+    projected = project(event.get("result"))
+    if projected != event.get("result"):
+        message["data"]["content"] = json.dumps(projected, ensure_ascii=False, sort_keys=True, default=str)
     return message
 
 

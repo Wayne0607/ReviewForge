@@ -141,3 +141,26 @@ capacity, source gates, semantic tools, retry accounting or publication rules.
 It does not enable a provider's thinking mode or fabricate missing provider
 state. A protocol change requires a new bound run, not an upgrade of an old
 checkpoint. Default legacy mode and production settings remain unchanged.
+
+## Original excerpts accompanying diff navigation (2026-11-17)
+
+The native-session retest produced valid findings but exposed an evidence-delivery
+assumption: a model reading the diff would separately ask for both source sides.
+One defect replicate instead compared a head original against base diff navigation.
+The frozen original-base acceptance criterion rejected it despite the correct
+defect and local comment. No source gate or rubric was relaxed.
+
+Only the new delivery kernel enriches `read_diff`: controller-compiled pinned
+hunk ranges select actual `read_source` excerpts from each nonempty base/head
+side. Overlapping ranges are merged; an original already resident in this same
+session can cover a requested range. Original bytes, side, revision, hashes and
+source IDs remain separate from the diff's navigation ID. Missing or structural
+material remains a concrete gap, and cannot suppress the navigation result or
+become original evidence. Empty hunk sides do not manufacture source lines.
+
+The compound receipt is persisted intact. Its original bodies are projected once
+in the requesting session's working set, with handles in the native receipt.
+Another session receives no delivery credit or working-set entry from these
+reads; only its own successful model request proves delivery. Reading never
+changes a finding revision. The old pinned gateway and historical kernels retain
+their existing semantics; changed source hashes require a fresh evaluation run.

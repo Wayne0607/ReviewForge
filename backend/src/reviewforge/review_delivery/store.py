@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import Binding
+from .evidence import validate_absence
 
 
 def _json(value: Any) -> str:
@@ -120,6 +121,8 @@ class DeliveryStore:
                     attempted TEXT,
                     recovery_condition TEXT,
                     reason TEXT);
+                CREATE TABLE IF NOT EXISTS verdict_absence (verdict_id TEXT PRIMARY KEY REFERENCES verdicts(id),
+                    premises TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS delivery_cooldowns (finding_id TEXT PRIMARY KEY REFERENCES findings(id),
                 retry_not_before REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox (finding_id TEXT PRIMARY KEY REFERENCES findings(id),
@@ -587,10 +590,16 @@ class DeliveryStore:
         return self._list("verifications")
 
     def get_verdict(self, verdict_id: str) -> dict[str, Any]:
-        return self._get("verdicts", verdict_id)
+        verdict = self._get("verdicts", verdict_id)
+        # Historical corrections can be recovered without upgrading their schema.
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='verdict_absence'").fetchone():
+            row = self.db.execute("SELECT premises FROM verdict_absence WHERE verdict_id=?", (verdict_id,)).fetchone()
+            if row:
+                verdict["absence_claims"] = json.loads(row[0])
+        return verdict
 
     def list_verdicts(self) -> list[dict[str, Any]]:
-        return self._list("verdicts")
+        return [self.get_verdict(item["id"]) for item in self._list("verdicts")]
 
     def record_verdict(
         self,
@@ -602,6 +611,7 @@ class DeliveryStore:
         attempted: Any = None,
         recovery_condition: str | None = None,
         reason: str | None = None,
+        absence_claims: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if verdict not in {"accept", "reject", "needs_evidence"}:
             raise ValueError("invalid verdict")
@@ -620,6 +630,8 @@ class DeliveryStore:
                 raise ValueError("source not delivered to verifier")
             if verdict == "accept" and not ids:
                 raise ValueError("accept requires delivered original evidence")
+            premises = absence_claims if absence_claims is not None else []
+            validate_absence(premises, self.get_source, set(ids), delivered)
             if approved_payload is not None and approved_payload != finding["claim"]:
                 raise ValueError("approved payload differs from verified finding")
             payload = finding["claim"] if verdict == "accept" else None
@@ -634,6 +646,9 @@ class DeliveryStore:
                 reason,
             )
             if previous:
+                prior_premises = self.get_verdict(previous["id"]).get("absence_claims", [])
+                if prior_premises != premises:
+                    raise ValueError("verification already decided with different absence premises")
                 if (
                     tuple(
                         previous[k]
@@ -665,6 +680,7 @@ class DeliveryStore:
                 "INSERT INTO verdicts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (verdict_id, task_id, finding["id"], finding["revision"], *fields),
             )
+            self.db.execute("INSERT INTO verdict_absence VALUES (?,?)", (verdict_id, _json(premises)))
             self.db.execute("UPDATE verifications SET status=? WHERE id=?", (verdict, task_id))
             self.db.execute("UPDATE findings SET state=? WHERE id=?", (verdict, finding["id"]))
             if verdict == "accept":
@@ -697,7 +713,7 @@ class DeliveryStore:
                     )
                 elif not old["remote_id"]:
                     self.db.execute("DELETE FROM outbox WHERE finding_id=?", (finding["id"],))
-        return self._get("verdicts", verdict_id)
+        return self.get_verdict(verdict_id)
 
     def get_outbox(self, finding_id: str) -> dict[str, Any] | None:
         row = self.db.execute(

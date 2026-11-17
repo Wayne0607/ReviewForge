@@ -201,3 +201,50 @@ an already prepared request exactly. Provider continuation remains session-local
 and never becomes original evidence. Generic workspace-only sessions and old
 frozen kernels retain their earlier policies. This requires a fresh source/run
 binding; provider cache hits and quality improvements still need live validation.
+
+## Closed scopes for absence premises (`closed-scope-1`)
+
+The completed `f345926` replay disproved a second assumption: authentic original
+citations and independent delivery do not establish sufficient coverage for a
+negative claim. Its missing-translation finding was true on post-run complete
+inspection, but the verifier relied on an incomplete search and partial catalog.
+The previous boundary checked source identity, not declared negative premises.
+The authorized repair keeps semantic judgment with the model and makes scope
+completeness a controller-checkable obligation.
+
+Every native verdict explicitly supplies `absence_claims` (an empty array when
+no essential negative premise is used). Each premise identifies its fact,
+bounded authoritative scope, and cited original source IDs. A complete source
+file, or contiguous originals covering all its lines, can support a bounded
+file-level absence judgment. A partial excerpt, search result, shared note,
+unavailable source or ordinary test log cannot. Proof references must also be
+verdict citations and have reached this verifier's successful model request.
+Validation and the normalized premise record commit with the verdict/outbox;
+failure leaves the same finding/revision available for supplementary evidence.
+
+The delivery kernel's `check_text` checks an exact, case-sensitive literal in
+every file matching an explicit glob at pinned head/base. It uses the complete
+content-hashed snapshot, without search exclusions or result caps. Its immutable
+test artifact records the snapshot digest, predicate, selected paths/body hashes,
+all match positions and concrete gaps. Binary/unreadable files and an empty
+selection cannot prove content absence. A complete zero-match artifact proves
+only that literal is absent in those files; it is not proof of missing behavior,
+an unknown external requirement, or the authority of the chosen scope. The
+verifier must establish those semantic connections from relevant code/config.
+
+The controller does not parse prose to guess whether a model has omitted a
+negative premise, nor certify arbitrary programs with literal search. Required
+declaration and model instructions address that semantic responsibility; saved
+adversarial real-model cases and manual premise review still test adherence.
+This is a bounded evidence guarantee, not a formal verifier of all natural
+language judgments. Unrelated incomplete navigation does not block positive
+evidence or accepted findings. Notes/reads do not change finding versions,
+supplementary evidence returns to the same finding, and already accepted old
+verdicts are not silently reclassified. New source bindings are required; old
+checkpoint and legacy semantics remain unchanged.
+
+Acceptance first exercises late/sibling keys, true absence, unreadable scopes,
+independent delivery, same-finding recovery, atomic persistence and restart.
+Then fixed real-model small gates precede three preselected PR replays. Comments
+remain local, physical failures/unknown usage remain in accounting, and no
+main/production-default change is authorized by this validation.

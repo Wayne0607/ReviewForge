@@ -25,6 +25,7 @@ READ_TOOLS = {
     "changed_notes",
     "list_findings",
     "read_research",
+    "check_text",
 }
 
 

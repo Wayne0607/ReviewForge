@@ -28,6 +28,16 @@ CLAIM = {
 }
 COMMON = [
     spec(
+        "check_text",
+        "Check an exact case-sensitive literal across every file matching a glob in pinned head/base, "
+        "including files skipped by search. Returns an auditable check artifact with file hashes, matches "
+        "and gaps. A complete zero-match result proves only this literal is absent in this scope; "
+        "you must establish that this scope/predicate is sufficient for your semantic claim. "
+        "Binary/unreadable files and empty scopes cannot prove absence.",
+        {"glob": STR, "literal": STR, "side": {"type": "string", "enum": ["head", "base"]}},
+        ["glob", "literal"],
+    ),
+    spec(
         "set_progress",
         "Update your current investigation focus and next steps; this is navigation, not evidence.",
         {"focus": STR, "next_steps": STR, "finding_ids": REFS},
@@ -112,15 +122,27 @@ VERIFY = [
     spec(
         "submit_verdict",
         "After attempting to refute the finding, judge it using originals received in this session. "
+        "Declare every absence premise needed by accept/reject in absence_claims (otherwise []). "
+        "Each requires an explicit bounded scope and complete original files or a complete zero-match "
+        "check_text artifact, all cited in source_ids. Partial searches/excerpts cannot prove absence. "
         "For needs_evidence specify the missing fact, attempted sources and recovery condition.",
         {
             "verdict": {"type": "string", "enum": ["accept", "reject", "needs_evidence"]},
             "source_ids": REFS,
             "reason": STR,
+            "absence_claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"fact": STR, "scope": STR, "source_ids": REFS},
+                    "required": ["fact", "scope", "source_ids"],
+                    "additionalProperties": False,
+                },
+            },
             "missing_fact": STR,
             "attempted": REFS,
             "recovery_condition": STR,
         },
-        ["verdict", "source_ids", "reason"],
+        ["verdict", "source_ids", "reason", "absence_claims"],
     )
 ]

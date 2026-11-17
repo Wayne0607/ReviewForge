@@ -24,6 +24,8 @@ BASE, HEAD = "a" * 40, "b" * 40
 
 
 def call(name, args, turn):
+    if name == "submit_verdict":
+        args = {"absence_claims": [], **args}
     return AIMessage(content="", tool_calls=[{"id": f"call-{turn}", "name": name, "args": args}])
 
 

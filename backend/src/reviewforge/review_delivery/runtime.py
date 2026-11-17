@@ -31,6 +31,7 @@ from .context import (
     reading_cycle,
     resident_sources,
 )
+from .evidence import check_text
 from .excerpts import original_ranges
 from .tools import COMMON, LEAD, RESEARCH, VERIFY
 
@@ -512,6 +513,9 @@ class DeliveryRuntime:
         errors = sorted(Draft202012Validator(schema).iter_errors(args), key=lambda error: str(list(error.path)))
         if errors:
             raise ValueError("invalid tool arguments: " + errors[0].message)
+        if name == "check_text":
+            result, source = self._capture_source(await check_text(self.gateway, args))
+            return result, [source["id"]], False
         if name in {x["function"]["name"] for x in self.gateway.tool_specs}:
             raw = await self.gateway(name, args)
             result, source = self._capture_source(raw)
@@ -644,6 +648,7 @@ class DeliveryRuntime:
                 attempted=args.get("attempted"),
                 recovery_condition=args.get("recovery_condition"),
                 reason=args.get("reason"),
+                absence_claims=args["absence_claims"],
             )
             if self.publisher:
                 await self.publisher()

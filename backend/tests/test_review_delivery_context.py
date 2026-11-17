@@ -11,6 +11,8 @@ from reviewforge.review_delivery.tools import spec
 
 
 def call(name, args):
+    if name == "submit_verdict":
+        args = {"absence_claims": [], **args}
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": "call"}])
 
 

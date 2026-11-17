@@ -52,6 +52,7 @@ def setup(tmp_path, files):
     source = store.put_source("original", "head", b"trigger", {"revision": "head", "path": "trigger.py"})
     finding = store.create_finding({"title": "Missing catalog key"}, [source["id"]], lead["id"])
     task = store.create_verification(finding["id"], verifier["id"])
+    store.record_delivery(verifier["id"], [source["id"]])
     runtime = DeliveryRuntime(store, gateway(files), None, None)
     return store, runtime, finding, task
 
@@ -60,7 +61,8 @@ async def invoke(runtime, task, name, args, invocation):
     return await runtime._tool("verifier", task["session_id"], task["id"], name, args, invocation)
 
 
-def verdict(proof, trigger=None):
+def verdict(store, proof):
+    trigger = store.list_findings()[0]["source_ids"][0]
     return {
         "verdict": "accept",
         "reason": "Authoritative catalog has no key",
@@ -94,7 +96,7 @@ async def test_unreadable_and_empty_scopes_are_not_absence_proofs(tmp_path, file
     store.record_delivery(task["session_id"], ids)
     assert not json.loads(result["content"])["complete"]
     with pytest.raises(ValueError, match="incomplete"):
-        await invoke(runtime, task, "submit_verdict", verdict(ids[0]), "judge")
+        await invoke(runtime, task, "submit_verdict", verdict(store, ids[0]), "judge")
     assert not store.list_verdicts() and not store.list_outbox()
     assert store.get_finding(finding["id"])["revision"] == 1
 
@@ -104,11 +106,11 @@ async def test_partial_original_rejected_then_same_finding_accepts_complete_chun
     _, first, _ = await invoke(runtime, task, "read_source", {"path": "en.json", "end_line": 1}, "first")
     store.record_delivery(task["session_id"], first)
     with pytest.raises(ValueError, match="scope is incomplete"):
-        await invoke(runtime, task, "submit_verdict", verdict(first[0]), "partial")
+        await invoke(runtime, task, "submit_verdict", verdict(store, first[0]), "partial")
     assert not store.list_outbox()
     _, remaining, _ = await invoke(runtime, task, "read_source", {"path": "en.json", "start_line": 2}, "rest")
     store.record_delivery(task["session_id"], remaining)
-    args = verdict(first[0])
+    args = verdict(store, first[0])
     args["source_ids"] += remaining
     args["absence_claims"][0]["source_ids"] += remaining
     await invoke(runtime, task, "submit_verdict", args, "complete")
@@ -129,13 +131,13 @@ async def test_closed_check_requires_own_delivery_and_zero_matches(tmp_path):
     store, runtime, _, task = setup(tmp_path, {"en.json": b'"target": 1\n'})
     _, found, _ = await invoke(runtime, task, "check_text", {"glob": "*.json", "literal": "target"}, "found")
     with pytest.raises(ValueError, match="not delivered"):
-        await invoke(runtime, task, "submit_verdict", verdict(found[0]), "unread")
+        await invoke(runtime, task, "submit_verdict", verdict(store, found[0]), "unread")
     store.record_delivery(task["session_id"], found)
     with pytest.raises(ValueError, match="scope is incomplete"):
-        await invoke(runtime, task, "submit_verdict", verdict(found[0]), "wrong")
+        await invoke(runtime, task, "submit_verdict", verdict(store, found[0]), "wrong")
     _, absent, _ = await invoke(runtime, task, "check_text", {"glob": "*.json", "literal": "missing_key"}, "absent")
     store.record_delivery(task["session_id"], absent)
-    await invoke(runtime, task, "submit_verdict", verdict(absent[0]), "right")
+    await invoke(runtime, task, "submit_verdict", verdict(store, absent[0]), "right")
     assert len(store.list_verdicts()) == 1
 
 
@@ -144,7 +146,7 @@ async def test_incomplete_navigation_cannot_prove_absence_or_block_unrelated_pos
     _, source, _ = await invoke(runtime, task, "read_source", {"path": "code.py"}, "original")
     nav = store.put_source("navigation", "head", b"no results", {"complete": False})
     store.record_delivery(task["session_id"], [*source, nav["id"]])
-    args = verdict(nav["id"])
+    args = verdict(store, nav["id"])
     args["source_ids"] = source
     with pytest.raises(ValueError, match="cited"):
         await invoke(runtime, task, "submit_verdict", args, "nav")
@@ -172,11 +174,11 @@ async def test_full_single_file_cannot_close_a_multi_file_scope(tmp_path):
     _, first, _ = await invoke(runtime, task, "read_source", {"path": "a.json"}, "first")
     store.record_delivery(task["session_id"], first)
     with pytest.raises(ValueError, match="b.json"):
-        await invoke(runtime, task, "submit_verdict", verdict(first[0]), "incomplete")
+        await invoke(runtime, task, "submit_verdict", verdict(store, first[0]), "incomplete")
     assert not store.list_verdicts() and not store.list_outbox()
     _, second, _ = await invoke(runtime, task, "read_source", {"path": "b.json"}, "second")
     store.record_delivery(task["session_id"], second)
-    args = verdict(first[0])
+    args = verdict(store, first[0])
     args["source_ids"] += second
     args["absence_claims"][0]["source_ids"] += second
     await invoke(runtime, task, "submit_verdict", args, "closed")

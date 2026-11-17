@@ -244,6 +244,12 @@ only that literal is absent in those files; it is not proof of missing behavior,
 an unknown external requirement, or the authority of the chosen scope. The
 verifier must establish those semantic connections from relevant code/config.
 
+Check artifacts have no repository file path and cannot manufacture a pinned
+code link. An accepted finding must also cite original triggering code; a check
+artifact alone is rejected before committing the verdict/outbox. Published
+locations identify real repository files, while derived scope proofs remain
+auditable with the verdict.
+
 The controller does not parse prose to guess whether a model has omitted a
 negative premise, nor certify arbitrary programs with literal search. Required
 declaration and model instructions address that semantic responsibility; saved

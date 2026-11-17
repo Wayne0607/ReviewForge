@@ -58,7 +58,8 @@ async def check_text(gateway, args):
         "kind": "test",
         "side": side,
         "revision": revision,
-        "path": "check_text:" + pattern,
+        # This is an executed artifact, not a repository file location.
+        "path": "",
         "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
         "metadata": {"status": "available", "complete": not gaps, "check_type": "closed-text-1"},
     }

@@ -1,13 +1,16 @@
 import json
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from reviewforge.review_delivery.contracts import Binding
+from reviewforge.review_delivery.evidence import check_text
 from reviewforge.review_delivery.publication import FindingPublisher
 from reviewforge.review_delivery.store import DeliveryStore
 from reviewforge.tools.github_api import GitHubAPIError, GitHubClient
+from tests.test_review_delivery_absence import Snapshot
 
 HEAD, BASE = "a" * 40, "b" * 40
 
@@ -79,6 +82,32 @@ async def test_two_independent_findings_and_blocked_finding(tmp_path):
     await publisher.publish(a)
     await publisher.publish(b)
     assert len(github.calls) == 2
+    store.close()
+
+
+async def test_closed_check_artifact_does_not_create_a_fictitious_code_link_or_decide_without_trigger(tmp_path):
+    store, source = setup(tmp_path)
+    workspace = Snapshot({"en.json": b"{}\n"})
+    workspace.head_sha = HEAD
+    raw = await check_text(
+        SimpleNamespace(workspace=workspace, state=SimpleNamespace(head_sha=HEAD)),
+        {"glob": "*.json", "literal": "target"},
+    )
+    metadata = {k: v for k, v in raw.items() if k not in {"content", "kind", "side"}}
+    artifact = store.put_source("original", "head", raw["content"].encode(), {"kind": raw["kind"], **metadata})
+    store.record_delivery("verifier", [artifact["id"]])
+    finding = store.create_finding({"title": "Missing key", "body": "UI displays the raw key"}, [source], "lead")
+    task = store.create_verification(finding["id"], "verifier")
+    with pytest.raises(ValueError, match="triggering code"):
+        store.record_verdict(task["id"], "accept", [artifact["id"]], reason="literal absent")
+    assert not store.list_verdicts() and not store.list_outbox()
+    store.record_verdict(task["id"], "accept", [source, artifact["id"]], reason="trigger and checked catalog")
+    github = Github()
+    await FindingPublisher(store, github, 123).drain()
+    body = github.comments[0]["body"]
+    assert f"/blob/{HEAD}/src/a.py#L4" in body
+    assert body.count("/blob/") == 1
+    assert "check_text:" not in body and "check_text%3A" not in body
     store.close()
 
 

@@ -651,6 +651,10 @@ class DeliveryStore:
                 raise ValueError("source not delivered to verifier")
             if verdict == "accept" and not ids:
                 raise ValueError("accept requires delivered original evidence")
+            if verdict == "accept" and all(
+                self.get_source(sid)["metadata"].get("metadata", {}).get("check_type") == "closed-text-1" for sid in ids
+            ):
+                raise ValueError("accept also requires original triggering code; a check artifact has no code location")
             premises = absence_claims if absence_claims is not None else []
             validate_absence(premises, self.get_source, set(ids), delivered, self.snapshot_manifest)
             if approved_payload is not None and approved_payload != finding["claim"]:

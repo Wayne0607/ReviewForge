@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import Binding
-from .evidence import validate_absence
+from .evidence import manifest_digest, validate_absence
 
 
 def _json(value: Any) -> str:
@@ -123,6 +123,7 @@ class DeliveryStore:
                     reason TEXT);
                 CREATE TABLE IF NOT EXISTS verdict_absence (verdict_id TEXT PRIMARY KEY REFERENCES verdicts(id),
                     premises TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS snapshot_manifests (side TEXT PRIMARY KEY, files TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS delivery_cooldowns (finding_id TEXT PRIMARY KEY REFERENCES findings(id),
                 retry_not_before REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox (finding_id TEXT PRIMARY KEY REFERENCES findings(id),
@@ -601,6 +602,26 @@ class DeliveryStore:
     def list_verdicts(self) -> list[dict[str, Any]]:
         return [self.get_verdict(item["id"]) for item in self._list("verdicts")]
 
+    def register_snapshot(self, side, files):
+        """Persist controller-supplied membership only when it matches the frozen binding."""
+        if side not in {"base", "head"} or manifest_digest(files) != self.binding.source_environment.get(side):
+            raise ValueError("scope manifest differs from frozen snapshot binding")
+        encoded = _json(files)
+        with self._tx():
+            old = self.db.execute("SELECT files FROM snapshot_manifests WHERE side=?", (side,)).fetchone()
+            if old and old[0] != encoded:
+                raise ValueError("scope manifest changed")
+            self.db.execute("INSERT OR IGNORE INTO snapshot_manifests VALUES (?,?)", (side, encoded))
+
+    def snapshot_manifest(self, side):
+        row = self.db.execute("SELECT files FROM snapshot_manifests WHERE side=?", (side,)).fetchone()
+        if row is None:
+            raise ValueError("complete pinned scope manifest is unavailable")
+        files = json.loads(row[0])
+        if manifest_digest(files) != self.binding.source_environment.get(side):
+            raise ValueError("scope manifest differs from frozen snapshot binding")
+        return files
+
     def record_verdict(
         self,
         task_id: str,
@@ -631,7 +652,7 @@ class DeliveryStore:
             if verdict == "accept" and not ids:
                 raise ValueError("accept requires delivered original evidence")
             premises = absence_claims if absence_claims is not None else []
-            validate_absence(premises, self.get_source, set(ids), delivered)
+            validate_absence(premises, self.get_source, set(ids), delivered, self.snapshot_manifest)
             if approved_payload is not None and approved_payload != finding["claim"]:
                 raise ValueError("approved payload differs from verified finding")
             payload = finding["claim"] if verdict == "accept" else None

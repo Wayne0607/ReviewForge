@@ -21,6 +21,8 @@ from langchain_core.messages import (
     messages_to_dict,
 )
 
+from reviewforge.review_v42.snapshot import snapshot_identity
+
 from .agents import LEAD_PROMPT, RESEARCH_PROMPT, VERIFY_PROMPT
 from .context import (
     READ_TOOLS,
@@ -640,6 +642,12 @@ class DeliveryRuntime:
             self.store.complete_research(task_id, args)
             return args, [], True
         if role == "verifier" and name == "submit_verdict":
+            for side in {claim["scope"]["side"] for claim in args["absence_claims"]}:
+                workspace = self.gateway.workspace if side == "head" else self.gateway.base_workspace
+                if workspace is None:
+                    raise ValueError("complete pinned scope workspace is unavailable")
+                await snapshot_identity(workspace)
+                self.store.register_snapshot(side, workspace._review_v42_body_manifest)
             result = self.store.record_verdict(
                 task_id,
                 args["verdict"],

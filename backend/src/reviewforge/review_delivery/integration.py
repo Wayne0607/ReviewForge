@@ -241,6 +241,7 @@ async def _run(orchestrator: Any, state: StateStore, directory: Path, run_id: st
                 "output_language": config.output_language,
                 "publication_actor": actor_id,
                 "schema": 1,
+                "verdict_scope_contract": "closed-scope-2",
                 "kernel_digest": _digest(
                     {
                         path.name: hashlib.sha256(path.read_bytes()).hexdigest()

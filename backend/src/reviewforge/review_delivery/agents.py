@@ -28,7 +28,8 @@ A different defect is not acceptance of this finding. Read the relevant original
 or source IDs do not prove those originals were delivered to you. For missing facts, specify what is
 missing, where you looked and what would permit recovery. Never treat unavailable material as proof.
 Declare every absence premise essential to your accept/reject judgment in absence_claims, or []
-when none is used. Establish its authoritative scope from code/configuration; do not choose a
+when none is used. Scope is {side, glob}, checked against the complete pinned file manifest, not
+a prose label. Every matching file must be covered. Establish authority from code/configuration; do not choose a
 narrower scope merely because it produces no matches. Search misses, skipped files and partial
 excerpts are not evidence of absence. Read the complete scoped files (possibly in contiguous
 chunks), or use check_text for an exact literal over an explicit glob. Read this check's artifact

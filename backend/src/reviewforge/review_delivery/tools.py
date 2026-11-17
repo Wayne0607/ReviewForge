@@ -123,7 +123,8 @@ VERIFY = [
         "submit_verdict",
         "After attempting to refute the finding, judge it using originals received in this session. "
         "Declare every absence premise needed by accept/reject in absence_claims (otherwise []). "
-        "Each requires an explicit bounded scope and complete original files or a complete zero-match "
+        "Each scope is {side, glob}; all matching files in the pinned manifest require complete "
+        "originals or complete zero-match "
         "check_text artifact, all cited in source_ids. Partial searches/excerpts cannot prove absence. "
         "For needs_evidence specify the missing fact, attempted sources and recovery condition.",
         {
@@ -134,7 +135,16 @@ VERIFY = [
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": {"fact": STR, "scope": STR, "source_ids": REFS},
+                    "properties": {
+                        "fact": STR,
+                        "scope": {
+                            "type": "object",
+                            "properties": {"side": {"type": "string", "enum": ["head", "base"]}, "glob": STR},
+                            "required": ["side", "glob"],
+                            "additionalProperties": False,
+                        },
+                        "source_ids": REFS,
+                    },
                     "required": ["fact", "scope", "source_ids"],
                     "additionalProperties": False,
                 },

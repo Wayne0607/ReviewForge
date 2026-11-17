@@ -202,7 +202,7 @@ and never becomes original evidence. Generic workspace-only sessions and old
 frozen kernels retain their earlier policies. This requires a fresh source/run
 binding; provider cache hits and quality improvements still need live validation.
 
-## Closed scopes for absence premises (`closed-scope-1`)
+## Closed scopes for absence premises (`closed-scope-2`)
 
 The completed `f345926` replay disproved a second assumption: authentic original
 citations and independent delivery do not establish sufficient coverage for a
@@ -214,13 +214,25 @@ completeness a controller-checkable obligation.
 
 Every native verdict explicitly supplies `absence_claims` (an empty array when
 no essential negative premise is used). Each premise identifies its fact,
-bounded authoritative scope, and cited original source IDs. A complete source
+structured scope `{side, glob}`, and cited original source IDs. A complete source
 file, or contiguous originals covering all its lines, can support a bounded
 file-level absence judgment. A partial excerpt, search result, shared note,
 unavailable source or ordinary test log cannot. Proof references must also be
 verdict citations and have reached this verifier's successful model request.
 Validation and the normalized premise record commit with the verdict/outbox;
 failure leaves the same finding/revision available for supplementary evidence.
+
+The first live retest showed that a free-text scope still allowed an authentic
+complete `app.py` to be described as repository-wide proof. Its mechanical
+gates passed, but root semantic review stopped progression before any full PR.
+The revised controller stores the complete path/body-hash manifest once per
+snapshot, validates its digest against the frozen binding, and expands each
+structured scope against it. Every selected file must have a complete original
+byte reconstruction matching its bound hash, or belong to an independently
+delivered, complete zero-match literal check covering that file. A full file
+cannot close a multi-file scope. Failure identifies the actual missing paths.
+Positive or incomplete check artifacts may accompany other evidence but do not
+close any scope; unrelated positive evidence remains usable.
 
 The delivery kernel's `check_text` checks an exact, case-sensitive literal in
 every file matching an explicit glob at pinned head/base. It uses the complete

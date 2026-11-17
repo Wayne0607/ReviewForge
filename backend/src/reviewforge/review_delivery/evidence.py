@@ -64,8 +64,17 @@ async def check_text(gateway, args):
     }
 
 
-def validate_absence(claims, get_source, cited, delivered):
-    """Validate declared coverage, never infer absence from claim prose."""
+def manifest_digest(files):
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(files, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+
+
+def validate_absence(claims, get_source, cited, delivered, get_manifest):
+    """Check coverage against snapshot membership, never infer facts from prose."""
     if not isinstance(claims, list):
         raise ValueError("absence_claims must be a list (empty when no negative premise is used)")
     for claim in claims:
@@ -74,49 +83,83 @@ def validate_absence(claims, get_source, cited, delivered):
             or set(claim) != {"fact", "scope", "source_ids"}
             or not isinstance(claim["fact"], str)
             or not claim["fact"].strip()
-            or not isinstance(claim["scope"], str)
-            or not claim["scope"].strip()
             or not isinstance(claim["source_ids"], list)
             or not claim["source_ids"]
         ):
-            raise ValueError("each absence premise requires fact, explicit scope and source_ids")
-        groups = {}
+            raise ValueError("each absence premise requires fact, structured scope and source_ids")
+        scope = claim["scope"]
+        if (
+            not isinstance(scope, dict)
+            or set(scope) != {"side", "glob"}
+            or scope["side"] not in {"base", "head"}
+            or not isinstance(scope["glob"], str)
+            or not scope["glob"]
+        ):
+            raise ValueError("absence scope requires explicit side and nonempty glob")
+        manifest = get_manifest(scope["side"])
+        required = {p for p in manifest if fnmatch.fnmatchcase(p, scope["glob"])}
+        if not required:
+            raise ValueError("absence scope matches no files; select the authoritative content scope")
+        covered, groups = set(), {}
         for identity in claim["source_ids"]:
             if identity not in cited or identity not in delivered:
                 raise ValueError("absence evidence must be cited and independently delivered")
             source = get_source(identity)
             if source["kind"] != "original":
                 raise ValueError("navigation cannot prove absence")
+            if source["snapshot_side"] != scope["side"]:
+                continue  # An authentic comparison source cannot close the other snapshot.
             metadata = source["metadata"]
             details = metadata.get("metadata", {})
             if details.get("check_type") == "closed-text-1":
                 proof = json.loads(source["content"])
+                expected = {p: h for p, h in manifest.items() if fnmatch.fnmatchcase(p, proof["glob"])}
+                actual = {f["path"]: f["sha256"] for f in proof["files"]}
                 if (
-                    proof.get("schema") != "closed-text-1"
-                    or proof.get("complete") is not True
-                    or not proof.get("files")
-                    or proof.get("matches") != []
-                    or proof.get("gaps") != []
+                    proof.get("schema") == "closed-text-1"
+                    and proof.get("complete") is True
+                    and proof.get("snapshot_digest") == manifest_digest(manifest)
+                    and proof.get("matches") == []
+                    and proof.get("gaps") == []
+                    and actual == expected
                 ):
-                    raise ValueError("literal absence check is incomplete or found a counterexample")
+                    covered.update(actual)
+                # Positive/incomplete checks are supporting observations, not absence proof.
+                # Complete originals may still prove the semantic premise independently.
                 continue
-            if metadata.get("kind") != "source":
-                raise ValueError("absence requires complete source files or a closed check_text result")
+            path = metadata.get("path")
+            if path not in required or metadata.get("kind") != "source":
+                continue
+            if details.get("empty") and source["content"] == b"" and manifest[path] == hashlib.sha256(b"").hexdigest():
+                covered.add(path)
+                continue
             total = details.get("file_lines")
-            if details.get("empty") and source["content"] == b"":
-                continue
             start, end = metadata.get("start_line"), metadata.get("end_line")
             if type(total) is not int or type(start) is not int or type(end) is not int or total < 1:
-                raise ValueError(
-                    "absence scope needs file_lines and complete original ranges; read_source without a range"
-                )
-            key = source["snapshot_side"], metadata.get("path"), metadata.get("revision")
-            groups.setdefault(key, []).append((start, end, total))
-        for ranges in groups.values():
-            cursor, total = 1, ranges[0][2]
-            for start, end, count in sorted(ranges):
-                if count != total or start > cursor or end < start or end > total:
-                    raise ValueError("absence scope has missing or inconsistent original ranges")
-                cursor = max(cursor, end + 1)
-            if cursor != total + 1:
-                raise ValueError("partial originals cannot prove file-wide absence; read remaining lines or check_text")
+                continue
+            parts = source["content"].split(b"\n")
+            lines = [part + b"\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+            if end - start + 1 != len(lines) or start < 1 or end > total:
+                raise ValueError("original line range does not match absence scope bytes")
+            groups.setdefault(path, []).append((start, total, lines))
+        for path, ranges in groups.items():
+            total, lines = ranges[0][1], {}
+            for start, count, body in ranges:
+                if count != total:
+                    raise ValueError("inconsistent original file size in absence proof")
+                for number, line in enumerate(body, start):
+                    if number in lines and lines[number] != line:
+                        raise ValueError("conflicting original lines in absence proof")
+                    lines[number] = line
+            if len(lines) == total and set(lines) == set(range(1, total + 1)):
+                raw = b"".join(lines[n] for n in range(1, total + 1))
+                if hashlib.sha256(raw).hexdigest() != manifest[path]:
+                    raise ValueError("complete original differs from pinned scope manifest")
+                covered.add(path)
+        missing = sorted(required - covered)
+        if missing:
+            raise ValueError(
+                "absence scope is incomplete: "
+                + json.dumps({"scope": scope, "missing_paths": missing})
+                + "; read complete originals or a complete zero-match check_text result"
+            )

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -5,7 +6,7 @@ import pytest
 
 from reviewforge.core.state import StateStore
 from reviewforge.review_delivery.contracts import Binding
-from reviewforge.review_delivery.evidence import check_text
+from reviewforge.review_delivery.evidence import check_text, manifest_digest
 from reviewforge.review_delivery.runtime import DeliveryRuntime
 from reviewforge.review_delivery.store import DeliveryStore
 from reviewforge.review_v42.adapter import PinnedToolGateway
@@ -35,7 +36,18 @@ def gateway(files):
 
 
 def setup(tmp_path, files):
-    store = DeliveryStore(tmp_path / "review.db", Binding("run", "org/repo", 1, "base", "head", {}, {}))
+    store = DeliveryStore(
+        tmp_path / "review.db",
+        Binding(
+            "run",
+            "org/repo",
+            1,
+            "base",
+            "head",
+            {"head": manifest_digest({p: hashlib.sha256(b).hexdigest() for p, b in files.items()})},
+            {},
+        ),
+    )
     lead, verifier = store.create_session("lead"), store.create_session("verifier")
     source = store.put_source("original", "head", b"trigger", {"revision": "head", "path": "trigger.py"})
     finding = store.create_finding({"title": "Missing catalog key"}, [source["id"]], lead["id"])
@@ -53,7 +65,7 @@ def verdict(proof, trigger=None):
         "verdict": "accept",
         "reason": "Authoritative catalog has no key",
         "source_ids": [proof, *([trigger] if trigger else [])],
-        "absence_claims": [{"fact": "key absent", "scope": "English catalog", "source_ids": [proof]}],
+        "absence_claims": [{"fact": "key absent", "scope": {"side": "head", "glob": "*"}, "source_ids": [proof]}],
     }
 
 
@@ -91,7 +103,7 @@ async def test_partial_original_rejected_then_same_finding_accepts_complete_chun
     store, runtime, finding, task = setup(tmp_path, {"en.json": b"first\nsecond\nlast\n"})
     _, first, _ = await invoke(runtime, task, "read_source", {"path": "en.json", "end_line": 1}, "first")
     store.record_delivery(task["session_id"], first)
-    with pytest.raises(ValueError, match="partial originals"):
+    with pytest.raises(ValueError, match="scope is incomplete"):
         await invoke(runtime, task, "submit_verdict", verdict(first[0]), "partial")
     assert not store.list_outbox()
     _, remaining, _ = await invoke(runtime, task, "read_source", {"path": "en.json", "start_line": 2}, "rest")
@@ -119,7 +131,7 @@ async def test_closed_check_requires_own_delivery_and_zero_matches(tmp_path):
     with pytest.raises(ValueError, match="not delivered"):
         await invoke(runtime, task, "submit_verdict", verdict(found[0]), "unread")
     store.record_delivery(task["session_id"], found)
-    with pytest.raises(ValueError, match="counterexample"):
+    with pytest.raises(ValueError, match="scope is incomplete"):
         await invoke(runtime, task, "submit_verdict", verdict(found[0]), "wrong")
     _, absent, _ = await invoke(runtime, task, "check_text", {"glob": "*.json", "literal": "missing_key"}, "absent")
     store.record_delivery(task["session_id"], absent)
@@ -153,3 +165,31 @@ async def test_verdict_requires_explicit_negative_premise_declaration(tmp_path):
             runtime, task, "submit_verdict", {"verdict": "accept", "source_ids": [], "reason": "assumed"}, "missing"
         )
     assert not store.list_verdicts() and not store.list_outbox()
+
+
+async def test_full_single_file_cannot_close_a_multi_file_scope(tmp_path):
+    store, runtime, finding, task = setup(tmp_path, {"a.json": b"{}\n", "b.json": b"{}\n"})
+    _, first, _ = await invoke(runtime, task, "read_source", {"path": "a.json"}, "first")
+    store.record_delivery(task["session_id"], first)
+    with pytest.raises(ValueError, match="b.json"):
+        await invoke(runtime, task, "submit_verdict", verdict(first[0]), "incomplete")
+    assert not store.list_verdicts() and not store.list_outbox()
+    _, second, _ = await invoke(runtime, task, "read_source", {"path": "b.json"}, "second")
+    store.record_delivery(task["session_id"], second)
+    args = verdict(first[0])
+    args["source_ids"] += second
+    args["absence_claims"][0]["source_ids"] += second
+    await invoke(runtime, task, "submit_verdict", args, "closed")
+    assert store.get_finding(finding["id"])["revision"] == 1
+    assert len(store.list_outbox()) == 1
+
+
+def test_scope_membership_is_bound_and_cannot_be_replaced(tmp_path):
+    store, _, _, _ = setup(tmp_path, {"a.py": b"a\n", "b.py": b"b\n"})
+    with pytest.raises(ValueError, match="frozen snapshot"):
+        store.register_snapshot("head", {"a.py": hashlib.sha256(b"a\n").hexdigest()})
+    files = {"a.py": hashlib.sha256(b"a\n").hexdigest(), "b.py": hashlib.sha256(b"b\n").hexdigest()}
+    store.register_snapshot("head", files)
+    store.db.execute("UPDATE snapshot_manifests SET files=? WHERE side='head'", (json.dumps({"a.py": files["a.py"]}),))
+    with pytest.raises(ValueError, match="frozen snapshot"):
+        store.snapshot_manifest("head")

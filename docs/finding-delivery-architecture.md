@@ -142,6 +142,13 @@ It does not enable a provider's thinking mode or fabricate missing provider
 state. A protocol change requires a new bound run, not an upgrade of an old
 checkpoint. Default legacy mode and production settings remain unchanged.
 
+Lead and research completion gaps must identify the missing fact, checked sources
+and the specific authoritative input that allows recovery, including a request
+for that input. Merely describing absence does not tell the recipient how to
+resume. These remain free-text tool arguments, with no prose-template validator
+or extra evidence-gathering step; independent `needs_evidence` verdicts retain
+their existing explicit missing-fact/attempt/recovery fields.
+
 ## Original excerpts accompanying diff navigation (2026-11-17)
 
 The native-session retest produced valid findings but exposed an evidence-delivery

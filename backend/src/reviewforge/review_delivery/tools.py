@@ -92,7 +92,9 @@ LEAD = [
     spec("read_research", "Read a delegated research result.", {"task_id": STR}, ["task_id"]),
     spec(
         "finish_review",
-        "Finish the review, or identify specific remaining gaps.",
+        "Finish the review. For each remaining gap, explain the missing fact, checked sources, "
+        "and request the specific authoritative input that would permit recovery. Use free text; "
+        "absence alone is not a recovery condition.",
         {"summary": STR, "gaps": {"type": "array", "items": STR}},
         ["summary", "gaps"],
     ),
@@ -100,7 +102,8 @@ LEAD = [
 RESEARCH = [
     spec(
         "finish_research",
-        "Return an answer to the delegated question with original source IDs and concrete gaps.",
+        "Return an answer to the delegated question with original source IDs and concrete gaps. "
+        "For each gap, identify the missing fact, checked sources and specific input needed to resume.",
         {"answer": STR, "source_ids": REFS, "gaps": {"type": "array", "items": STR}},
         ["answer", "source_ids", "gaps"],
     )

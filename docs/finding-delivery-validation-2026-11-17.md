@@ -203,3 +203,28 @@ earlier successful samples will not be combined with the new kernel's results.
 All comment transports in these runs are local simulations, with zero real
 GitHub writes. These fixture results do not establish holdout quality or a cost
 improvement over v3.
+
+## Companion-original retest (`94abc22`)
+
+Full Linux CI passed (**4,376 passed, 3 skipped**). The saved-case gate passed
+with **6 responses, 64,771 known tokens**, one independent accept and one local
+comment; exact original-byte/side/delivery auditing and zero-request restart
+reconciliation passed. Fresh A1 and A2 both passed the previously failing
+original-base comparison requirement, with one accepted defect and one local
+comment each (**15/125,984** and **16/137,788** responses/tokens). B1 correctly
+closed the equivalent implementation with no finding (**13/152,398**).
+
+C1 correctly identified the absent authoritative commercial policy and produced
+no unsupported finding/comment (**7/45,612**), but did not request the missing
+input or state a concrete recovery condition. The frozen rubric requires that
+recovery step, so **C1 failed**. No full PR started; unrun replicates will not be
+represented as passing. This cohort totals **57 responses, 526,553 known tokens,
+zero unknown/in-flight requests**. All comments remained local simulations.
+
+The main-review completion prompt/tool description asked only to name gaps,
+whereas independent-verifier gaps already explicitly require recovery conditions.
+The follow-up aligns the lead/research free-text completion instructions: state
+the missing fact, checked sources, and request the specific authoritative input
+that permits recovery. It adds no schema fields, prose matcher, semantic veto or
+extra read requirement. This instruction change requires a fresh run binding;
+the original truth rubric and all earlier failed records stay unchanged.

@@ -2,6 +2,8 @@
 
 ## 当前开发状态
 
+- 2026-11-17 `94abc22` 完整 Linux CI **4376 passed、3 skipped**；保存 Case **6 响应、64771 已知 tokens**，1 accept/1 本地评论，原文独立送达及零请求重启通过。新 A1/A2 均通过双侧原文与单条发现投递，B1 正确排除等价变更。C1 零误报、正确识别缺政策，但未请求恢复输入，按原冻结门槛判失败；完整 PR 未启动。该绑定合计 **57 响应、526553 已知 tokens、0 未知/在途**。后续仅补齐主审/调查助手结束说明中的恢复条件要求，不增加字段、语义模板门禁或额外读取步骤，须新绑定重验。[记录](docs/finding-delivery-validation-2026-11-17.md#companion-original-retest-94abc22)。
+
 - 2026-11-17 `89af63e` 完整 Linux CI **4369 passed、3 skipped**；正式保存 Case **9 响应、102788 已知 tokens**，1 个独立 accept、1 条本地评论，原文与独立送达审计通过，重启零新请求。新内核空板 A1/B1/C1 逐发现门槛通过；A2 虽正确交付一条缺陷，但主审与核验均未读取 base 原文，仅用 diff 导航比较，按冻结门槛判失败。合计 **67 响应、645255 已知 tokens、0 未知/在途**，九样本未全通过，完整 PR 未启动。后续在新内核的 `read_diff` 伴随独立 base/head 原文摘录，导航身份不变，须新绑定重新验收。[记录](docs/finding-delivery-validation-2026-11-17.md#product-native-session-retest-89af63e)。
 
 - 2026-11-17 `c46eb5c` 完整 Linux CI 4360 passed、3 skipped；保存 Case 按单动作判重后 29 响应、170364 已知 tokens、0 未知/在途，仍无判决，循环自然 partial。独立原生协议诊断用同一模型/Case/原文/语义提示和工具，在保留本会话的原生续接状态及完整工具历史后，7 完整响应落盘 1 accept、1 条本地评论，47513 已知 tokens，另 1 次失败用量未知；原文与独立送达审计通过。对照同时改变历史投影和传输，不能单独归因某字段或视为正式验收。现只为新 `review_delivery` 的 Go DeepSeek 配置原生会话策略与稳定请求头；旧 v4.2 SSE/历史 checkpoint 不变。9 项原生协议回归通过，完整 CI 和正式保存 Case/小样本仍待验收。[记录](docs/finding-delivery-validation-2026-11-17.md#action-level-retest-and-isolated-native-protocol-diagnostic-c46eb5c)。

@@ -274,3 +274,137 @@ original tool replies. Its invariant test fails on `ae850d6` at the second
 request and passes for both stored messages and the actual provider wire message
 array in the new implementation. Live cache, saved-case, small-cohort and full
 replay acceptance remain pending for that repair.
+
+The stopped review's existing verifier subsequently completed alone under the
+original `ae850d6` binding: **one accept and one local comment** for the team
+ADMIN/OWNER `&&` authorization error. Both archive hashes, exact original ranges,
+actual successful own-session input bodies, finding/verdict versions and local
+delivery receipts passed auditing. It matches the selected benchmark's permission
+reference issue. Restart added zero model calls and preserved the comment body
+and all identities. The stopped lead was not resumed. Combined main/verification
+usage is **78 complete responses, 8,100,001 known tokens, 3 failed unknown-usage
+attempts** (81 physical attempts), with known Go allowance receipts totaling
+USD **0.99531659** and known balance charge USD 0. The interrupted main review
+does not provide a complete quality/recall score for the five reference issues.
+
+## Chronological-append retest (`f345926`)
+
+The chronological prefix invariant fails on the previous source at the second
+request. New offline tests cover actual stored and provider-wire message-array
+prefixes, changing focus, repeated originals, independent finding/verdict
+conversations, restart and explicit release. Selected regressions **92 passed**;
+full Linux CI **4,378 passed, 3 skipped**.
+
+The saved gate passed with **6 responses, 50,194 known tokens**, one accept and
+one local comment, exact successful-request original-body proof and zero-request
+restart. Its measured cached input is **35,968 / 47,442 (75.8%)**. Its known Go
+allowance receipt sum is USD **0.00417624**; this single case does not establish
+a general savings ratio.
+
+All **nine fresh small episodes passed the same frozen core truth, source,
+identity and delivery gates**, with **89 complete responses, 659,238 known
+tokens**, one failed unknown-usage attempt (90 physical attempts). Defect
+replicates delivered one independent accept/comment each; equivalent and
+missing-policy replicates produced no unsupported comments, and missing policy
+included concrete recovery input. Actual input bodies are checked independently
+of delivery rows. Report limitations remain: C1 unnecessarily questions the
+dollars/cents contract already given in README; B3 unnecessarily raises a
+counterfactual unreported-config caveat despite verified fixed snapshots.
+
+The fresh historical Cal.com #14740 full-source replay ended naturally as
+**partial**, with **158 complete responses, 9,278,989 known tokens** (9,167,765
+input and 111,224 output), **9 failed unknown-usage attempts**, 167 physical
+attempts and **zero in-flight requests**. Its six current independently accepted
+findings produced **six separate local simulated comments**. Seven historical
+accept verdicts include a correction and independent reverification of the same
+finding, not a seventh finding or duplicate comment. The lead's first candidate
+was submitted in response 44; delivery worked but initial discovery remains slow.
+
+| Current finding | Result and review limitation |
+| --- | --- |
+| ADMIN/OWNER authorization uses `&&` | Non-owner team admins are denied; matches reference issue |
+| Raw guest list passed to confirmation sender | Existing attendees receive another confirmation in mixed old/new requests; matches reference issue |
+| Email normalization differs from existing booking policy | Case/alias blacklist bypass and case-sensitive attendee duplication; matches reference issue. Stripping `+` tags indiscriminately for attendee identity is an overly broad fix suggestion |
+| Duplicate addresses within one request | Duplicate attendee rows and emails; matches reference issue |
+| Add-guests sender ignores standard-email controls | Explicitly corrected at revision 2 to remove unsupported team-member recipients, independently reverified, then updated the same comment |
+| Missing permission translation key | Complete English-catalog inspection corroborates the fact, but the model's negative-evidence proof is insufficient, as detailed below |
+
+The selected record in the existing 50-PR pool contains five reference comments.
+This run matches four and does not report its initial-empty-string suggestion;
+the email-control and translation findings are additional. Reference matching
+is not a formal recall/precision measurement: the reference is not exhaustive,
+this PR has been reused heavily during development, and no unseen holdout or v3
+comparison was run. Some manual line numbers and initial toast wording are
+imprecise; canonical source-range references remain available.
+
+All **184** original-source records passed exact frozen archive, side, revision,
+range and body checks. The audit also checked actual successful own-session
+model inputs, finding/task revisions, outbox records and local delivery receipts.
+All **150 consecutive request pairs** preserved prior native messages unchanged,
+with no changed prefix or explicit release. Restart through the same frozen
+product entry produced **zero new requests**, identical report state, and the
+same six local comment IDs and bodies. These checks establish mechanical
+integrity; they do not establish that every cited source proves the claim.
+
+Input cache hits were **8,348,800 / 9,167,765 tokens (91.1%)**. Known provider
+Go allowance receipts total **USD 0.2575507**, with known balance charge USD 0.
+The nine failed attempts' usage remains unknown; these are not invoice totals.
+Do not calculate a savings ratio against the previous interrupted review, which
+performed different work and never finished its main review.
+
+The lead explicitly ended with missing-product-spec gaps: permitted booking
+states and seat-based-event scope need the excluded issue/design text, and no
+add-guests-specific exception to the general email-disable setting was found.
+These gaps remain visible rather than being converted into unsupported defects
+or a clean completion result.
+
+### Strict evidence gap and next acceptance boundary
+
+The translation-key verifier treated a navigation search with **`complete=false`**
+and **314 skipped paths**, together with partial English-catalog excerpts, as
+proof that the key was globally absent. Its source IDs, bytes and independent
+delivery are authentic, but it did not receive the complete canonical catalog.
+This violates the separation between navigation and evidence for an absence
+claim. An independent post-run parse of every English JSON catalog in the
+verified head archive (one file) confirms the key is absent. That check supports
+the fact; it is **not retroactively credited as model input**. The frozen verdict
+and outbox have not been edited to conceal the gap.
+
+Consequently **strict evidence acceptance is false**, and this run is **not ready
+for the main/production quality gate**. Six accepted local comments demonstrate
+delivery, not six fully certified publication decisions. Default legacy and
+`main` remain unchanged; **zero real GitHub comments** were posted.
+
+The next bounded task is to design and verify negative evidence over an explicit
+closed scope: a complete canonical original, or an auditable closed-scope check,
+must support an absence claim. Incomplete navigation and partial excerpts can
+locate evidence, but cannot prove absence; supplementary evidence or a specific
+gap must return to the same finding. This should not block a positive claim
+because an unrelated query is incomplete, and should not introduce prose regex
+gates, arbitrary call quotas, or automatic upgrades of old checkpoints.
+
+Before another full replay, add adversarial saved cases with a key outside the
+excerpt or inside a skipped file, a genuinely absent key, and a positive claim
+with an unrelated incomplete query. Verify same-finding recovery, independent
+judgment and restart/no-duplicate delivery, then repeat the small comparison and
+use an unseen PR. A full 50-PR rollout and production publication remain pending.
+
+### Tracked Go validation usage
+
+Across this day's tracked Go evaluation lineage, including interrupted diagnostics
+and successive retests, the private physical ledgers total **713 attempts,
+697 complete responses, 21,003,455 known tokens, 16 failed unknown-usage attempts,
+zero in flight**, and **USD 1.52212977 known Go allowance consumption**. Known
+balance charge is USD 0. This scope includes the initial saved-case run and the
+isolated native-protocol diagnostic; it excludes setup probes and earlier
+non-Go supplier calls. It is not an invoice, a production cost estimate, or the
+cost of the final full PR alone. The latest saved, nine-small and full cohort
+accounts for 253 responses and 9,988,421 known tokens within that total.
+
+Private audit artifacts are under
+`.reviewforge/benchmarks/finding-delivery-resident-20261117-142539/`, notably
+`full/provenance-audit.json`, `full/native-prefix-audit.json`,
+`full/restart-gate.json`, `full/quality-review.json`,
+`full/manual-complete-locale-check.json` and `full/final-usage.json`.
+The lineage rollup is
+`.reviewforge/eval-private/opencode-go-20261117/evaluation-usage-rollup.json`.

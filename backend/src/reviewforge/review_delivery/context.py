@@ -64,12 +64,83 @@ def projected_receipt(event, resident, released=()):
     return message
 
 
-def native_history(events, resident, delivered):
+def native_context(working_set, previous=None):
+    """Append changed navigation state; originals live in native tool replies.
+
+    The native exchange itself already preserves the complete read history.
+    Reinjecting either it or original bodies ahead of that exchange invalidates
+    its stable prefix. Persist the state and delta with the actual request.
+    """
+    previous = previous or {}
+    state = {
+        key: value
+        for key, value in working_set.items()
+        if key not in {"retained_sources", "read_history_navigation_only"}
+    }
+    handles = [
+        {
+            "id": source["id"],
+            "kind": source["kind"],
+            "snapshot_side": source["snapshot_side"],
+            "metadata": {
+                key: source["metadata"][key]
+                for key in ("path", "revision", "start_line", "end_line")
+                if key in source["metadata"]
+            },
+        }
+        for source in working_set["retained_sources"]
+    ]
+    state["retained_sources"] = handles
+    before = {item["id"]: item for item in previous.get("retained_sources", [])}
+    current = {item["id"]: item for item in handles}
+    delta = {
+        key: value
+        for key, value in state.items()
+        if key != "retained_sources" and (key not in previous or value != previous[key])
+    }
+    added = [value for key, value in current.items() if before.get(key) != value]
+    removed = [key for key in before if key not in current]
+    if added:
+        delta["retained_sources_added"] = added
+    if removed:
+        delta["released_source_ids"] = removed
+    unset = [key for key in previous if key not in state]
+    if unset:
+        delta["unset_fields"] = unset
+    return state, delta
+
+
+def _native_receipt(event, seen, released):
+    message = deepcopy(event["message"])
+    identities = set(event.get("source_ids", []))
+
+    def project(value):
+        if isinstance(value, list):
+            return [project(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        identity = value.get("source_id", value.get("id"))
+        if "content" in value and isinstance(identity, str) and identity in identities:
+            pointer = "source_content_released" if identity in released else "content_in_session_history"
+            if identity in released or identity in seen:
+                value = {**{key: item for key, item in value.items() if key != "content"}, pointer: identity}
+            else:
+                seen.add(identity)
+        return {key: project(item) for key, item in value.items()}
+
+    result = project(event.get("result"))
+    if result != event.get("result"):
+        message["data"]["content"] = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+    return message
+
+
+def native_history(events, delivered):
     """Replay this session's provider state and tool exchanges, never another's.
 
     Preserve provider-returned assistant fields. Already delivered historical
-    bodies can be represented by durable handles. The latest newly requested
-    result remains available even if it is navigation or explicitly released.
+    Original bodies first appear in their actual tool reply, once. Workspace
+    deltas remain at the chronological position where the model received them.
+    Only explicit release rewrites an already delivered historical body.
     """
     released = set()
     for event in events:
@@ -80,15 +151,18 @@ def native_history(events, resident, delivered):
         elif event.get("type") == "receipt" and event.get("ok"):
             released.difference_update(event.get("source_ids", []))
     responses = [e for e in events if e.get("type") == "response"]
+    requests = {event["id"]: event for event in events if event.get("type") == "request"}
     messages = []
+    seen = set()
     for event in responses:
+        messages.extend(requests[event["request_id"]].get("context_messages", []))
         messages.extend(event.get("raw_message", event["message"]))
         receipts = sorted(
             [e for e in events if e.get("type") == "receipt" and e["request_id"] == event["request_id"]],
             key=lambda e: e["index"],
         )
         prunable = released.intersection(delivered) if event is not responses[-1] else ()
-        messages.extend(projected_receipt(e, resident, prunable) for e in receipts)
+        messages.extend(_native_receipt(e, seen, prunable) for e in receipts)
     return messages
 
 

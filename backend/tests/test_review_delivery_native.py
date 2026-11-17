@@ -51,6 +51,55 @@ async def test_native_state_survives_multiple_tool_rounds_without_entering_works
     assert (await runtime._session(other["id"], "lead", "Separate question"))["status"] == "complete"
 
 
+async def test_native_requests_extend_actual_messages_and_wire_prefix_while_workspace_changes(tmp_path):
+    store = store_at(tmp_path)
+    router = ModelRouter(
+        LLMConfig(
+            base_url="https://opencode.ai/inference/go/openai/v1", api_key="test-only", model="deepseek-v4.1-flash"
+        )
+    )
+    adapter = raw_models(router, request_timeout=900)["v42_reviewer"]
+    snapshots, wire = [], []
+
+    class Appending(Script):
+        async def ainvoke(self, messages):
+            snapshot = messages_to_dict(messages)
+            payload = adapter._get_request_payload(messages)["messages"]
+            if snapshots:
+                assert snapshot[: len(snapshots[-1])] == snapshots[-1]
+                assert payload[: len(wire[-1])] == wire[-1]
+            snapshots.append(snapshot)
+            wire.append(payload)
+            return await super().ainvoke(messages)
+
+    def compare(messages):
+        text = "\n".join(str(m.content) for m in messages)
+        assert text.count("UNIQUE ORIGINAL base.py") == text.count("UNIQUE ORIGINAL head.py") == 1
+        assert "content_in_session_history" in text
+        assert workspace(messages)["progress"] == {"focus": "compare units", "next_steps": "conclude"}
+        assert len(workspace(messages)["retained_sources"]) == 2
+        return finish()
+
+    lead = Appending(
+        [
+            continued(call("read_source", {"path": "base.py"}), "opaque-A"),
+            continued(call("set_progress", {"focus": "compare units", "next_steps": "conclude"}), "opaque-focus"),
+            continued(call("read_source", {"path": "head.py"}), "opaque-B"),
+            continued(call("read_source", {"path": "base.py"}), "opaque-reread"),
+            compare,
+        ]
+    )
+    assert (await DeliveryRuntime(store, Gateway(), lead, Script([]), conversation_protocols=NATIVE).run("Compare"))[
+        "status"
+    ] == "complete"
+    session = store.list_sessions()[0]["id"]
+    assert len(store.delivered_sources(session)) == 2
+    requests = [turn["payload"] for turn in store.list_turns(session) if turn["payload"]["type"] == "request"]
+    assert all("context_state" in request for request in requests)
+    # The earlier focus update remains at its actual chronological position.
+    assert sum("compare units" in message["data"].get("content", "") for message in snapshots[-1]) == 1
+
+
 async def test_native_pending_request_replays_exactly_after_restart(tmp_path):
     store = store_at(tmp_path)
     pending = []
@@ -84,6 +133,76 @@ async def test_native_pending_request_replays_exactly_after_restart(tmp_path):
         )
     )["status"] == "complete"
     assert len(store.delivered_sources(session)) == 2
+
+
+async def test_native_finding_verdict_cycle_keeps_bodies_and_provider_state_independent(tmp_path):
+    store = store_at(tmp_path)
+    requests = {"lead": [], "verifier": []}
+
+    class Recording(Script):
+        def __init__(self, role, steps):
+            super().__init__(steps)
+            self.role = role
+
+        async def ainvoke(self, messages):
+            snapshot = messages_to_dict(messages)
+            if requests[self.role]:
+                assert snapshot[: len(requests[self.role][-1])] == requests[self.role][-1]
+            requests[self.role].append(snapshot)
+            return await super().ainvoke(messages)
+
+    def author(messages):
+        assert "verifier-private" not in str(messages_to_dict(messages))
+        return continued(
+            call(
+                "submit_finding",
+                {
+                    "claim": {"title": "Regression", "body": "Unsafe path introduced"},
+                    "source_ids": [store.list_sources()[0]["id"]],
+                },
+            ),
+            "lead-private",
+        )
+
+    def challenge(messages):
+        assert "lead-private" not in str(messages_to_dict(messages))
+        assert workspace(messages)["retained_sources"] == []
+        return continued(call("read_saved_source", {"source_id": store.list_sources()[0]["id"]}), "verifier-private")
+
+    def decide(messages):
+        assert "lead-private" not in str(messages_to_dict(messages))
+        assert "UNIQUE ORIGINAL head.py" in "\n".join(str(m.content) for m in messages)
+        return continued(
+            call(
+                "submit_verdict",
+                {
+                    "verdict": "accept",
+                    "source_ids": [store.list_sources()[0]["id"]],
+                    "reason": "Independent refutation checked",
+                },
+            ),
+            "verifier-private",
+        )
+
+    def complete(messages):
+        assert "verifier-private" not in str(messages_to_dict(messages))
+        assert store.list_findings()[0]["state"] == "accept"
+        return finish()
+
+    lead = Recording("lead", [continued(call("read_source", {"path": "head.py"}), "lead-private"), author, complete])
+    verifier = Recording("verifier", [challenge, decide])
+    runtime = DeliveryRuntime(
+        store,
+        Gateway(),
+        lead,
+        verifier,
+        conversation_protocols={"lead": {"native_history": True}, "verifier": {"native_history": True}},
+    )
+    assert (await runtime.run("Review"))["status"] == "complete"
+    assert len(store.list_verdicts()) == len(store.list_outbox()) == 1
+    before = lead.calls, verifier.calls
+    await runtime.run("Review")
+    assert (lead.calls, verifier.calls) == before
 
 
 async def test_native_release_removes_historical_original_bodies_without_dropping_protocol_state(tmp_path):

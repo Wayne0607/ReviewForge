@@ -30,6 +30,8 @@ def conversation_protocols(router):
             "provider": "opencode-go" if go else "generic",
             "native_history": go and effective["model"] in {"deepseek-v4.1-flash", "deepseek-v4-pro"},
         }
+        if policies[role]["native_history"]:
+            policies[role]["history_layout"] = "native-append-1"
     return policies
 
 

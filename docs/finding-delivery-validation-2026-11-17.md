@@ -228,3 +228,49 @@ the missing fact, checked sources, and request the specific authoritative input
 that permits recovery. It adds no schema fields, prose matcher, semantic veto or
 extra read requirement. This instruction change requires a fresh run binding;
 the original truth rubric and all earlier failed records stay unchanged.
+
+## Recovery-instruction retest (`ae850d6`)
+
+Full Linux CI passed (**4,376 passed, 3 skipped**). The actual saved-case gate
+passed with **10 responses, 103,006 known tokens**, one independent accept and
+one local comment; exact original-byte/side/delivery auditing and zero-request
+restart reconciliation passed. All **nine fresh small episodes passed their
+frozen core truth/source/identity/delivery criteria**:
+
+| Fixture | Complete responses | Known tokens | Result |
+| --- | ---: | ---: | --- |
+| A, three defect replicates | 51 | 523,350 | One independent accept/comment each |
+| B, three equivalent-change replicates | 28 | 266,423 | Zero false findings/comments |
+| C, three missing-policy replicates | 19 | 126,664 | Concrete recovery input, zero unsupported comments |
+
+The small cohort used **98 complete responses, 916,437 known tokens**, plus one
+failed physical request with unknown usage (99 physical attempts). Fixture test
+limitations and expected policy partials remain in the original reports. This
+does not certify every phrase: C1 misattributes the policy-absence sentence to
+a nonexistent base code comment (it is actually in README); A1's core regression
+is supported but its downstream refresh/renewal impact wording is speculative.
+These report-quality limitations are recorded explicitly in the gate summary.
+
+The subsequent Cal.com #14740 historical full-source replay was interrupted at
+a request boundary after proving the native-prefix architecture gap, not at an
+artificial call/token quota. At drain it had **58 complete responses, 7,091,593
+known tokens**, one failed unknown-usage attempt, zero in-flight calls, one
+persisted candidate, no verdict/comment. A prepared verifier request was saved
+before dispatch. The stopped main review is not a full-PR quality result.
+
+At a representative point, original source bodies totaled about 119 KB while
+the submitted request serialized to 747,444 characters. A later pair shared only
+two complete leading messages and 11,635 of 780,741 serialized characters. Final
+main-review input cache hits were **428,032 / 7,057,565 tokens (about 6.1%)**.
+Actual calls had distinct arguments; repeated EventManager reads used different
+ranges. The evidence therefore does not support blaming this diagnostic on the
+earlier same-read loop. It exposes broad exploration without early delivery,
+plus repeated processing of a reconstructed native context with a mutable prefix.
+
+The existing candidate's verifier is being resumed alone under its original
+frozen source/configuration, without resuming the lead or importing a verdict.
+The new `native-append-1` repair preserves chronological workspace deltas and
+original tool replies. Its invariant test fails on `ae850d6` at the second
+request and passes for both stored messages and the actual provider wire message
+array in the new implementation. Live cache, saved-case, small-cohort and full
+replay acceptance remain pending for that repair.

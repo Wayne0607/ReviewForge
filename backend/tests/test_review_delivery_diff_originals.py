@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import ToolMessage
 
 from reviewforge.core.state import StateStore
 from reviewforge.review_delivery.contracts import Binding
@@ -40,10 +41,18 @@ async def test_diff_delivers_independent_originals_once_without_promoting_naviga
         text = "\n".join(str(message.content) for message in messages)
         assert text.count("result = 1") == 2  # one diff line, one original
         assert text.count("result = 0") == 2
-        receipt = json.loads(messages[-1].content)
+        receipt = json.loads(
+            next(message.content for message in reversed(messages) if isinstance(message, ToolMessage))
+        )
         assert receipt["kind"] == "diff" and receipt["metadata"]["navigation_only"]
         assert len(receipt["originals"]) == 2 and not receipt["evidence_gaps"]
-        assert all("content" not in source and "content_in_working_set" in source for source in receipt["originals"])
+        if native:
+            assert all("content" in source for source in receipt["originals"])
+            assert all("content" not in source for source in sources)
+        else:
+            assert all(
+                "content" not in source and "content_in_working_set" in source for source in receipt["originals"]
+            )
         assert len({receipt["source_id"], *(source["source_id"] for source in receipt["originals"])}) == 3
         assert all(not store.delivered_sources(session["id"]) for session in store.list_sessions())
         return finish()

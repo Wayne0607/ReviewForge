@@ -15,7 +15,23 @@ def call(name, args):
 
 
 def workspace(messages):
-    return json.loads(messages[2].content.split(": ", 1)[1])
+    state = {"retained_sources": []}
+    for message in messages:
+        if not isinstance(message.content, str):
+            continue
+        if message.content.startswith("Current session working set (notes are navigation): "):
+            state = json.loads(message.content.split(": ", 1)[1])
+        elif message.content.startswith("Session workspace update (navigation only): "):
+            delta = json.loads(message.content.split(": ", 1)[1])
+            sources = {item["id"]: item for item in state["retained_sources"]}
+            sources.update({item["id"]: item for item in delta.pop("retained_sources_added", [])})
+            for identity in delta.pop("released_source_ids", []):
+                sources.pop(identity, None)
+            for key in delta.pop("unset_fields", []):
+                state.pop(key, None)
+            state.update(delta)
+            state["retained_sources"] = list(sources.values())
+    return state
 
 
 def finish():

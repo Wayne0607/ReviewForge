@@ -165,9 +165,39 @@ source IDs remain separate from the diff's navigation ID. Missing or structural
 material remains a concrete gap, and cannot suppress the navigation result or
 become original evidence. Empty hunk sides do not manufacture source lines.
 
-The compound receipt is persisted intact. Its original bodies are projected once
-in the requesting session's working set, with handles in the native receipt.
+The compound receipt is persisted intact. Workspace-only sessions project its
+original bodies once in the working set. Native append sessions keep each body
+in its first tool reply, with duplicate references pointing to that reply.
 Another session receives no delivery credit or working-set entry from these
 reads; only its own successful model request proves delivery. Reading never
 changes a finding revision. The old pinned gateway and historical kernels retain
 their existing semantics; changed source hashes require a fresh evaluation run.
+
+## Chronological native conversation (`native-append-1`)
+
+The first native projection rebuilt every request with a changing working-set
+message before the entire assistant/tool history. The full-PR diagnostic proved
+that its append/cache assumption was false: two consecutive requests shared
+only their first two complete messages; 780,741 serialized characters had a
+shared prefix of only 11,635 characters. The interrupted main review reported
+7,057,565 input tokens with just 428,032 cached input tokens (about 6.1%).
+This is separate from defect-discovery quality; it does not explain by itself
+why the lead deferred its first candidate until late in the exploration.
+
+For new native sessions, requests instead preserve every previously submitted
+workspace update at its actual chronological position, then append the returned
+provider state, tool results and changed navigation state. Original bodies stay
+in their first native tool reply; an identical source ID later points to that
+reply. The current working-set update contains added/released source handles
+and changed focus/finding/note state, not another copy of bodies or the complete
+query history already present in native exchanges. The controller persists both
+the state snapshot used to calculate the delta and the exact update messages.
+
+Without an explicit release, each subsequent actual request and provider wire
+message array extends the preceding submitted array unchanged. Explicit release
+can prune previously delivered historical bodies; newly read material remains
+fully deliverable before it can be reduced to a released handle. Restart replays
+an already prepared request exactly. Provider continuation remains session-local
+and never becomes original evidence. Generic workspace-only sessions and old
+frozen kernels retain their earlier policies. This requires a fresh source/run
+binding; provider cache hits and quality improvements still need live validation.

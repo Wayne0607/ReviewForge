@@ -22,7 +22,15 @@ from langchain_core.messages import (
 )
 
 from .agents import LEAD_PROMPT, RESEARCH_PROMPT, VERIFY_PROMPT
-from .context import READ_TOOLS, native_history, projected_receipt, read_history, reading_cycle, resident_sources
+from .context import (
+    READ_TOOLS,
+    native_context,
+    native_history,
+    projected_receipt,
+    read_history,
+    reading_cycle,
+    resident_sources,
+)
 from .excerpts import original_ranges
 from .tools import COMMON, LEAD, RESEARCH, VERIFY
 
@@ -291,14 +299,25 @@ class DeliveryRuntime:
                 if last and response_event:
                     previous += [projected_receipt(e, retained) for e in receipts]
                 delivered = list(dict.fromkeys([*delivered, *retained]))
-                chat = [
-                    SystemMessage(content=prompts[role]),
-                    HumanMessage(content=task),
-                    HumanMessage(content="Current session working set (notes are navigation): " + _json(working_set)),
-                ]
+                chat = [SystemMessage(content=prompts[role]), HumanMessage(content=task)]
+                native_fields = {}
                 if protocol.get("native_history"):
-                    previous = native_history(events, retained, self.store.delivered_sources(session))
-                chat += messages_from_dict(previous)
+                    state, delta = native_context(working_set, last.get("context_state") if last else None)
+                    updates = (
+                        [HumanMessage(content="Session workspace update (navigation only): " + _json(delta))]
+                        if delta
+                        else []
+                    )
+                    previous = native_history(events, self.store.delivered_sources(session))
+                    chat += [*messages_from_dict(previous), *updates]
+                    native_fields = {"context_state": state, "context_messages": messages_to_dict(updates)}
+                else:
+                    chat += [
+                        HumanMessage(
+                            content="Current session working set (notes are navigation): " + _json(working_set)
+                        ),
+                        *messages_from_dict(previous),
+                    ]
                 request_id = uuid.uuid4().hex
                 last = {
                     "type": "request",
@@ -306,6 +325,7 @@ class DeliveryRuntime:
                     "messages": messages_to_dict(chat),
                     "source_ids": delivered,
                     "note_watermarks": note_watermarks,
+                    **native_fields,
                 }
                 self._append(session, last, "request:" + request_id)
                 response_event = None
